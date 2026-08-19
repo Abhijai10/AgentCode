@@ -1,0 +1,43 @@
+{
+  "schema_version": 1,
+  "kind": "roadmap_state",
+  "authority": "DOC-09 Master Project Roadmap (docs/coredocs/09_Master_Project_Roadmap.md)",
+  "last_updated": "2026-08-20",
+  "phases": [
+    { "id": "P00", "name": "Project Governance & Architecture Freeze", "status": "COMPLETE", "evidence": ["docs/progress/phase-00-completion.md"] },
+    { "id": "P01", "name": "OSS Extraction & Evidence Collection", "status": "IN_PROGRESS", "evidence": ["docs/reference/AGENTCODE_REFERENCE_CATALOG.md", "docs/extraction/"] },
+    { "id": "P02", "name": "Repository Skeleton & Development Infrastructure", "status": "COMPLETE", "evidence": ["docs/progress/phase-02-completion.md"] },
+    { "id": "P03", "name": "Background Daemon & Persistent Kernel Foundation", "status": "NOT_STARTED", "evidence": [] },
+    { "id": "P04", "name": "Model Broker & OmniRoute Provider Fabric", "status": "NOT_STARTED", "evidence": [] },
+    { "id": "P05", "name": "Native Tool Runtime Foundation", "status": "NOT_STARTED", "evidence": [] },
+    { "id": "P06", "name": "Desktop Interface Foundation", "status": "NOT_STARTED", "evidence": [] },
+    { "id": "P07", "name": "Git & Worktree Foundation", "status": "NOT_STARTED", "evidence": [] },
+    { "id": "P08", "name": "Code Intelligence Foundation", "status": "NOT_STARTED", "evidence": [] },
+    { "id": "P09", "name": "Context Engine & Persistent Memory", "status": "NOT_STARTED", "evidence": [] },
+    { "id": "P10", "name": "Verification & Evidence Foundation", "status": "NOT_STARTED", "evidence": [] },
+    { "id": "P11", "name": "Skills, Hooks & MCP", "status": "NOT_STARTED", "evidence": [] },
+    { "id": "P12", "name": "Security Foundation", "status": "NOT_STARTED", "evidence": [] },
+    { "id": "P13", "name": "Browser & QA", "status": "NOT_STARTED", "evidence": [] },
+    { "id": "P14", "name": "Design Studio", "status": "NOT_STARTED", "evidence": [] },
+    { "id": "P15", "name": "Cloud Security", "status": "NOT_STARTED", "evidence": [] },
+    { "id": "P16", "name": "AI Security", "status": "NOT_STARTED", "evidence": [] },
+    { "id": "P17", "name": "Performance & Resource Discipline", "status": "NOT_STARTED", "evidence": [] },
+    { "id": "P18", "name": "Dogfooding & Self-Hosting", "status": "NOT_STARTED", "evidence": [] },
+    { "id": "P19", "name": "Packaging & Distribution", "status": "NOT_STARTED", "evidence": [] },
+    { "id": "P20", "name": "Release Readiness", "status": "NOT_STARTED", "evidence": [] },
+    { "id": "P21", "name": "Post-V1 Platform & Ecosystem", "status": "NOT_STARTED", "evidence": [] },
+    { "id": "P22", "name": "Community & Governance Evolution", "status": "NOT_STARTED", "evidence": [] },
+    { "id": "P23", "name": "Long-Term Architecture Evolution", "status": "NOT_STARTED", "evidence": [] },
+    { "id": "P24", "name": "Sustained Security Posture", "status": "NOT_STARTED", "evidence": [] },
+    { "id": "P25", "name": "Global Reliability Engineering", "status": "NOT_STARTED", "evidence": [] },
+    { "id": "P26", "name": "Advanced Product Intelligence", "status": "NOT_STARTED", "evidence": [] },
+    { "id": "P27", "name": "Ecosystem Integrations", "status": "NOT_STARTED", "evidence": [] },
+    { "id": "P28", "name": "Internationalization & Accessibility", "status": "NOT_STARTED", "evidence": [] },
+    { "id": "P29", "name": "V1 Release Engineering", "status": "NOT_STARTED", "evidence": [] }
+  ],
+  "rules": [
+    "status COMPLETE requires all WP ACCEPTED plus Doc 10 phase gates passing plus completion evidence",
+    "status must reflect evidence, never intent",
+    "updates to this file must match docs/progress/PHASE_STATUS.md"
+  ]
+}
