@@ -53,9 +53,13 @@ build dependency; no committed path references it.
 | Repository | Exception | Justification | Owner sign-off |
 |------------|-----------|----------------|----------------|
 | daytona (REF-017) | License UNKNOWN — local clone contains no license file | No license file or declared license is present in the clone; upstream license link in README references a tag (v0.190.0) not present in the clone | recorded by P01-WP02; reuse BLOCKED_FOR_COPY until upstream license text is confirmed and reviewed |
-| cloudsploit (REF-011) | GPL-3.0 | Strong copyleft: BLOCKED for runtime/adaptation reuse without an approved amendment; cataloged as research/pattern-study only | recorded by P01-WP02 |
-| ScoutSuite (REF-048) | GPL-2.0 | Strong copyleft: BLOCKED for runtime/adaptation reuse without an approved amendment; cataloged as research/pattern-study only | recorded by P01-WP02 |
-| ctags (REF-016) | GPL-2.0 | Strong copyleft: BLOCKED for reuse; tool-invocation boundary would need review per ADR-0008 | recorded by P01-WP02 |
+| cloudsploit (REF-011) | GPL-3.0-or-later | Strong copyleft: BLOCKED for runtime/adaptation reuse without an approved amendment; cataloged as research/pattern-study only | recorded by P01-WP02 |
+| ScoutSuite (REF-048) | GPL-2.0-or-later | Strong copyleft: BLOCKED for runtime/adaptation reuse without an approved amendment; cataloged as research/pattern-study only | recorded by P01-WP02 |
+| ctags (REF-016) | GPL-2.0-or-later | Strong copyleft: BLOCKED for reuse; tool-invocation boundary would need review per ADR-0008 | recorded by P01-WP02 |
+| semgrep (REF-049) | LGPL-2.1-or-later | Weak copyleft: REVIEW classification (boundary analysis required) before any reuse decision | recorded by P01-WP02 |
+| trailofbits-skills (REF-058) | CC-BY-SA-4.0 | Share-alike copyleft: reuse requires share-alike compliance review; pattern-study only for now | recorded by P01-WP02 |
+| ripgrep (REF-043) | Unlicense OR MIT | Dual license; choose permissive side (MIT) for any adoption — recorded, not an exception blocking use | recorded by P01-WP02 |
+| dyad (REF-018) | Apache-2.0 with `src/pro/` portions clause | Portions under `src/pro/` carry a separate license; any adoption must avoid that subtree or review its license | recorded by P01-WP02 |
 
 ## Governing Rules
 
