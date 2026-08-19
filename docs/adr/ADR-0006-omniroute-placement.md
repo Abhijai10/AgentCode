@@ -31,18 +31,21 @@ what is the build relationship?
 
 ## Evidence
 
-- Doc 07 §20–24, §97–98, §103; extraction P01-WP03 (OmniRoute package layout,
-  routing core entrypoints, licensing) — see docs/extraction/03-provider-fabric/.
+- Doc 07 §20–24, §97–98, §103.
+- (Previously cited P01-WP03 extraction (package layout, routing entrypoints,
+  licensing) — that extraction record does not exist yet; claim removed in the
+  2026-08-20 ADR audit. P01-WP03 must record it before Phase 4.)
 
 ## Decision
 
 - The provider fabric is the first-party TypeScript package
   `services/provider_gateway` (pnpm workspace), implementing the AgentCode-adopted
-  subset of the OmniRoute routing model (top-K/fallback, capability mapping) per the
-  P01-WP03 extraction record.
+  subset of the OmniRoute routing model (top-K/fallback, capability mapping); the
+  exact adopted subset is fixed by the P01-WP03 extraction record when it exists.
 - Upstream OmniRoute source remains a research input in
-  `/Volumes/T7 Shield/GitHub-Repos-dependency/OmniRoute` at a pinned SHA; it is never
-  a runtime dependency and never vendored wholesale.
+  `/Volumes/T7 Shield/GitHub-Repos-dependency/OmniRoute`; the pinned HEAD SHA is
+  recorded in the reference catalog (REF-032, docs/reference/AGENTCODE_REFERENCE_CATALOG.md).
+  It is never a runtime dependency and never vendored wholesale.
 - Phase 2 creates only the package skeleton (builds, health-check truthfulness); the
   routing implementation arrives in Phase 4 (HC-P04).
 - Attribution and license obligations per docs/legal/ and Doc 07 §93.

@@ -35,6 +35,6 @@ Admission record:  docs/policy/dependency-admissions/DEP-ADM-<NNN>.md
 | ID | Name | Strategy | Adopting phase | Notes |
 |----|------|----------|----------------|-------|
 | TOOL-001 | git (macOS system) | SYSTEM_DEPENDENCY | P07 (Git foundation) | provided by macOS/Xcode toolchain; not used by Phase 2 build |
-| (open) | ripgrep | (candidate: MANAGED_DOWNLOAD or BUNDLED) | P08 | extraction P01-WP07; decision recorded at adoption |
+| (open) | ripgrep | (candidate: MANAGED_DOWNLOAD or BUNDLED) | P08 | decision recorded at adoption; P01 extraction (catalog REF-043) informs it |
 
 No external binary is required to build/test Phase 2 (P2-G1 clean-build gate).

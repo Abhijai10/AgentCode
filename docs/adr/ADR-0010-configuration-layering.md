@@ -30,8 +30,10 @@ How is configuration loaded, layered and owned across AgentCode?
 
 ## Evidence
 
-- Doc 09 HC-P02; Doc 11 §41; extraction P01-WP04 donor config patterns
-  (codex/openhands use layered file+env config) — see docs/extraction/04-agent-runtime/.
+- Doc 09 HC-P02; Doc 11 §41.
+- (Previously cited P01-WP04 extraction (donor config patterns) — that extraction
+  record does not exist yet; claim removed in the 2026-08-20 ADR audit. P01-WP04 may
+  confirm or refine the layer stack when it runs.)
 
 ## Decision
 

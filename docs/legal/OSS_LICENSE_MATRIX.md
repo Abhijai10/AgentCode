@@ -1,6 +1,7 @@
 # OSS License Matrix
 
-Status: ACTIVE (Phase 0). Updated by P01-WP02 and every dependency admission.
+Status: ACTIVE (Phase 0). Updated by P01-WP02 (reference-library classification) and
+by every dependency admission (Phase 2+).
 
 Classification legend:
 
@@ -13,39 +14,48 @@ Classification legend:
 
 License gate verdicts: PASS / REVIEW / BLOCKED / PENDING (per `DEPENDENCY_ADMISSION.md`).
 
-## Phase 2 Build/Runtime Dependencies
+## Admitted Dependencies
 
-| Dependency | Version | License | Classification | Verdict | License file inspected |
-|------------|---------|---------|----------------|---------|------------------------|
-| rusqlite (bundled SQLite) | 0.37.x (pinned in Cargo.lock) | MIT (rusqlite) / Public Domain (SQLite) | DIRECT_RUNTIME_DEPENDENCY | PASS | yes — crates.io source + sqlite3 public domain notice |
-| tracing | 0.1.x | MIT/Apache-2.0 | DIRECT_RUNTIME_DEPENDENCY | PASS | yes |
-| tracing-subscriber | 0.3.x | MIT/Apache-2.0 | DIRECT_RUNTIME_DEPENDENCY | PASS | yes |
-| serde / serde_json / toml | 1.x | MIT/Apache-2.0 | DIRECT_RUNTIME_DEPENDENCY | PASS | yes |
-| anyhow | 1.x | MIT/Apache-2.0 | DIRECT_RUNTIME_DEPENDENCY | PASS | yes |
-| thiserror | 2.x | MIT/Apache-2.0 | DIRECT_RUNTIME_DEPENDENCY | PASS | yes |
-| pino | 9.x | MIT | DIRECT_RUNTIME_DEPENDENCY (TS) | PASS | yes |
-| react / react-dom | 18.x | MIT | DIRECT_RUNTIME_DEPENDENCY (desktop renderer) | PASS | yes |
-| tauri / tauri-build (Tauri 2) | 2.x | MIT/Apache-2.0 (Tauri core) | DIRECT_RUNTIME_DEPENDENCY (desktop) | PASS | yes |
-| vite / typescript / eslint / vitest / prettier | pinned | MIT | DEV | PASS | yes |
+**None.** No dependency is admitted yet: there are no Cargo.toml/Cargo.lock,
+package.json/pnpm-lock.yaml or node_modules in the repository. Nothing may claim a
+PASS license verdict, a lockfile pin, or an inspected license file until Phase 2
+installs the dependency and the admission record (DEP-ADM-NNN) exists.
 
-## Foundation Extraction Sources (reference library)
+## Proposed Phase 2 Candidates (NOT admitted — PROPOSED only)
 
-| Repository | License | Classification | Verdict | Notes |
-|------------|---------|----------------|---------|-------|
-| OmniRoute | (see P01-WP02 record) | PATTERN_STUDY_ONLY / SOURCE_ADAPTATION (Phase 4) | PASS/PENDING | recorded in P01-WP02 |
-| codex | ... | PATTERN_STUDY_ONLY | PASS | P01-WP02 |
-| aider | ... | PATTERN_STUDY_ONLY | PASS | P01-WP02 |
-| openhands | ... | PATTERN_STUDY_ONLY | PASS | P01-WP02 |
-| opencode | ... | PATTERN_STUDY_ONLY | PASS | P01-WP02 |
-| mini-swe-agent | ... | PATTERN_STUDY_ONLY | PASS | P01-WP02 |
-| tree-sitter | ... | PATTERN_STUDY_ONLY | PASS | P01-WP02 |
-| rtk | ... | PATTERN_STUDY_ONLY | PASS | P01-WP02 |
-| letta-code | ... | PATTERN_STUDY_ONLY | PASS | P01-WP02 |
-| ... (complete list in P01-WP02) | | | | |
+Declared licenses below are upstream metadata only; license files have NOT been
+inspected (no installed artifacts exist). Every row becomes ACTUAL with a pinned
+version + inspected license file at its Phase 2 admission.
+
+| Dependency | Declared license | Classification | License review | Resolved version | Admission record |
+|------------|------------------|----------------|----------------|------------------|------------------|
+| rusqlite (bundled SQLite) | MIT (crate) / Public Domain (SQLite) | DIRECT_RUNTIME_DEPENDENCY | NOT_INSPECTED (PROPOSED) | null (pin at admission) | P02 |
+| tracing / tracing-subscriber | MIT OR Apache-2.0 | DIRECT_RUNTIME_DEPENDENCY | NOT_INSPECTED (PROPOSED) | null | P02 |
+| serde / serde_json / toml | MIT OR Apache-2.0 | DIRECT_RUNTIME_DEPENDENCY | NOT_INSPECTED (PROPOSED) | null | P02 |
+| anyhow / thiserror | MIT OR Apache-2.0 | DIRECT_RUNTIME_DEPENDENCY | NOT_INSPECTED (PROPOSED) | null | P02 |
+| pino | MIT | DIRECT_RUNTIME_DEPENDENCY (TS) | NOT_INSPECTED (PROPOSED) | null | P02 |
+| react / react-dom | MIT | DIRECT_RUNTIME_DEPENDENCY (desktop renderer) | NOT_INSPECTED (PROPOSED) | null | P02 |
+| tauri / tauri-build (Tauri 2) | MIT OR Apache-2.0 | DIRECT_RUNTIME_DEPENDENCY (desktop) | NOT_INSPECTED (PROPOSED) | null | P02 |
+| vite / typescript / eslint / vitest / prettier / @tauri-apps/cli | MIT or Apache-2.0 per tool | BINARY_TOOL_INVOCATION (dev) | NOT_INSPECTED (PROPOSED) | null | P02 |
+
+Machine-readable companion: `docs/legal/third_party_manifest.json` (CAND-* entries,
+status PROPOSED, review NOT_INSPECTED).
+
+## Foundation Extraction Sources (reference library — research input only)
+
+Classification and license inspection of every cataloged reference repository is
+recorded in `docs/reference/LICENSE_PROVENANCE_MATRIX.md` (P01-WP02) and
+`docs/reference/licenses_scan.json`. The reference library is never a runtime or
+build dependency; no committed path references it.
 
 ## Known Exceptions
 
-(none yet — P1-G7: every exception recorded here with justification and owner sign-off)
+| Repository | Exception | Justification | Owner sign-off |
+|------------|-----------|----------------|----------------|
+| daytona (REF-017) | License UNKNOWN — local clone contains no license file | No license file or declared license is present in the clone; upstream license link in README references a tag (v0.190.0) not present in the clone | recorded by P01-WP02; reuse BLOCKED_FOR_COPY until upstream license text is confirmed and reviewed |
+| cloudsploit (REF-011) | GPL-3.0 | Strong copyleft: BLOCKED for runtime/adaptation reuse without an approved amendment; cataloged as research/pattern-study only | recorded by P01-WP02 |
+| ScoutSuite (REF-048) | GPL-2.0 | Strong copyleft: BLOCKED for runtime/adaptation reuse without an approved amendment; cataloged as research/pattern-study only | recorded by P01-WP02 |
+| ctags (REF-016) | GPL-2.0 | Strong copyleft: BLOCKED for reuse; tool-invocation boundary would need review per ADR-0008 | recorded by P01-WP02 |
 
 ## Governing Rules
 
@@ -54,3 +64,5 @@ License gate verdicts: PASS / REVIEW / BLOCKED / PENDING (per `DEPENDENCY_ADMISS
 2. `PATTERN_STUDY_ONLY` implies the AgentCode implementation is original; no
    verbatim code blocks are taken from the donor.
 3. This matrix is updated in the same commit as the dependency admission.
+4. No dependency row may claim PASS/inspected/pinned state before its actual
+   admission (Repair 5, 2026-08-20 recovery run).

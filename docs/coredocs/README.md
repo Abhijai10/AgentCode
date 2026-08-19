@@ -16,19 +16,22 @@ implementation decision in this repository.
 
 ## Document Index
 
-| ID | File | Title | Status |
-|----|------|-------|--------|
-| DOC-01 | `01_Model_Selector.md` | Model Selector | FINAL (locked baseline) |
-| DOC-02 | `02_Code_Intelligence_Context_Persistent_Memory.md` | Code Intelligence, Context & Persistent Memory | FINAL (locked baseline) |
-| DOC-03 | `03_Autonomy_Kernel_Agent_Runtime.md` | Autonomy Kernel & Agent Runtime | FINAL (locked baseline) |
-| DOC-04 | `04_Tools_Edit_Git_Sandbox_Skills_Hooks_HARDENED.md` | Tools, Edit, Git, Sandbox, Skills, Hooks (HARDENED) | FINAL (locked baseline) |
-| DOC-05 | `05_Verification_Security_RedTeam.md` | Verification, Security & Red Team | FINAL (locked baseline) |
-| DOC-06 | `06_Design_Studio_Product_UX.md` | Design Studio & Product UX | FINAL (locked baseline) |
-| DOC-07 | `07_OSS_Extraction_Blueprint.md` | Implementation & OSS Extraction Blueprint | FINAL (locked baseline) |
-| DOC-08 | `08_Product_Requirements_Document_PRD.md` | Product Requirements Document (PRD) | FINAL (locked baseline) |
-| DOC-09 | `09_Master_Project_Roadmap.md` | Master Project Roadmap | FINAL (locked baseline) |
-| DOC-10 | `10_Success_Definition_Acceptance_Gates.md` | Success Definition & Acceptance Gates | FINAL (locked baseline) |
-| DOC-11 | `11_Phase_Wise_Implementation_Playbook.md` | Phase-Wise Implementation Playbook | FINAL (locked baseline) |
+| ID | File | Title | Rev | Status |
+|----|------|-------|-----|--------|
+| DOC-01 | `01_Model_Selector.md` | Model, Provider, Routing & Reliability Architecture Specification | 1 | FINAL (locked baseline) |
+| DOC-02 | `02_Code_Intelligence_Context_Persistent_Memory.md` | Code Intelligence, Context & Persistent Memory Architecture | 2 | FINAL (locked baseline) |
+| DOC-03 | `03_Autonomy_Kernel_Agent_Runtime.md` | Autonomy Kernel & Agent Runtime Architecture | 2 | FINAL (locked baseline) |
+| DOC-04 | `04_Tools_Edit_Git_Sandbox_Skills_Hooks_HARDENED.md` | Tools, Edit, Git, Sandbox, Skills & Hooks Architecture | 2 | FINAL (locked baseline) |
+| DOC-05 | `05_Verification_Security_RedTeam.md` | Verification, Security & Red-Team Architecture | 1 | FINAL (locked baseline) |
+| DOC-06 | `06_Design_Studio_Product_UX.md` | Design Studio & Product UX Architecture | 2 | FINAL (locked baseline) |
+| DOC-07 | `07_OSS_Extraction_Blueprint.md` | Implementation & OSS Extraction Blueprint | 2 | FINAL (locked baseline) |
+| DOC-08 | `08_Product_Requirements_Document_PRD.md` | Product Requirements Document (PRD) | 2 | FINAL (locked baseline) |
+| DOC-09 | `09_Master_Project_Roadmap.md` | Master Project Roadmap | 3 | FINAL (locked baseline) |
+| DOC-10 | `10_Success_Definition_Acceptance_Gates.md` | Success Definition & Acceptance Gates | 2 | FINAL (locked baseline) |
+| DOC-11 | `11_Phase_Wise_Implementation_Playbook.md` | Phase-Wise Implementation Playbook | 2 | FINAL (locked baseline) |
+
+Titles and revisions are read from each document's own header (verified 2026-08-20);
+sha256 of each file is recorded in `docs/registry/documents.json`.
 
 ## Registry Rules
 

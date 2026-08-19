@@ -20,7 +20,8 @@ is **implementation drift** — repair it, do not redesign the architecture.
 
 ## 2. No Casual Architecture Drift
 
-Locked (do not redesign without an approved amendment ADR):
+Locked (do not redesign without an approved amendment — see `docs/adr/README.md`
+amendment path):
 
 - Kernel ownership (mission/task/completion truth)
 - SQLite V1 control plane (single authoritative Kernel writer; no UI/provider/

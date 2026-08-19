@@ -29,9 +29,10 @@ Which structured logging stack and conventions do all AgentCode services share?
 
 ## Evidence
 
-- Doc 09 HC-P02; Doc 11 H22–H23; extraction P01-WP04: donor runtimes use
-  structured/tracing-style logging (codex-rs tracing; opencode pino-style) — see
-  docs/extraction/04-agent-runtime/.
+- Doc 09 HC-P02; Doc 11 H22–H23.
+- (Previously cited P01-WP04 extraction (donor runtimes' structured logging) — that
+  extraction record does not exist yet; claim removed in the 2026-08-20 ADR audit.
+  P01-WP04 may confirm or refine the choice when it runs.)
 
 ## Decision
 

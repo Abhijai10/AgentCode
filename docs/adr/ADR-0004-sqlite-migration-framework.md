@@ -35,9 +35,11 @@ and satisfies Doc 11 H17/H18 (concurrency/singleton, migration rules)?
 
 ## Evidence
 
-- Doc 03 §0.31, Doc 11 H17/H18; extraction P01-WP04 (codex-rs uses rusqlite-style
-  direct SQLite with embedded migrations), P01-WP08 (letta-core migrations via custom
-  runner) — direct-driver + small migration runner is the proven donor pattern.
+- Doc 03 §0.31, Doc 11 H17/H18.
+- (Previously cited P01-WP04/P01-WP08 extraction confirmation of the
+  direct-driver + small migration runner pattern — those extraction records do not
+  exist yet; claim removed in the 2026-08-20 ADR audit. P01-WP04 may confirm or
+  refine this when it runs.)
 
 ## Decision
 

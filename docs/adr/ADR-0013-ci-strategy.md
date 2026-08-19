@@ -59,5 +59,6 @@ What does CI run, where, and how does it stay deterministic?
 
 ## Verification
 
-- P2-G4; CI run against this batch's branch; gate-catalog validation script
+- P2-G4 (Phase 2): CI workflow is created in Phase 2 and must pass against the
+  Phase 2 branch; gate-catalog validation script
   (scripts/validate-gate-catalog.mjs) checks P0/P1/P2 gate registry consistency.

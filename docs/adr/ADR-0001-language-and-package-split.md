@@ -37,9 +37,9 @@ the boundaries?
 - Doc 07 §102–103, §104 (Local RPC boundary).
 - Doc 06 §8030: "Tauri 2 + React/TypeScript/Vite is the preferred V1 desktop direction".
 - Doc 02 §115 example: backend language = Rust (LONG_LIVED knowledge class).
-- Extraction: P01-WP04 (runtime) — donor runtimes (codex Rust core, opencode TS loop)
-  confirm per-language strengths; P01-WP03 (provider fabric) confirms TS provider
-  ecosystem.
+- (Previously cited P01-WP03/P01-WP04 extraction confirmation — those extraction
+  records do not exist yet; claim removed in the 2026-08-20 ADR audit. P01-WP03/WP04
+  extraction may confirm or refine this decision when they run.)
 
 ## Decision
 
