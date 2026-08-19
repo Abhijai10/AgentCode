@@ -1,10 +1,10 @@
 # WP-P00-WP04 — License-Review Workflow
 
 - **Phase:** P00
-- **Status:** ACCEPTED
+- **Status:** ACCEPTED (re-validated 2026-08-20 recovery run)
 - **Risk:** HIGH | **Release scope:** REQUIRED_V1
 - **Base commit:** c941bdd
-- **Accepted commit:** (recorded in phase-00-completion.md)
+- **Accepted commit:** (recorded in phase-00-completion.md and phase-00-completion.json)
 - **Owner modules:** docs/legal/
 - **Architecture refs:** DOC-10 P0-G5; DOC-11 §19/H-P00; DOC-07 §89–95, §2038
 - **Acceptance gates:** P0-G5
@@ -37,3 +37,16 @@ machine-readable manifest).
 
 - Handoff: P01-WP02 populates foundation-source rows from actual license files of
   reference repos.
+
+## 2026-08-20 Recovery Validation
+
+- Legal artifacts repaired: third_party_manifest.json rewritten (CAND-* entries, status PROPOSED, license_review NOT_INSPECTED, resolved_version null); OSS_LICENSE_MATRIX.md split admitted (none) vs proposed; THIRD_PARTY_NOTICES.md removed fabricated dependency attributions.
+- Reference-library classification moved to P01-WP02 (docs/reference/LICENSE_PROVENANCE_MATRIX.md).
+
+## Evidence (2026-08-20)
+
+- P0-G5: license-review workflow exists (docs/legal/LICENSE_REVIEW.md) and legal artifacts are truthful (no false inspected/pinned claims).
+
+## Handoff (2026-08-20)
+
+- P01-WP02 populates foundation-source rows from actual license files of reference repos; Phase 2 admissions use DEP-ADM records.

@@ -1,10 +1,10 @@
 # WP-P00-WP02 — ADR Framework
 
 - **Phase:** P00
-- **Status:** ACCEPTED
+- **Status:** ACCEPTED (re-validated 2026-08-20 recovery run)
 - **Risk:** HIGH | **Release scope:** REQUIRED_V1
 - **Base commit:** c941bdd
-- **Accepted commit:** (recorded in phase-00-completion.md)
+- **Accepted commit:** (recorded in phase-00-completion.md and phase-00-completion.json)
 - **Owner modules:** docs/adr/
 - **Architecture refs:** DOC-10 P0-G2, P0-G3; DOC-11 §17/H-P00; DOC-07 §2
 - **Acceptance gates:** P0-G2, P0-G3
@@ -48,3 +48,17 @@ PENDING), and the Phase 2-required ADR set.
 
 - ADRs are additive; supersession via new ADR only.
 - Handoff: Phase 2 WPs cite ADR IDs; Phase 1 packets may cite ADR-0004/0006/0008.
+
+## 2026-08-20 Recovery Validation
+
+- All 13 ADRs audited (docs/progress/adr-audit-phase00.md): decisions doc-backed; 5 fake extraction citations removed (ADR-0001/0004/0006/0009/0010); ADR-0006 SHA claim fixed; ADR-0013 verification text made future-tense.
+- Bounded PENDING item (ADR-0005 transport) retained with deadline.
+
+## Evidence (2026-08-20)
+
+- P0-G2: ADR directory + template + README exist.
+- P0-G3: foundational unresolved choices have ADRs; open transport choice has explicit bounded-PENDING marker (ADR-0005).
+
+## Handoff (2026-08-20)
+
+- Phase 2 WPs cite ADR IDs; P01-WP03/04 extraction will re-confirm ADR-0001/0004/0009/0010 evidence.

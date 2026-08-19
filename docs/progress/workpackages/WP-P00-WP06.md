@@ -1,10 +1,10 @@
 # WP-P00-WP06 — Developer Implementation Rules
 
 - **Phase:** P00
-- **Status:** ACCEPTED
+- **Status:** ACCEPTED (re-validated 2026-08-20 recovery run)
 - **Risk:** HIGH | **Release scope:** REQUIRED_V1
 - **Base commit:** c941bdd
-- **Accepted commit:** (recorded in phase-00-completion.md)
+- **Accepted commit:** (recorded in phase-00-completion.md and phase-00-completion.json)
 - **Owner modules:** AGENTS.md
 - **Architecture refs:** DOC-10 P0-G7; DOC-11 §21/H-P00, H33–H36
 - **Acceptance gates:** P0-G7
@@ -35,3 +35,16 @@ session startup/shutdown.
 ## Rollback / Cleanup / Handoff
 
 - Handoff: all agents must read AGENTS.md before writing.
+
+## 2026-08-20 Recovery Validation
+
+- AGENTS.md wording unified per phase-00-review.md finding 2 (approved amendment path reference).
+- Governance understanding check passed and recorded in docs/progress/phase-00-governance-validation.md.
+
+## Evidence (2026-08-20)
+
+- P0-G7: source-of-truth hierarchy in AGENTS.md; independent understanding check answers Q1/Q2/Q3 correctly (PASS).
+
+## Handoff (2026-08-20)
+
+- All agents must read AGENTS.md before writing.
