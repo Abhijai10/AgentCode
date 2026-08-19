@@ -5,7 +5,7 @@
   "last_updated": "2026-08-20",
   "phase_name_source": "Doc 09 HC-P00..HC-P29 exact contract names; no aliases",
   "phases": [
-    { "id": "P00", "name": "Project Governance & Architecture Freeze", "status": "IN_PROGRESS", "notes": "VALIDATING — completion package created and gates recorded 2026-08-20; marked COMPLETE on next tracker update after commit", "evidence": ["docs/progress/phase-00-completion.md", "docs/progress/phase-00-completion.json", "docs/progress/phase-00-governance-validation.md"] },
+    { "id": "P00", "name": "Project Governance & Architecture Freeze", "status": "COMPLETE", "notes": "all P00 WPs ACCEPTED; gates P0-G1..G7 PASS with recorded runs; failure/understanding checks PASS; completion package committed 2026-08-20", "evidence": ["docs/progress/phase-00-completion.md", "docs/progress/phase-00-completion.json", "docs/progress/phase-00-governance-validation.md", "docs/progress/adr-audit-phase00.md"] },
     { "id": "P01", "name": "OSS Extraction & Evidence Collection", "status": "IN_PROGRESS", "notes": "EXTRACTION — P01-WP01, P01-WP02 accepted; P01-WP03..WP17 not started", "evidence": ["docs/reference/AGENTCODE_REFERENCE_CATALOG.md", "docs/reference/LICENSE_PROVENANCE_MATRIX.md", "docs/reference/licenses_scan.json"] },
     { "id": "P02", "name": "Repository Skeleton & Development Infrastructure", "status": "NOT_STARTED", "notes": "no implementation exists; earlier COMPLETE claim retracted", "evidence": [] },
     { "id": "P03", "name": "Background Daemon & Persistent Kernel Foundation", "status": "NOT_STARTED", "notes": "requires ADR-0005 transport resolution", "evidence": [] },

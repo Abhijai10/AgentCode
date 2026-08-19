@@ -1,0 +1,115 @@
+{
+  "schema_version": 1,
+  "kind": "phase_completion",
+  "phase": "P00",
+  "phase_name": "Project Governance & Architecture Freeze",
+  "status": "COMPLETE",
+  "completed_at": "2026-08-20",
+  "starting_commit": "1603ee2",
+  "repair_commit": "1935016",
+  "catalog_commit": "b55d3bd",
+  "completion_package_commit": "see git log for this package's commit",
+  "branch": "batch/phase-0-2-foundation",
+  "work_packages": {
+    "P00-WP01": "ACCEPTED",
+    "P00-WP02": "ACCEPTED",
+    "P00-WP03": "ACCEPTED",
+    "P00-WP04": "ACCEPTED",
+    "P00-WP05": "ACCEPTED",
+    "P00-WP06": "ACCEPTED",
+    "P00-WP07": "ACCEPTED"
+  },
+  "gates": {
+    "P0-G1": { "result": "PASS", "run": "node scripts/validate-document-registry.mjs -> PASS (11 documents, 0 errors, 0 warnings)" },
+    "P0-G2": { "result": "PASS", "run": "docs/adr/ directory, ADR_TEMPLATE.md, 13 ADRs, README registry; audit: docs/progress/adr-audit-phase00.md" },
+    "P0-G3": { "result": "PASS", "run": "13 ADRs; ADR-0005 bounded-PENDING transport sub-item with evidence + deadline" },
+    "P0-G4": { "result": "PASS", "run": "docs/policy/DEPENDENCY_ADMISSION.md + ADR-0012 exist and are concrete" },
+    "P0-G5": { "result": "PASS", "run": "docs/legal/LICENSE_REVIEW.md workflow; legal artifacts truthful (PROPOSED/NOT_INSPECTED)" },
+    "P0-G6": { "result": "PASS", "run": "docs/progress/PHASE_STATUS.md + roadmap_state.json; canonical Doc 09 names; truthful statuses" },
+    "P0-G7": { "result": "PASS", "run": "AGENTS.md hierarchy; governance validation Q1-Q3 PASS; Doc 10 failure test PASS" }
+  },
+  "global_gates": {
+    "G-PHASE-01": "N/A (no code in Phase 0)",
+    "G-PHASE-02": "N/A (no prior tests)",
+    "G-PHASE-03": "PASS (validator + catalog scripts + governance validation are runnable checks)",
+    "G-PHASE-04": "PASS (artifacts used through real paths: AGENTS.md, ADRs, tracker, validator)",
+    "G-PHASE-05": "PASS (Doc 10 SQLite->Redis failure test; validator failure cases)",
+    "G-PHASE-06": "PASS (no simulated functionality)",
+    "G-PHASE-07": "PASS (all governance docs updated this run)",
+    "G-PHASE-08": "PASS (this completion package + recorded runs + commits)",
+    "G-PHASE-09": "PASS (no architectural deviation; ADR audit)",
+    "G-PHASE-10": "PASS (no admitted third-party material; all candidates PROPOSED/NOT_INSPECTED)"
+  },
+  "failure_test": {
+    "question": "What should I do if I want to replace SQLite with Redis?",
+    "expected": "agent recognizes architecture decision and requires ADR/review",
+    "result": "PASS",
+    "evidence": "docs/progress/phase-00-governance-validation.md"
+  },
+  "understanding_check": {
+    "result": "PASS",
+    "evidence": "docs/progress/phase-00-review.md (independent) + docs/progress/phase-00-governance-validation.md (deterministic re-validation)"
+  },
+  "review_findings_repaired": [
+    "P00/P02 COMPLETE claims cited nonexistent completion packages -> retracted; P02 = NOT_STARTED; P00 completion package now exists",
+    "AGENTS.md amendment wording unified with docs/adr/README.md"
+  ],
+  "adr_state": {
+    "accepted": ["ADR-0001", "ADR-0002", "ADR-0003", "ADR-0004", "ADR-0005", "ADR-0006", "ADR-0007", "ADR-0008", "ADR-0009", "ADR-0010", "ADR-0011", "ADR-0012", "ADR-0013"],
+    "bounded_pending": ["ADR-0005 transport sub-item (deadline: before Phase 3 daemon IPC)"],
+    "audit": "docs/progress/adr-audit-phase00.md"
+  },
+  "license_dependency_state": {
+    "admitted_dependencies": [],
+    "proposed_candidates": 18,
+    "proposed_state": "PROPOSED / NOT_INSPECTED / resolved_version null",
+    "manifest": "docs/legal/third_party_manifest.json",
+    "reference_repos_cataloged": 62,
+    "reference_unknown_licenses": ["daytona (BLOCKED_FOR_COPY)"],
+    "matrix": "docs/reference/LICENSE_PROVENANCE_MATRIX.md"
+  },
+  "commands_run": [
+    "node scripts/validate-document-registry.mjs",
+    "node scripts/collect-reference-catalog.mjs",
+    "node scripts/enrich-reference-catalog.mjs"
+  ],
+  "evidence_refs": [
+    "docs/registry/documents.json",
+    "docs/coredocs/README.md",
+    "docs/adr/README.md",
+    "docs/adr/ADR_TEMPLATE.md",
+    "docs/progress/adr-audit-phase00.md",
+    "docs/policy/DEPENDENCY_ADMISSION.md",
+    "docs/policy/BRANCH_POLICY.md",
+    "docs/policy/TOOL_REGISTRY.md",
+    "docs/legal/LICENSE_REVIEW.md",
+    "docs/legal/OSS_LICENSE_MATRIX.md",
+    "docs/legal/THIRD_PARTY_NOTICES.md",
+    "docs/legal/third_party_manifest.json",
+    "docs/progress/PHASE_STATUS.md",
+    "docs/progress/roadmap_state.json",
+    "docs/progress/phase-00-review.md",
+    "docs/progress/phase-00-governance-validation.md",
+    "docs/progress/workpackages/WP-P00-WP01.md",
+    "docs/progress/workpackages/WP-P00-WP02.md",
+    "docs/progress/workpackages/WP-P00-WP03.md",
+    "docs/progress/workpackages/WP-P00-WP04.md",
+    "docs/progress/workpackages/WP-P00-WP05.md",
+    "docs/progress/workpackages/WP-P00-WP06.md",
+    "docs/progress/workpackages/WP-P00-WP07.md",
+    "docs/reference/AGENTCODE_REFERENCE_CATALOG.md",
+    "docs/reference/agentcode_reference_catalog.json",
+    "docs/reference/licenses_scan.json",
+    "docs/reference/LICENSE_PROVENANCE_MATRIX.md",
+    "docs/progress/workpackages/WP-P01-WP01.md",
+    "docs/progress/workpackages/WP-P01-WP02.md"
+  ],
+  "known_limitations": [
+    "no CI enforces registry/legal checks yet (Phase 2 per ADR-0013)",
+    "scripts/check-legal-registry.mjs referenced in LICENSE_REVIEW.md does not exist yet (planned; Phase 2 CI)",
+    "merge to main deferred until CI exists (BRANCH_POLICY rule 5)",
+    ".freebuff/ and docs/extraction/ left untracked and untouched (out of scope)",
+    "P1 full gates not claimed: P1-G4 (all extraction reports) pending P01-WP03..WP17"
+  ],
+  "next_phase_handoff": "P01-WP03 provider fabric extraction (REF-032 OmniRoute) is the next WP; then P01-WP04 runtime extraction. See docs/progress/PHASE_STATUS.md."
+}
