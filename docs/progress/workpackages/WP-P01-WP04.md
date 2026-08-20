@@ -4,7 +4,7 @@
 - **Status:** ACCEPTED
 - **Risk:** HIGH | **Release scope:** REQUIRED_V1
 - **Base commit:** e365e2eff81010663622340bb45672d2ae7036d2
-- **Accepted commit:** TO_BE_FILLED_AFTER_COMMIT
+- **Accepted commit:** 7ee6c2fc6939ad4b8a88200ab08d79fa02a309e2
 - **Owner modules:** docs/extraction/, docs/extraction/packets/, docs/extraction/decisions/
 - **Architecture refs:** DOC-03; DOC-07 §122-123; DOC-10 P1-G4/P1-G8; DOC-11 P01-WP04
 - **Acceptance gates:** P1-G4, P1-G8 extraction evidence
@@ -38,4 +38,3 @@ code was added.
 Phase 6 Basic Worker Agent Loop and Phase 12 Full Autonomy Kernel & Multi-Agent
 Runtime consume the implementation packet. Phase 1 remains IN_PROGRESS; Phase 2
 remains NOT_STARTED.
-

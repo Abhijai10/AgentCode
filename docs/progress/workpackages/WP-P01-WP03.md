@@ -4,7 +4,7 @@
 - **Status:** ACCEPTED
 - **Risk:** HIGH | **Release scope:** REQUIRED_V1
 - **Base commit:** e365e2eff81010663622340bb45672d2ae7036d2
-- **Accepted commit:** TO_BE_FILLED_AFTER_COMMIT
+- **Accepted commit:** 7ee6c2fc6939ad4b8a88200ab08d79fa02a309e2
 - **Owner modules:** docs/extraction/, docs/extraction/packets/, docs/extraction/decisions/
 - **Architecture refs:** DOC-01; DOC-07 §116-117; DOC-10 P1-G4; DOC-11 P01-WP03
 - **Acceptance gates:** P1-G4 extraction evidence
@@ -37,4 +37,3 @@ decisions. No production implementation code was added.
 
 Phase 4 Model Broker & OmniRoute Provider Fabric consumes the implementation packet.
 Phase 1 remains IN_PROGRESS; Phase 2 remains NOT_STARTED.
-
