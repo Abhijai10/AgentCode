@@ -4,7 +4,7 @@
 - **Status:** ACCEPTED
 - **Risk:** HIGH | **Release scope:** REQUIRED_V1
 - **Base commit:** 60d7cc1526643a6af7932825fb7455295813e55e
-- **Accepted commit:** TO_BE_FILLED_AFTER_COMMIT
+- **Accepted commit:** d2c64fe9a77bc8be119d7e019fd40ffc407f3d6b
 - **Owner modules:** docs/extraction/, docs/extraction/packets/, docs/extraction/decisions/
 - **Architecture refs:** DOC-07 Campaign J; DOC-10 P1-G4; DOC-11 P01-WP12
 - **Acceptance gates:** P1-G4 extraction evidence
