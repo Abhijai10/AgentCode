@@ -10,11 +10,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "ac-code-intel"
+version = "0.1.0"
+dependencies = [
+ "ac-common",
+]
+
+[[package]]
 name = "ac-common"
 version = "0.1.0"
 
 [[package]]
 name = "ac-config"
+version = "0.1.0"
+dependencies = [
+ "ac-common",
+]
+
+[[package]]
+name = "ac-context"
 version = "0.1.0"
 dependencies = [
  "ac-common",
@@ -30,7 +44,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "ac-desktop-placeholder"
+version = "0.1.0"
+dependencies = [
+ "ac-common",
+]
+
+[[package]]
 name = "ac-evidence"
+version = "0.1.0"
+dependencies = [
+ "ac-common",
+]
+
+[[package]]
+name = "ac-git"
 version = "0.1.0"
 dependencies = [
  "ac-common",
@@ -53,8 +81,62 @@ dependencies = [
 ]
 
 [[package]]
+name = "ac-migrations"
+version = "0.1.0"
+dependencies = [
+ "ac-common",
+]
+
+[[package]]
+name = "ac-provider"
+version = "0.1.0"
+dependencies = [
+ "ac-common",
+]
+
+[[package]]
 name = "ac-runtime"
 version = "0.1.0"
 dependencies = [
  "ac-common",
+ "ac-context",
+ "ac-evidence",
+ "ac-git",
+ "ac-provider",
+ "ac-security",
+ "ac-tool",
+]
+
+[[package]]
+name = "ac-sandbox"
+version = "0.1.0"
+dependencies = [
+ "ac-common",
+ "ac-security",
+]
+
+[[package]]
+name = "ac-security"
+version = "0.1.0"
+dependencies = [
+ "ac-common",
+]
+
+[[package]]
+name = "ac-tool"
+version = "0.1.0"
+dependencies = [
+ "ac-common",
+ "ac-evidence",
+ "ac-sandbox",
+ "ac-security",
+]
+
+[[package]]
+name = "ac-verification"
+version = "0.1.0"
+dependencies = [
+ "ac-common",
+ "ac-evidence",
+ "ac-security",
 ]

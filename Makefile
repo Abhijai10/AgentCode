@@ -24,6 +24,12 @@ build:
 daemon-build:
 	cargo build -p ac-daemon
 
+desktop-build:
+	cargo build -p ac-desktop-placeholder
+
+migrations-check:
+	cargo test -p ac-migrations
+
 validate: format-check lint typecheck test
 
 clean:

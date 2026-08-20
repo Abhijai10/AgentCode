@@ -5,9 +5,19 @@ members = [
     "crates/ac-logging",
     "crates/ac-evidence",
     "crates/ac-changeset",
+    "crates/ac-migrations",
     "crates/ac-kernel",
+    "crates/ac-security",
+    "crates/ac-sandbox",
+    "crates/ac-provider",
+    "crates/ac-tool",
+    "crates/ac-git",
+    "crates/ac-code-intel",
+    "crates/ac-context",
+    "crates/ac-verification",
     "crates/ac-runtime",
     "crates/ac-daemon",
+    "apps/desktop-placeholder",
 ]
 resolver = "2"
 

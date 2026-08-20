@@ -1,18 +1,14 @@
 [package]
-name = "ac-runtime"
+name = "ac-tool"
 version = "0.1.0"
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
 
 [dependencies]
 ac-common = { path = "../ac-common" }
-ac-context = { path = "../ac-context" }
-ac-git = { path = "../ac-git" }
-ac-provider = { path = "../ac-provider" }
-ac-tool = { path = "../ac-tool" }
-
-[dev-dependencies]
 ac-evidence = { path = "../ac-evidence" }
+ac-sandbox = { path = "../ac-sandbox" }
 ac-security = { path = "../ac-security" }
 
 [lints]
