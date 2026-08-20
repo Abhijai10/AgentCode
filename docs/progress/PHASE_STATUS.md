@@ -5,12 +5,12 @@ Doc 10 gates for the phase pass and completion evidence exists).
 
 Phase names are the EXACT canonical names from Doc 09 HC-P00..HC-P29 (no aliases).
 
-Last updated: 2026-08-20 (recovery + foundation validation run)
+Last updated: 2026-08-21 (Phase 1 extraction WP03-WP05)
 
 | Phase | Name (Doc 09 HC-*) | Status | Notes |
 |-------|--------------------|--------|-------|
 | P00 | Project Governance & Architecture Freeze | COMPLETE | all P00 WPs ACCEPTED; gates P0-G1..G7 pass with recorded evidence; failure/understanding checks PASS; evidence: docs/progress/phase-00-completion.md (+ .json), phase-00-governance-validation.md, adr-audit-phase00.md |
-| P01 | OSS Extraction & Evidence Collection | IN_PROGRESS (EXTRACTION) | P01-WP01 (reference catalog) and P01-WP02 (license/provenance matrix) ACCEPTED; P01-WP03..WP17 NOT_STARTED; full P1-G4 not claimed |
+| P01 | OSS Extraction & Evidence Collection | IN_PROGRESS (EXTRACTION) | P01-WP01 (reference catalog), P01-WP02 (license/provenance matrix), P01-WP03 (provider fabric), P01-WP04 (agent runtime), and P01-WP05 (tools/editing) ACCEPTED; P01-WP06..WP17 NOT_STARTED; full P1-G4 not claimed |
 | P02 | Repository Skeleton & Development Infrastructure | NOT_STARTED | no implementation exists; earlier COMPLETE claim was premature and is retracted |
 | P03 | Background Daemon & Persistent Kernel Foundation | NOT_STARTED | requires IPC transport resolution (ADR-0005 bounded PENDING item) |
 | P04 | Model Broker & OmniRoute Provider Fabric | NOT_STARTED | requires P01-WP03 packet |
