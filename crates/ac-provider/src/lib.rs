@@ -66,6 +66,41 @@ pub enum ProviderFailureClass {
     Cancelled,
 }
 
+pub trait ProviderAdapter {
+    fn stream(
+        &self,
+        request: &NormalizedInferenceRequest,
+        cancel: &dyn Fn() -> bool,
+    ) -> Result<Vec<ProviderStreamEvent>, ProviderFailureClass>;
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct ScriptedProvider {
+    responses: Vec<Result<Vec<ProviderStreamEvent>, ProviderFailureClass>>,
+}
+
+impl ScriptedProvider {
+    pub fn new(responses: Vec<Result<Vec<ProviderStreamEvent>, ProviderFailureClass>>) -> Self {
+        Self { responses }
+    }
+}
+
+impl ProviderAdapter for ScriptedProvider {
+    fn stream(
+        &self,
+        _request: &NormalizedInferenceRequest,
+        cancel: &dyn Fn() -> bool,
+    ) -> Result<Vec<ProviderStreamEvent>, ProviderFailureClass> {
+        if cancel() {
+            return Err(ProviderFailureClass::Cancelled);
+        }
+        self.responses
+            .first()
+            .cloned()
+            .unwrap_or_else(|| Ok(vec![ProviderStreamEvent::Finished]))
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RouteAttempt {
     pub id: StableId,

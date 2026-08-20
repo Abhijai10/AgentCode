@@ -51,7 +51,7 @@
   "blockers": [],
   "later_phase_status": "P03-P29 remain NOT_STARTED in roadmap_state.json",
   "known_limitations": [
-    "Persistent SQLite execution is not yet wired.",
+    "Persistent SQLite execution is started in P03 via ac-db; P02 itself remains the repository skeleton and migration-harness phase.",
     "External provider/tool/browser/scanner/git command integrations are controlled interfaces and local foundations only.",
     "Tauri desktop work is deferred to the later desktop phase."
   ]

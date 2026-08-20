@@ -48,7 +48,7 @@ Establish the production repository skeleton and development infrastructure need
 
 ## Known Limitations
 
-- Persistent SQLite execution is not yet wired; P02 includes the migration harness and initial schema only.
+- Persistent SQLite execution is now started in P03 via `ac-db`; P02 itself remains the repository skeleton and migration-harness phase.
 - Provider, tool, browser, scanner, git, and sandbox crates expose local foundation behavior and controlled interfaces, not production external integrations.
 - Tauri desktop work remains deferred to the later desktop phase; P02 includes only a launchable placeholder.
 - Roadmap phases P03 and later remain NOT_STARTED until their canonical WPs are implemented and accepted.

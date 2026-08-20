@@ -131,14 +131,36 @@ impl CapabilityPolicy {
     }
 
     pub fn evaluate(&self, requested: &[Capability]) -> SecurityDecision {
-        if requested.iter().any(|cap| self.denied.contains(cap)) {
+        if requested
+            .iter()
+            .any(|cap| matches_capability(&self.denied, cap))
+        {
             return SecurityDecision::Deny;
         }
-        if requested.iter().all(|cap| self.allowed.contains(cap)) {
+        if requested
+            .iter()
+            .all(|cap| matches_capability(&self.allowed, cap))
+        {
             SecurityDecision::Allow
         } else {
             SecurityDecision::RequireApproval
         }
+    }
+}
+
+fn matches_capability(set: &BTreeSet<Capability>, requested: &Capability) -> bool {
+    if set.contains(requested) {
+        return true;
+    }
+    match requested {
+        Capability::FilesystemRead(_) => set.contains(&Capability::FilesystemRead("*".to_string())),
+        Capability::FilesystemWrite(_) => {
+            set.contains(&Capability::FilesystemWrite("*".to_string()))
+        }
+        Capability::ProcessExec(_) => set.contains(&Capability::ProcessExec("*".to_string())),
+        Capability::Network(_) => set.contains(&Capability::Network("*".to_string())),
+        Capability::SecretRead(_) => set.contains(&Capability::SecretRead("*".to_string())),
+        Capability::BrowserAutomation | Capability::SecurityScan => false,
     }
 }
 

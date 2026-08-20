@@ -252,6 +252,10 @@ impl AgentSession {
         self.token.cancel();
     }
 
+    pub fn is_cancelled(&self) -> bool {
+        self.token.is_cancelled()
+    }
+
     pub fn stop(&mut self) -> AcResult<()> {
         match self.state {
             AgentSessionState::Created

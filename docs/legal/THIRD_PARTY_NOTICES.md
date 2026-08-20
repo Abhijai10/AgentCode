@@ -8,16 +8,22 @@ and `docs/legal/third_party_manifest.json` (machine-readable companion).
 
 ## Currently in the tree
 
-**No third-party material is currently in the tree.** There are no admitted runtime
-dependencies, no vendored code, no forked or adapted source. The first entries appear
-here only when a dependency passes its admission record (DEP-ADM-NNN) and its license
-file has been inspected at its pinned version — never before.
+### rusqlite 0.32.1
 
-(Note: a previous revision of this file listed rusqlite/tracing/pino/react/tauri
-copyright entries as if admitted. Those dependencies were NOT admitted and their
-license files were NOT inspected — no lockfiles or installed artifacts existed. The
-entries were removed in the 2026-08-20 recovery run. Those packages remain PROPOSED
-candidates; see `third_party_manifest.json`.)
+License: MIT.
+Use: SQLite driver for the AgentCode control-plane store.
+Admission: `docs/policy/dependency-admissions/DEP-ADM-001-rusqlite.md`.
+License inspected at:
+`~/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/rusqlite-0.32.1/LICENSE`.
+
+### libsqlite3-sys 0.30.1
+
+License: MIT for Rust binding crate; bundled SQLite source remains public domain per
+SQLite project terms.
+Use: native SQLite binding used by `rusqlite` with the `bundled` feature.
+Admission: `docs/policy/dependency-admissions/DEP-ADM-001-rusqlite.md`.
+License inspected at:
+`~/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/libsqlite3-sys-0.30.1/LICENSE`.
 
 ## Reference-Research Attribution
 
