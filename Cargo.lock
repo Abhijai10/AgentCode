@@ -56,9 +56,12 @@ dependencies = [
 name = "ac-daemon"
 version = "0.1.0"
 dependencies = [
+ "ac-common",
  "ac-config",
+ "ac-db",
  "ac-kernel",
  "ac-logging",
+ "ac-runtime",
 ]
 
 [[package]]

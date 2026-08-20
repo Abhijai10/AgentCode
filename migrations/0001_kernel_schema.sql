@@ -41,3 +41,18 @@ CREATE TABLE IF NOT EXISTS worktrees (
     status TEXT NOT NULL,
     created_at_ms INTEGER NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS agent_sessions (
+    id TEXT PRIMARY KEY,
+    mission_id TEXT NOT NULL,
+    state TEXT NOT NULL,
+    updated_at_ms INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS agent_checkpoints (
+    id TEXT PRIMARY KEY,
+    session_id TEXT NOT NULL,
+    next_step INTEGER NOT NULL,
+    state TEXT NOT NULL,
+    created_at_ms INTEGER NOT NULL
+);

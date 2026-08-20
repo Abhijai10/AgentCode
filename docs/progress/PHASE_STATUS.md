@@ -5,17 +5,17 @@ Doc 10 gates for the phase pass and completion evidence exists).
 
 Phase names are the EXACT canonical names from Doc 09 HC-P00..HC-P29 (no aliases).
 
-Last updated: 2026-08-21 (P03/P06 implementation started)
+Last updated: 2026-08-21 (P03/P06 foundations expanded)
 
 | Phase | Name (Doc 09 HC-*) | Status | Notes |
 |-------|--------------------|--------|-------|
 | P00 | Project Governance & Architecture Freeze | COMPLETE | all P00 WPs ACCEPTED; gates P0-G1..G7 pass with recorded evidence; failure/understanding checks PASS; evidence: docs/progress/phase-00-completion.md (+ .json), phase-00-governance-validation.md, adr-audit-phase00.md |
 | P01 | OSS Extraction & Evidence Collection | COMPLETE | P01-WP01..P01-WP17 ACCEPTED; P1-G1..P1-G8 PASS; evidence: docs/progress/phase-01-completion.md (+ .json), phase-01-gate-review.md, phase-01-architecture-dependency-map.md |
 | P02 | Repository Skeleton & Development Infrastructure | COMPLETE | P02-WP01 ACCEPTED; P2-G1..P2-G8 PASS; evidence: docs/progress/phase-02-completion.md (+ .json) |
-| P03 | Background Daemon & Persistent Kernel Foundation | IN_PROGRESS | P03-WP01 started; `ac-db` SQLite persistence added for Kernel mission/event state; IPC/restart/daemon singleton gates remain |
+| P03 | Background Daemon & Persistent Kernel Foundation | IN_PROGRESS | P03-WP01 expanded; `ac-db` persists Kernel mission/event state plus AgentSession/checkpoint recovery evidence; `ac-daemon` has lifecycle, singleton lock, local IPC, health, and interrupted-session recovery foundations; OS IPC/reconnect/full resume gates remain |
 | P04 | Model Broker & OmniRoute Provider Fabric | NOT_STARTED | requires P01-WP03 packet |
 | P05 | Native Tool Runtime Foundation | NOT_STARTED | |
-| P06 | Basic Worker Agent Loop | IN_PROGRESS | P06-WP01 started; `ac-agent` planner/runtime loop foundation added with evidence-backed ChangeSets |
+| P06 | Basic Worker Agent Loop | IN_PROGRESS | P06-WP01 expanded; `ac-agent` now runs planner/context/provider/tool/ChangeSet/verification flow with isolated workspace demo and verification repair retry; production provider adapters and full project validation profiles remain |
 | P07 | Git, Worktrees & Checkpointing | NOT_STARTED | |
 | P08 | Code Intelligence Foundation | NOT_STARTED | |
 | P09 | Semantic Intelligence & Repository Graph | NOT_STARTED | |

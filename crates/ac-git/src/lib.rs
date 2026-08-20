@@ -1,4 +1,6 @@
 use std::collections::BTreeMap;
+use std::fs;
+use std::path::Path;
 use std::path::PathBuf;
 
 use ac_common::{AcError, AcResult, StableId, TimestampMillis};
@@ -159,6 +161,55 @@ impl GitCoordinator {
     pub fn worktree(&self, id: &StableId) -> Option<&WorktreeRecord> {
         self.worktrees.get(id)
     }
+
+    pub fn create_task_workspace(
+        &mut self,
+        source_root: PathBuf,
+        worktree_root: PathBuf,
+        owner_mission_id: StableId,
+        owner_worker_id: StableId,
+    ) -> AcResult<StableId> {
+        copy_dir(&source_root, &worktree_root)?;
+        let repository_id = self.register_repository(source_root, "working-tree", "main")?;
+        self.create_worktree(
+            &repository_id,
+            owner_mission_id,
+            owner_worker_id,
+            worktree_root,
+            "agent/task-workspace",
+            "working-tree",
+        )
+    }
+}
+
+fn copy_dir(source: &Path, destination: &Path) -> AcResult<()> {
+    if !source.is_dir() {
+        return Err(AcError::validation(
+            "GIT-SOURCE_NOT_DIRECTORY",
+            "task workspace source must be a directory",
+        ));
+    }
+    fs::create_dir_all(destination)
+        .map_err(|err| AcError::validation("GIT-WORKTREE_CREATE_FAILED", err.to_string()))?;
+    for entry in fs::read_dir(source)
+        .map_err(|err| AcError::validation("GIT-WORKTREE_READ_FAILED", err.to_string()))?
+    {
+        let entry = entry
+            .map_err(|err| AcError::validation("GIT-WORKTREE_READ_FAILED", err.to_string()))?;
+        let path = entry.path();
+        let name = entry.file_name();
+        if name.to_string_lossy() == ".git" {
+            continue;
+        }
+        let target = destination.join(name);
+        if path.is_dir() {
+            copy_dir(&path, &target)?;
+        } else if path.is_file() {
+            fs::copy(&path, &target)
+                .map_err(|err| AcError::validation("GIT-WORKTREE_COPY_FAILED", err.to_string()))?;
+        }
+    }
+    Ok(())
 }
 
 pub fn validate_branch(branch: &str) -> AcResult<()> {
@@ -208,5 +259,30 @@ mod tests {
             )
             .unwrap_err();
         assert_eq!(err.code(), "GIT-UNKNOWN_WORKTREE");
+    }
+
+    #[test]
+    fn task_workspace_isolated_from_source_directory() {
+        let source = std::env::temp_dir().join(format!("agentcode-src-{}", StableId::new("tmp")));
+        let worktree = std::env::temp_dir().join(format!("agentcode-wt-{}", StableId::new("tmp")));
+        fs::create_dir_all(source.join("src")).unwrap();
+        fs::write(source.join("src/lib.rs"), "pub fn old() {}\n").unwrap();
+        let mut git = GitCoordinator::new();
+        let worktree_id = git
+            .create_task_workspace(
+                source.clone(),
+                worktree.clone(),
+                StableId::new("mission"),
+                StableId::new("worker"),
+            )
+            .unwrap();
+        fs::write(worktree.join("src/lib.rs"), "pub fn new() {}\n").unwrap();
+        assert_eq!(
+            fs::read_to_string(source.join("src/lib.rs")).unwrap(),
+            "pub fn old() {}\n"
+        );
+        assert!(git.worktree(&worktree_id).is_some());
+        let _ = fs::remove_dir_all(source);
+        let _ = fs::remove_dir_all(worktree);
     }
 }

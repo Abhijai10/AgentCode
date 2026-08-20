@@ -7,7 +7,7 @@
 - **Accepted commit:** not accepted yet
 - **Owner modules:** `crates/ac-db`, `migrations/0001_kernel_schema.sql`
 - **Architecture refs:** ADR-0004; P02 completion package; Phase 1 runtime/context/evidence packets
-- **Acceptance gates:** P3-G7/P3-G8 partial; full P3-G1..P3-G10 not complete
+- **Acceptance gates:** P3-G1/P3-G2/P3-G5/P3-G7/P3-G8 partial; full P3-G1..P3-G10 not complete
 
 ## Implemented In This Batch
 
@@ -17,17 +17,24 @@
 - Added persistence APIs for Kernel missions, Kernel events, and evidence records.
 - Added file-backed reopen test proving mission and event history survive process-style closure.
 - Added dependency admission/legal notice updates for `rusqlite`/`libsqlite3-sys`.
+- Added AgentSession and checkpoint tables for durable restart evidence.
+- Added interrupted-session recovery query for daemon startup reconciliation.
+- Added future-schema guard (`DB-FUTURE_VERSION`) so newer databases are rejected instead of silently migrated backward.
+- Added idempotent Kernel event append semantics for replay/recovery.
+- Added `ac-daemon` lifecycle foundation with singleton lock, local IPC command contract, session creation, checkpoint persistence, restart recovery inspection, and health reporting.
 
 ## Validation
 
 - `cargo check --workspace --all-targets` PASS.
 - `cargo test --workspace --quiet` PASS.
+- `cargo clippy --workspace --all-targets --quiet -- -D warnings` PASS.
 - `jq empty docs/legal/third_party_manifest.json` PASS.
 
 ## Remaining Before Acceptance
 
-- Unknown-future-version behavior.
 - Previous-version fixture migration.
 - Interrupted migration recovery/failure test.
-- Daemon singleton/write ownership lock.
-- Restart reconciliation and IPC reconnect gates.
+- OS/socket IPC transport beyond in-process `LocalIpc`.
+- Robust daemon singleton metadata/PID validation beyond create-new lock file.
+- Restart reconciliation that resumes detailed persisted execution state, not only interrupted-session discovery.
+- IPC reconnect gates.

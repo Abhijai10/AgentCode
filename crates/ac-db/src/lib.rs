@@ -25,6 +25,15 @@ impl ControlPlaneDb {
     }
 
     pub fn migrate(&mut self) -> AcResult<()> {
+        let current_version = self.user_version()?;
+        if current_version > 1 {
+            return Err(AcError::conflict(
+                "DB-FUTURE_VERSION",
+                format!(
+                    "database user_version {current_version} is newer than supported version 1"
+                ),
+            ));
+        }
         let tx = self.connection.transaction().map_err(db_error)?;
         tx.execute_batch(include_str!("../../../migrations/0001_kernel_schema.sql"))
             .map_err(db_error)?;
@@ -84,7 +93,7 @@ impl ControlPlaneDb {
             .join(",");
         self.connection
             .execute(
-                "INSERT INTO kernel_events (id, decision_kind, subject_id, evidence_refs, created_at_ms)
+                "INSERT OR IGNORE INTO kernel_events (id, decision_kind, subject_id, evidence_refs, created_at_ms)
                  VALUES (?1, ?2, ?3, ?4, ?5)",
                 params![
                     event.id.as_str(),
@@ -139,6 +148,111 @@ pub struct PersistedMission {
     pub original_goal: String,
     pub state: String,
     pub created_at_ms: i64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PersistedSession {
+    pub id: String,
+    pub mission_id: String,
+    pub state: String,
+    pub updated_at_ms: i64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PersistedCheckpoint {
+    pub id: String,
+    pub session_id: String,
+    pub next_step: u32,
+    pub state: String,
+    pub created_at_ms: i64,
+}
+
+impl ControlPlaneDb {
+    pub fn save_session(
+        &self,
+        session_id: &StableId,
+        mission_id: &StableId,
+        state: &str,
+    ) -> AcResult<()> {
+        self.connection
+            .execute(
+                "INSERT INTO agent_sessions (id, mission_id, state, updated_at_ms)
+                 VALUES (?1, ?2, ?3, ?4)
+                 ON CONFLICT(id) DO UPDATE SET state = excluded.state, updated_at_ms = excluded.updated_at_ms",
+                params![
+                    session_id.as_str(),
+                    mission_id.as_str(),
+                    state,
+                    millis(TimestampMillis::now())
+                ],
+            )
+            .map_err(db_error)?;
+        Ok(())
+    }
+
+    pub fn save_checkpoint(
+        &self,
+        id: &StableId,
+        session_id: &StableId,
+        next_step: u32,
+        state: &str,
+    ) -> AcResult<()> {
+        self.connection
+            .execute(
+                "INSERT INTO agent_checkpoints (id, session_id, next_step, state, created_at_ms)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![
+                    id.as_str(),
+                    session_id.as_str(),
+                    next_step,
+                    state,
+                    millis(TimestampMillis::now())
+                ],
+            )
+            .map_err(db_error)?;
+        Ok(())
+    }
+
+    pub fn update_session_state(&self, session_id: &StableId, state: &str) -> AcResult<()> {
+        let changed = self
+            .connection
+            .execute(
+                "UPDATE agent_sessions
+                 SET state = ?2, updated_at_ms = ?3
+                 WHERE id = ?1",
+                params![session_id.as_str(), state, millis(TimestampMillis::now())],
+            )
+            .map_err(db_error)?;
+        if changed == 0 {
+            return Err(AcError::conflict(
+                "DB-SESSION_NOT_FOUND",
+                format!("agent session {} was not found", session_id),
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn interrupted_sessions(&self) -> AcResult<Vec<PersistedSession>> {
+        let mut stmt = self
+            .connection
+            .prepare(
+                "SELECT id, mission_id, state, updated_at_ms
+                 FROM agent_sessions
+                 WHERE state NOT IN ('completed', 'cancelled', 'failed')",
+            )
+            .map_err(db_error)?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok(PersistedSession {
+                    id: row.get(0)?,
+                    mission_id: row.get(1)?,
+                    state: row.get(2)?,
+                    updated_at_ms: row.get(3)?,
+                })
+            })
+            .map_err(db_error)?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(db_error)
+    }
 }
 
 fn millis(ts: TimestampMillis) -> i64 {
@@ -222,5 +336,37 @@ mod tests {
             assert_eq!(db.kernel_event_count().unwrap(), 1);
         }
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn interrupted_sessions_are_recovered_after_reopen() {
+        let path = std::env::temp_dir().join(format!("agentcode-{}.sqlite", StableId::new("db")));
+        let session_id = StableId::new("session");
+        let mission_id = StableId::new("mission");
+        {
+            let mut db = ControlPlaneDb::open(&path).unwrap();
+            db.migrate().unwrap();
+            db.save_session(&session_id, &mission_id, "executing")
+                .unwrap();
+            db.save_checkpoint(&StableId::new("cp"), &session_id, 2, "executing")
+                .unwrap();
+        }
+        {
+            let db = ControlPlaneDb::open(&path).unwrap();
+            let interrupted = db.interrupted_sessions().unwrap();
+            assert_eq!(interrupted.len(), 1);
+            assert_eq!(interrupted[0].id, session_id.to_string());
+        }
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn future_schema_version_is_rejected() {
+        let mut db = ControlPlaneDb::open_memory().unwrap();
+        db.connection
+            .pragma_update(None, "user_version", 99)
+            .unwrap();
+        let error = db.migrate().unwrap_err();
+        assert_eq!(error.code(), "DB-FUTURE_VERSION");
     }
 }

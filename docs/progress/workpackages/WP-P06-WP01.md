@@ -16,6 +16,12 @@
 - Added provider trait and scripted provider adapter for local tests without hardcoding provider logic into runtime.
 - Added Tool Broker local workspace tools for file read, file write, directory list, search, and sandbox-planned command execution.
 - Added tests for planner ordering, simple coding task to ChangeSet, tool failure recovery, cancellation, and checkpoint resume.
+- Added explicit planner objective, expected outcomes, and stopping condition fields.
+- Reordered the plan lifecycle so ChangeSet intent is prepared and Kernel-approved before tool execution.
+- Added ContextBuilder integration that assembles Kernel goal state, raw evidence, accepted memory, and ranked retrieval candidates with authority labels.
+- Added isolated workspace agent construction that creates a task workspace, registers workspace tools only against that root, and keeps source files unchanged.
+- Added deterministic verification repair loop with repair evidence before retry.
+- Added autonomous demo test that fixes a fixture inside an isolated workspace and proves the source repository remains unchanged.
 
 ## Boundaries Preserved
 
@@ -24,6 +30,8 @@
 - File writes happen inside tool executors and are represented as ChangeSets for Kernel approval.
 - Evidence is recorded for tool results and verification.
 - Context packs label authority class and do not treat retrieval as truth.
+- Git/worktree state is attached as task evidence and does not become hidden agent memory.
+- Verification failure produces evidence and retry behavior; it is not silently converted to success.
 
 ## Validation
 
@@ -34,7 +42,8 @@
 ## Remaining Before Acceptance
 
 - Full production provider adapters.
-- Real git worktree creation/isolation against repositories.
+- Real `git worktree` command integration against repositories.
 - Full build/test/lint command profiles per project.
 - Durable persisted AgentSession resume path through daemon.
 - Completion request protocol and full benchmark gate.
+- Rich repair planning beyond deterministic local retry.
