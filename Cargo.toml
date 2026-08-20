@@ -1,0 +1,20 @@
+[workspace]
+members = [
+    "crates/ac-common",
+    "crates/ac-config",
+    "crates/ac-logging",
+    "crates/ac-evidence",
+    "crates/ac-changeset",
+    "crates/ac-kernel",
+    "crates/ac-runtime",
+    "crates/ac-daemon",
+]
+resolver = "2"
+
+[workspace.package]
+edition = "2021"
+license = "UNLICENSED"
+repository = "https://example.invalid/AgentCode"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
