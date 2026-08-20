@@ -121,6 +121,33 @@ impl WorkspaceTools {
                 cwd: self.root.clone(),
             }),
         )?;
+        for (id, command) in [
+            ("repo.status", vec!["git", "status", "--short"]),
+            ("repo.diff", vec!["git", "diff", "--", "."]),
+            ("repo.branch", vec!["git", "branch", "--show-current"]),
+            ("dev.test", vec!["cargo", "test", "--quiet"]),
+            ("dev.format", vec!["cargo", "fmt", "--all"]),
+            ("dev.check", vec!["cargo", "check", "--quiet"]),
+        ] {
+            broker.register_tool(
+                ToolDefinition {
+                    id: id.to_string(),
+                    version: "1".to_string(),
+                    required_capabilities: vec![Capability::ProcessExec(command[0].to_string())],
+                },
+                Box::new(FixedCommandTool {
+                    sandbox: SandboxManager::new(SandboxPolicy {
+                        workspace_roots: vec![self.root.clone()],
+                        capability_policy: CapabilityPolicy::new()
+                            .allow(Capability::ProcessExec("*".to_string())),
+                        network_default_allow: false,
+                        max_timeout_ms: 30_000,
+                    }),
+                    cwd: self.root.clone(),
+                    argv: command.iter().map(ToString::to_string).collect(),
+                }),
+            )?;
+        }
         Ok(())
     }
 }
@@ -210,50 +237,71 @@ impl ToolExecutor for CommandExecTool {
             .split_whitespace()
             .map(ToString::to_string)
             .collect::<Vec<_>>();
-        let plan = self.sandbox.prepare_execution(ExecRequest {
-            argv,
-            cwd: self.cwd.clone(),
-            env: BTreeMap::new(),
-            network: false,
-            timeout_ms: 5_000,
-        })?;
-        let mut child = Command::new(&plan.argv[0])
-            .args(&plan.argv[1..])
-            .current_dir(&plan.cwd)
-            .env_clear()
-            .envs(&plan.allowed_env)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .map_err(|err| AcError::validation("TOOL-COMMAND_SPAWN_FAILED", err.to_string()))?;
-        let deadline = Instant::now() + Duration::from_millis(plan.timeout_ms);
-        loop {
-            if child
-                .try_wait()
-                .map_err(|err| AcError::validation("TOOL-COMMAND_WAIT_FAILED", err.to_string()))?
-                .is_some()
-            {
-                let output = child.wait_with_output().map_err(|err| {
-                    AcError::validation("TOOL-COMMAND_OUTPUT_FAILED", err.to_string())
-                })?;
-                return Ok(format!(
-                    "status:{}\nstdout:{}\nstderr:{}",
-                    output.status.code().unwrap_or(-1),
-                    String::from_utf8_lossy(&output.stdout),
-                    String::from_utf8_lossy(&output.stderr)
-                ));
-            }
-            if Instant::now() >= deadline {
-                let _ = child.kill();
-                return Err(AcError::new(
-                    "TOOL-COMMAND_TIMEOUT",
-                    "command timed out and was killed",
-                    ac_common::ErrorKind::Unavailable,
-                    ac_common::Retryability::Retryable,
-                ));
-            }
-            std::thread::sleep(Duration::from_millis(10));
+        run_sandboxed_command(&self.sandbox, self.cwd.clone(), argv, 5_000)
+    }
+}
+
+struct FixedCommandTool {
+    sandbox: SandboxManager,
+    cwd: PathBuf,
+    argv: Vec<String>,
+}
+
+impl ToolExecutor for FixedCommandTool {
+    fn execute(&self, _request: &ToolRequest) -> AcResult<String> {
+        run_sandboxed_command(&self.sandbox, self.cwd.clone(), self.argv.clone(), 30_000)
+    }
+}
+
+fn run_sandboxed_command(
+    sandbox: &SandboxManager,
+    cwd: PathBuf,
+    argv: Vec<String>,
+    timeout_ms: u64,
+) -> AcResult<String> {
+    let plan = sandbox.prepare_execution(ExecRequest {
+        argv,
+        cwd,
+        env: BTreeMap::new(),
+        network: false,
+        timeout_ms,
+    })?;
+    let mut child = Command::new(&plan.argv[0])
+        .args(&plan.argv[1..])
+        .current_dir(&plan.cwd)
+        .env_clear()
+        .envs(&plan.allowed_env)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|err| AcError::validation("TOOL-COMMAND_SPAWN_FAILED", err.to_string()))?;
+    let deadline = Instant::now() + Duration::from_millis(plan.timeout_ms);
+    loop {
+        if child
+            .try_wait()
+            .map_err(|err| AcError::validation("TOOL-COMMAND_WAIT_FAILED", err.to_string()))?
+            .is_some()
+        {
+            let output = child.wait_with_output().map_err(|err| {
+                AcError::validation("TOOL-COMMAND_OUTPUT_FAILED", err.to_string())
+            })?;
+            return Ok(format!(
+                "status:{}\nstdout:{}\nstderr:{}",
+                output.status.code().unwrap_or(-1),
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            ));
         }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            return Err(AcError::new(
+                "TOOL-COMMAND_TIMEOUT",
+                "command timed out and was killed",
+                ac_common::ErrorKind::Unavailable,
+                ac_common::Retryability::Retryable,
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(10));
     }
 }
 
@@ -397,7 +445,12 @@ impl ToolBroker {
                 tool: Some(request.tool_id.clone()),
             },
             format!("mem://tool/{}/output", request.id),
-            format!("len:{}", observation.len()),
+            format!(
+                "tool:{};params:{};len:{}",
+                request.tool_id,
+                request.payload.len(),
+                observation.len()
+            ),
         )?;
         Ok(ToolResult {
             request_id: request.id,
@@ -428,6 +481,19 @@ mod tests {
     use super::*;
 
     struct EchoExecutor;
+
+    fn run_git<const N: usize>(cwd: &Path, args: [&str; N]) {
+        let output = Command::new("git")
+            .args(args)
+            .current_dir(cwd)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
 
     impl ToolExecutor for EchoExecutor {
         fn execute(&self, request: &ToolRequest) -> AcResult<String> {
@@ -491,5 +557,52 @@ mod tests {
             .unwrap();
         assert_eq!(result.status, ToolStatus::Succeeded);
         assert!(result.observation.contains("ok"));
+    }
+
+    #[test]
+    fn repository_tool_records_execution_evidence() {
+        let root = std::env::temp_dir().join(format!("agentcode-tool-{}", StableId::new("t")));
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("README.md"), "hello\n").unwrap();
+        run_git(&root, ["init"]);
+        run_git(&root, ["add", "."]);
+        run_git(
+            &root,
+            [
+                "-c",
+                "user.name=AgentCode Test",
+                "-c",
+                "user.email=agentcode@example.test",
+                "commit",
+                "-m",
+                "initial",
+            ],
+        );
+        fs::write(root.join("README.md"), "changed\n").unwrap();
+        let mut broker = ToolBroker::new(
+            CapabilityPolicy::new()
+                .allow(Capability::FilesystemRead("*".to_string()))
+                .allow(Capability::ProcessExec("*".to_string())),
+        );
+        WorkspaceTools::new(root.clone())
+            .register_all(&mut broker)
+            .unwrap();
+        let mut evidence = EvidenceStore::new();
+        let result = broker
+            .invoke(
+                ToolRequest {
+                    id: StableId::new("toolreq"),
+                    tool_id: "repo.status".to_string(),
+                    tool_version: "1".to_string(),
+                    payload: String::new(),
+                    capabilities: vec![Capability::ProcessExec("git".to_string())],
+                },
+                &mut evidence,
+            )
+            .unwrap();
+        assert_eq!(result.status, ToolStatus::Succeeded);
+        assert!(result.observation.contains("README.md"));
+        assert_eq!(evidence.len(), 1);
+        let _ = fs::remove_dir_all(root);
     }
 }

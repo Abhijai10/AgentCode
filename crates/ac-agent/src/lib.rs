@@ -1,14 +1,21 @@
 use std::collections::VecDeque;
+use std::fs;
+use std::path::Path;
 use std::path::PathBuf;
 
 use ac_changeset::{ChangeOperation, ChangeSet, RollbackPlan};
-use ac_code_intel::ContextCandidate;
+use ac_code_intel::{
+    CodeIntelligenceService, ContextCandidate, RepositoryScope, SourceFileIdentity,
+};
 use ac_common::{AcError, AcResult, StableId, TimestampMillis};
 use ac_context::{AuthorityClass, ContextEngine, ContextNode, ContextPack, MemoryService};
 use ac_evidence::{EvidenceKind, EvidenceStore, Provenance};
 use ac_git::GitCoordinator;
 use ac_kernel::{MissionState, PolicyBoundary};
-use ac_provider::{ProviderCapability, ProviderRegistry, ProviderStreamEvent};
+use ac_provider::{
+    ProviderCapability, ProviderFailureClass, ProviderRegistry, ProviderStreamEvent,
+    ScriptedProvider,
+};
 use ac_runtime::{AgentSession, AgentSessionState};
 use ac_security::{Capability, CapabilityPolicy};
 use ac_tool::{ToolBroker, ToolRequest, ToolResult, ToolStatus};
@@ -44,7 +51,7 @@ pub enum PlanStepKind {
     RetrieveContext,
     AskProvider,
     ExecuteTool { tool_id: String, payload: String },
-    Verify { plan_name: String },
+    Verify { plan_name: String, tool_id: String },
     PrepareChangeSet { path: String, content: String },
 }
 
@@ -61,22 +68,36 @@ pub struct ExecutionPlan {
     pub id: StableId,
     pub goal_id: StableId,
     pub objective: String,
+    pub assumptions: Vec<String>,
+    pub required_files: Vec<String>,
     pub steps: Vec<PlanStep>,
+    pub expected_verification: String,
     pub stopping_condition: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProviderReasoning {
+    pub text: String,
+    pub events: Vec<ProviderStreamEvent>,
 }
 
 #[derive(Default)]
 pub struct AgentPlanner;
 
 impl AgentPlanner {
-    pub fn plan(&self, goal: &Goal) -> ExecutionPlan {
+    pub fn plan(
+        &self,
+        goal: &Goal,
+        context: &ContextPack,
+        reasoning: &ProviderReasoning,
+    ) -> ExecutionPlan {
         let inspect = PlanStep {
             id: StableId::new("step"),
             kind: PlanStepKind::InspectWorkspace,
             depends_on: Vec::new(),
             expected_outcome: "repository shape is known".to_string(),
         };
-        let context = PlanStep {
+        let context_step = PlanStep {
             id: StableId::new("step"),
             kind: PlanStepKind::RetrieveContext,
             depends_on: vec![inspect.id.clone()],
@@ -85,17 +106,34 @@ impl AgentPlanner {
         let provider = PlanStep {
             id: StableId::new("step"),
             kind: PlanStepKind::AskProvider,
-            depends_on: vec![context.id.clone()],
+            depends_on: vec![context_step.id.clone()],
             expected_outcome: "provider action proposal is normalized".to_string(),
         };
-        let (target, content) = infer_change(&goal.text);
+        let required_files = required_files(goal, reasoning, context);
+        let (target, content) = infer_change(&goal.text, reasoning);
+        let read_dependencies = required_files
+            .iter()
+            .map(|path| PlanStep {
+                id: StableId::new("step"),
+                kind: PlanStepKind::ExecuteTool {
+                    tool_id: "fs.read".to_string(),
+                    payload: path.clone(),
+                },
+                depends_on: vec![provider.id.clone()],
+                expected_outcome: format!("{} content is inspected through Tool Broker", path),
+            })
+            .collect::<Vec<_>>();
+        let changeset_dependency = read_dependencies
+            .last()
+            .map(|step| step.id.clone())
+            .unwrap_or_else(|| provider.id.clone());
         let changeset = PlanStep {
             id: StableId::new("step"),
             kind: PlanStepKind::PrepareChangeSet {
                 path: target.clone(),
                 content: content.clone(),
             },
-            depends_on: vec![provider.id.clone()],
+            depends_on: vec![changeset_dependency],
             expected_outcome: "Kernel-approved ChangeSet is ready".to_string(),
         };
         let write = PlanStep {
@@ -111,15 +149,22 @@ impl AgentPlanner {
             id: StableId::new("step"),
             kind: PlanStepKind::Verify {
                 plan_name: "phase3-local-validation".to_string(),
+                tool_id: verification_tool(&target).to_string(),
             },
             depends_on: vec![write.id.clone()],
             expected_outcome: "validation evidence recorded".to_string(),
         };
+        let mut steps = vec![inspect, context_step, provider];
+        steps.extend(read_dependencies);
+        steps.extend([changeset, write, verify]);
         ExecutionPlan {
             id: StableId::new("plan"),
             goal_id: goal.id.clone(),
             objective: goal.text.clone(),
-            steps: vec![inspect, context, provider, changeset, write, verify],
+            assumptions: assumptions(reasoning),
+            required_files,
+            steps,
+            expected_verification: "verification tool exits with status:0".to_string(),
             stopping_condition: goal.stopping_condition.clone(),
         }
     }
@@ -136,6 +181,8 @@ impl ContextBuilder {
         goal: &Goal,
         prior_evidence: &[StableId],
         memory: &MemoryService,
+        code_intel: &mut CodeIntelligenceService,
+        repository: Option<RepositoryContext>,
         candidates: Vec<ContextCandidate>,
     ) -> AcResult<ContextPack> {
         let mut nodes = Vec::new();
@@ -170,7 +217,27 @@ impl ContextBuilder {
                 degraded: false,
             });
         }
-        for candidate in rank_candidates(candidates).into_iter().take(5) {
+        let mut ranked_candidates = candidates;
+        if let Some(repository) = repository {
+            let files = collect_source_files(&repository.root)?;
+            let receipt = code_intel.index_repository(repository.scope, files)?;
+            nodes.push(ContextNode {
+                id: StableId::new("ctxnode"),
+                source_ref: receipt.id,
+                authority: AuthorityClass::RuntimeContext,
+                content: format!(
+                    "repository:{} files_indexed:{} degraded:{}",
+                    repository.root.display(),
+                    receipt.files_indexed,
+                    receipt.degraded
+                ),
+                token_estimate: 10,
+                protected: false,
+                degraded: receipt.degraded,
+            });
+            ranked_candidates.extend(search_goal_terms(code_intel, &goal.text));
+        }
+        for candidate in rank_candidates(ranked_candidates).into_iter().take(5) {
             nodes.push(ContextNode {
                 id: StableId::new("ctxnode"),
                 source_ref: StableId::new("candidate"),
@@ -183,6 +250,11 @@ impl ContextBuilder {
         }
         self.engine.build_context_pack(nodes, 512)
     }
+}
+
+pub struct RepositoryContext {
+    pub root: PathBuf,
+    pub scope: RepositoryScope,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -223,6 +295,7 @@ pub struct AutonomousAgent<P: PolicyBoundary> {
     evidence: EvidenceStore,
     context_engine: ContextEngine,
     context_builder: ContextBuilder,
+    code_intel: CodeIntelligenceService,
     memory: MemoryService,
     git: GitCoordinator,
     verification: VerificationEngine,
@@ -252,6 +325,7 @@ impl<P: PolicyBoundary> AutonomousAgent<P> {
             evidence,
             context_engine: ContextEngine,
             context_builder: ContextBuilder::default(),
+            code_intel: CodeIntelligenceService::new(),
             memory,
             git,
             verification,
@@ -271,11 +345,32 @@ impl<P: PolicyBoundary> AutonomousAgent<P> {
         let mission_id = self.kernel.create_mission(goal.text.clone())?;
         self.kernel
             .transition_mission(&mission_id, MissionState::Active, Vec::new())?;
-        self.state = AutonomousState::Planning;
-        let plan = self.planner.plan(&goal);
         let mut evidence_refs = Vec::new();
         let mut validation = None;
         let mut changeset = None;
+
+        let inspect_evidence = self.evidence.append(
+            EvidenceKind::DerivedContext,
+            provenance("agent.inspect"),
+            format!("mem://agent/{}/inspect", goal.id),
+            "inspect",
+        )?;
+        evidence_refs.push(inspect_evidence);
+        let context = self.build_context(&goal, &evidence_refs)?;
+        evidence_refs.push(context.id.clone());
+        if self.session.is_cancelled() || self.session.state() == AgentSessionState::Cancelling {
+            self.state = AutonomousState::Cancelled;
+            self.kernel.transition_mission(
+                &mission_id,
+                MissionState::Cancelled,
+                evidence_refs.clone(),
+            )?;
+            return Ok(self.report(goal.id, changeset, evidence_refs, validation));
+        }
+        let reasoning = self.ask_provider(&goal, &context)?;
+
+        self.state = AutonomousState::Planning;
+        let plan = self.planner.plan(&goal, &context, &reasoning);
         self.state = AutonomousState::Executing;
 
         for (index, step) in plan.steps.iter().enumerate() {
@@ -293,22 +388,9 @@ impl<P: PolicyBoundary> AutonomousAgent<P> {
             let checkpoint = self.checkpoint(index);
             self.checkpoints.push(checkpoint);
             match &step.kind {
-                PlanStepKind::InspectWorkspace => {
-                    let evidence = self.evidence.append(
-                        EvidenceKind::DerivedContext,
-                        provenance("agent.inspect"),
-                        format!("mem://agent/{}/inspect", goal.id),
-                        "inspect",
-                    )?;
-                    evidence_refs.push(evidence);
-                }
-                PlanStepKind::RetrieveContext => {
-                    let pack = self.build_context(&goal, &evidence_refs)?;
-                    evidence_refs.push(pack.id);
-                }
-                PlanStepKind::AskProvider => {
-                    self.ask_provider(&goal)?;
-                }
+                PlanStepKind::InspectWorkspace
+                | PlanStepKind::RetrieveContext
+                | PlanStepKind::AskProvider => {}
                 PlanStepKind::ExecuteTool { tool_id, payload } => {
                     let result = self.invoke_with_retry(tool_id, payload, 2)?;
                     evidence_refs.push(result.evidence_ref.clone());
@@ -317,9 +399,14 @@ impl<P: PolicyBoundary> AutonomousAgent<P> {
                         return Ok(self.report(goal.id, changeset, evidence_refs, validation));
                     }
                 }
-                PlanStepKind::Verify { plan_name } => {
+                PlanStepKind::Verify { plan_name, tool_id } => {
                     self.state = AutonomousState::Verifying;
-                    validation = Some(self.verify_with_repair(plan_name, &mut evidence_refs)?);
+                    validation = Some(self.verify_with_repair(
+                        plan_name,
+                        tool_id,
+                        &goal,
+                        &mut evidence_refs,
+                    )?);
                     self.state = AutonomousState::Executing;
                 }
                 PlanStepKind::PrepareChangeSet { path, content } => {
@@ -387,24 +474,64 @@ impl<P: PolicyBoundary> AutonomousAgent<P> {
 
     fn build_context(&mut self, goal: &Goal, evidence_refs: &[StableId]) -> AcResult<ContextPack> {
         let _engine_boundary = &self.context_engine;
-        self.context_builder
-            .build(goal, evidence_refs, &self.memory, Vec::new())
+        let repository = self
+            .session
+            .worker()
+            .workspace_ref
+            .as_ref()
+            .and_then(|worktree_id| self.git.worktree(worktree_id))
+            .map(|worktree| RepositoryContext {
+                root: worktree.path.clone(),
+                scope: RepositoryScope {
+                    repository_id: worktree.repository_id.clone(),
+                    worktree_id: worktree.id.clone(),
+                    root: worktree.path.display().to_string(),
+                    commit: worktree.base_commit.clone(),
+                    trust_profile: "isolated-worktree".to_string(),
+                },
+            });
+        self.context_builder.build(
+            goal,
+            evidence_refs,
+            &self.memory,
+            &mut self.code_intel,
+            repository,
+            Vec::new(),
+        )
     }
 
-    fn ask_provider(&mut self, goal: &Goal) -> AcResult<()> {
+    fn ask_provider(&mut self, goal: &Goal, context: &ContextPack) -> AcResult<ProviderReasoning> {
         let request = self.providers.normalize_request(
-            goal.text.clone(),
+            format!(
+                "goal:{}\ncontext_nodes:{}\nstopping_condition:{}",
+                goal.text,
+                context.nodes.len(),
+                goal.stopping_condition
+            ),
             vec![ProviderCapability::Chat],
             512,
         )?;
-        let attempt = self.providers.start_attempt(&request)?;
-        self.providers.record_event(
-            &attempt,
-            ProviderStreamEvent::Delta("plan accepted".to_string()),
+        let events = self
+            .providers
+            .stream_with_retry(&request, 2, &|| self.session.is_cancelled())
+            .map_err(provider_error)?;
+        let text = events
+            .iter()
+            .filter_map(|event| match event {
+                ProviderStreamEvent::Delta(text) => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let evidence = self.evidence.append(
+            EvidenceKind::DerivedContext,
+            provenance("agent.provider"),
+            format!("mem://agent/{}/provider", goal.id),
+            format!("events:{};text:{}", events.len(), text.len()),
         )?;
-        self.providers
-            .record_event(&attempt, ProviderStreamEvent::Finished)?;
-        Ok(())
+        self.memory
+            .record_fact("provider produced a task plan proposal", vec![evidence], 70)?;
+        Ok(ProviderReasoning { text, events })
     }
 
     fn invoke_with_retry(
@@ -439,12 +566,19 @@ impl<P: PolicyBoundary> AutonomousAgent<P> {
     fn verify_with_repair(
         &mut self,
         plan_name: &str,
+        tool_id: &str,
+        goal: &Goal,
         evidence_refs: &mut Vec<StableId>,
     ) -> AcResult<ValidationRunReport> {
         let max_attempts = 2;
         let mut last_report = None;
         for attempt in 0..max_attempts {
-            let passed = self.verification_failures_remaining == 0;
+            let tool_result = self.invoke_with_retry(tool_id, "", 1)?;
+            evidence_refs.push(tool_result.evidence_ref.clone());
+            let forced_failure = self.verification_failures_remaining > 0;
+            let passed = !forced_failure
+                && tool_result.status == ToolStatus::Succeeded
+                && tool_result.observation.contains("status:0");
             let report = self.verification.record_validation(
                 plan_name.to_string(),
                 passed,
@@ -459,6 +593,19 @@ impl<P: PolicyBoundary> AutonomousAgent<P> {
                 self.verification_failures_remaining -= 1;
             }
             if attempt + 1 < max_attempts {
+                let repair_reasoning = self.ask_provider(
+                    goal,
+                    &ContextPack {
+                        id: StableId::new("ctx"),
+                        nodes: Vec::new(),
+                        budget: 1,
+                        omitted_count: 0,
+                    },
+                )?;
+                let (path, content) = infer_change(&goal.text, &repair_reasoning);
+                let repair_result =
+                    self.invoke_with_retry("fs.write", &format!("{}\n{}", path, content), 1)?;
+                evidence_refs.push(repair_result.evidence_ref);
                 let repair = self.evidence.append(
                     EvidenceKind::DerivedContext,
                     provenance("agent.repair"),
@@ -512,6 +659,19 @@ pub fn default_provider_registry() -> AcResult<ProviderRegistry> {
         vec![ProviderCapability::LocalModel, ProviderCapability::Chat],
         "local",
     )?;
+    providers.register_adapter(
+        &provider_id,
+        Box::new(ScriptedProvider::new(vec![Ok(vec![
+            ProviderStreamEvent::Delta(
+                "assumption: deterministic local provider\nverify: dev.test".to_string(),
+            ),
+            ProviderStreamEvent::Usage {
+                input_tokens: 8,
+                output_tokens: 12,
+            },
+            ProviderStreamEvent::Finished,
+        ])])),
+    )?;
     providers.register_model(
         &provider_id,
         "local-scripted",
@@ -563,9 +723,19 @@ fn requested_capabilities(tool_id: &str) -> Vec<Capability> {
     match tool_id {
         "fs.write" => vec![Capability::FilesystemWrite("*".to_string())],
         "fs.read" | "fs.list" | "fs.search" => vec![Capability::FilesystemRead("*".to_string())],
-        "cmd.exec" => vec![Capability::ProcessExec("*".to_string())],
+        "cmd.exec" | "repo.status" | "repo.diff" | "repo.branch" | "dev.test" | "dev.format"
+        | "dev.check" => vec![Capability::ProcessExec("*".to_string())],
         _ => Vec::new(),
     }
+}
+
+fn provider_error(failure: ProviderFailureClass) -> AcError {
+    AcError::new(
+        "AGENT-PROVIDER_FAILURE",
+        format!("provider failed: {:?}", failure),
+        ac_common::ErrorKind::Unavailable,
+        ac_common::Retryability::Retryable,
+    )
 }
 
 fn provenance(source: &str) -> Provenance {
@@ -577,19 +747,157 @@ fn provenance(source: &str) -> Provenance {
     }
 }
 
-fn infer_change(goal: &str) -> (String, String) {
-    let target = goal
-        .split_whitespace()
-        .find(|part| part.ends_with(".md") || part.ends_with(".txt") || part.ends_with(".rs"))
+fn infer_change(goal: &str, reasoning: &ProviderReasoning) -> (String, String) {
+    let target = reasoning
+        .text
+        .lines()
+        .find_map(|line| line.strip_prefix("write_file:").map(str::trim))
+        .or_else(|| {
+            goal.split_whitespace().find(|part| {
+                part.ends_with(".md") || part.ends_with(".txt") || part.ends_with(".rs")
+            })
+        })
         .unwrap_or("AGENTCODE_OUTPUT.txt")
         .trim_matches(|ch: char| ch == '"' || ch == '\'' || ch == '`')
         .to_string();
-    let content = if goal.to_ascii_lowercase().contains("fix the bug") && target.ends_with(".rs") {
+    let content = reasoning
+        .text
+        .split_once("content:\n")
+        .map(|(_, content)| content.trim_end().to_string() + "\n")
+        .unwrap_or_else(|| inferred_content(goal, &target));
+    (target, content)
+}
+
+fn inferred_content(goal: &str, target: &str) -> String {
+    if goal.to_ascii_lowercase().contains("fix the bug") && target.ends_with(".rs") {
         "pub fn fixture_answer() -> u32 {\n    42\n}\n".to_string()
     } else {
         format!("{}\n", goal.trim())
-    };
-    (target, content)
+    }
+}
+
+fn required_files(
+    goal: &Goal,
+    reasoning: &ProviderReasoning,
+    context: &ContextPack,
+) -> Vec<String> {
+    let mut files = reasoning
+        .text
+        .lines()
+        .filter_map(|line| line.strip_prefix("required_file:").map(str::trim))
+        .filter(|path| !path.is_empty())
+        .map(ToString::to_string)
+        .collect::<Vec<_>>();
+    files.extend(goal.text.split_whitespace().filter_map(|part| {
+        let cleaned = part.trim_matches(|ch: char| ch == '"' || ch == '\'' || ch == '`');
+        (cleaned.ends_with(".md") || cleaned.ends_with(".txt") || cleaned.ends_with(".rs"))
+            .then(|| cleaned.to_string())
+    }));
+    files.extend(context.nodes.iter().filter_map(|node| {
+        node.content
+            .split_once(':')
+            .and_then(|(path, _)| path.ends_with(".rs").then(|| path.to_string()))
+    }));
+    files.sort();
+    files.dedup();
+    files
+}
+
+fn assumptions(reasoning: &ProviderReasoning) -> Vec<String> {
+    let assumptions = reasoning
+        .text
+        .lines()
+        .filter_map(|line| line.strip_prefix("assumption:").map(str::trim))
+        .filter(|line| !line.is_empty())
+        .map(ToString::to_string)
+        .collect::<Vec<_>>();
+    if assumptions.is_empty() {
+        vec!["provider supplied no explicit assumptions".to_string()]
+    } else {
+        assumptions
+    }
+}
+
+fn verification_tool(target: &str) -> &'static str {
+    if target.ends_with(".rs") {
+        "dev.test"
+    } else {
+        "repo.diff"
+    }
+}
+
+fn search_goal_terms(code_intel: &CodeIntelligenceService, goal: &str) -> Vec<ContextCandidate> {
+    goal.split(|ch: char| !ch.is_ascii_alphanumeric() && ch != '_')
+        .filter(|term| term.len() > 2)
+        .flat_map(|term| code_intel.search_text(term))
+        .collect()
+}
+
+fn collect_source_files(root: &Path) -> AcResult<Vec<(SourceFileIdentity, String)>> {
+    let mut files = Vec::new();
+    collect_source_files_inner(root, root, &mut files)?;
+    Ok(files)
+}
+
+fn collect_source_files_inner(
+    root: &Path,
+    current: &Path,
+    files: &mut Vec<(SourceFileIdentity, String)>,
+) -> AcResult<()> {
+    for entry in fs::read_dir(current)
+        .map_err(|err| AcError::validation("AGENT-CONTEXT_READ_FAILED", err.to_string()))?
+    {
+        let entry = entry
+            .map_err(|err| AcError::validation("AGENT-CONTEXT_READ_FAILED", err.to_string()))?;
+        let path = entry.path();
+        let name = entry.file_name();
+        if name.to_string_lossy() == ".git" || name.to_string_lossy() == "target" {
+            continue;
+        }
+        if path.is_dir() {
+            collect_source_files_inner(root, &path, files)?;
+        } else if path.is_file() {
+            let relative = path
+                .strip_prefix(root)
+                .unwrap_or(&path)
+                .display()
+                .to_string();
+            if !is_indexable(&relative) {
+                continue;
+            }
+            let content = fs::read_to_string(&path).unwrap_or_default();
+            let metadata = fs::symlink_metadata(&path)
+                .map_err(|err| AcError::validation("AGENT-CONTEXT_STAT_FAILED", err.to_string()))?;
+            files.push((
+                SourceFileIdentity {
+                    relative_path: relative,
+                    language: language_for(&path),
+                    content_hash: format!("len:{}", content.len()),
+                    size_bytes: metadata.len(),
+                    symlink: metadata.file_type().is_symlink(),
+                },
+                content,
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn is_indexable(path: &str) -> bool {
+    [".rs", ".md", ".toml", ".txt"]
+        .iter()
+        .any(|suffix| path.ends_with(suffix))
+}
+
+fn language_for(path: &Path) -> String {
+    match path.extension().and_then(|ext| ext.to_str()) {
+        Some("rs") => "rust",
+        Some("md") => "markdown",
+        Some("toml") => "toml",
+        Some("txt") => "text",
+        _ => "unknown",
+    }
+    .to_string()
 }
 
 #[cfg(test)]
@@ -602,6 +910,8 @@ mod tests {
     struct FlakyTool {
         failures: std::sync::Mutex<usize>,
     }
+
+    struct EchoTool;
 
     impl ToolExecutor for FlakyTool {
         fn execute(&self, request: &ToolRequest) -> AcResult<String> {
@@ -617,6 +927,28 @@ mod tests {
             }
             Ok(request.payload.clone())
         }
+    }
+
+    impl ToolExecutor for EchoTool {
+        fn execute(&self, request: &ToolRequest) -> AcResult<String> {
+            if request.tool_id == "dev.test" || request.tool_id == "repo.diff" {
+                return Ok("status:0\nstdout:ok\nstderr:".to_string());
+            }
+            Ok(request.payload.clone())
+        }
+    }
+
+    fn run_git<const N: usize>(cwd: &Path, args: [&str; N]) {
+        let output = std::process::Command::new("git")
+            .args(args)
+            .current_dir(cwd)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 
     fn agent_with_tool(
@@ -636,6 +968,18 @@ mod tests {
                 }),
             )
             .unwrap();
+        for id in ["fs.read", "repo.diff", "dev.test"] {
+            tools
+                .register_tool(
+                    ToolDefinition {
+                        id: id.to_string(),
+                        version: "1".to_string(),
+                        required_capabilities: Vec::new(),
+                    },
+                    Box::new(EchoTool),
+                )
+                .unwrap();
+        }
         AutonomousAgent::new(
             ac_kernel::Kernel::new(AllowAllPolicy),
             AgentSession::new(Worker::new()),
@@ -651,17 +995,30 @@ mod tests {
     #[test]
     fn planner_orders_goal_to_changeset() {
         let goal = Goal::new("Create README.md").unwrap();
-        let plan = AgentPlanner.plan(&goal);
+        let context = ContextPack {
+            id: StableId::new("ctx"),
+            nodes: Vec::new(),
+            budget: 512,
+            omitted_count: 0,
+        };
+        let reasoning = ProviderReasoning {
+            text: "assumption: tests identify the bug\nrequired_file: README.md\nverify: repo.diff"
+                .to_string(),
+            events: vec![ProviderStreamEvent::Finished],
+        };
+        let plan = AgentPlanner.plan(&goal, &context, &reasoning);
         assert!(matches!(plan.steps[0].kind, PlanStepKind::InspectWorkspace));
         assert_eq!(plan.objective, "Create README.md");
+        assert_eq!(plan.required_files, vec!["README.md".to_string()]);
+        assert!(!plan.assumptions.is_empty());
         assert!(plan
             .steps
             .iter()
             .all(|step| !step.expected_outcome.is_empty()));
-        assert!(matches!(
-            plan.steps[3].kind,
-            PlanStepKind::PrepareChangeSet { .. }
-        ));
+        assert!(plan
+            .steps
+            .iter()
+            .any(|step| matches!(step.kind, PlanStepKind::PrepareChangeSet { .. })));
         assert!(matches!(
             plan.steps.last().unwrap().kind,
             PlanStepKind::Verify { .. }
@@ -669,9 +1026,53 @@ mod tests {
     }
 
     #[test]
+    fn context_retrieval_returns_relevant_files_as_evidence_context() {
+        let root = std::env::temp_dir().join(format!("agentcode-context-{}", StableId::new("tmp")));
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(
+            root.join("src/auth.rs"),
+            "pub fn authenticate() -> bool { false }\n",
+        )
+        .unwrap();
+        let goal = Goal::new("Fix authenticate in src/auth.rs").unwrap();
+        let mut code_intel = CodeIntelligenceService::new();
+        let context = ContextBuilder::default()
+            .build(
+                &goal,
+                &[],
+                &MemoryService::new(),
+                &mut code_intel,
+                Some(RepositoryContext {
+                    root: root.clone(),
+                    scope: RepositoryScope {
+                        repository_id: StableId::new("repo"),
+                        worktree_id: StableId::new("wt"),
+                        root: root.display().to_string(),
+                        commit: "working-tree".to_string(),
+                        trust_profile: "test".to_string(),
+                    },
+                }),
+                Vec::new(),
+            )
+            .unwrap();
+        assert!(context
+            .nodes
+            .iter()
+            .any(|node| node.content.contains("src/auth.rs")));
+        assert!(context
+            .nodes
+            .iter()
+            .any(|node| node.authority == AuthorityClass::RetrievalAccelerator));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn simple_coding_task_produces_validated_changeset() {
         let mut agent = agent_with_tool(
-            CapabilityPolicy::new().allow(Capability::FilesystemWrite("*".to_string())),
+            CapabilityPolicy::new()
+                .allow(Capability::FilesystemRead("*".to_string()))
+                .allow(Capability::FilesystemWrite("*".to_string()))
+                .allow(Capability::ProcessExec("*".to_string())),
             0,
         );
         let report = agent
@@ -698,7 +1099,10 @@ mod tests {
     #[test]
     fn cancellation_stops_agent_safely() {
         let mut agent = agent_with_tool(
-            CapabilityPolicy::new().allow(Capability::FilesystemWrite("*".to_string())),
+            CapabilityPolicy::new()
+                .allow(Capability::FilesystemRead("*".to_string()))
+                .allow(Capability::FilesystemWrite("*".to_string()))
+                .allow(Capability::ProcessExec("*".to_string())),
             0,
         );
         agent.request_cancel();
@@ -727,7 +1131,10 @@ mod tests {
     #[test]
     fn tool_failure_retries_and_recovers() {
         let mut agent = agent_with_tool(
-            CapabilityPolicy::new().allow(Capability::FilesystemWrite("*".to_string())),
+            CapabilityPolicy::new()
+                .allow(Capability::FilesystemRead("*".to_string()))
+                .allow(Capability::FilesystemWrite("*".to_string()))
+                .allow(Capability::ProcessExec("*".to_string())),
             1,
         );
         let report = agent
@@ -740,7 +1147,10 @@ mod tests {
     #[test]
     fn verification_failure_repairs_and_retries() {
         let mut agent = agent_with_tool(
-            CapabilityPolicy::new().allow(Capability::FilesystemWrite("*".to_string())),
+            CapabilityPolicy::new()
+                .allow(Capability::FilesystemRead("*".to_string()))
+                .allow(Capability::FilesystemWrite("*".to_string()))
+                .allow(Capability::ProcessExec("*".to_string())),
             1,
         )
         .with_verification_failures(1);
@@ -759,11 +1169,36 @@ mod tests {
         let worktree =
             std::env::temp_dir().join(format!("agentcode-demo-wt-{}", StableId::new("tmp")));
         std::fs::create_dir_all(source.join("src")).unwrap();
+        std::fs::create_dir_all(source.join("tests")).unwrap();
+        std::fs::write(
+            source.join("Cargo.toml"),
+            "[package]\nname = \"agentcode_demo_fixture\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[lib]\npath = \"src/lib.rs\"\n",
+        )
+        .unwrap();
         std::fs::write(
             source.join("src/lib.rs"),
             "pub fn fixture_answer() -> u32 {\n    41\n}\n",
         )
         .unwrap();
+        std::fs::write(
+            source.join("tests/fixture.rs"),
+            "use agentcode_demo_fixture::fixture_answer;\n\n#[test]\nfn fixture_answer_is_correct() {\n    assert_eq!(fixture_answer(), 42);\n}\n",
+        )
+        .unwrap();
+        run_git(&source, ["init"]);
+        run_git(&source, ["add", "."]);
+        run_git(
+            &source,
+            [
+                "-c",
+                "user.name=AgentCode Test",
+                "-c",
+                "user.email=agentcode@example.test",
+                "commit",
+                "-m",
+                "initial",
+            ],
+        );
         let mut agent = isolated_workspace_agent(
             source.clone(),
             worktree.clone(),

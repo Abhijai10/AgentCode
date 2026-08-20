@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
-use std::fs;
 use std::path::Path;
 use std::path::PathBuf;
+use std::process::Command;
 
 use ac_common::{AcError, AcResult, StableId, TimestampMillis};
 
@@ -40,6 +40,16 @@ pub struct CheckpointRecord {
     pub commit_ref: String,
     pub reason: String,
     pub created_at: TimestampMillis,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WorktreeDiff {
+    pub worktree_id: StableId,
+    pub branch: String,
+    pub base_commit: String,
+    pub head_commit: String,
+    pub status: String,
+    pub diff: String,
 }
 
 #[derive(Default)]
@@ -169,47 +179,116 @@ impl GitCoordinator {
         owner_mission_id: StableId,
         owner_worker_id: StableId,
     ) -> AcResult<StableId> {
-        copy_dir(&source_root, &worktree_root)?;
-        let repository_id = self.register_repository(source_root, "working-tree", "main")?;
+        let base_commit = git_output(&source_root, ["rev-parse", "HEAD"])?;
+        let default_branch = git_output(&source_root, ["branch", "--show-current"])
+            .unwrap_or_else(|_| "main".to_string());
+        let branch = format!("agent/task-{}", StableId::new("branch"));
+        validate_branch(&branch)?;
+        git_output(
+            &source_root,
+            [
+                "worktree",
+                "add",
+                "-b",
+                branch.as_str(),
+                worktree_root.to_str().ok_or_else(|| {
+                    AcError::validation("GIT-WORKTREE_PATH_UTF8", "worktree path must be UTF-8")
+                })?,
+                base_commit.as_str(),
+            ],
+        )?;
+        let repository_id =
+            self.register_repository(source_root, base_commit.clone(), default_branch)?;
         self.create_worktree(
             &repository_id,
             owner_mission_id,
             owner_worker_id,
             worktree_root,
-            "agent/task-workspace",
-            "working-tree",
+            branch,
+            base_commit,
         )
+    }
+
+    pub fn worktree_status(&self, worktree_id: &StableId) -> AcResult<String> {
+        let worktree = self
+            .worktrees
+            .get(worktree_id)
+            .ok_or_else(|| AcError::validation("GIT-UNKNOWN_WORKTREE", "worktree not found"))?;
+        git_output(&worktree.path, ["status", "--short"])
+    }
+
+    pub fn worktree_branch(&self, worktree_id: &StableId) -> AcResult<String> {
+        let worktree = self
+            .worktrees
+            .get(worktree_id)
+            .ok_or_else(|| AcError::validation("GIT-UNKNOWN_WORKTREE", "worktree not found"))?;
+        git_output(&worktree.path, ["branch", "--show-current"])
+    }
+
+    pub fn worktree_head(&self, worktree_id: &StableId) -> AcResult<String> {
+        let worktree = self
+            .worktrees
+            .get(worktree_id)
+            .ok_or_else(|| AcError::validation("GIT-UNKNOWN_WORKTREE", "worktree not found"))?;
+        git_output(&worktree.path, ["rev-parse", "HEAD"])
+    }
+
+    pub fn worktree_diff(&self, worktree_id: &StableId) -> AcResult<WorktreeDiff> {
+        let worktree = self
+            .worktrees
+            .get(worktree_id)
+            .ok_or_else(|| AcError::validation("GIT-UNKNOWN_WORKTREE", "worktree not found"))?;
+        let status = git_output(&worktree.path, ["status", "--short"])?;
+        let diff = git_output(&worktree.path, ["diff", "--", "."])?;
+        let head_commit = git_output(&worktree.path, ["rev-parse", "HEAD"])?;
+        Ok(WorktreeDiff {
+            worktree_id: worktree_id.clone(),
+            branch: worktree.branch.clone(),
+            base_commit: worktree.base_commit.clone(),
+            head_commit,
+            status,
+            diff,
+        })
+    }
+
+    pub fn cleanup_worktree(&mut self, worktree_id: &StableId) -> AcResult<()> {
+        let worktree = self
+            .worktrees
+            .get_mut(worktree_id)
+            .ok_or_else(|| AcError::validation("GIT-UNKNOWN_WORKTREE", "worktree not found"))?;
+        let repository = self
+            .repositories
+            .get(&worktree.repository_id)
+            .ok_or_else(|| AcError::validation("GIT-UNKNOWN_REPOSITORY", "repository not found"))?;
+        git_output(
+            &repository.root,
+            [
+                "worktree",
+                "remove",
+                "--force",
+                worktree.path.to_str().ok_or_else(|| {
+                    AcError::validation("GIT-WORKTREE_PATH_UTF8", "worktree path must be UTF-8")
+                })?,
+            ],
+        )?;
+        worktree.status = WorktreeStatus::Cleaned;
+        Ok(())
     }
 }
 
-fn copy_dir(source: &Path, destination: &Path) -> AcResult<()> {
-    if !source.is_dir() {
+fn git_output<const N: usize>(cwd: &Path, args: [&str; N]) -> AcResult<String> {
+    let output = Command::new("git")
+        .args(args)
+        .current_dir(cwd)
+        .output()
+        .map_err(|err| AcError::validation("GIT-COMMAND_FAILED", err.to_string()))?;
+    if !output.status.success() {
         return Err(AcError::validation(
-            "GIT-SOURCE_NOT_DIRECTORY",
-            "task workspace source must be a directory",
+            "GIT-COMMAND_FAILED",
+            String::from_utf8_lossy(&output.stderr).trim().to_string(),
         ));
     }
-    fs::create_dir_all(destination)
-        .map_err(|err| AcError::validation("GIT-WORKTREE_CREATE_FAILED", err.to_string()))?;
-    for entry in fs::read_dir(source)
-        .map_err(|err| AcError::validation("GIT-WORKTREE_READ_FAILED", err.to_string()))?
-    {
-        let entry = entry
-            .map_err(|err| AcError::validation("GIT-WORKTREE_READ_FAILED", err.to_string()))?;
-        let path = entry.path();
-        let name = entry.file_name();
-        if name.to_string_lossy() == ".git" {
-            continue;
-        }
-        let target = destination.join(name);
-        if path.is_dir() {
-            copy_dir(&path, &target)?;
-        } else if path.is_file() {
-            fs::copy(&path, &target)
-                .map_err(|err| AcError::validation("GIT-WORKTREE_COPY_FAILED", err.to_string()))?;
-        }
-    }
-    Ok(())
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
 pub fn validate_branch(branch: &str) -> AcResult<()> {
@@ -235,6 +314,20 @@ pub fn validate_branch(branch: &str) -> AcResult<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
+
+    fn run_git<const N: usize>(cwd: &Path, args: [&str; N]) {
+        let output = Command::new("git")
+            .args(args)
+            .current_dir(cwd)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
 
     #[test]
     fn unsafe_branch_names_are_rejected() {
@@ -267,6 +360,20 @@ mod tests {
         let worktree = std::env::temp_dir().join(format!("agentcode-wt-{}", StableId::new("tmp")));
         fs::create_dir_all(source.join("src")).unwrap();
         fs::write(source.join("src/lib.rs"), "pub fn old() {}\n").unwrap();
+        run_git(&source, ["init"]);
+        run_git(&source, ["add", "."]);
+        run_git(
+            &source,
+            [
+                "-c",
+                "user.name=AgentCode Test",
+                "-c",
+                "user.email=agentcode@example.test",
+                "commit",
+                "-m",
+                "initial",
+            ],
+        );
         let mut git = GitCoordinator::new();
         let worktree_id = git
             .create_task_workspace(
@@ -277,12 +384,15 @@ mod tests {
             )
             .unwrap();
         fs::write(worktree.join("src/lib.rs"), "pub fn new() {}\n").unwrap();
+        let diff = git.worktree_diff(&worktree_id).unwrap();
+        assert!(diff.status.contains("src/lib.rs"));
+        assert!(diff.diff.contains("pub fn new"));
         assert_eq!(
             fs::read_to_string(source.join("src/lib.rs")).unwrap(),
             "pub fn old() {}\n"
         );
         assert!(git.worktree(&worktree_id).is_some());
+        git.cleanup_worktree(&worktree_id).unwrap();
         let _ = fs::remove_dir_all(source);
-        let _ = fs::remove_dir_all(worktree);
     }
 }

@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 
 use ac_common::{AcError, AcResult, StableId, TimestampMillis};
 
@@ -115,6 +115,7 @@ pub struct RouteAttempt {
 pub struct ProviderRegistry {
     providers: BTreeMap<StableId, ProviderDefinition>,
     models: BTreeMap<StableId, ModelCapability>,
+    adapters: BTreeMap<StableId, Box<dyn ProviderAdapter>>,
     attempts: Vec<RouteAttempt>,
 }
 
@@ -150,6 +151,21 @@ impl ProviderRegistry {
             },
         );
         Ok(id)
+    }
+
+    pub fn register_adapter(
+        &mut self,
+        provider_id: &StableId,
+        adapter: Box<dyn ProviderAdapter>,
+    ) -> AcResult<()> {
+        if !self.providers.contains_key(provider_id) {
+            return Err(AcError::validation(
+                "PROVIDER-UNKNOWN_PROVIDER",
+                "provider must be registered before adapter",
+            ));
+        }
+        self.adapters.insert(provider_id.clone(), adapter);
+        Ok(())
     }
 
     pub fn register_model(
@@ -269,14 +285,99 @@ impl ProviderRegistry {
         Ok(())
     }
 
+    pub fn stream_with_retry(
+        &mut self,
+        request: &NormalizedInferenceRequest,
+        max_attempts: usize,
+        cancel: &dyn Fn() -> bool,
+    ) -> Result<Vec<ProviderStreamEvent>, ProviderFailureClass> {
+        let model = self
+            .models
+            .get(&request.model_id)
+            .ok_or(ProviderFailureClass::UnsupportedCapability)?
+            .clone();
+        let mut remaining = VecDeque::from_iter(0..max_attempts.max(1));
+        let mut last_failure = None;
+        while remaining.pop_front().is_some() {
+            if cancel() {
+                return Err(ProviderFailureClass::Cancelled);
+            }
+            let attempt_id = self
+                .start_attempt(request)
+                .map_err(|_| ProviderFailureClass::MalformedResponse)?;
+            let result = {
+                let adapter = self
+                    .adapters
+                    .get(&model.provider_id)
+                    .ok_or(ProviderFailureClass::UnsupportedCapability)?;
+                adapter.stream(request, cancel)
+            };
+            match result {
+                Ok(events) => {
+                    for event in &events {
+                        self.record_event(&attempt_id, event.clone())
+                            .map_err(|_| ProviderFailureClass::MalformedResponse)?;
+                    }
+                    if matches!(events.last(), Some(ProviderStreamEvent::Finished)) {
+                        return Ok(events);
+                    }
+                    self.finish_failed(&attempt_id, ProviderFailureClass::StreamAborted)
+                        .map_err(|_| ProviderFailureClass::MalformedResponse)?;
+                    last_failure = Some(ProviderFailureClass::StreamAborted);
+                }
+                Err(failure) => {
+                    self.finish_failed(&attempt_id, failure)
+                        .map_err(|_| ProviderFailureClass::MalformedResponse)?;
+                    if !is_retryable(failure) {
+                        return Err(failure);
+                    }
+                    last_failure = Some(failure);
+                }
+            }
+        }
+        Err(last_failure.unwrap_or(ProviderFailureClass::ServerError))
+    }
+
     pub fn attempts(&self) -> &[RouteAttempt] {
         &self.attempts
     }
 }
 
+fn is_retryable(failure: ProviderFailureClass) -> bool {
+    matches!(
+        failure,
+        ProviderFailureClass::RateLimited
+            | ProviderFailureClass::Timeout
+            | ProviderFailureClass::ServerError
+            | ProviderFailureClass::StreamAborted
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+
+    struct RetryProvider {
+        responses: Mutex<VecDeque<Result<Vec<ProviderStreamEvent>, ProviderFailureClass>>>,
+    }
+
+    impl ProviderAdapter for RetryProvider {
+        fn stream(
+            &self,
+            _request: &NormalizedInferenceRequest,
+            cancel: &dyn Fn() -> bool,
+        ) -> Result<Vec<ProviderStreamEvent>, ProviderFailureClass> {
+            if cancel() {
+                return Err(ProviderFailureClass::Cancelled);
+            }
+            self.responses
+                .lock()
+                .unwrap()
+                .pop_front()
+                .unwrap_or(Err(ProviderFailureClass::ServerError))
+        }
+    }
 
     #[test]
     fn model_selection_uses_capabilities_not_provider_state() {
@@ -311,5 +412,80 @@ mod tests {
             .select_model(&[ProviderCapability::Vision])
             .unwrap_err();
         assert_eq!(err.code(), "PROVIDER-NO_CAPABLE_MODEL");
+    }
+
+    #[test]
+    fn provider_streaming_retries_and_records_lifecycle() {
+        let mut registry = ProviderRegistry::new();
+        let provider = registry
+            .register_provider(
+                "mock",
+                Some("env:AGENTCODE_PROVIDER_KEY".to_string()),
+                vec![ProviderCapability::Chat, ProviderCapability::Streaming],
+                "mock",
+            )
+            .unwrap();
+        registry
+            .register_adapter(
+                &provider,
+                Box::new(RetryProvider {
+                    responses: Mutex::new(VecDeque::from([
+                        Err(ProviderFailureClass::Timeout),
+                        Ok(vec![
+                            ProviderStreamEvent::Delta("plan".to_string()),
+                            ProviderStreamEvent::Usage {
+                                input_tokens: 3,
+                                output_tokens: 5,
+                            },
+                            ProviderStreamEvent::Finished,
+                        ]),
+                    ])),
+                }),
+            )
+            .unwrap();
+        registry
+            .register_model(
+                &provider,
+                "mock-model",
+                vec![ProviderCapability::Chat, ProviderCapability::Streaming],
+                4096,
+            )
+            .unwrap();
+        let request = registry
+            .normalize_request("plan task", vec![ProviderCapability::Chat], 128)
+            .unwrap();
+        let events = registry.stream_with_retry(&request, 2, &|| false).unwrap();
+        assert!(matches!(events.last(), Some(ProviderStreamEvent::Finished)));
+        assert_eq!(registry.attempts().len(), 2);
+        assert_eq!(
+            registry.attempts()[0].failure,
+            Some(ProviderFailureClass::Timeout)
+        );
+    }
+
+    #[test]
+    fn provider_streaming_obeys_cancellation() {
+        let mut registry = ProviderRegistry::new();
+        let provider = registry
+            .register_provider("mock", None, vec![ProviderCapability::Chat], "mock")
+            .unwrap();
+        registry
+            .register_adapter(&provider, Box::new(ScriptedProvider::default()))
+            .unwrap();
+        registry
+            .register_model(
+                &provider,
+                "mock-model",
+                vec![ProviderCapability::Chat],
+                4096,
+            )
+            .unwrap();
+        let request = registry
+            .normalize_request("plan task", vec![ProviderCapability::Chat], 128)
+            .unwrap();
+        let failure = registry
+            .stream_with_retry(&request, 1, &|| true)
+            .unwrap_err();
+        assert_eq!(failure, ProviderFailureClass::Cancelled);
     }
 }
