@@ -4,7 +4,7 @@
 - **Status:** ACCEPTED
 - **Risk:** CRITICAL | **Release scope:** REQUIRED_V1
 - **Base commit:** 3f8c6916f83e124d88dbbb59106ee662e6624925
-- **Accepted commit:** TO_BE_FILLED_AFTER_COMMIT
+- **Accepted commit:** e059aedcb66a32874845766e849ea5783324c10b
 - **Owner modules:** docs/extraction/, docs/extraction/packets/, docs/extraction/decisions/
 - **Architecture refs:** DOC-04; DOC-07 H46; DOC-10 P1-G4; DOC-11 P01-WP09
 - **Acceptance gates:** P1-G4 extraction evidence
@@ -30,4 +30,3 @@ Extraction cites exact source paths, important symbols, control flow, lifecycle,
 ## Handoff
 
 Future sandbox, Tool Broker, Process Manager, and permission-policy implementation phases consume the implementation packet. Phase 1 remains IN_PROGRESS; Phase 2 remains NOT_STARTED.
-
