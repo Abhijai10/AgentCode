@@ -1,0 +1,57 @@
+{
+  "schema_version": 1,
+  "kind": "phase_completion",
+  "phase": "P01",
+  "phase_name": "OSS Extraction & Evidence Collection",
+  "status": "COMPLETE",
+  "completed_at": "2026-08-21",
+  "starting_commit": "1d8a48253c645f0beae6e36f66074098ebc1d8db",
+  "completion_package_commit": "see git log for this package commit",
+  "branch": "batch/phase-0-2-foundation",
+  "completed_work_packages": {
+    "P01-WP01": { "status": "ACCEPTED", "accepted_commit": "1935016" },
+    "P01-WP02": { "status": "ACCEPTED", "accepted_commit": "1935016" },
+    "P01-WP03": { "status": "ACCEPTED", "accepted_commit": "7ee6c2fc6939ad4b8a88200ab08d79fa02a309e2" },
+    "P01-WP04": { "status": "ACCEPTED", "accepted_commit": "7ee6c2fc6939ad4b8a88200ab08d79fa02a309e2" },
+    "P01-WP05": { "status": "ACCEPTED", "accepted_commit": "7ee6c2fc6939ad4b8a88200ab08d79fa02a309e2" },
+    "P01-WP06": { "status": "ACCEPTED", "accepted_commit": "e059aedcb66a32874845766e849ea5783324c10b" },
+    "P01-WP07": { "status": "ACCEPTED", "accepted_commit": "c2de2290a4dea6176d68064906470210f522d59e" },
+    "P01-WP08": { "status": "ACCEPTED", "accepted_commit": "c2de2290a4dea6176d68064906470210f522d59e" },
+    "P01-WP09": { "status": "ACCEPTED", "accepted_commit": "e059aedcb66a32874845766e849ea5783324c10b" },
+    "P01-WP10": { "status": "ACCEPTED", "accepted_commit": "e059aedcb66a32874845766e849ea5783324c10b" },
+    "P01-WP11": { "status": "ACCEPTED", "accepted_commit": "d2c64fe9a77bc8be119d7e019fd40ffc407f3d6b" },
+    "P01-WP12": { "status": "ACCEPTED", "accepted_commit": "d2c64fe9a77bc8be119d7e019fd40ffc407f3d6b" },
+    "P01-WP13": { "status": "ACCEPTED", "accepted_commit": "d2c64fe9a77bc8be119d7e019fd40ffc407f3d6b" },
+    "P01-WP14": { "status": "ACCEPTED", "accepted_commit": "d2c64fe9a77bc8be119d7e019fd40ffc407f3d6b" },
+    "P01-WP15": { "status": "ACCEPTED", "accepted_commit": "d2c64fe9a77bc8be119d7e019fd40ffc407f3d6b" },
+    "P01-WP16": { "status": "ACCEPTED", "accepted_commit": "d2c64fe9a77bc8be119d7e019fd40ffc407f3d6b" },
+    "P01-WP17": { "status": "ACCEPTED", "accepted_commit": "d2c64fe9a77bc8be119d7e019fd40ffc407f3d6b" }
+  },
+  "evidence_commits": [
+    "1935016",
+    "7ee6c2fc6939ad4b8a88200ab08d79fa02a309e2",
+    "e059aedcb66a32874845766e849ea5783324c10b",
+    "c2de2290a4dea6176d68064906470210f522d59e",
+    "d2c64fe9a77bc8be119d7e019fd40ffc407f3d6b"
+  ],
+  "gates": {
+    "P1-G1": { "status": "PASS", "evidence": "docs/reference/AGENTCODE_REFERENCE_CATALOG.md" },
+    "P1-G2": { "status": "PASS", "evidence": "reference catalog plus WP extraction pinned commits" },
+    "P1-G3": { "status": "PASS", "evidence": "docs/reference/LICENSE_PROVENANCE_MATRIX.md; docs/reference/licenses_scan.json" },
+    "P1-G4": { "status": "PASS", "evidence": "accepted WP01-WP17 records and extraction reports" },
+    "P1-G5": { "status": "PASS", "evidence": "accepted extraction reports cite exact donor source paths" },
+    "P1-G6": { "status": "PASS", "evidence": "docs/extraction/decisions/ADOPTION_*.md" },
+    "P1-G7": { "status": "PASS", "evidence": "license provenance matrix and legal matrix" },
+    "P1-G8": { "status": "PASS", "evidence": "docs/extraction/packets/P01_WP*_IMPLEMENTATION_PACKET.md" }
+  },
+  "gate_review": "docs/progress/phase-01-gate-review.md",
+  "architecture_dependency_map": "docs/progress/phase-01-architecture-dependency-map.md",
+  "blockers": [],
+  "phase_2_status": "NOT_STARTED",
+  "implementation_code_introduced": false,
+  "known_limitations": [
+    "Phase 1 is extraction-only and does not implement production capabilities.",
+    "ADR-0005 transport sub-item remains bounded pending before Phase 3 daemon IPC work.",
+    "Reference-library repositories are research input only and are not runtime dependencies."
+  ]
+}
