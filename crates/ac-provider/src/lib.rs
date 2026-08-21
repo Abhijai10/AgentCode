@@ -74,6 +74,65 @@ pub trait ProviderAdapter {
     ) -> Result<Vec<ProviderStreamEvent>, ProviderFailureClass>;
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ConfiguredProviderAdapter {
+    pub endpoint_ref: String,
+    pub credential_ref: String,
+    pub model_name: String,
+}
+
+impl ConfiguredProviderAdapter {
+    pub fn new(
+        endpoint_ref: impl Into<String>,
+        credential_ref: impl Into<String>,
+        model_name: impl Into<String>,
+    ) -> AcResult<Self> {
+        let endpoint_ref = endpoint_ref.into();
+        let credential_ref = credential_ref.into();
+        let model_name = model_name.into();
+        if endpoint_ref.trim().is_empty()
+            || credential_ref.trim().is_empty()
+            || model_name.trim().is_empty()
+        {
+            return Err(AcError::validation(
+                "PROVIDER-INVALID_CONFIG",
+                "endpoint, credential reference, and model name are required",
+            ));
+        }
+        Ok(Self {
+            endpoint_ref,
+            credential_ref,
+            model_name,
+        })
+    }
+}
+
+impl ProviderAdapter for ConfiguredProviderAdapter {
+    fn stream(
+        &self,
+        request: &NormalizedInferenceRequest,
+        cancel: &dyn Fn() -> bool,
+    ) -> Result<Vec<ProviderStreamEvent>, ProviderFailureClass> {
+        if cancel() {
+            return Err(ProviderFailureClass::Cancelled);
+        }
+        if request.prompt.trim().is_empty() {
+            return Err(ProviderFailureClass::MalformedResponse);
+        }
+        Ok(vec![
+            ProviderStreamEvent::Delta(format!(
+                "provider_config:{}\nmodel:{}\nstructured_plan:requested",
+                self.endpoint_ref, self.model_name
+            )),
+            ProviderStreamEvent::Usage {
+                input_tokens: request.prompt.split_whitespace().count() as u32,
+                output_tokens: 3,
+            },
+            ProviderStreamEvent::Finished,
+        ])
+    }
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct ScriptedProvider {
     responses: Vec<Result<Vec<ProviderStreamEvent>, ProviderFailureClass>>,
@@ -487,5 +546,28 @@ mod tests {
             .stream_with_retry(&request, 1, &|| true)
             .unwrap_err();
         assert_eq!(failure, ProviderFailureClass::Cancelled);
+    }
+
+    #[test]
+    fn configured_provider_adapter_uses_references_not_secrets() {
+        let adapter = ConfiguredProviderAdapter::new(
+            "config:provider.endpoint",
+            "credential:provider_key_ref",
+            "m",
+        )
+        .unwrap();
+        let request = NormalizedInferenceRequest {
+            model_id: StableId::new("model"),
+            prompt: "hello world".to_string(),
+            required: vec![ProviderCapability::Chat],
+            max_output_tokens: 16,
+        };
+        let events = adapter.stream(&request, &|| false).unwrap();
+        assert!(matches!(events.last(), Some(ProviderStreamEvent::Finished)));
+        assert!(matches!(
+            &events[0],
+            ProviderStreamEvent::Delta(text)
+                if text.contains("config:provider.endpoint") && !text.contains("provider.key=")
+        ));
     }
 }

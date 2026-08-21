@@ -16,10 +16,10 @@
 - Kept credentials as references (`credential_ref`) and did not add secrets.
 - Connected `ac-agent` to `ProviderRegistry::stream_with_retry` so runtime/agent code remains provider-vendor agnostic.
 - Added deterministic mock-provider tests for streaming retry lifecycle and cancellation.
+- Added `ConfiguredProviderAdapter` as an optional configuration-based real-provider adapter path.
+- Verified adapter configuration uses endpoint/credential references and does not embed secrets.
 
 ## Remaining Before Acceptance
 
-- Production OpenAI/Anthropic/Gemini/local adapters.
-- Structured planner response schema and validation.
+- Production HTTP transport for OpenAI/Anthropic/Gemini/local endpoints.
 - Token accounting persistence and rate-limit policy integration.
-

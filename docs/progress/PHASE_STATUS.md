@@ -5,7 +5,7 @@ Doc 10 gates for the phase pass and completion evidence exists).
 
 Phase names are the EXACT canonical names from Doc 09 HC-P00..HC-P29 (no aliases).
 
-Last updated: 2026-08-21 (core autonomous coding path expanded)
+Last updated: 2026-08-21 (core autonomous coding path nearing gate readiness)
 
 | Phase | Name (Doc 09 HC-*) | Status | Notes |
 |-------|--------------------|--------|-------|
@@ -13,10 +13,10 @@ Last updated: 2026-08-21 (core autonomous coding path expanded)
 | P01 | OSS Extraction & Evidence Collection | COMPLETE | P01-WP01..P01-WP17 ACCEPTED; P1-G1..P1-G8 PASS; evidence: docs/progress/phase-01-completion.md (+ .json), phase-01-gate-review.md, phase-01-architecture-dependency-map.md |
 | P02 | Repository Skeleton & Development Infrastructure | COMPLETE | P02-WP01 ACCEPTED; P2-G1..P2-G8 PASS; evidence: docs/progress/phase-02-completion.md (+ .json) |
 | P03 | Background Daemon & Persistent Kernel Foundation | IN_PROGRESS | P03-WP01 expanded; `ac-db` persists Kernel mission/event state plus AgentSession/checkpoint recovery evidence; `ac-daemon` has lifecycle, singleton lock, local IPC, health, and interrupted-session recovery foundations; OS IPC/reconnect/full resume gates remain |
-| P04 | Model Broker & OmniRoute Provider Fabric | IN_PROGRESS | P04-WP01 started; ProviderRegistry now owns adapter streaming lifecycle with retry, cancellation, finish validation, and failure recording; production vendor adapters remain |
+| P04 | Model Broker & OmniRoute Provider Fabric | IN_PROGRESS | P04-WP01 expanded; ProviderRegistry owns adapter streaming lifecycle and optional config-based provider adapter path; production HTTP vendor transports remain |
 | P05 | Native Tool Runtime Foundation | IN_PROGRESS | P05-WP01 started; repository and development tools route through Tool Broker/Sandbox and emit evidence; project-specific command profiles remain |
-| P06 | Basic Worker Agent Loop | IN_PROGRESS | P06-WP01 expanded; `ac-agent` now runs planner/context/provider/tool/ChangeSet/verification flow with isolated workspace demo and verification repair retry; production provider adapters and full project validation profiles remain |
-| P07 | Git, Worktrees & Checkpointing | IN_PROGRESS | P07-WP01 started; task workspaces now use real `git worktree add -b`, track branch/base/head/status/diff, and prove source checkout isolation; merge/review and durable worktree state remain |
+| P06 | Basic Worker Agent Loop | IN_PROGRESS | P06-WP01 expanded; `ac-agent` now validates structured plans, creates metadata-rich ChangeSets, runs verification/repair, and completes a real-worktree autonomous benchmark with merge simulation; full gate review remains |
+| P07 | Git, Worktrees & Checkpointing | IN_PROGRESS | P07-WP01 expanded; task workspaces use real `git worktree add -b`, checkpoint/recover/cleanup, track branch/base/current/diff, and support Kernel-approved merge review; durable worktree state remains |
 | P08 | Code Intelligence Foundation | IN_PROGRESS | P08-WP01 started; ContextBuilder indexes isolated workspace files and ranks snippets as retrieval evidence; incremental watching and graph ranking remain |
 | P09 | Semantic Intelligence & Repository Graph | NOT_STARTED | |
 | P10 | Persistent Memory & Knowledge Freshness | NOT_STARTED | |

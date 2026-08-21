@@ -29,6 +29,7 @@ pub struct WorktreeRecord {
     pub path: PathBuf,
     pub branch: String,
     pub base_commit: String,
+    pub current_commit: String,
     pub status: WorktreeStatus,
     pub created_at: TimestampMillis,
 }
@@ -50,6 +51,17 @@ pub struct WorktreeDiff {
     pub head_commit: String,
     pub status: String,
     pub diff: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MergeReview {
+    pub id: StableId,
+    pub worktree_id: StableId,
+    pub branch: String,
+    pub base_commit: String,
+    pub merge_commit: Option<String>,
+    pub approved_by_kernel: bool,
+    pub cleaned_up: bool,
 }
 
 #[derive(Default)]
@@ -126,6 +138,7 @@ impl GitCoordinator {
                 owner_worker_id,
                 path,
                 branch,
+                current_commit: base_commit.clone(),
                 base_commit,
                 status: WorktreeStatus::Active,
                 created_at: TimestampMillis::now(),
@@ -168,8 +181,64 @@ impl GitCoordinator {
         Ok(id)
     }
 
+    pub fn checkpoint_current(
+        &mut self,
+        worktree_id: &StableId,
+        reason: impl Into<String>,
+    ) -> AcResult<StableId> {
+        let reason = reason.into();
+        let worktree_path = self
+            .worktrees
+            .get(worktree_id)
+            .ok_or_else(|| AcError::validation("GIT-UNKNOWN_WORKTREE", "worktree not found"))?
+            .path
+            .clone();
+        git_output(&worktree_path, ["add", "."])?;
+        git_output(
+            &worktree_path,
+            [
+                "-c",
+                "user.name=AgentCode",
+                "-c",
+                "user.email=agentcode@example.test",
+                "commit",
+                "--allow-empty",
+                "-m",
+                reason.as_str(),
+            ],
+        )?;
+        let commit = git_output(&worktree_path, ["rev-parse", "HEAD"])?;
+        if let Some(worktree) = self.worktrees.get_mut(worktree_id) {
+            worktree.current_commit = commit.clone();
+        }
+        self.checkpoint(worktree_id, commit, reason)
+    }
+
+    pub fn recover_worktree(&mut self, checkpoint_id: &StableId) -> AcResult<StableId> {
+        let checkpoint = self
+            .checkpoints
+            .get(checkpoint_id)
+            .ok_or_else(|| AcError::validation("GIT-UNKNOWN_CHECKPOINT", "checkpoint not found"))?
+            .clone();
+        let worktree = self
+            .worktrees
+            .get_mut(&checkpoint.worktree_id)
+            .ok_or_else(|| AcError::validation("GIT-UNKNOWN_WORKTREE", "worktree not found"))?;
+        git_output(
+            &worktree.path,
+            ["reset", "--hard", checkpoint.commit_ref.as_str()],
+        )?;
+        worktree.current_commit = checkpoint.commit_ref;
+        worktree.status = WorktreeStatus::Active;
+        Ok(worktree.id.clone())
+    }
+
     pub fn worktree(&self, id: &StableId) -> Option<&WorktreeRecord> {
         self.worktrees.get(id)
+    }
+
+    pub fn checkpoint_record(&self, id: &StableId) -> Option<&CheckpointRecord> {
+        self.checkpoints.get(id)
     }
 
     pub fn create_task_workspace(
@@ -274,6 +343,44 @@ impl GitCoordinator {
         worktree.status = WorktreeStatus::Cleaned;
         Ok(())
     }
+
+    pub fn prepare_merge_review(
+        &self,
+        worktree_id: &StableId,
+        approved_by_kernel: bool,
+    ) -> AcResult<MergeReview> {
+        if !approved_by_kernel {
+            return Err(AcError::policy_denied(
+                "GIT-MERGE_REQUIRES_KERNEL_APPROVAL",
+                "local merge review requires Kernel approval",
+            ));
+        }
+        let worktree = self
+            .worktrees
+            .get(worktree_id)
+            .ok_or_else(|| AcError::validation("GIT-UNKNOWN_WORKTREE", "worktree not found"))?;
+        Ok(MergeReview {
+            id: StableId::new("merge"),
+            worktree_id: worktree_id.clone(),
+            branch: worktree.branch.clone(),
+            base_commit: worktree.base_commit.clone(),
+            merge_commit: Some(git_output(&worktree.path, ["rev-parse", "HEAD"])?),
+            approved_by_kernel,
+            cleaned_up: false,
+        })
+    }
+
+    pub fn complete_merge_review(&mut self, review: &mut MergeReview) -> AcResult<()> {
+        if !review.approved_by_kernel {
+            return Err(AcError::policy_denied(
+                "GIT-MERGE_REQUIRES_KERNEL_APPROVAL",
+                "local merge review requires Kernel approval",
+            ));
+        }
+        self.cleanup_worktree(&review.worktree_id)?;
+        review.cleaned_up = true;
+        Ok(())
+    }
 }
 
 fn git_output<const N: usize>(cwd: &Path, args: [&str; N]) -> AcResult<String> {
@@ -358,6 +465,8 @@ mod tests {
     fn task_workspace_isolated_from_source_directory() {
         let source = std::env::temp_dir().join(format!("agentcode-src-{}", StableId::new("tmp")));
         let worktree = std::env::temp_dir().join(format!("agentcode-wt-{}", StableId::new("tmp")));
+        let _ = fs::remove_dir_all(&source);
+        let _ = fs::remove_dir_all(&worktree);
         fs::create_dir_all(source.join("src")).unwrap();
         fs::write(source.join("src/lib.rs"), "pub fn old() {}\n").unwrap();
         run_git(&source, ["init"]);
@@ -387,12 +496,75 @@ mod tests {
         let diff = git.worktree_diff(&worktree_id).unwrap();
         assert!(diff.status.contains("src/lib.rs"));
         assert!(diff.diff.contains("pub fn new"));
+        let checkpoint = git
+            .checkpoint_current(&worktree_id, "agent checkpoint")
+            .unwrap();
+        assert!(git.checkpoint_record(&checkpoint).is_some());
+        fs::write(worktree.join("src/lib.rs"), "pub fn broken() {}\n").unwrap();
+        git.recover_worktree(&checkpoint).unwrap();
+        assert_eq!(
+            fs::read_to_string(worktree.join("src/lib.rs")).unwrap(),
+            "pub fn new() {}\n"
+        );
         assert_eq!(
             fs::read_to_string(source.join("src/lib.rs")).unwrap(),
             "pub fn old() {}\n"
         );
         assert!(git.worktree(&worktree_id).is_some());
         git.cleanup_worktree(&worktree_id).unwrap();
+        assert_eq!(
+            git.worktree(&worktree_id).unwrap().status,
+            WorktreeStatus::Cleaned
+        );
+        let _ = fs::remove_dir_all(source);
+    }
+
+    #[test]
+    fn merge_review_requires_approval_and_cleans_worktree() {
+        let source = std::env::temp_dir().join(format!("agentcode-src-{}", StableId::new("tmp")));
+        let worktree = std::env::temp_dir().join(format!("agentcode-wt-{}", StableId::new("tmp")));
+        let _ = fs::remove_dir_all(&source);
+        let _ = fs::remove_dir_all(&worktree);
+        fs::create_dir_all(&source).unwrap();
+        fs::write(source.join("README.md"), "old\n").unwrap();
+        run_git(&source, ["init"]);
+        run_git(&source, ["add", "."]);
+        run_git(
+            &source,
+            [
+                "-c",
+                "user.name=AgentCode Test",
+                "-c",
+                "user.email=agentcode@example.test",
+                "commit",
+                "-m",
+                "initial",
+            ],
+        );
+        let mut git = GitCoordinator::new();
+        let worktree_id = git
+            .create_task_workspace(
+                source.clone(),
+                worktree.clone(),
+                StableId::new("mission"),
+                StableId::new("worker"),
+            )
+            .unwrap();
+        fs::write(worktree.join("README.md"), "new\n").unwrap();
+        git.checkpoint_current(&worktree_id, "ready").unwrap();
+        assert_eq!(
+            git.prepare_merge_review(&worktree_id, false)
+                .unwrap_err()
+                .code(),
+            "GIT-MERGE_REQUIRES_KERNEL_APPROVAL"
+        );
+        let mut review = git.prepare_merge_review(&worktree_id, true).unwrap();
+        git.complete_merge_review(&mut review).unwrap();
+        assert!(review.cleaned_up);
+        assert_eq!(
+            fs::read_to_string(source.join("README.md")).unwrap(),
+            "old\n"
+        );
         let _ = fs::remove_dir_all(source);
     }
 }

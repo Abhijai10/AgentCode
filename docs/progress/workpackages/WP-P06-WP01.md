@@ -25,6 +25,9 @@
 - Reworked planning flow to collect workspace context, stream provider reasoning through the ProviderRegistry adapter lifecycle, then build an execution graph with assumptions, required files, dependencies, expected verification, and stopping condition.
 - Connected verification to actual Tool Broker development commands (`dev.test`/`repo.diff`) instead of recording validation success directly.
 - Added repair retry behavior that records failed verification, asks the provider path for repair context, reapplies the proposed change through Tool Broker, and reruns verification.
+- Replaced line-oriented planner parsing with a strict structured plan protocol and validation.
+- Added invalid plan rejection for missing fields, unknown fields, unsupported actions, and unsafe path targets.
+- Extended the autonomous benchmark to create a stronger Rust fixture, run verification, generate a metadata-rich ChangeSet, simulate Kernel-approved merge review, archive the ChangeSet, and clean up the worktree.
 
 ## Boundaries Preserved
 
@@ -37,6 +40,8 @@
 - Verification failure produces evidence and retry behavior; it is not silently converted to success.
 - Provider output informs plans but does not execute tools or own policy.
 - Verification tools run through Tool Broker and Sandbox boundaries.
+- Planner validation is pure; it does not execute actions.
+- ChangeSet is the final autonomous artifact and carries originating task/session, file summaries, evidence refs, and verification status.
 
 ## Validation
 
@@ -47,7 +52,6 @@
 ## Remaining Before Acceptance
 
 - Full production provider adapters.
-- Provider output parsing is line-oriented; structured plan schemas are still future work.
 - Full build/test/lint command profile discovery per project.
 - Durable persisted AgentSession resume path through daemon.
 - Completion request protocol and full benchmark gate.

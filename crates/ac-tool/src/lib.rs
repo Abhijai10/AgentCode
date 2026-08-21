@@ -262,7 +262,7 @@ fn run_sandboxed_command(
     let plan = sandbox.prepare_execution(ExecRequest {
         argv,
         cwd,
-        env: BTreeMap::new(),
+        env: toolchain_env(),
         network: false,
         timeout_ms,
     })?;
@@ -303,6 +303,17 @@ fn run_sandboxed_command(
         }
         std::thread::sleep(Duration::from_millis(10));
     }
+}
+
+fn toolchain_env() -> BTreeMap<String, String> {
+    ["PATH", "HOME", "CARGO_HOME", "RUSTUP_HOME", "RUSTC_WRAPPER"]
+        .iter()
+        .filter_map(|key| {
+            std::env::var(key)
+                .ok()
+                .map(|value| ((*key).to_string(), value))
+        })
+        .collect()
 }
 
 fn safe_join(root: &Path, relative: &str) -> AcResult<PathBuf> {

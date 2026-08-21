@@ -3,7 +3,9 @@ use std::fs;
 use std::path::Path;
 use std::path::PathBuf;
 
-use ac_changeset::{ChangeOperation, ChangeSet, RollbackPlan};
+use ac_changeset::{
+    ChangeOperation, ChangeSet, ChangeSetMetadata, ChangeSetState, FileChangeSummary, RollbackPlan,
+};
 use ac_code_intel::{
     CodeIntelligenceService, ContextCandidate, RepositoryScope, SourceFileIdentity,
 };
@@ -81,6 +83,86 @@ pub struct ProviderReasoning {
     pub events: Vec<ProviderStreamEvent>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StructuredPlanStep {
+    pub id: String,
+    pub action: String,
+    pub target: String,
+    pub reason: String,
+    pub expected_output: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StructuredPlan {
+    pub goal: String,
+    pub assumptions: Vec<String>,
+    pub steps: Vec<StructuredPlanStep>,
+    pub verification_requirements: Vec<String>,
+    pub stopping_condition: String,
+}
+
+impl StructuredPlan {
+    pub fn parse(text: &str) -> AcResult<Self> {
+        let mut goal = None;
+        let mut assumptions = Vec::new();
+        let mut steps = Vec::new();
+        let mut verification_requirements = Vec::new();
+        let mut stopping_condition = None;
+        for raw in text.lines() {
+            let line = raw.trim();
+            if line.is_empty() {
+                continue;
+            }
+            if let Some(value) = line.strip_prefix("goal=") {
+                goal = Some(required_field("goal", value)?);
+            } else if let Some(value) = line.strip_prefix("assumption=") {
+                assumptions.push(required_field("assumption", value)?);
+            } else if let Some(value) = line.strip_prefix("verify=") {
+                verification_requirements.push(required_field("verify", value)?);
+            } else if let Some(value) = line.strip_prefix("stopping_condition=") {
+                stopping_condition = Some(required_field("stopping_condition", value)?);
+            } else if let Some(value) = line.strip_prefix("step=") {
+                steps.push(parse_structured_step(value)?);
+            } else if line.starts_with("content:") || line.starts_with("write_file:") {
+                continue;
+            } else {
+                return Err(AcError::validation(
+                    "AGENT-PLAN_UNKNOWN_FIELD",
+                    format!("unknown structured plan field: {}", line),
+                ));
+            }
+        }
+        let plan = Self {
+            goal: goal.ok_or_else(|| missing_field("goal"))?,
+            assumptions,
+            steps,
+            verification_requirements,
+            stopping_condition: stopping_condition
+                .ok_or_else(|| missing_field("stopping_condition"))?,
+        };
+        plan.validate()?;
+        Ok(plan)
+    }
+
+    pub fn validate(&self) -> AcResult<()> {
+        if self.goal.trim().is_empty()
+            || self.stopping_condition.trim().is_empty()
+            || self.assumptions.is_empty()
+            || self.steps.is_empty()
+            || self.verification_requirements.is_empty()
+        {
+            return Err(AcError::validation(
+                "AGENT-PLAN_MISSING_FIELD",
+                "goal, assumptions, steps, verification requirements, and stopping condition are required",
+            ));
+        }
+        for step in &self.steps {
+            validate_plan_step(step)?;
+        }
+        Ok(())
+    }
+}
+
 #[derive(Default)]
 pub struct AgentPlanner;
 
@@ -109,7 +191,9 @@ impl AgentPlanner {
             depends_on: vec![context_step.id.clone()],
             expected_outcome: "provider action proposal is normalized".to_string(),
         };
-        let required_files = required_files(goal, reasoning, context);
+        let structured = StructuredPlan::parse(&reasoning.text)
+            .unwrap_or_else(|_| fallback_structured_plan(goal, reasoning));
+        let required_files = required_files(goal, reasoning, context, &structured);
         let (target, content) = infer_change(&goal.text, reasoning);
         let read_dependencies = required_files
             .iter()
@@ -164,8 +248,8 @@ impl AgentPlanner {
             assumptions: assumptions(reasoning),
             required_files,
             steps,
-            expected_verification: "verification tool exits with status:0".to_string(),
-            stopping_condition: goal.stopping_condition.clone(),
+            expected_verification: structured.verification_requirements.join("; "),
+            stopping_condition: structured.stopping_condition,
         }
     }
 }
@@ -284,6 +368,7 @@ pub struct AgentRunReport {
     pub changeset: Option<ChangeSet>,
     pub evidence_refs: Vec<StableId>,
     pub validation: Option<ValidationRunReport>,
+    pub merge_review: Option<ac_git::MergeReview>,
 }
 
 pub struct AutonomousAgent<P: PolicyBoundary> {
@@ -425,6 +510,34 @@ impl<P: PolicyBoundary> AutonomousAgent<P> {
                             description: "rollback to prior agent checkpoint".to_string(),
                         }),
                     )?;
+                    let (files_changed, additions, removals) = self
+                        .session
+                        .worker()
+                        .workspace_ref
+                        .as_ref()
+                        .and_then(|worktree_id| self.git.worktree_diff(worktree_id).ok())
+                        .map(|diff| summarize_diff(&diff.diff))
+                        .filter(|(files, _, _)| !files.is_empty())
+                        .unwrap_or_else(|| {
+                            (
+                                vec![FileChangeSummary {
+                                    path: path.clone(),
+                                    additions: content.lines().count() as u32,
+                                    removals: 0,
+                                }],
+                                content.lines().count() as u32,
+                                0,
+                            )
+                        });
+                    proposed.attach_metadata(ChangeSetMetadata {
+                        originating_task: goal.id.clone(),
+                        originating_agent_session: self.session.id().clone(),
+                        files_changed,
+                        additions,
+                        removals,
+                        evidence_refs: evidence_refs.clone(),
+                        verification_passed: validation.as_ref().map(|report| report.passed),
+                    })?;
                     proposed.validate()?;
                     self.kernel.approve_changeset(&mut proposed)?;
                     changeset = Some(proposed);
@@ -433,6 +546,12 @@ impl<P: PolicyBoundary> AutonomousAgent<P> {
         }
 
         self.state = AutonomousState::Completed;
+        if let Some(changeset) = &mut changeset {
+            if let Some(metadata) = &mut changeset.metadata {
+                metadata.evidence_refs = evidence_refs.clone();
+                metadata.verification_passed = validation.as_ref().map(|report| report.passed);
+            }
+        }
         self.kernel.transition_mission(
             &mission_id,
             MissionState::Completed,
@@ -470,6 +589,32 @@ impl<P: PolicyBoundary> AutonomousAgent<P> {
 
     pub fn into_evidence(self) -> EvidenceStore {
         self.evidence
+    }
+
+    pub fn prepare_merge_after_review(
+        &mut self,
+        changeset: &mut ChangeSet,
+    ) -> AcResult<ac_git::MergeReview> {
+        if changeset.state != ChangeSetState::Approved && changeset.state != ChangeSetState::Applied
+        {
+            return Err(AcError::conflict(
+                "AGENT-MERGE_CHANGESET_NOT_APPROVED",
+                "merge review requires an approved changeset",
+            ));
+        }
+        let worktree_id = self
+            .session
+            .worker()
+            .workspace_ref
+            .clone()
+            .ok_or_else(|| AcError::validation("AGENT-NO_WORKTREE", "agent has no worktree"))?;
+        let mut review = self.git.prepare_merge_review(&worktree_id, true)?;
+        if changeset.state == ChangeSetState::Approved {
+            changeset.mark_applied()?;
+        }
+        self.git.complete_merge_review(&mut review)?;
+        changeset.archive()?;
+        Ok(review)
     }
 
     fn build_context(&mut self, goal: &Goal, evidence_refs: &[StableId]) -> AcResult<ContextPack> {
@@ -647,6 +792,7 @@ impl<P: PolicyBoundary> AutonomousAgent<P> {
             changeset,
             evidence_refs,
             validation,
+            merge_review: None,
         }
     }
 }
@@ -663,7 +809,7 @@ pub fn default_provider_registry() -> AcResult<ProviderRegistry> {
         &provider_id,
         Box::new(ScriptedProvider::new(vec![Ok(vec![
             ProviderStreamEvent::Delta(
-                "assumption: deterministic local provider\nverify: dev.test".to_string(),
+                "goal=deterministic local coding task\nassumption=repository is isolated\nstep=id:s1|action:read|target:src/lib.rs|reason:inspect implementation|expected_output:file content\nstep=id:s2|action:modify|target:src/lib.rs|reason:fix requested behavior|expected_output:updated implementation\nverify=status:0\nstopping_condition=changeset prepared with verification evidence".to_string(),
             ),
             ProviderStreamEvent::Usage {
                 input_tokens: 8,
@@ -780,14 +926,23 @@ fn required_files(
     goal: &Goal,
     reasoning: &ProviderReasoning,
     context: &ContextPack,
+    structured: &StructuredPlan,
 ) -> Vec<String> {
-    let mut files = reasoning
-        .text
-        .lines()
-        .filter_map(|line| line.strip_prefix("required_file:").map(str::trim))
+    let mut files = structured
+        .steps
+        .iter()
+        .map(|step| step.target.as_str())
         .filter(|path| !path.is_empty())
         .map(ToString::to_string)
         .collect::<Vec<_>>();
+    files.extend(
+        reasoning
+            .text
+            .lines()
+            .filter_map(|line| line.strip_prefix("required_file:").map(str::trim))
+            .filter(|path| !path.is_empty())
+            .map(ToString::to_string),
+    );
     files.extend(goal.text.split_whitespace().filter_map(|part| {
         let cleaned = part.trim_matches(|ch: char| ch == '"' || ch == '\'' || ch == '`');
         (cleaned.ends_with(".md") || cleaned.ends_with(".txt") || cleaned.ends_with(".rs"))
@@ -804,17 +959,120 @@ fn required_files(
 }
 
 fn assumptions(reasoning: &ProviderReasoning) -> Vec<String> {
-    let assumptions = reasoning
-        .text
-        .lines()
-        .filter_map(|line| line.strip_prefix("assumption:").map(str::trim))
-        .filter(|line| !line.is_empty())
-        .map(ToString::to_string)
-        .collect::<Vec<_>>();
-    if assumptions.is_empty() {
-        vec!["provider supplied no explicit assumptions".to_string()]
-    } else {
-        assumptions
+    StructuredPlan::parse(&reasoning.text)
+        .map(|plan| plan.assumptions)
+        .unwrap_or_else(|_| vec!["provider supplied no valid structured assumptions".to_string()])
+}
+
+fn parse_structured_step(value: &str) -> AcResult<StructuredPlanStep> {
+    let mut id = None;
+    let mut action = None;
+    let mut target = None;
+    let mut reason = None;
+    let mut expected_output = None;
+    for part in value.split('|') {
+        let (key, field_value) = part.split_once(':').ok_or_else(|| {
+            AcError::validation(
+                "AGENT-PLAN_INVALID_STEP",
+                "step fields must be key:value pairs separated by |",
+            )
+        })?;
+        let field_value = required_field(key, field_value)?;
+        match key {
+            "id" => id = Some(field_value),
+            "action" => action = Some(field_value),
+            "target" => target = Some(field_value),
+            "reason" => reason = Some(field_value),
+            "expected_output" => expected_output = Some(field_value),
+            _ => {
+                return Err(AcError::validation(
+                    "AGENT-PLAN_UNKNOWN_STEP_FIELD",
+                    format!("unknown step field: {}", key),
+                ));
+            }
+        }
+    }
+    Ok(StructuredPlanStep {
+        id: id.ok_or_else(|| missing_field("step.id"))?,
+        action: action.ok_or_else(|| missing_field("step.action"))?,
+        target: target.ok_or_else(|| missing_field("step.target"))?,
+        reason: reason.ok_or_else(|| missing_field("step.reason"))?,
+        expected_output: expected_output.ok_or_else(|| missing_field("step.expected_output"))?,
+    })
+}
+
+fn validate_plan_step(step: &StructuredPlanStep) -> AcResult<()> {
+    let allowed = matches!(
+        step.action.as_str(),
+        "inspect" | "read" | "modify" | "verify" | "changeset" | "repair"
+    );
+    if !allowed {
+        return Err(AcError::validation(
+            "AGENT-PLAN_UNSAFE_STEP",
+            format!("unsafe or unsupported action: {}", step.action),
+        ));
+    }
+    if step.target.contains("..") || step.target.starts_with('/') {
+        return Err(AcError::validation(
+            "AGENT-PLAN_UNSAFE_STEP",
+            "plan step target must stay inside the repository",
+        ));
+    }
+    for field in [
+        &step.id,
+        &step.action,
+        &step.target,
+        &step.reason,
+        &step.expected_output,
+    ] {
+        if field.trim().is_empty() {
+            return Err(AcError::validation(
+                "AGENT-PLAN_MISSING_FIELD",
+                "step fields cannot be empty",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn required_field(name: &str, value: &str) -> AcResult<String> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Err(missing_field(name));
+    }
+    Ok(value.to_string())
+}
+
+fn missing_field(name: &str) -> AcError {
+    AcError::validation(
+        "AGENT-PLAN_MISSING_FIELD",
+        format!("missing structured plan field: {}", name),
+    )
+}
+
+fn fallback_structured_plan(goal: &Goal, reasoning: &ProviderReasoning) -> StructuredPlan {
+    let (target, _) = infer_change(&goal.text, reasoning);
+    StructuredPlan {
+        goal: goal.text.clone(),
+        assumptions: vec!["fallback plan derived from invalid provider structure".to_string()],
+        steps: vec![
+            StructuredPlanStep {
+                id: "s1".to_string(),
+                action: "read".to_string(),
+                target: target.clone(),
+                reason: "inspect target file".to_string(),
+                expected_output: "file content".to_string(),
+            },
+            StructuredPlanStep {
+                id: "s2".to_string(),
+                action: "modify".to_string(),
+                target,
+                reason: "apply requested change".to_string(),
+                expected_output: "updated file".to_string(),
+            },
+        ],
+        verification_requirements: vec!["status:0".to_string()],
+        stopping_condition: goal.stopping_condition.clone(),
     }
 }
 
@@ -824,6 +1082,43 @@ fn verification_tool(target: &str) -> &'static str {
     } else {
         "repo.diff"
     }
+}
+
+fn summarize_diff(diff: &str) -> (Vec<FileChangeSummary>, u32, u32) {
+    let mut files = Vec::new();
+    let mut current_path = None;
+    let mut additions = 0;
+    let mut removals = 0;
+    let mut total_additions = 0;
+    let mut total_removals = 0;
+    for line in diff.lines() {
+        if let Some(path) = line.strip_prefix("+++ b/") {
+            if let Some(path) = current_path.take() {
+                files.push(FileChangeSummary {
+                    path,
+                    additions,
+                    removals,
+                });
+            }
+            current_path = Some(path.to_string());
+            additions = 0;
+            removals = 0;
+        } else if line.starts_with('+') && !line.starts_with("+++") {
+            additions += 1;
+            total_additions += 1;
+        } else if line.starts_with('-') && !line.starts_with("---") {
+            removals += 1;
+            total_removals += 1;
+        }
+    }
+    if let Some(path) = current_path {
+        files.push(FileChangeSummary {
+            path,
+            additions,
+            removals,
+        });
+    }
+    (files, total_additions, total_removals)
 }
 
 fn search_goal_terms(code_intel: &CodeIntelligenceService, goal: &str) -> Vec<ContextCandidate> {
@@ -946,7 +1241,9 @@ mod tests {
             .unwrap();
         assert!(
             output.status.success(),
-            "{}",
+            "git {:?} failed\nstdout:{}\nstderr:{}",
+            args,
+            String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
         );
     }
@@ -1002,8 +1299,7 @@ mod tests {
             omitted_count: 0,
         };
         let reasoning = ProviderReasoning {
-            text: "assumption: tests identify the bug\nrequired_file: README.md\nverify: repo.diff"
-                .to_string(),
+            text: "goal=Create README.md\nassumption=tests identify the bug\nstep=id:s1|action:read|target:README.md|reason:inspect docs|expected_output:file content\nstep=id:s2|action:modify|target:README.md|reason:create docs|expected_output:updated docs\nverify=repo.diff status:0\nstopping_condition=changeset ready".to_string(),
             events: vec![ProviderStreamEvent::Finished],
         };
         let plan = AgentPlanner.plan(&goal, &context, &reasoning);
@@ -1023,6 +1319,27 @@ mod tests {
             plan.steps.last().unwrap().kind,
             PlanStepKind::Verify { .. }
         ));
+    }
+
+    #[test]
+    fn structured_plan_validation_rejects_missing_and_unsafe_steps() {
+        let valid = StructuredPlan::parse(
+            "goal=Fix auth\nassumption=tests are present\nstep=id:s1|action:read|target:src/auth.rs|reason:inspect|expected_output:file\nverify=status:0\nstopping_condition=verified changeset",
+        )
+        .unwrap();
+        assert_eq!(valid.steps[0].action, "read");
+        assert_eq!(
+            StructuredPlan::parse(
+                "goal=Fix auth\nassumption=tests are present\nstep=id:s1|action:shell|target:src/auth.rs|reason:bad|expected_output:no\nverify=status:0\nstopping_condition=done",
+            )
+            .unwrap_err()
+            .code(),
+            "AGENT-PLAN_UNSAFE_STEP"
+        );
+        assert_eq!(
+            StructuredPlan::parse("goal=Fix auth").unwrap_err().code(),
+            "AGENT-PLAN_MISSING_FIELD"
+        );
     }
 
     #[test]
@@ -1168,6 +1485,8 @@ mod tests {
             std::env::temp_dir().join(format!("agentcode-demo-src-{}", StableId::new("tmp")));
         let worktree =
             std::env::temp_dir().join(format!("agentcode-demo-wt-{}", StableId::new("tmp")));
+        let _ = std::fs::remove_dir_all(&source);
+        let _ = std::fs::remove_dir_all(&worktree);
         std::fs::create_dir_all(source.join("src")).unwrap();
         std::fs::create_dir_all(source.join("tests")).unwrap();
         std::fs::write(
@@ -1209,7 +1528,7 @@ mod tests {
                 .allow(Capability::ProcessExec("*".to_string())),
         )
         .unwrap();
-        let report = agent
+        let mut report = agent
             .run_goal(Goal::new("Fix the bug in src/lib.rs").unwrap())
             .unwrap();
         assert_eq!(report.state, AutonomousState::Completed);
@@ -1221,8 +1540,23 @@ mod tests {
             std::fs::read_to_string(worktree.join("src/lib.rs")).unwrap(),
             "pub fn fixture_answer() -> u32 {\n    42\n}\n"
         );
-        assert!(report.changeset.is_some());
+        let changeset = report.changeset.as_ref().unwrap();
+        assert_eq!(changeset.state, ChangeSetState::Approved);
+        let metadata = changeset.metadata.as_ref().unwrap();
+        assert_eq!(metadata.verification_passed, Some(true));
+        assert!(metadata
+            .files_changed
+            .iter()
+            .any(|file| file.path == "src/lib.rs"));
+        let mut changeset = report.changeset.take().unwrap();
+        let review = agent.prepare_merge_after_review(&mut changeset).unwrap();
+        assert!(review.approved_by_kernel);
+        assert!(review.cleaned_up);
+        assert_eq!(changeset.state, ChangeSetState::Archived);
+        assert_eq!(
+            std::fs::read_to_string(source.join("src/lib.rs")).unwrap(),
+            "pub fn fixture_answer() -> u32 {\n    41\n}\n"
+        );
         let _ = std::fs::remove_dir_all(source);
-        let _ = std::fs::remove_dir_all(worktree);
     }
 }

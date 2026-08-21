@@ -16,10 +16,11 @@
 - Added cleanup support through `git worktree remove --force`.
 - Updated autonomous fixture to run in a real git worktree and prove the source repository file remains unchanged.
 - Added targeted worktree isolation test with initialized repository and committed base.
+- Added current commit tracking on WorktreeRecord.
+- Added checkpoint-current, recover-worktree, and checkpoint lookup support.
+- Added local merge review objects that require Kernel approval and clean up worktrees after review completion.
 
 ## Remaining Before Acceptance
 
-- Merge/review result object.
 - Stale worktree recovery and cleanup policy.
 - Durable persisted worktree records beyond in-memory coordinator state.
-
