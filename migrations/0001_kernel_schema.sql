@@ -67,3 +67,17 @@ CREATE TABLE IF NOT EXISTS worktree_checkpoints (
     reason TEXT NOT NULL,
     created_at_ms INTEGER NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS provider_routing_decisions (
+    id TEXT PRIMARY KEY,
+    task_id TEXT NOT NULL,
+    candidates_json TEXT NOT NULL,
+    selected_json TEXT,
+    rejected_json TEXT NOT NULL,
+    fallback_reason TEXT,
+    latency_ms INTEGER NOT NULL,
+    input_tokens INTEGER NOT NULL,
+    output_tokens INTEGER NOT NULL,
+    estimated_cost_micros INTEGER NOT NULL,
+    created_at_ms INTEGER NOT NULL
+);

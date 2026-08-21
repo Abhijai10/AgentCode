@@ -15,8 +15,8 @@ use ac_evidence::{EvidenceKind, EvidenceStore, Provenance};
 use ac_git::GitCoordinator;
 use ac_kernel::{MissionState, PolicyBoundary};
 use ac_provider::{
-    ProviderCapability, ProviderFailureClass, ProviderRegistry, ProviderStreamEvent,
-    ScriptedProvider,
+    PrivacyClass, ProviderCapability, ProviderFailureClass, ProviderRegistry, ProviderStreamEvent,
+    RoutingProfile, ScriptedProvider, TaskProfile,
 };
 use ac_runtime::{AgentSession, AgentSessionState};
 use ac_security::{Capability, CapabilityPolicy};
@@ -715,20 +715,23 @@ impl<P: PolicyBoundary> AutonomousAgent<P> {
     }
 
     fn ask_provider(&mut self, goal: &Goal, context: &ContextPack) -> AcResult<ProviderReasoning> {
-        let request = self.providers.normalize_request(
-            format!(
-                "goal:{}\ncontext_nodes:{}\nstopping_condition:{}",
-                goal.text,
-                context.nodes.len(),
-                goal.stopping_condition
-            ),
-            vec![ProviderCapability::Chat],
-            512,
-        )?;
-        let events = self
+        let mut profile = TaskProfile::coding(goal.id.clone(), RoutingProfile::FreeFirst);
+        profile.required_context = context.budget;
+        let execution = self
             .providers
-            .stream_with_retry(&request, 2, &|| self.session.is_cancelled())
+            .request_model(
+                &profile,
+                format!(
+                    "goal:{}\ncontext_nodes:{}\nstopping_condition:{}",
+                    goal.text,
+                    context.nodes.len(),
+                    goal.stopping_condition
+                ),
+                512,
+                &|| self.session.is_cancelled(),
+            )
             .map_err(provider_error)?;
+        let events = execution.events;
         let text = events
             .iter()
             .filter_map(|event| match event {
@@ -889,12 +892,39 @@ pub fn default_provider_registry() -> AcResult<ProviderRegistry> {
             ProviderStreamEvent::Finished,
         ])])),
     )?;
-    providers.register_model(
-        &provider_id,
-        "local-scripted",
-        vec![ProviderCapability::Chat, ProviderCapability::Streaming],
-        8192,
-    )?;
+    providers
+        .register_model(
+            &provider_id,
+            "local-scripted",
+            vec![ProviderCapability::Chat, ProviderCapability::Streaming],
+            8192,
+        )
+        .and_then(|model_id| {
+            let connection_id = providers.register_connection(
+                &provider_id,
+                "local-test-account",
+                None,
+                "local",
+                "config:local-scripted.endpoint",
+                true,
+                false,
+                true,
+            )?;
+            let identity_id = providers.register_model_identity(
+                "local-scripted-family",
+                8192,
+                80,
+                70,
+                false,
+                false,
+                true,
+                0,
+                0,
+                PrivacyClass::LocalOnly,
+            )?;
+            providers.register_model_route(&identity_id, &model_id, &connection_id)?;
+            Ok(model_id)
+        })?;
     Ok(providers)
 }
 

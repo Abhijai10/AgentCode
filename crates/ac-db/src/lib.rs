@@ -202,6 +202,21 @@ pub struct PersistedGitCheckpoint {
     pub created_at_ms: i64,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RoutingDecisionRecord {
+    pub id: String,
+    pub task_id: String,
+    pub candidates_json: String,
+    pub selected_json: Option<String>,
+    pub rejected_json: String,
+    pub fallback_reason: Option<String>,
+    pub latency_ms: u64,
+    pub input_tokens: u32,
+    pub output_tokens: u32,
+    pub estimated_cost_micros: u64,
+    pub created_at_ms: i64,
+}
+
 impl ControlPlaneDb {
     pub fn save_session(
         &self,
@@ -480,6 +495,70 @@ impl ControlPlaneDb {
         }
         Ok(None)
     }
+
+    pub fn save_routing_decision(&self, decision: &RoutingDecisionRecord) -> AcResult<()> {
+        self.connection
+            .execute(
+                "INSERT INTO provider_routing_decisions (
+                    id, task_id, candidates_json, selected_json, rejected_json, fallback_reason,
+                    latency_ms, input_tokens, output_tokens, estimated_cost_micros, created_at_ms
+                 )
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+                 ON CONFLICT(id) DO UPDATE SET
+                    candidates_json = excluded.candidates_json,
+                    selected_json = excluded.selected_json,
+                    rejected_json = excluded.rejected_json,
+                    fallback_reason = excluded.fallback_reason,
+                    latency_ms = excluded.latency_ms,
+                    input_tokens = excluded.input_tokens,
+                    output_tokens = excluded.output_tokens,
+                    estimated_cost_micros = excluded.estimated_cost_micros",
+                params![
+                    decision.id.as_str(),
+                    decision.task_id.as_str(),
+                    decision.candidates_json.as_str(),
+                    decision.selected_json.as_deref(),
+                    decision.rejected_json.as_str(),
+                    decision.fallback_reason.as_deref(),
+                    decision.latency_ms,
+                    decision.input_tokens,
+                    decision.output_tokens,
+                    decision.estimated_cost_micros,
+                    decision.created_at_ms
+                ],
+            )
+            .map_err(db_error)?;
+        Ok(())
+    }
+
+    pub fn routing_decision(&self, id: &str) -> AcResult<Option<RoutingDecisionRecord>> {
+        let mut stmt = self
+            .connection
+            .prepare(
+                "SELECT id, task_id, candidates_json, selected_json, rejected_json, fallback_reason,
+                        latency_ms, input_tokens, output_tokens, estimated_cost_micros, created_at_ms
+                 FROM provider_routing_decisions
+                 WHERE id = ?1",
+            )
+            .map_err(db_error)?;
+        let mut rows = stmt.query(params![id]).map_err(db_error)?;
+        if let Some(row) = rows.next().map_err(db_error)? {
+            return Ok(Some(RoutingDecisionRecord {
+                id: row.get(0).map_err(db_error)?,
+                task_id: row.get(1).map_err(db_error)?,
+                candidates_json: row.get(2).map_err(db_error)?,
+                selected_json: row.get(3).map_err(db_error)?,
+                rejected_json: row.get(4).map_err(db_error)?,
+                fallback_reason: row.get(5).map_err(db_error)?,
+                latency_ms: row.get(6).map_err(db_error)?,
+                input_tokens: row.get(7).map_err(db_error)?,
+                output_tokens: row.get(8).map_err(db_error)?,
+                estimated_cost_micros: row.get(9).map_err(db_error)?,
+                created_at_ms: row.get(10).map_err(db_error)?,
+            }));
+        }
+        Ok(None)
+    }
 }
 
 fn millis(ts: TimestampMillis) -> i64 {
@@ -694,6 +773,37 @@ mod tests {
         let _ = fs::remove_file(db_path);
         let _ = fs::remove_dir_all(worktree_path);
         let _ = fs::remove_dir_all(source);
+    }
+
+    #[test]
+    fn routing_decision_evidence_survives_reopen_without_secrets() {
+        let path = std::env::temp_dir().join(format!("agentcode-{}.sqlite", StableId::new("db")));
+        let decision = RoutingDecisionRecord {
+            id: StableId::new("routing").to_string(),
+            task_id: StableId::new("task").to_string(),
+            candidates_json: "[{\"connection\":\"free\",\"score\":90}]".to_string(),
+            selected_json: Some("{\"connection\":\"free\"}".to_string()),
+            rejected_json: "[\"paid_disallowed\"]".to_string(),
+            fallback_reason: Some("connection-1:RateLimit".to_string()),
+            latency_ms: 12,
+            input_tokens: 7,
+            output_tokens: 11,
+            estimated_cost_micros: 0,
+            created_at_ms: millis(TimestampMillis::now()),
+        };
+        {
+            let mut db = ControlPlaneDb::open(&path).unwrap();
+            db.migrate().unwrap();
+            db.save_routing_decision(&decision).unwrap();
+        }
+        {
+            let db = ControlPlaneDb::open(&path).unwrap();
+            let loaded = db.routing_decision(&decision.id).unwrap().unwrap();
+            assert_eq!(loaded.task_id, decision.task_id);
+            assert_eq!(loaded.output_tokens, 11);
+            assert!(!format!("{:?}", loaded).contains("SECRET"));
+        }
+        let _ = fs::remove_file(path);
     }
 
     #[test]
