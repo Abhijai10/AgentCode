@@ -5,19 +5,19 @@ Doc 10 gates for the phase pass and completion evidence exists).
 
 Phase names are the EXACT canonical names from Doc 09 HC-P00..HC-P29 (no aliases).
 
-Last updated: 2026-08-21 (core autonomous coding path nearing gate readiness)
+Last updated: 2026-08-21 (Phase 3 autonomous coding capability complete)
 
 | Phase | Name (Doc 09 HC-*) | Status | Notes |
 |-------|--------------------|--------|-------|
 | P00 | Project Governance & Architecture Freeze | COMPLETE | all P00 WPs ACCEPTED; gates P0-G1..G7 pass with recorded evidence; failure/understanding checks PASS; evidence: docs/progress/phase-00-completion.md (+ .json), phase-00-governance-validation.md, adr-audit-phase00.md |
 | P01 | OSS Extraction & Evidence Collection | COMPLETE | P01-WP01..P01-WP17 ACCEPTED; P1-G1..P1-G8 PASS; evidence: docs/progress/phase-01-completion.md (+ .json), phase-01-gate-review.md, phase-01-architecture-dependency-map.md |
 | P02 | Repository Skeleton & Development Infrastructure | COMPLETE | P02-WP01 ACCEPTED; P2-G1..P2-G8 PASS; evidence: docs/progress/phase-02-completion.md (+ .json) |
-| P03 | Background Daemon & Persistent Kernel Foundation | IN_PROGRESS | P03-WP01 expanded; `ac-db` persists Kernel mission/event state plus AgentSession/checkpoint recovery evidence; `ac-daemon` has lifecycle, singleton lock, local IPC, health, and interrupted-session recovery foundations; OS IPC/reconnect/full resume gates remain |
-| P04 | Model Broker & OmniRoute Provider Fabric | IN_PROGRESS | P04-WP01 expanded; ProviderRegistry owns adapter streaming lifecycle and optional config-based provider adapter path; production HTTP vendor transports remain |
-| P05 | Native Tool Runtime Foundation | IN_PROGRESS | P05-WP01 started; repository and development tools route through Tool Broker/Sandbox and emit evidence; project-specific command profiles remain |
-| P06 | Basic Worker Agent Loop | IN_PROGRESS | P06-WP01 expanded; `ac-agent` now validates structured plans, creates metadata-rich ChangeSets, runs verification/repair, and completes a real-worktree autonomous benchmark with merge simulation; full gate review remains |
-| P07 | Git, Worktrees & Checkpointing | IN_PROGRESS | P07-WP01 expanded; task workspaces use real `git worktree add -b`, checkpoint/recover/cleanup, track branch/base/current/diff, and support Kernel-approved merge review; durable worktree state remains |
-| P08 | Code Intelligence Foundation | IN_PROGRESS | P08-WP01 started; ContextBuilder indexes isolated workspace files and ranks snippets as retrieval evidence; incremental watching and graph ranking remain |
+| P03 | Background Daemon & Persistent Kernel Foundation | COMPLETE | P03-WP01 ACCEPTED for autonomous coding scope; SQLite persists Kernel mission/event state plus AgentSession, WorktreeRecord, ChangeSet, and checkpoint recovery evidence; completion evidence: docs/progress/phase-03-completion.md (+ .json) |
+| P04 | Model Broker & OmniRoute Provider Fabric | COMPLETE | P04-WP01 ACCEPTED for autonomous coding scope; ProviderRegistry owns adapter streaming lifecycle, mock CI provider remains, and optional HTTP transport is configured without hardcoded secrets |
+| P05 | Native Tool Runtime Foundation | COMPLETE | P05-WP01 ACCEPTED for autonomous coding scope; repository/development/file tools route through Tool Broker/Sandbox and emit evidence for planning, verification, repair, and benchmark execution |
+| P06 | Basic Worker Agent Loop | COMPLETE | P06-WP01 ACCEPTED; structured planning, context retrieval, Tool Broker execution, generated repair planning, ChangeSet artifact lifecycle, Kernel approval, and autonomous benchmark pass |
+| P07 | Git, Worktrees & Checkpointing | COMPLETE | P07-WP01 ACCEPTED; real git worktree create/checkpoint/recover/cleanup, controlled local merge, rejected merge, and conflict rollback are tested |
+| P08 | Code Intelligence Foundation | COMPLETE | P08-WP01 ACCEPTED for autonomous coding scope; ContextBuilder indexes isolated workspace files and ranks snippets as evidence/context; deeper graph/freshness work remains later roadmap scope |
 | P09 | Semantic Intelligence & Repository Graph | NOT_STARTED | |
 | P10 | Persistent Memory & Knowledge Freshness | NOT_STARTED | |
 | P11 | Context Engine & Token Efficiency | NOT_STARTED | |

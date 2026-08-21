@@ -68,8 +68,10 @@ dependencies = [
 name = "ac-db"
 version = "0.1.0"
 dependencies = [
+ "ac-changeset",
  "ac-common",
  "ac-evidence",
+ "ac-git",
  "ac-kernel",
  "rusqlite",
 ]

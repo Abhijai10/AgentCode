@@ -6,8 +6,10 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+ac-changeset = { path = "../ac-changeset" }
 ac-common = { path = "../ac-common" }
 ac-evidence = { path = "../ac-evidence" }
+ac-git = { path = "../ac-git" }
 ac-kernel = { path = "../ac-kernel" }
 rusqlite = { version = "0.32", features = ["bundled"] }
 

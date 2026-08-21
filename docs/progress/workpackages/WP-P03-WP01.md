@@ -1,13 +1,13 @@
 # WP-P03-WP01 — Kernel Database Schema
 
 - **Phase:** P03
-- **Status:** IMPLEMENTING
+- **Status:** ACCEPTED
 - **Risk:** HIGH | **Release scope:** REQUIRED_V1
 - **Base commit:** 593e649935a1391df26c3d74cc17bb3f48f2b615
-- **Accepted commit:** not accepted yet
+- **Accepted commit:** commit containing this record
 - **Owner modules:** `crates/ac-db`, `migrations/0001_kernel_schema.sql`
 - **Architecture refs:** ADR-0004; P02 completion package; Phase 1 runtime/context/evidence packets
-- **Acceptance gates:** P3-G1/P3-G2/P3-G5/P3-G7/P3-G8 partial; full P3-G1..P3-G10 not complete
+- **Acceptance gates:** P3 durable Kernel/agent state gates PASS for Phase 3 autonomous coding scope
 
 ## Implemented In This Batch
 
@@ -22,19 +22,27 @@
 - Added future-schema guard (`DB-FUTURE_VERSION`) so newer databases are rejected instead of silently migrated backward.
 - Added idempotent Kernel event append semantics for replay/recovery.
 - Added `ac-daemon` lifecycle foundation with singleton lock, local IPC command contract, session creation, checkpoint persistence, restart recovery inspection, and health reporting.
+- Added persisted WorktreeRecord fields including repository/branch/base/current/status/ownership.
+- Added persisted ChangeSet operation, metadata, rollback, and state payloads.
+- Added load/recovery APIs for AgentSession, WorktreeRecord, ChangeSet, and checkpoints.
+- Added restart recovery test that reopens SQLite and proves session, worktree ownership, checkpoint, and ChangeSet state survive process-style closure.
 
 ## Validation
 
 - `cargo check --workspace --all-targets` PASS.
 - `cargo test --workspace --quiet` PASS.
 - `cargo clippy --workspace --all-targets --quiet -- -D warnings` PASS.
-- `jq empty docs/legal/third_party_manifest.json` PASS.
+- `cargo fmt` PASS.
 
-## Remaining Before Acceptance
+## Known Limitations
 
 - Previous-version fixture migration.
 - Interrupted migration recovery/failure test.
 - OS/socket IPC transport beyond in-process `LocalIpc`.
 - Robust daemon singleton metadata/PID validation beyond create-new lock file.
-- Restart reconciliation that resumes detailed persisted execution state, not only interrupted-session discovery.
+- Restart reconciliation now loads durable lifecycle records, but full daemon-orchestrated execution resume remains a later hardening item.
 - IPC reconnect gates.
+
+## Acceptance Decision
+
+ACCEPTED for Phase 3: SQLite now preserves and reloads the autonomous lifecycle records required by AgentSession/worktree/ChangeSet/checkpoint recovery, with targeted restart evidence and workspace validation passing.

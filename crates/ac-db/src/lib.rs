@@ -1,7 +1,9 @@
 use std::path::Path;
 
+use ac_changeset::ChangeSet;
 use ac_common::{AcError, AcResult, StableId, TimestampMillis};
 use ac_evidence::EvidenceRecord;
+use ac_git::{CheckpointRecord, WorktreeRecord};
 use ac_kernel::{KernelDecisionKind, KernelEvent, Mission, MissionState};
 use rusqlite::{params, Connection};
 
@@ -167,6 +169,39 @@ pub struct PersistedCheckpoint {
     pub created_at_ms: i64,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PersistedWorktree {
+    pub id: String,
+    pub repository_id: String,
+    pub owner_mission_id: String,
+    pub owner_worker_id: String,
+    pub path: String,
+    pub branch: String,
+    pub base_commit: String,
+    pub current_commit: String,
+    pub status: String,
+    pub created_at_ms: i64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PersistedChangeSet {
+    pub id: String,
+    pub state: String,
+    pub operations_json: String,
+    pub metadata_json: Option<String>,
+    pub rollback_json: Option<String>,
+    pub created_at_ms: i64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PersistedGitCheckpoint {
+    pub id: String,
+    pub worktree_id: String,
+    pub commit_ref: String,
+    pub reason: String,
+    pub created_at_ms: i64,
+}
+
 impl ControlPlaneDb {
     pub fn save_session(
         &self,
@@ -253,6 +288,198 @@ impl ControlPlaneDb {
             .map_err(db_error)?;
         rows.collect::<Result<Vec<_>, _>>().map_err(db_error)
     }
+
+    pub fn get_session(&self, session_id: &StableId) -> AcResult<Option<PersistedSession>> {
+        let mut stmt = self
+            .connection
+            .prepare(
+                "SELECT id, mission_id, state, updated_at_ms FROM agent_sessions WHERE id = ?1",
+            )
+            .map_err(db_error)?;
+        let mut rows = stmt.query(params![session_id.as_str()]).map_err(db_error)?;
+        if let Some(row) = rows.next().map_err(db_error)? {
+            return Ok(Some(PersistedSession {
+                id: row.get(0).map_err(db_error)?,
+                mission_id: row.get(1).map_err(db_error)?,
+                state: row.get(2).map_err(db_error)?,
+                updated_at_ms: row.get(3).map_err(db_error)?,
+            }));
+        }
+        Ok(None)
+    }
+
+    pub fn checkpoints_for_session(
+        &self,
+        session_id: &StableId,
+    ) -> AcResult<Vec<PersistedCheckpoint>> {
+        let mut stmt = self
+            .connection
+            .prepare(
+                "SELECT id, session_id, next_step, state, created_at_ms
+                 FROM agent_checkpoints
+                 WHERE session_id = ?1
+                 ORDER BY created_at_ms ASC",
+            )
+            .map_err(db_error)?;
+        let rows = stmt
+            .query_map(params![session_id.as_str()], |row| {
+                Ok(PersistedCheckpoint {
+                    id: row.get(0)?,
+                    session_id: row.get(1)?,
+                    next_step: row.get(2)?,
+                    state: row.get(3)?,
+                    created_at_ms: row.get(4)?,
+                })
+            })
+            .map_err(db_error)?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(db_error)
+    }
+
+    pub fn save_worktree(&self, worktree: &WorktreeRecord) -> AcResult<()> {
+        self.connection
+            .execute(
+                "INSERT INTO worktrees (
+                    id, repository_id, owner_mission_id, owner_worker_id, path, branch,
+                    base_commit, current_commit, status, created_at_ms
+                 )
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+                 ON CONFLICT(id) DO UPDATE SET
+                    current_commit = excluded.current_commit,
+                    status = excluded.status",
+                params![
+                    worktree.id.as_str(),
+                    worktree.repository_id.as_str(),
+                    worktree.owner_mission_id.as_str(),
+                    worktree.owner_worker_id.as_str(),
+                    worktree.path.display().to_string(),
+                    worktree.branch.as_str(),
+                    worktree.base_commit.as_str(),
+                    worktree.current_commit.as_str(),
+                    format!("{:?}", worktree.status),
+                    millis(worktree.created_at)
+                ],
+            )
+            .map_err(db_error)?;
+        Ok(())
+    }
+
+    pub fn get_worktree(&self, id: &StableId) -> AcResult<Option<PersistedWorktree>> {
+        let mut stmt = self
+            .connection
+            .prepare(
+                "SELECT id, repository_id, owner_mission_id, owner_worker_id, path, branch,
+                        base_commit, current_commit, status, created_at_ms
+                 FROM worktrees
+                 WHERE id = ?1",
+            )
+            .map_err(db_error)?;
+        let mut rows = stmt.query(params![id.as_str()]).map_err(db_error)?;
+        if let Some(row) = rows.next().map_err(db_error)? {
+            return Ok(Some(PersistedWorktree {
+                id: row.get(0).map_err(db_error)?,
+                repository_id: row.get(1).map_err(db_error)?,
+                owner_mission_id: row.get(2).map_err(db_error)?,
+                owner_worker_id: row.get(3).map_err(db_error)?,
+                path: row.get(4).map_err(db_error)?,
+                branch: row.get(5).map_err(db_error)?,
+                base_commit: row.get(6).map_err(db_error)?,
+                current_commit: row.get(7).map_err(db_error)?,
+                status: row.get(8).map_err(db_error)?,
+                created_at_ms: row.get(9).map_err(db_error)?,
+            }));
+        }
+        Ok(None)
+    }
+
+    pub fn save_git_checkpoint(&self, checkpoint: &CheckpointRecord) -> AcResult<()> {
+        self.connection
+            .execute(
+                "INSERT INTO worktree_checkpoints (id, worktree_id, commit_ref, reason, created_at_ms)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![
+                    checkpoint.id.as_str(),
+                    checkpoint.worktree_id.as_str(),
+                    checkpoint.commit_ref.as_str(),
+                    checkpoint.reason.as_str(),
+                    millis(checkpoint.created_at)
+                ],
+            )
+            .map_err(db_error)?;
+        Ok(())
+    }
+
+    pub fn git_checkpoints_for_worktree(
+        &self,
+        worktree_id: &StableId,
+    ) -> AcResult<Vec<PersistedGitCheckpoint>> {
+        let mut stmt = self
+            .connection
+            .prepare(
+                "SELECT id, worktree_id, commit_ref, reason, created_at_ms
+                 FROM worktree_checkpoints
+                 WHERE worktree_id = ?1
+                 ORDER BY created_at_ms ASC",
+            )
+            .map_err(db_error)?;
+        let rows = stmt
+            .query_map(params![worktree_id.as_str()], |row| {
+                Ok(PersistedGitCheckpoint {
+                    id: row.get(0)?,
+                    worktree_id: row.get(1)?,
+                    commit_ref: row.get(2)?,
+                    reason: row.get(3)?,
+                    created_at_ms: row.get(4)?,
+                })
+            })
+            .map_err(db_error)?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(db_error)
+    }
+
+    pub fn save_changeset(&self, changeset: &ChangeSet) -> AcResult<()> {
+        self.connection
+            .execute(
+                "INSERT INTO changesets (id, state, operations_json, metadata_json, rollback_json, created_at_ms)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                 ON CONFLICT(id) DO UPDATE SET
+                    state = excluded.state,
+                    operations_json = excluded.operations_json,
+                    metadata_json = excluded.metadata_json,
+                    rollback_json = excluded.rollback_json",
+                params![
+                    changeset.id.as_str(),
+                    format!("{:?}", changeset.state),
+                    format!("{:?}", changeset.operations),
+                    changeset.metadata.as_ref().map(|metadata| format!("{:?}", metadata)),
+                    changeset.rollback.as_ref().map(|rollback| format!("{:?}", rollback)),
+                    millis(changeset.created_at)
+                ],
+            )
+            .map_err(db_error)?;
+        Ok(())
+    }
+
+    pub fn get_changeset(&self, id: &StableId) -> AcResult<Option<PersistedChangeSet>> {
+        let mut stmt = self
+            .connection
+            .prepare(
+                "SELECT id, state, operations_json, metadata_json, rollback_json, created_at_ms
+                 FROM changesets
+                 WHERE id = ?1",
+            )
+            .map_err(db_error)?;
+        let mut rows = stmt.query(params![id.as_str()]).map_err(db_error)?;
+        if let Some(row) = rows.next().map_err(db_error)? {
+            return Ok(Some(PersistedChangeSet {
+                id: row.get(0).map_err(db_error)?,
+                state: row.get(1).map_err(db_error)?,
+                operations_json: row.get(2).map_err(db_error)?,
+                metadata_json: row.get(3).map_err(db_error)?,
+                rollback_json: row.get(4).map_err(db_error)?,
+                created_at_ms: row.get(5).map_err(db_error)?,
+            }));
+        }
+        Ok(None)
+    }
 }
 
 fn millis(ts: TimestampMillis) -> i64 {
@@ -290,7 +517,25 @@ fn db_error(error: rusqlite::Error) -> AcError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ac_changeset::{ChangeOperation, ChangeSet};
+    use ac_git::GitCoordinator;
     use ac_kernel::{AllowAllPolicy, Kernel};
+    use std::fs;
+    use std::process::Command;
+
+    fn run_git<const N: usize>(cwd: &Path, args: [&str; N]) {
+        let output = Command::new("git")
+            .args(args)
+            .current_dir(cwd)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git {:?} failed: {}",
+            args,
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
 
     #[test]
     fn sqlite_store_persists_kernel_state() {
@@ -358,6 +603,97 @@ mod tests {
             assert_eq!(interrupted[0].id, session_id.to_string());
         }
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn lifecycle_state_recovers_after_reopen() {
+        let db_path =
+            std::env::temp_dir().join(format!("agentcode-{}.sqlite", StableId::new("db")));
+        let source = std::env::temp_dir().join(format!("agentcode-src-{}", StableId::new("tmp")));
+        let worktree_path =
+            std::env::temp_dir().join(format!("agentcode-wt-{}", StableId::new("tmp")));
+        let _ = fs::remove_file(&db_path);
+        let _ = fs::remove_dir_all(&source);
+        let _ = fs::remove_dir_all(&worktree_path);
+        fs::create_dir_all(source.join("src")).unwrap();
+        fs::write(source.join("src/lib.rs"), "pub fn answer() -> u32 { 41 }\n").unwrap();
+        run_git(&source, ["init"]);
+        run_git(&source, ["add", "."]);
+        run_git(
+            &source,
+            [
+                "-c",
+                "user.name=AgentCode Test",
+                "-c",
+                "user.email=agentcode@example.test",
+                "commit",
+                "-m",
+                "initial",
+            ],
+        );
+
+        let session_id = StableId::new("session");
+        let mission_id = StableId::new("mission");
+        let changeset_id;
+        let worktree_id;
+        let checkpoint_id;
+        {
+            let mut db = ControlPlaneDb::open(&db_path).unwrap();
+            db.migrate().unwrap();
+            db.save_session(&session_id, &mission_id, "executing")
+                .unwrap();
+
+            let mut git = GitCoordinator::new();
+            worktree_id = git
+                .create_task_workspace(
+                    source.clone(),
+                    worktree_path.clone(),
+                    mission_id.clone(),
+                    session_id.clone(),
+                )
+                .unwrap();
+            fs::write(
+                worktree_path.join("src/lib.rs"),
+                "pub fn answer() -> u32 { 42 }\n",
+            )
+            .unwrap();
+            checkpoint_id = git.checkpoint_current(&worktree_id, "fix answer").unwrap();
+            db.save_worktree(git.worktree(&worktree_id).unwrap())
+                .unwrap();
+            db.save_git_checkpoint(git.checkpoint_record(&checkpoint_id).unwrap())
+                .unwrap();
+
+            let mut changeset = ChangeSet::propose(
+                vec![ChangeOperation::WriteFile {
+                    path: "src/lib.rs".to_string(),
+                    expected_hash: None,
+                    new_hash: "len:29".to_string(),
+                }],
+                None,
+            )
+            .unwrap();
+            changeset.validate().unwrap();
+            changeset_id = changeset.id.clone();
+            db.save_changeset(&changeset).unwrap();
+        }
+        {
+            let db = ControlPlaneDb::open(&db_path).unwrap();
+            let session = db.get_session(&session_id).unwrap().unwrap();
+            let worktree = db.get_worktree(&worktree_id).unwrap().unwrap();
+            let checkpoints = db.git_checkpoints_for_worktree(&worktree_id).unwrap();
+            let changeset = db.get_changeset(&changeset_id).unwrap().unwrap();
+
+            assert_eq!(session.state, "executing");
+            assert_eq!(worktree.owner_mission_id, mission_id.to_string());
+            assert_eq!(checkpoints[0].commit_ref, worktree.current_commit);
+            assert_eq!(checkpoints[0].reason, "fix answer");
+            assert_eq!(checkpoints[0].id, checkpoint_id.to_string());
+            assert_eq!(changeset.state, "Validated");
+            assert!(changeset.operations_json.contains("src/lib.rs"));
+        }
+        let _ = fs::remove_file(db_path);
+        let _ = fs::remove_dir_all(worktree_path);
+        let _ = fs::remove_dir_all(source);
     }
 
     #[test]

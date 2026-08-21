@@ -163,6 +163,68 @@ impl StructuredPlan {
     }
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RepairPlan {
+    pub failure_reason: String,
+    pub affected_files: Vec<String>,
+    pub proposed_action: String,
+    pub expected_verification: String,
+}
+
+impl RepairPlan {
+    pub fn generate(goal: &Goal, failure_reason: impl Into<String>) -> AcResult<Self> {
+        let failure_reason = failure_reason.into();
+        let affected_files = goal
+            .text
+            .split_whitespace()
+            .map(|part| part.trim_matches(|ch: char| ch == '"' || ch == '\'' || ch == '`'))
+            .filter(|part| part.ends_with(".rs") || part.ends_with(".md") || part.ends_with(".txt"))
+            .map(ToString::to_string)
+            .collect::<Vec<_>>();
+        let affected_files = if affected_files.is_empty() {
+            vec!["AGENTCODE_OUTPUT.txt".to_string()]
+        } else {
+            affected_files
+        };
+        let plan = Self {
+            failure_reason,
+            affected_files,
+            proposed_action: "fs.write".to_string(),
+            expected_verification: "status:0".to_string(),
+        };
+        plan.validate()?;
+        Ok(plan)
+    }
+
+    pub fn validate(&self) -> AcResult<()> {
+        if self.failure_reason.trim().is_empty()
+            || self.affected_files.is_empty()
+            || self.proposed_action.trim().is_empty()
+            || self.expected_verification.trim().is_empty()
+        {
+            return Err(AcError::validation(
+                "AGENT-REPAIR_MISSING_FIELD",
+                "repair plan requires failure reason, affected files, action, and expected verification",
+            ));
+        }
+        if self.proposed_action != "fs.write" {
+            return Err(AcError::validation(
+                "AGENT-REPAIR_UNSAFE",
+                "repair plan action is not allowed",
+            ));
+        }
+        for file in &self.affected_files {
+            if file.contains("..") || file.starts_with('/') {
+                return Err(AcError::validation(
+                    "AGENT-REPAIR_UNSAFE",
+                    "repair plan target must stay inside the repository",
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
 #[derive(Default)]
 pub struct AgentPlanner;
 
@@ -594,6 +656,7 @@ impl<P: PolicyBoundary> AutonomousAgent<P> {
     pub fn prepare_merge_after_review(
         &mut self,
         changeset: &mut ChangeSet,
+        approved_by_kernel: bool,
     ) -> AcResult<ac_git::MergeReview> {
         if changeset.state != ChangeSetState::Approved && changeset.state != ChangeSetState::Applied
         {
@@ -608,7 +671,13 @@ impl<P: PolicyBoundary> AutonomousAgent<P> {
             .workspace_ref
             .clone()
             .ok_or_else(|| AcError::validation("AGENT-NO_WORKTREE", "agent has no worktree"))?;
-        let mut review = self.git.prepare_merge_review(&worktree_id, true)?;
+        let mut review = self
+            .git
+            .prepare_merge_review(&worktree_id, approved_by_kernel)?;
+        if !self.git.worktree_status(&worktree_id)?.trim().is_empty() {
+            self.git
+                .checkpoint_current(&worktree_id, "approved changeset checkpoint")?;
+        }
         if changeset.state == ChangeSetState::Approved {
             changeset.mark_applied()?;
         }
@@ -738,6 +807,7 @@ impl<P: PolicyBoundary> AutonomousAgent<P> {
                 self.verification_failures_remaining -= 1;
             }
             if attempt + 1 < max_attempts {
+                let repair_plan = RepairPlan::generate(goal, tool_result.observation.clone())?;
                 let repair_reasoning = self.ask_provider(
                     goal,
                     &ContextPack {
@@ -747,7 +817,8 @@ impl<P: PolicyBoundary> AutonomousAgent<P> {
                         omitted_count: 0,
                     },
                 )?;
-                let (path, content) = infer_change(&goal.text, &repair_reasoning);
+                let (_, content) = infer_change(&goal.text, &repair_reasoning);
+                let path = repair_plan.affected_files[0].clone();
                 let repair_result =
                     self.invoke_with_retry("fs.write", &format!("{}\n{}", path, content), 1)?;
                 evidence_refs.push(repair_result.evidence_ref);
@@ -755,7 +826,7 @@ impl<P: PolicyBoundary> AutonomousAgent<P> {
                     EvidenceKind::DerivedContext,
                     provenance("agent.repair"),
                     format!("mem://agent/{}/repair", self.session.id()),
-                    "verification-repair",
+                    format!("repair-plan:{:?}", repair_plan),
                 )?;
                 evidence_refs.push(repair);
             }
@@ -1480,6 +1551,18 @@ mod tests {
     }
 
     #[test]
+    fn repair_plan_rejects_unsafe_generated_targets() {
+        let mut plan = RepairPlan::generate(
+            &Goal::new("Fix the bug in src/lib.rs").unwrap(),
+            "status:101",
+        )
+        .unwrap();
+        assert_eq!(plan.proposed_action, "fs.write");
+        plan.affected_files = vec!["../outside.rs".to_string()];
+        assert_eq!(plan.validate().unwrap_err().code(), "AGENT-REPAIR_UNSAFE");
+    }
+
+    #[test]
     fn autonomous_demo_fixes_fixture_inside_isolated_workspace() {
         let source =
             std::env::temp_dir().join(format!("agentcode-demo-src-{}", StableId::new("tmp")));
@@ -1549,13 +1632,24 @@ mod tests {
             .iter()
             .any(|file| file.path == "src/lib.rs"));
         let mut changeset = report.changeset.take().unwrap();
-        let review = agent.prepare_merge_after_review(&mut changeset).unwrap();
+        let mut rejected = changeset.clone();
+        assert_eq!(
+            agent
+                .prepare_merge_after_review(&mut rejected, false)
+                .unwrap_err()
+                .code(),
+            "GIT-MERGE_REQUIRES_KERNEL_APPROVAL"
+        );
+        let review = agent
+            .prepare_merge_after_review(&mut changeset, true)
+            .unwrap();
         assert!(review.approved_by_kernel);
         assert!(review.cleaned_up);
+        assert!(review.merge_commit.is_some());
         assert_eq!(changeset.state, ChangeSetState::Archived);
         assert_eq!(
             std::fs::read_to_string(source.join("src/lib.rs")).unwrap(),
-            "pub fn fixture_answer() -> u32 {\n    41\n}\n"
+            "pub fn fixture_answer() -> u32 {\n    42\n}\n"
         );
         let _ = std::fs::remove_dir_all(source);
     }

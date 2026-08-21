@@ -26,6 +26,8 @@ CREATE TABLE IF NOT EXISTS evidence_records (
 CREATE TABLE IF NOT EXISTS changesets (
     id TEXT PRIMARY KEY,
     state TEXT NOT NULL,
+    operations_json TEXT NOT NULL DEFAULT '',
+    metadata_json TEXT,
     rollback_json TEXT,
     created_at_ms INTEGER NOT NULL
 );
@@ -38,6 +40,7 @@ CREATE TABLE IF NOT EXISTS worktrees (
     path TEXT NOT NULL,
     branch TEXT NOT NULL,
     base_commit TEXT NOT NULL,
+    current_commit TEXT NOT NULL DEFAULT '',
     status TEXT NOT NULL,
     created_at_ms INTEGER NOT NULL
 );
@@ -54,5 +57,13 @@ CREATE TABLE IF NOT EXISTS agent_checkpoints (
     session_id TEXT NOT NULL,
     next_step INTEGER NOT NULL,
     state TEXT NOT NULL,
+    created_at_ms INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS worktree_checkpoints (
+    id TEXT PRIMARY KEY,
+    worktree_id TEXT NOT NULL,
+    commit_ref TEXT NOT NULL,
+    reason TEXT NOT NULL,
     created_at_ms INTEGER NOT NULL
 );

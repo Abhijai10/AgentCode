@@ -1,4 +1,7 @@
 use std::collections::{BTreeMap, VecDeque};
+use std::io::{Read, Write};
+use std::net::{TcpStream, ToSocketAddrs};
+use std::time::Duration;
 
 use ac_common::{AcError, AcResult, StableId, TimestampMillis};
 
@@ -130,6 +133,111 @@ impl ProviderAdapter for ConfiguredProviderAdapter {
             },
             ProviderStreamEvent::Finished,
         ])
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HttpProviderAdapter {
+    pub endpoint: String,
+    pub credential_env: Option<String>,
+    pub model_name: String,
+    pub timeout_ms: u64,
+}
+
+impl HttpProviderAdapter {
+    pub fn new(
+        endpoint: impl Into<String>,
+        credential_env: Option<String>,
+        model_name: impl Into<String>,
+        timeout_ms: u64,
+    ) -> AcResult<Self> {
+        let endpoint = endpoint.into();
+        let model_name = model_name.into();
+        if !endpoint.starts_with("http://") || model_name.trim().is_empty() || timeout_ms == 0 {
+            return Err(AcError::validation(
+                "PROVIDER-INVALID_HTTP_CONFIG",
+                "http endpoint, model name, and timeout are required",
+            ));
+        }
+        Ok(Self {
+            endpoint,
+            credential_env,
+            model_name,
+            timeout_ms,
+        })
+    }
+}
+
+impl ProviderAdapter for HttpProviderAdapter {
+    fn stream(
+        &self,
+        request: &NormalizedInferenceRequest,
+        cancel: &dyn Fn() -> bool,
+    ) -> Result<Vec<ProviderStreamEvent>, ProviderFailureClass> {
+        if cancel() {
+            return Err(ProviderFailureClass::Cancelled);
+        }
+        let endpoint = parse_http_endpoint(&self.endpoint)?;
+        let timeout = Duration::from_millis(self.timeout_ms);
+        let address = endpoint
+            .address
+            .to_socket_addrs()
+            .map_err(|_| ProviderFailureClass::ServerError)?
+            .next()
+            .ok_or(ProviderFailureClass::ServerError)?;
+        let mut stream = TcpStream::connect_timeout(&address, timeout)
+            .map_err(|_| ProviderFailureClass::Timeout)?;
+        stream
+            .set_read_timeout(Some(timeout))
+            .map_err(|_| ProviderFailureClass::ServerError)?;
+        stream
+            .set_write_timeout(Some(timeout))
+            .map_err(|_| ProviderFailureClass::ServerError)?;
+        if cancel() {
+            return Err(ProviderFailureClass::Cancelled);
+        }
+        let credential = self
+            .credential_env
+            .as_ref()
+            .and_then(|name| std::env::var(name).ok());
+        let body = format!(
+            "{{\"model\":\"{}\",\"prompt\":\"{}\",\"max_output_tokens\":{}}}",
+            escape_json(&self.model_name),
+            escape_json(&request.prompt),
+            request.max_output_tokens
+        );
+        let auth = credential
+            .as_ref()
+            .map(|value| format!("Authorization: Bearer {}\r\n", value))
+            .unwrap_or_default();
+        let wire = format!(
+            "POST {} HTTP/1.1\r\nHost: {}\r\n{}Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            endpoint.path,
+            endpoint.host_header,
+            auth,
+            body.len(),
+            body
+        );
+        stream
+            .write_all(wire.as_bytes())
+            .map_err(|_| ProviderFailureClass::Timeout)?;
+        let mut response = String::new();
+        stream
+            .read_to_string(&mut response)
+            .map_err(|_| ProviderFailureClass::Timeout)?;
+        if cancel() {
+            return Err(ProviderFailureClass::Cancelled);
+        }
+        let (headers, body) = response
+            .split_once("\r\n\r\n")
+            .ok_or(ProviderFailureClass::MalformedResponse)?;
+        let status = headers
+            .lines()
+            .next()
+            .and_then(|line| line.split_whitespace().nth(1))
+            .and_then(|code| code.parse::<u16>().ok())
+            .ok_or(ProviderFailureClass::MalformedResponse)?;
+        events_from_http_parts(status, body, request)
     }
 }
 
@@ -412,6 +520,79 @@ fn is_retryable(failure: ProviderFailureClass) -> bool {
     )
 }
 
+struct ParsedHttpEndpoint {
+    address: String,
+    host_header: String,
+    path: String,
+}
+
+fn parse_http_endpoint(endpoint: &str) -> Result<ParsedHttpEndpoint, ProviderFailureClass> {
+    let rest = endpoint
+        .strip_prefix("http://")
+        .ok_or(ProviderFailureClass::MalformedResponse)?;
+    let (authority, path) = rest.split_once('/').unwrap_or((rest, ""));
+    if authority.trim().is_empty() {
+        return Err(ProviderFailureClass::MalformedResponse);
+    }
+    let address = if authority.contains(':') {
+        authority.to_string()
+    } else {
+        format!("{}:80", authority)
+    };
+    Ok(ParsedHttpEndpoint {
+        address,
+        host_header: authority.to_string(),
+        path: format!("/{}", path),
+    })
+}
+
+fn escape_json(value: &str) -> String {
+    value
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('\n', "\\n")
+}
+
+fn extract_delta(body: &str) -> Option<String> {
+    let trimmed = body.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if let Some(start) = trimmed.find("\"delta\"") {
+        let after_key = &trimmed[start + "\"delta\"".len()..];
+        let after_colon = after_key.split_once(':')?.1.trim_start();
+        let value = after_colon.strip_prefix('"')?;
+        let end = value.find('"')?;
+        return Some(value[..end].replace("\\n", "\n").replace("\\\"", "\""));
+    }
+    Some(trimmed.to_string())
+}
+
+fn events_from_http_parts(
+    status: u16,
+    body: &str,
+    request: &NormalizedInferenceRequest,
+) -> Result<Vec<ProviderStreamEvent>, ProviderFailureClass> {
+    match status {
+        200..=299 => {
+            let delta = extract_delta(body).ok_or(ProviderFailureClass::MalformedResponse)?;
+            Ok(vec![
+                ProviderStreamEvent::Delta(delta),
+                ProviderStreamEvent::Usage {
+                    input_tokens: request.prompt.split_whitespace().count() as u32,
+                    output_tokens: body.split_whitespace().count() as u32,
+                },
+                ProviderStreamEvent::Finished,
+            ])
+        }
+        401 | 403 => Err(ProviderFailureClass::Auth),
+        408 | 504 => Err(ProviderFailureClass::Timeout),
+        429 => Err(ProviderFailureClass::RateLimited),
+        400..=499 => Err(ProviderFailureClass::MalformedResponse),
+        _ => Err(ProviderFailureClass::ServerError),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -569,5 +750,35 @@ mod tests {
             ProviderStreamEvent::Delta(text)
                 if text.contains("config:provider.endpoint") && !text.contains("provider.key=")
         ));
+    }
+
+    #[test]
+    fn http_provider_adapter_normalizes_mocked_response() {
+        let adapter = HttpProviderAdapter::new(
+            "http://provider.example/v1/chat",
+            Some("AGENTCODE_TEST_PROVIDER_KEY".to_string()),
+            "fixture-model",
+            1000,
+        )
+        .unwrap();
+        let request = NormalizedInferenceRequest {
+            model_id: StableId::new("model"),
+            prompt: "plan".to_string(),
+            required: vec![ProviderCapability::Chat],
+            max_output_tokens: 32,
+        };
+        let endpoint = parse_http_endpoint(&adapter.endpoint).unwrap();
+        assert_eq!(endpoint.path, "/v1/chat");
+        let events =
+            events_from_http_parts(200, "{\"delta\":\"goal=fix\\nverify=status:0\"}", &request)
+                .unwrap();
+        assert!(matches!(events.last(), Some(ProviderStreamEvent::Finished)));
+        assert!(
+            matches!(&events[0], ProviderStreamEvent::Delta(text) if text.contains("goal=fix"))
+        );
+        assert_eq!(
+            events_from_http_parts(429, "rate limited", &request).unwrap_err(),
+            ProviderFailureClass::RateLimited
+        );
     }
 }

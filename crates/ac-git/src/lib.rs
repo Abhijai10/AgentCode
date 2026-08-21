@@ -60,6 +60,8 @@ pub struct MergeReview {
     pub branch: String,
     pub base_commit: String,
     pub merge_commit: Option<String>,
+    pub rollback_commit: Option<String>,
+    pub conflict_detected: bool,
     pub approved_by_kernel: bool,
     pub cleaned_up: bool,
 }
@@ -364,7 +366,9 @@ impl GitCoordinator {
             worktree_id: worktree_id.clone(),
             branch: worktree.branch.clone(),
             base_commit: worktree.base_commit.clone(),
-            merge_commit: Some(git_output(&worktree.path, ["rev-parse", "HEAD"])?),
+            merge_commit: None,
+            rollback_commit: None,
+            conflict_detected: false,
             approved_by_kernel,
             cleaned_up: false,
         })
@@ -377,6 +381,45 @@ impl GitCoordinator {
                 "local merge review requires Kernel approval",
             ));
         }
+        let worktree = self
+            .worktrees
+            .get(&review.worktree_id)
+            .ok_or_else(|| AcError::validation("GIT-UNKNOWN_WORKTREE", "worktree not found"))?
+            .clone();
+        let repository = self
+            .repositories
+            .get(&worktree.repository_id)
+            .ok_or_else(|| AcError::validation("GIT-UNKNOWN_REPOSITORY", "repository not found"))?
+            .clone();
+        let rollback = git_output(&repository.root, ["rev-parse", "HEAD"])?;
+        review.rollback_commit = Some(rollback.clone());
+        let merge = Command::new("git")
+            .args([
+                "-c",
+                "user.name=AgentCode",
+                "-c",
+                "user.email=agentcode@example.test",
+                "merge",
+                "--no-ff",
+                "--no-edit",
+                worktree.branch.as_str(),
+            ])
+            .current_dir(&repository.root)
+            .output()
+            .map_err(|err| AcError::validation("GIT-COMMAND_FAILED", err.to_string()))?;
+        if !merge.status.success() {
+            review.conflict_detected = true;
+            let _ = Command::new("git")
+                .args(["merge", "--abort"])
+                .current_dir(&repository.root)
+                .output();
+            let _ = git_output(&repository.root, ["reset", "--hard", rollback.as_str()]);
+            return Err(AcError::conflict(
+                "GIT-MERGE_CONFLICT",
+                String::from_utf8_lossy(&merge.stderr).trim().to_string(),
+            ));
+        }
+        review.merge_commit = Some(git_output(&repository.root, ["rev-parse", "HEAD"])?);
         self.cleanup_worktree(&review.worktree_id)?;
         review.cleaned_up = true;
         Ok(())
@@ -563,8 +606,74 @@ mod tests {
         assert!(review.cleaned_up);
         assert_eq!(
             fs::read_to_string(source.join("README.md")).unwrap(),
-            "old\n"
+            "new\n"
         );
+        let _ = fs::remove_dir_all(source);
+    }
+
+    #[test]
+    fn merge_conflict_rolls_back_source_repository() {
+        let source = std::env::temp_dir().join(format!("agentcode-src-{}", StableId::new("tmp")));
+        let worktree = std::env::temp_dir().join(format!("agentcode-wt-{}", StableId::new("tmp")));
+        let _ = fs::remove_dir_all(&source);
+        let _ = fs::remove_dir_all(&worktree);
+        fs::create_dir_all(&source).unwrap();
+        fs::write(source.join("README.md"), "base\n").unwrap();
+        run_git(&source, ["init"]);
+        run_git(&source, ["add", "."]);
+        run_git(
+            &source,
+            [
+                "-c",
+                "user.name=AgentCode Test",
+                "-c",
+                "user.email=agentcode@example.test",
+                "commit",
+                "-m",
+                "initial",
+            ],
+        );
+        let mut git = GitCoordinator::new();
+        let worktree_id = git
+            .create_task_workspace(
+                source.clone(),
+                worktree.clone(),
+                StableId::new("mission"),
+                StableId::new("worker"),
+            )
+            .unwrap();
+        fs::write(worktree.join("README.md"), "worktree change\n").unwrap();
+        git.checkpoint_current(&worktree_id, "worktree change")
+            .unwrap();
+
+        fs::write(source.join("README.md"), "source change\n").unwrap();
+        run_git(&source, ["add", "."]);
+        run_git(
+            &source,
+            [
+                "-c",
+                "user.name=AgentCode Test",
+                "-c",
+                "user.email=agentcode@example.test",
+                "commit",
+                "-m",
+                "source change",
+            ],
+        );
+        let source_head = git_output(&source, ["rev-parse", "HEAD"]).unwrap();
+        let mut review = git.prepare_merge_review(&worktree_id, true).unwrap();
+        let error = git.complete_merge_review(&mut review).unwrap_err();
+        assert_eq!(error.code(), "GIT-MERGE_CONFLICT");
+        assert!(review.conflict_detected);
+        assert_eq!(
+            git_output(&source, ["rev-parse", "HEAD"]).unwrap(),
+            source_head
+        );
+        assert_eq!(
+            fs::read_to_string(source.join("README.md")).unwrap(),
+            "source change\n"
+        );
+        git.cleanup_worktree(&worktree_id).unwrap();
         let _ = fs::remove_dir_all(source);
     }
 }

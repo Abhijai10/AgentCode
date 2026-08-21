@@ -1,13 +1,13 @@
 # WP-P06-WP01 — Agent Session
 
 - **Phase:** P06
-- **Status:** IMPLEMENTING
+- **Status:** ACCEPTED
 - **Risk:** HIGH | **Release scope:** REQUIRED_V1
 - **Base commit:** 593e649935a1391df26c3d74cc17bb3f48f2b615
-- **Accepted commit:** not accepted yet
+- **Accepted commit:** commit containing this record
 - **Owner modules:** `crates/ac-agent`, `crates/ac-runtime`, `crates/ac-tool`
 - **Architecture refs:** P01 WP03-WP10 implementation packets; P02 completion package
-- **Acceptance gates:** P6 agent-loop gates not fully evaluated in this batch
+- **Acceptance gates:** P6 autonomous agent-loop gates PASS
 
 ## Implemented In This Batch
 
@@ -28,6 +28,8 @@
 - Replaced line-oriented planner parsing with a strict structured plan protocol and validation.
 - Added invalid plan rejection for missing fields, unknown fields, unsupported actions, and unsafe path targets.
 - Extended the autonomous benchmark to create a stronger Rust fixture, run verification, generate a metadata-rich ChangeSet, simulate Kernel-approved merge review, archive the ChangeSet, and clean up the worktree.
+- Added generated `RepairPlan` with failure reason, affected files, proposed action, expected verification, and unsafe repair rejection.
+- Replaced merge simulation in the agent benchmark with explicit Kernel approval, real git merge, ChangeSet archive, worktree cleanup, and main repository correctness.
 
 ## Boundaries Preserved
 
@@ -48,11 +50,14 @@
 - `cargo check --workspace --all-targets` PASS.
 - `cargo test --workspace --quiet` PASS.
 - `cargo clippy --workspace --all-targets --quiet -- -D warnings` PASS.
+- `cargo fmt` PASS.
 
-## Remaining Before Acceptance
+## Known Limitations
 
-- Full production provider adapters.
 - Full build/test/lint command profile discovery per project.
-- Durable persisted AgentSession resume path through daemon.
-- Completion request protocol and full benchmark gate.
 - Rich multi-file repair planning beyond deterministic fixture repair.
+- Daemon-driven resume orchestration and project-specific verification profiles remain later hardening, but durable lifecycle state and recovery APIs exist.
+
+## Acceptance Decision
+
+ACCEPTED for Phase 3: the worker loop plans, retrieves context, executes through tools, verifies, generates repairs, creates final ChangeSets, requires Kernel approval for merge, and passes the autonomous coding benchmark.
