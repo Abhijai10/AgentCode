@@ -17,6 +17,10 @@ path = "security_boundary.rs"
 name = "recovery_flow"
 path = "recovery_flow.rs"
 
+[[test]]
+name = "chaos_dogfood_flow"
+path = "chaos_dogfood_flow.rs"
+
 [dev-dependencies]
 ac-agent = { path = "../../crates/ac-agent" }
 ac-changeset = { path = "../../crates/ac-changeset" }

@@ -130,6 +130,12 @@ pub const DESKTOP_OPTIMIZATION_V15: Migration = Migration {
     sql: include_str!("../../../migrations/0015_desktop_optimization.sql"),
 };
 
+pub const CHAOS_DOGFOOD_V16: Migration = Migration {
+    id: "0016_chaos_dogfood",
+    description: "chaos recovery experiments and AgentCode dogfood mission evidence",
+    sql: include_str!("../../../migrations/0016_chaos_dogfood.sql"),
+};
+
 pub fn validate_migrations(migrations: &[Migration]) -> AcResult<()> {
     let mut seen = BTreeSet::new();
     for migration in migrations {

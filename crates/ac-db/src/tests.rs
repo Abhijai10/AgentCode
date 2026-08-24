@@ -92,7 +92,7 @@ mod tests {
     fn sqlite_store_persists_kernel_state() {
         let mut db = ControlPlaneDb::open_memory().unwrap();
         db.migrate().unwrap();
-        assert_eq!(db.user_version().unwrap(), 15);
+        assert_eq!(db.user_version().unwrap(), 16);
 
         let mut kernel = Kernel::new(AllowAllPolicy);
         kernel.start().unwrap();
@@ -784,7 +784,7 @@ mod tests {
         {
             let mut db = ControlPlaneDb::open(&path).unwrap();
             db.migrate().unwrap();
-            assert_eq!(db.user_version().unwrap(), 15);
+            assert_eq!(db.user_version().unwrap(), 16);
             db.save_changeset_transaction(
                 &transaction,
                 Some("task-p13"),
@@ -863,7 +863,7 @@ mod tests {
         {
             let mut db = ControlPlaneDb::open(&path).unwrap();
             db.migrate().unwrap();
-            assert_eq!(db.user_version().unwrap(), 15);
+            assert_eq!(db.user_version().unwrap(), 16);
             db.save_verification_profile(&profile).unwrap();
             db.save_verification_manifest(
                 &manifest,
@@ -945,7 +945,7 @@ mod tests {
         {
             let mut db = ControlPlaneDb::open(&path).unwrap();
             db.migrate().unwrap();
-            assert_eq!(db.user_version().unwrap(), 15);
+            assert_eq!(db.user_version().unwrap(), 16);
             db.save_browser_process(&process).unwrap();
             db.save_browser_session(&session).unwrap();
             db.save_browser_dev_server(&dev_server).unwrap();
@@ -978,7 +978,7 @@ mod tests {
         {
             let mut db = ControlPlaneDb::open(&path).unwrap();
             db.migrate().unwrap();
-            assert_eq!(db.user_version().unwrap(), 15);
+            assert_eq!(db.user_version().unwrap(), 16);
             let skill = SkillManifest {
                 id: skill_id.clone(),
                 name: "Rust".to_string(),
@@ -1075,7 +1075,7 @@ mod tests {
         {
             let mut db = ControlPlaneDb::open(&path).unwrap();
             db.migrate().unwrap();
-            assert_eq!(db.user_version().unwrap(), 15);
+            assert_eq!(db.user_version().unwrap(), 16);
             let orchestrator = ac_security::BaselineSecurityOrchestrator::new(
                 ac_security::SecurityPolicy::baseline(),
             );
@@ -1126,7 +1126,7 @@ mod tests {
         {
             let mut db = ControlPlaneDb::open(&path).unwrap();
             db.migrate().unwrap();
-            assert_eq!(db.user_version().unwrap(), 15);
+            assert_eq!(db.user_version().unwrap(), 16);
             db.save_discuss_session(&DiscussSessionRow {
                 id: discuss_id.clone(),
                 repository_id: "repo-a".to_string(),
@@ -1254,7 +1254,7 @@ mod tests {
         {
             let mut db = ControlPlaneDb::open(&path).unwrap();
             db.migrate().unwrap();
-            assert_eq!(db.user_version().unwrap(), 15);
+            assert_eq!(db.user_version().unwrap(), 16);
             db.save_desktop_session(&DesktopSessionRow {
                 id: session_id.clone(),
                 active_project_id: Some(project_id.clone()),
@@ -1362,6 +1362,129 @@ mod tests {
                 db.resource_telemetry_records("runtime").unwrap()[0].worker_count,
                 2
             );
+        }
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn phase24_25_chaos_and_dogfood_state_survive_reopen() {
+        let path = std::env::temp_dir().join(format!(
+            "agentcode-phase24-25-{}.sqlite",
+            StableId::new("db")
+        ));
+        let chaos_id = StableId::new("chaos").to_string();
+        let mission_id = StableId::new("mission").to_string();
+        let dogfood_id = StableId::new("dogfood").to_string();
+        let finding_id = StableId::new("dogfinding").to_string();
+        {
+            let mut db = ControlPlaneDb::open(&path).unwrap();
+            db.migrate().unwrap();
+            assert_eq!(db.user_version().unwrap(), 16);
+            db.save_chaos_experiment(&ChaosExperimentRow {
+                id: chaos_id.clone(),
+                gate_id: "P24-G5".to_string(),
+                test_id: "ACCEPT-P24_WORKER_DEATH".to_string(),
+                mission_id: mission_id.clone(),
+                fault_kind: "worker_death".to_string(),
+                expected_recovery: "RECOVER_AUTOMATICALLY".to_string(),
+                seed: 42,
+                runs: 3,
+                passes: 3,
+                final_result: "recovered without silent corruption".to_string(),
+                state_equivalent: true,
+                unresolved_failures: String::new(),
+                created_at_ms: 1,
+            })
+            .unwrap();
+            db.save_chaos_recovery_event(&ChaosRecoveryEventRow {
+                id: StableId::new("chaosevent").to_string(),
+                experiment_id: chaos_id.clone(),
+                sequence_no: 1,
+                phase: "recover".to_string(),
+                observed_behavior: "lease expired".to_string(),
+                recovery_action: "replacement worker".to_string(),
+                evidence_ref: "ev-chaos".to_string(),
+                created_at_ms: 2,
+            })
+            .unwrap();
+            db.save_chaos_report(&ChaosReportRow {
+                id: StableId::new("chaosreport").to_string(),
+                scope: "phase-24".to_string(),
+                experiments: 1,
+                recovered: 1,
+                recovery_percent: 100,
+                unresolved_failures: String::new(),
+                regression_list: String::new(),
+                created_at_ms: 3,
+            })
+            .unwrap();
+            db.save_dogfood_mission(&DogfoodMissionRow {
+                id: dogfood_id.clone(),
+                repository_id: "repo-agentcode".to_string(),
+                repository_path: "/repo".to_string(),
+                mission_kind: "bug_fix".to_string(),
+                objective: "repair contained bug".to_string(),
+                status: "verified".to_string(),
+                change_set_id: Some("cs-a".to_string()),
+                verification_report_id: Some("verify-a".to_string()),
+                evidence_refs: "ev-dogfood".to_string(),
+                human_interventions: 0,
+                provider_switches: 1,
+                worker_replacements: 1,
+                context_compactions: 0,
+                verifier_rejections: 0,
+                token_total: 1200,
+                paid_cost_micros: 0,
+                wall_time_ms: 15000,
+                created_at_ms: 4,
+            })
+            .unwrap();
+            db.save_dogfood_finding(&DogfoodFindingRow {
+                id: finding_id.clone(),
+                mission_id: dogfood_id.clone(),
+                severity: "medium".to_string(),
+                title: "self improvement".to_string(),
+                evidence_refs: "ev-dogfood".to_string(),
+                status: "proposed".to_string(),
+            })
+            .unwrap();
+            db.save_dogfood_proposal(&DogfoodProposalRow {
+                id: StableId::new("dogproposal").to_string(),
+                mission_id: dogfood_id.clone(),
+                finding_id,
+                summary: "normal mission proposal".to_string(),
+                affected_files: "crates/ac-agent/src/lib.rs".to_string(),
+                change_set_id: "cs-a".to_string(),
+                decision: "accepted".to_string(),
+                reason: "verified".to_string(),
+            })
+            .unwrap();
+            db.save_dogfood_report(&DogfoodReportRow {
+                id: StableId::new("dogreport").to_string(),
+                scope: "phase-25".to_string(),
+                missions_executed: 1,
+                findings: 1,
+                accepted_improvements: 1,
+                rejected_proposals: 0,
+                regressions: String::new(),
+                recommendations: "continue".to_string(),
+                created_at_ms: 5,
+            })
+            .unwrap();
+        }
+        {
+            let mut db = ControlPlaneDb::open(&path).unwrap();
+            db.migrate().unwrap();
+            let chaos = db.chaos_experiments().unwrap();
+            assert_eq!(chaos[0].passes, 3);
+            assert!(chaos[0].state_equivalent);
+            assert_eq!(db.chaos_recovery_events(&chaos_id).unwrap()[0].phase, "recover");
+            assert_eq!(db.chaos_reports().unwrap()[0].recovery_percent, 100);
+            let missions = db.dogfood_missions().unwrap();
+            assert_eq!(missions[0].status, "verified");
+            assert_eq!(db.dogfood_findings(&dogfood_id).unwrap()[0].severity, "medium");
+            assert_eq!(db.dogfood_proposals(&dogfood_id).unwrap()[0].decision, "accepted");
+            assert_eq!(db.dogfood_reports().unwrap()[0].accepted_improvements, 1);
         }
         let _ = fs::remove_file(path);
     }

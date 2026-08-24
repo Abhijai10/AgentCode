@@ -33,6 +33,7 @@ use ac_verification::{
 include!("discuss.rs");
 include!("design.rs");
 include!("desktop.rs");
+include!("dogfood.rs");
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Goal {
@@ -2083,5 +2084,75 @@ mod tests {
             "pub fn fixture_answer() -> u32 {\n    42\n}\n"
         );
         let _ = std::fs::remove_dir_all(source);
+    }
+
+    #[test]
+    fn phase25_dogfood_self_mission_creates_verified_changeset_and_evidence() {
+        let mut harness = DogfoodHarness::new();
+        let record = harness
+            .run_self_mission(DogfoodMissionInput {
+                repository_id: StableId::new("repo"),
+                repository_path: "/repo/agentcode".to_string(),
+                commit_ref: "abc123".to_string(),
+                kind: DogfoodMissionKind::SecurityAudit,
+                objective: "find security improvements".to_string(),
+            })
+            .unwrap();
+        assert_eq!(record.status, "verified");
+        assert_eq!(record.changeset.state, ChangeSetState::Accepted);
+        assert!(!record.privileged_bypass_used);
+        assert_eq!(record.findings[0].severity, "high");
+        assert_eq!(record.proposals[0].decision, "accepted");
+        assert_eq!(record.metrics.verifier_rejections, 1);
+        assert!(record
+            .changeset
+            .metadata
+            .as_ref()
+            .unwrap()
+            .verification_passed
+            .unwrap());
+    }
+
+    #[test]
+    fn phase25_dogfood_catalog_records_required_mission_metrics() {
+        let mut harness = DogfoodHarness::new();
+        let records = harness
+            .run_required_catalog(StableId::new("repo"), "/repo/agentcode", "abc123")
+            .unwrap();
+        assert_eq!(records.len(), 14);
+        assert!(records
+            .iter()
+            .any(|record| record.kind == DogfoodMissionKind::ProviderFailure
+                && record.metrics.provider_switches == 1));
+        assert!(records
+            .iter()
+            .any(|record| record.kind == DogfoodMissionKind::RestartRecovery
+                && record.metrics.worker_replacements == 1));
+        assert!(records
+            .iter()
+            .any(|record| record.kind == DogfoodMissionKind::LongUnattended
+                && record.metrics.context_compactions == 1));
+        assert!(records
+            .iter()
+            .all(|record| !record.privileged_bypass_used && record.status == "verified"));
+        let report = harness.feedback_report("phase-25");
+        assert_eq!(report.missions_executed, 14);
+        assert_eq!(report.accepted_improvements, 14);
+        assert!(report.regressions.is_empty());
+    }
+
+    #[test]
+    fn phase25_dogfood_rejects_incomplete_self_mission_input() {
+        let mut harness = DogfoodHarness::new();
+        let error = harness
+            .run_self_mission(DogfoodMissionInput {
+                repository_id: StableId::new("repo"),
+                repository_path: String::new(),
+                commit_ref: "abc123".to_string(),
+                kind: DogfoodMissionKind::BugFix,
+                objective: "repair contained bug".to_string(),
+            })
+            .unwrap_err();
+        assert_eq!(error.code(), "DOGFOOD-MISSION_INVALID");
     }
 }

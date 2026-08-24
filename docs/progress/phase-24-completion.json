@@ -1,0 +1,63 @@
+{
+  "phase": "P24",
+  "name": "Chaos Engineering & Recovery Validation",
+  "status": "COMPLETE",
+  "starting_commit": "3cef3d317c77038698c0c5bcb6cf78ec1c58dfbc",
+  "schema_version": 16,
+  "migration": "migrations/0016_chaos_dogfood.sql",
+  "workpackages": [
+    "P24-WP01",
+    "P24-WP02",
+    "P24-WP03",
+    "P24-WP04",
+    "P24-WP05",
+    "P24-WP06",
+    "P24-WP07",
+    "P24-WP08",
+    "P24-WP09",
+    "P24-WP10"
+  ],
+  "gates": [
+    "P24-G1",
+    "P24-G2",
+    "P24-G3",
+    "P24-G4",
+    "P24-G5",
+    "P24-G6",
+    "P24-G7",
+    "P24-G8",
+    "P24-G9",
+    "P24-G10",
+    "P24-G11",
+    "P24-G12",
+    "P24-G13",
+    "P24-G14",
+    "P24-G15",
+    "P24-G16",
+    "P24-G17",
+    "P24-G18",
+    "P24-G19",
+    "P24-G20",
+    "P24-G21",
+    "P24-G22",
+    "P24-G23",
+    "P24-G24",
+    "P24-G25"
+  ],
+  "evidence": [
+    "crates/ac-runtime/src/chaos.rs",
+    "crates/ac-db/src/chaos_dogfood.rs",
+    "tests/integration/chaos_dogfood_flow.rs"
+  ],
+  "validation": [
+    "cargo fmt --all",
+    "cargo check --workspace --all-targets",
+    "cargo test --workspace",
+    "cargo clippy --workspace --all-targets -- -D warnings",
+    "JSON validation",
+    "git diff --check"
+  ],
+  "limitations": [
+    "Real Mac destructive scenarios are deterministic injected records in this batch; packaged-product repetition remains for RC."
+  ]
+}

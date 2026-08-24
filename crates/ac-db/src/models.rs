@@ -713,3 +713,101 @@ pub struct TaskAttemptRecord {
     pub failure_class: Option<String>,
     pub created_at_ms: i64,
 }
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ChaosExperimentRow {
+    pub id: String,
+    pub gate_id: String,
+    pub test_id: String,
+    pub mission_id: String,
+    pub fault_kind: String,
+    pub expected_recovery: String,
+    pub seed: u64,
+    pub runs: u32,
+    pub passes: u32,
+    pub final_result: String,
+    pub state_equivalent: bool,
+    pub unresolved_failures: String,
+    pub created_at_ms: i64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ChaosRecoveryEventRow {
+    pub id: String,
+    pub experiment_id: String,
+    pub sequence_no: u32,
+    pub phase: String,
+    pub observed_behavior: String,
+    pub recovery_action: String,
+    pub evidence_ref: String,
+    pub created_at_ms: i64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ChaosReportRow {
+    pub id: String,
+    pub scope: String,
+    pub experiments: u32,
+    pub recovered: u32,
+    pub recovery_percent: u8,
+    pub unresolved_failures: String,
+    pub regression_list: String,
+    pub created_at_ms: i64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DogfoodMissionRow {
+    pub id: String,
+    pub repository_id: String,
+    pub repository_path: String,
+    pub mission_kind: String,
+    pub objective: String,
+    pub status: String,
+    pub change_set_id: Option<String>,
+    pub verification_report_id: Option<String>,
+    pub evidence_refs: String,
+    pub human_interventions: u32,
+    pub provider_switches: u32,
+    pub worker_replacements: u32,
+    pub context_compactions: u32,
+    pub verifier_rejections: u32,
+    pub token_total: u32,
+    pub paid_cost_micros: u64,
+    pub wall_time_ms: u64,
+    pub created_at_ms: i64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DogfoodFindingRow {
+    pub id: String,
+    pub mission_id: String,
+    pub severity: String,
+    pub title: String,
+    pub evidence_refs: String,
+    pub status: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DogfoodProposalRow {
+    pub id: String,
+    pub mission_id: String,
+    pub finding_id: String,
+    pub summary: String,
+    pub affected_files: String,
+    pub change_set_id: String,
+    pub decision: String,
+    pub reason: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DogfoodReportRow {
+    pub id: String,
+    pub scope: String,
+    pub missions_executed: u32,
+    pub findings: u32,
+    pub accepted_improvements: u32,
+    pub rejected_proposals: u32,
+    pub regressions: String,
+    pub recommendations: String,
+    pub created_at_ms: i64,
+}

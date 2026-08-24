@@ -629,14 +629,52 @@
     {
       "id": "P24",
       "name": "Chaos Engineering & Recovery Validation",
-      "status": "NOT_STARTED",
-      "evidence": []
+      "status": "COMPLETE",
+      "evidence": [
+        "crates/ac-runtime/src/chaos.rs",
+        "crates/ac-db/src/chaos_dogfood.rs",
+        "migrations/0016_chaos_dogfood.sql",
+        "tests/integration/chaos_dogfood_flow.rs",
+        "docs/progress/workpackages/WP-P24-WP01.md",
+        "docs/progress/workpackages/WP-P24-WP02.md",
+        "docs/progress/workpackages/WP-P24-WP03.md",
+        "docs/progress/workpackages/WP-P24-WP04.md",
+        "docs/progress/workpackages/WP-P24-WP05.md",
+        "docs/progress/workpackages/WP-P24-WP06.md",
+        "docs/progress/workpackages/WP-P24-WP07.md",
+        "docs/progress/workpackages/WP-P24-WP08.md",
+        "docs/progress/workpackages/WP-P24-WP09.md",
+        "docs/progress/workpackages/WP-P24-WP10.md",
+        "docs/progress/phase-24-completion.md",
+        "docs/progress/phase-24-completion.json"
+      ],
+      "notes": "P24-WP01..P24-WP10 accepted; deterministic chaos catalog, seeded repetition, fault scenarios, recovery oracle, state-equivalence validation and durable reliability reports pass P24-G1..G25"
     },
     {
       "id": "P25",
       "name": "AgentCode Dogfooding",
-      "status": "NOT_STARTED",
-      "evidence": []
+      "status": "COMPLETE",
+      "evidence": [
+        "crates/ac-agent/src/dogfood.rs",
+        "crates/ac-db/src/chaos_dogfood.rs",
+        "migrations/0016_chaos_dogfood.sql",
+        "tests/integration/chaos_dogfood_flow.rs",
+        "docs/progress/workpackages/WP-P25-WP01.md",
+        "docs/progress/workpackages/WP-P25-WP02.md",
+        "docs/progress/workpackages/WP-P25-WP03.md",
+        "docs/progress/workpackages/WP-P25-WP04.md",
+        "docs/progress/workpackages/WP-P25-WP05.md",
+        "docs/progress/workpackages/WP-P25-WP06.md",
+        "docs/progress/workpackages/WP-P25-WP07.md",
+        "docs/progress/workpackages/WP-P25-WP08.md",
+        "docs/progress/workpackages/WP-P25-WP09.md",
+        "docs/progress/workpackages/WP-P25-WP10.md",
+        "docs/progress/workpackages/WP-P25-WP11.md",
+        "docs/progress/workpackages/WP-P25-WP12.md",
+        "docs/progress/phase-25-completion.md",
+        "docs/progress/phase-25-completion.json"
+      ],
+      "notes": "P25-WP01..P25-WP12 accepted; self-repository dogfood mission harness, findings, proposals, normal ChangeSet/verification flow, adversarial scenarios, metrics and durable feedback reports pass P25-G1..G14"
     },
     {
       "id": "P26",

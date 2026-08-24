@@ -427,4 +427,63 @@ mod tests {
         assert_eq!(report.cost_per_verified_task_micros, Some(900));
         assert_eq!(optimization.token_usage()[0].task_id, task_id);
     }
+
+    #[test]
+    fn phase24_chaos_harness_recovers_provider_worker_db_and_verification_faults() {
+        let mut harness = ChaosHarness::new();
+        let catalog = ChaosHarness::catalog();
+        assert_eq!(catalog.len(), 25);
+        let selected = [
+            ChaosFaultKind::Provider429,
+            ChaosFaultKind::WorkerDeath,
+            ChaosFaultKind::ZombieWorker,
+            ChaosFaultKind::SqliteInterrupt,
+            ChaosFaultKind::FalseCompletion,
+        ];
+        for fault in selected {
+            let scenario = catalog
+                .iter()
+                .find(|scenario| scenario.fault_kind == fault)
+                .unwrap();
+            let result = harness
+                .run_scenario(
+                    scenario,
+                    ChaosRunConfig {
+                        mission_id: StableId::new("mission"),
+                        seed: 24,
+                        repeats: 3,
+                    },
+                )
+                .unwrap();
+            assert_eq!(result.passes, 3);
+            assert!(result.state_equivalent);
+            assert!(result.unresolved_failures.is_empty());
+            assert!(result.timeline.iter().any(|event| event.phase == "recover"));
+            assert!(result.timeline.iter().any(|event| event.phase == "oracle"));
+        }
+        let report = harness.reliability_report("phase-24");
+        assert_eq!(report.experiments, selected.len() as u32);
+        assert_eq!(report.recovery_percent, 100);
+        assert!(report.regression_list.is_empty());
+    }
+
+    #[test]
+    fn phase24_chaos_requires_repeated_runs() {
+        let mut harness = ChaosHarness::new();
+        let scenario = ChaosHarness::catalog()
+            .into_iter()
+            .find(|scenario| scenario.fault_kind == ChaosFaultKind::ProviderTimeout)
+            .unwrap();
+        let error = harness
+            .run_scenario(
+                &scenario,
+                ChaosRunConfig {
+                    mission_id: StableId::new("mission"),
+                    seed: 1,
+                    repeats: 1,
+                },
+            )
+            .unwrap_err();
+        assert_eq!(error.code(), "CHAOS-INSUFFICIENT_REPETITION");
+    }
 }

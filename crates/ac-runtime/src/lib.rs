@@ -14,6 +14,7 @@ include!("workers.rs");
 include!("scheduler.rs");
 include!("autonomy.rs");
 include!("optimization.rs");
+include!("chaos.rs");
 include!("recovery.rs");
 include!("session.rs");
 include!("tests.rs");
