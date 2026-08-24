@@ -28,6 +28,85 @@ pub enum SecurityDecision {
     RequireApproval,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
+pub enum RiskClass {
+    R0,
+    R1,
+    R2,
+    R3,
+    R4,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ToolRole {
+    Planner,
+    Worker,
+    Researcher,
+    Verifier,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PermissionContext {
+    pub role: ToolRole,
+    pub mission: CapabilityPolicy,
+    pub task: CapabilityPolicy,
+    pub sandbox: CapabilityPolicy,
+    pub risk: RiskClass,
+    pub approval_granted: bool,
+}
+
+impl PermissionContext {
+    pub fn standard_worker(policy: CapabilityPolicy) -> Self {
+        Self {
+            role: ToolRole::Worker,
+            mission: policy.clone(),
+            task: policy.clone(),
+            sandbox: policy,
+            risk: RiskClass::R1,
+            approval_granted: false,
+        }
+    }
+
+    pub fn evaluate(&self, requested: &[Capability]) -> SecurityDecision {
+        let role = role_policy(self.role).evaluate(requested);
+        let decisions = [
+            role,
+            self.mission.evaluate(requested),
+            self.task.evaluate(requested),
+            self.sandbox.evaluate(requested),
+        ];
+        if decisions.contains(&SecurityDecision::Deny) {
+            return SecurityDecision::Deny;
+        }
+        if self.risk >= RiskClass::R3 && !self.approval_granted {
+            return SecurityDecision::RequireApproval;
+        }
+        if decisions.contains(&SecurityDecision::RequireApproval) {
+            SecurityDecision::RequireApproval
+        } else {
+            SecurityDecision::Allow
+        }
+    }
+}
+
+pub fn role_policy(role: ToolRole) -> CapabilityPolicy {
+    match role {
+        ToolRole::Planner => {
+            CapabilityPolicy::new().allow(Capability::FilesystemRead("*".to_string()))
+        }
+        ToolRole::Worker => CapabilityPolicy::new()
+            .allow(Capability::FilesystemRead("*".to_string()))
+            .allow(Capability::FilesystemWrite("*".to_string()))
+            .allow(Capability::ProcessExec("*".to_string())),
+        ToolRole::Researcher => CapabilityPolicy::new()
+            .allow(Capability::FilesystemRead("*".to_string()))
+            .allow(Capability::Network("*".to_string())),
+        ToolRole::Verifier => CapabilityPolicy::new()
+            .allow(Capability::FilesystemRead("*".to_string()))
+            .allow(Capability::ProcessExec("*".to_string())),
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ExtensionRecord {
     pub id: StableId,
@@ -235,5 +314,33 @@ mod tests {
             .grant(&id, Capability::SecretRead("token".to_string()))
             .unwrap_err();
         assert_eq!(err.code(), "SECURITY-UNDECLARED_CAPABILITY");
+    }
+
+    #[test]
+    fn role_and_risk_are_an_intersection_not_a_capability_escalation() {
+        let context = PermissionContext {
+            role: ToolRole::Planner,
+            mission: CapabilityPolicy::new().allow(Capability::FilesystemWrite("*".to_string())),
+            task: CapabilityPolicy::new().allow(Capability::FilesystemWrite("*".to_string())),
+            sandbox: CapabilityPolicy::new().allow(Capability::FilesystemWrite("*".to_string())),
+            risk: RiskClass::R1,
+            approval_granted: true,
+        };
+        assert_eq!(
+            context.evaluate(&[Capability::FilesystemWrite("workspace".to_string())]),
+            SecurityDecision::RequireApproval
+        );
+        let high_risk = PermissionContext {
+            role: ToolRole::Worker,
+            risk: RiskClass::R4,
+            approval_granted: false,
+            ..PermissionContext::standard_worker(
+                CapabilityPolicy::new().allow(Capability::ProcessExec("*".to_string())),
+            )
+        };
+        assert_eq!(
+            high_risk.evaluate(&[Capability::ProcessExec("git".to_string())]),
+            SecurityDecision::RequireApproval
+        );
     }
 }

@@ -2,12 +2,268 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use ac_common::{AcError, AcResult, StableId, TimestampMillis};
-use ac_evidence::{EvidenceKind, EvidenceStore, Provenance};
-use ac_sandbox::{ExecRequest, SandboxManager, SandboxPolicy};
+use ac_evidence::{EvidenceStore, Provenance};
+use ac_sandbox::{ExecRequest, SandboxManager, SandboxPolicy, SecretBroker};
 use ac_security::{Capability, CapabilityPolicy, SecurityDecision};
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ToolDescriptor {
+    pub id: String,
+    pub version: String,
+    pub required_capabilities: Vec<Capability>,
+    pub risk: ac_security::RiskClass,
+    pub mutates_workspace: bool,
+    pub network_required: bool,
+    pub reversible: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ExecutionManifest {
+    pub argv: Vec<String>,
+    pub cwd: PathBuf,
+    pub timeout_ms: u64,
+    pub network: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ToolEvent {
+    Requested,
+    Denied { reason: String },
+    Started { manifest: ExecutionManifest },
+    Finished { status: ToolStatus },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ToolError {
+    pub code: String,
+    pub message: String,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ProcessState {
+    Running,
+    Finished,
+    Cancelled,
+    TimedOut,
+    Failed,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProcessRecord {
+    pub id: StableId,
+    pub task: String,
+    pub manifest: ExecutionManifest,
+    pub pid: u32,
+    pub state: ProcessState,
+    pub started_at: TimestampMillis,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct NativeProcessResult {
+    pub record: ProcessRecord,
+    pub exit_code: Option<i32>,
+    pub stdout: String,
+    pub stderr: String,
+}
+
+pub struct SecretProcessRequest<'a> {
+    pub request: ToolRequest,
+    pub sandbox: &'a SandboxManager,
+    pub argv: Vec<String>,
+    pub cwd: PathBuf,
+    pub timeout_ms: u64,
+    pub secret_references: &'a BTreeMap<String, String>,
+}
+
+#[derive(Clone, Default)]
+pub struct ProcessManager {
+    children: Arc<Mutex<BTreeMap<StableId, std::process::Child>>>,
+    records: Arc<Mutex<BTreeMap<StableId, ProcessRecord>>>,
+}
+
+impl ProcessManager {
+    pub fn run(
+        &self,
+        task: impl Into<String>,
+        plan: ac_sandbox::SandboxedExecutionPlan,
+    ) -> AcResult<NativeProcessResult> {
+        self.run_with_cancellation(task, plan, &AtomicBool::new(false))
+    }
+
+    pub fn run_with_cancellation(
+        &self,
+        task: impl Into<String>,
+        plan: ac_sandbox::SandboxedExecutionPlan,
+        cancelled: &AtomicBool,
+    ) -> AcResult<NativeProcessResult> {
+        let manifest = ExecutionManifest {
+            argv: plan.argv.clone(),
+            cwd: plan.cwd.clone(),
+            timeout_ms: plan.timeout_ms,
+            network: false,
+        };
+        let mut child = Command::new(&plan.argv[0])
+            .args(&plan.argv[1..])
+            .current_dir(&plan.cwd)
+            .env_clear()
+            .envs(&plan.allowed_env)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(|error| AcError::validation("TOOL-COMMAND_SPAWN_FAILED", error.to_string()))?;
+        let id = plan.id;
+        let record = ProcessRecord {
+            id: id.clone(),
+            task: task.into(),
+            manifest,
+            pid: child.id(),
+            state: ProcessState::Running,
+            started_at: TimestampMillis::now(),
+        };
+        self.records
+            .lock()
+            .expect("process records lock")
+            .insert(id.clone(), record.clone());
+        let deadline = Instant::now() + Duration::from_millis(plan.timeout_ms);
+        loop {
+            match child.try_wait().map_err(|error| {
+                AcError::validation("TOOL-COMMAND_WAIT_FAILED", error.to_string())
+            })? {
+                Some(status) => {
+                    let output = child.wait_with_output().map_err(|error| {
+                        AcError::validation("TOOL-COMMAND_OUTPUT_FAILED", error.to_string())
+                    })?;
+                    let mut finished = record.clone();
+                    finished.state = if status.success() {
+                        ProcessState::Finished
+                    } else {
+                        ProcessState::Failed
+                    };
+                    self.records
+                        .lock()
+                        .expect("process records lock")
+                        .insert(id, finished.clone());
+                    return Ok(NativeProcessResult {
+                        record: finished,
+                        exit_code: status.code(),
+                        stdout: String::from_utf8_lossy(&output.stdout).to_string(),
+                        stderr: String::from_utf8_lossy(&output.stderr).to_string(),
+                    });
+                }
+                None if cancelled.load(Ordering::Relaxed) => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    let mut cancelled_record = record.clone();
+                    cancelled_record.state = ProcessState::Cancelled;
+                    self.records
+                        .lock()
+                        .expect("process records lock")
+                        .insert(id, cancelled_record);
+                    return Err(AcError::new(
+                        "TOOL-COMMAND_CANCELLED",
+                        "command was cancelled and was killed",
+                        ac_common::ErrorKind::Unavailable,
+                        ac_common::Retryability::NotRetryable,
+                    ));
+                }
+                None if Instant::now() >= deadline => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    let mut timed_out = record.clone();
+                    timed_out.state = ProcessState::TimedOut;
+                    self.records
+                        .lock()
+                        .expect("process records lock")
+                        .insert(id, timed_out);
+                    return Err(AcError::new(
+                        "TOOL-COMMAND_TIMEOUT",
+                        "command timed out and was killed",
+                        ac_common::ErrorKind::Unavailable,
+                        ac_common::Retryability::Retryable,
+                    ));
+                }
+                None => std::thread::sleep(Duration::from_millis(10)),
+            }
+        }
+    }
+
+    pub fn start_background(
+        &self,
+        task: impl Into<String>,
+        plan: ac_sandbox::SandboxedExecutionPlan,
+    ) -> AcResult<StableId> {
+        let manifest = ExecutionManifest {
+            argv: plan.argv.clone(),
+            cwd: plan.cwd.clone(),
+            timeout_ms: plan.timeout_ms,
+            network: false,
+        };
+        let child = Command::new(&plan.argv[0])
+            .args(&plan.argv[1..])
+            .current_dir(&plan.cwd)
+            .env_clear()
+            .envs(&plan.allowed_env)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .map_err(|error| AcError::validation("TOOL-COMMAND_SPAWN_FAILED", error.to_string()))?;
+        let id = plan.id;
+        let record = ProcessRecord {
+            id: id.clone(),
+            task: task.into(),
+            manifest,
+            pid: child.id(),
+            state: ProcessState::Running,
+            started_at: TimestampMillis::now(),
+        };
+        self.children
+            .lock()
+            .expect("process children lock")
+            .insert(id.clone(), child);
+        self.records
+            .lock()
+            .expect("process records lock")
+            .insert(id.clone(), record);
+        Ok(id)
+    }
+
+    pub fn inspect(&self, id: &StableId) -> Option<ProcessRecord> {
+        self.records
+            .lock()
+            .expect("process records lock")
+            .get(id)
+            .cloned()
+    }
+
+    pub fn cancel(&self, id: &StableId) -> AcResult<()> {
+        let mut child = self
+            .children
+            .lock()
+            .expect("process children lock")
+            .remove(id)
+            .ok_or_else(|| {
+                AcError::validation(
+                    "TOOL-PROCESS_UNKNOWN",
+                    "background process is not registered",
+                )
+            })?;
+        child.kill().map_err(|error| {
+            AcError::validation("TOOL-PROCESS_CANCEL_FAILED", error.to_string())
+        })?;
+        let _ = child.wait();
+        let mut records = self.records.lock().expect("process records lock");
+        let record = records.get_mut(id).ok_or_else(|| {
+            AcError::validation("TOOL-PROCESS_UNKNOWN", "process record is not registered")
+        })?;
+        record.state = ProcessState::Cancelled;
+        Ok(())
+    }
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ToolDefinition {
@@ -70,6 +326,18 @@ impl WorkspaceTools {
         )?;
         broker.register_tool(
             ToolDefinition {
+                id: "fs.create".to_string(),
+                version: "1".to_string(),
+                required_capabilities: vec![Capability::FilesystemWrite(
+                    self.root.display().to_string(),
+                )],
+            },
+            Box::new(CreateFileTool {
+                root: self.root.clone(),
+            }),
+        )?;
+        broker.register_tool(
+            ToolDefinition {
                 id: "fs.read".to_string(),
                 version: "1".to_string(),
                 required_capabilities: vec![Capability::FilesystemRead(
@@ -77,6 +345,18 @@ impl WorkspaceTools {
                 )],
             },
             Box::new(ReadFileTool {
+                root: self.root.clone(),
+            }),
+        )?;
+        broker.register_tool(
+            ToolDefinition {
+                id: "fs.delete".to_string(),
+                version: "1".to_string(),
+                required_capabilities: vec![Capability::FilesystemWrite(
+                    self.root.display().to_string(),
+                )],
+            },
+            Box::new(DeleteFileTool {
                 root: self.root.clone(),
             }),
         )?;
@@ -119,6 +399,7 @@ impl WorkspaceTools {
                     max_timeout_ms: 30_000,
                 }),
                 cwd: self.root.clone(),
+                manager: ProcessManager::default(),
             }),
         )?;
         for (id, command) in [
@@ -145,6 +426,7 @@ impl WorkspaceTools {
                     }),
                     cwd: self.root.clone(),
                     argv: command.iter().map(ToString::to_string).collect(),
+                    manager: ProcessManager::default(),
                 }),
             )?;
         }
@@ -188,6 +470,48 @@ struct WriteFileTool {
     root: PathBuf,
 }
 
+struct CreateFileTool {
+    root: PathBuf,
+}
+
+impl ToolExecutor for CreateFileTool {
+    fn execute(&self, request: &ToolRequest) -> AcResult<String> {
+        let path = safe_join(&self.root, &request.payload)?;
+        if path.exists() {
+            return Err(AcError::conflict(
+                "TOOL-FS_CREATE_EXISTS",
+                "refusing to overwrite an existing file",
+            ));
+        }
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)
+                .map_err(|error| AcError::validation("TOOL-FS_CREATE_FAILED", error.to_string()))?;
+        }
+        fs::File::create(&path)
+            .map_err(|error| AcError::validation("TOOL-FS_CREATE_FAILED", error.to_string()))?;
+        Ok(format!("created:{}", request.payload))
+    }
+}
+
+struct DeleteFileTool {
+    root: PathBuf,
+}
+
+impl ToolExecutor for DeleteFileTool {
+    fn execute(&self, request: &ToolRequest) -> AcResult<String> {
+        let path = safe_join(&self.root, &request.payload)?;
+        if path.is_dir() {
+            return Err(AcError::policy_denied(
+                "TOOL-FS_DELETE_DIRECTORY",
+                "directory deletion is not permitted",
+            ));
+        }
+        fs::remove_file(&path)
+            .map_err(|error| AcError::validation("TOOL-FS_DELETE_FAILED", error.to_string()))?;
+        Ok(format!("deleted:{}", request.payload))
+    }
+}
+
 impl ToolExecutor for WriteFileTool {
     fn execute(&self, request: &ToolRequest) -> AcResult<String> {
         let (relative_path, content) = request.payload.split_once('\n').ok_or_else(|| {
@@ -222,6 +546,7 @@ impl ToolExecutor for SearchTool {
 struct CommandExecTool {
     sandbox: SandboxManager,
     cwd: PathBuf,
+    manager: ProcessManager,
 }
 
 impl ToolExecutor for CommandExecTool {
@@ -232,12 +557,13 @@ impl ToolExecutor for CommandExecTool {
                 "command payload cannot be empty",
             ));
         }
-        let argv = request
-            .payload
-            .split_whitespace()
-            .map(ToString::to_string)
-            .collect::<Vec<_>>();
-        run_sandboxed_command(&self.sandbox, self.cwd.clone(), argv, 5_000)
+        run_sandboxed_command(
+            &self.manager,
+            &self.sandbox,
+            self.cwd.clone(),
+            parse_argv(&request.payload)?,
+            5_000,
+        )
     }
 }
 
@@ -245,15 +571,23 @@ struct FixedCommandTool {
     sandbox: SandboxManager,
     cwd: PathBuf,
     argv: Vec<String>,
+    manager: ProcessManager,
 }
 
 impl ToolExecutor for FixedCommandTool {
     fn execute(&self, _request: &ToolRequest) -> AcResult<String> {
-        run_sandboxed_command(&self.sandbox, self.cwd.clone(), self.argv.clone(), 30_000)
+        run_sandboxed_command(
+            &self.manager,
+            &self.sandbox,
+            self.cwd.clone(),
+            self.argv.clone(),
+            30_000,
+        )
     }
 }
 
 fn run_sandboxed_command(
+    manager: &ProcessManager,
     sandbox: &SandboxManager,
     cwd: PathBuf,
     argv: Vec<String>,
@@ -266,43 +600,29 @@ fn run_sandboxed_command(
         network: false,
         timeout_ms,
     })?;
-    let mut child = Command::new(&plan.argv[0])
-        .args(&plan.argv[1..])
-        .current_dir(&plan.cwd)
-        .env_clear()
-        .envs(&plan.allowed_env)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|err| AcError::validation("TOOL-COMMAND_SPAWN_FAILED", err.to_string()))?;
-    let deadline = Instant::now() + Duration::from_millis(plan.timeout_ms);
-    loop {
-        if child
-            .try_wait()
-            .map_err(|err| AcError::validation("TOOL-COMMAND_WAIT_FAILED", err.to_string()))?
-            .is_some()
-        {
-            let output = child.wait_with_output().map_err(|err| {
-                AcError::validation("TOOL-COMMAND_OUTPUT_FAILED", err.to_string())
-            })?;
-            return Ok(format!(
-                "status:{}\nstdout:{}\nstderr:{}",
-                output.status.code().unwrap_or(-1),
-                String::from_utf8_lossy(&output.stdout),
-                String::from_utf8_lossy(&output.stderr)
-            ));
-        }
-        if Instant::now() >= deadline {
-            let _ = child.kill();
-            return Err(AcError::new(
-                "TOOL-COMMAND_TIMEOUT",
-                "command timed out and was killed",
-                ac_common::ErrorKind::Unavailable,
-                ac_common::Retryability::Retryable,
-            ));
-        }
-        std::thread::sleep(Duration::from_millis(10));
+    let result = manager.run("tool-command", plan)?;
+    Ok(format!(
+        "status:{}\nstdout:{}\nstderr:{}",
+        result.exit_code.unwrap_or(-1),
+        result.stdout,
+        result.stderr
+    ))
+}
+
+fn parse_argv(payload: &str) -> AcResult<Vec<String>> {
+    let argv = payload
+        .lines()
+        .map(str::trim)
+        .filter(|part| !part.is_empty())
+        .map(ToString::to_string)
+        .collect::<Vec<_>>();
+    if argv.is_empty() {
+        return Err(AcError::validation(
+            "TOOL-COMMAND_EMPTY",
+            "command argv requires one argument per line",
+        ));
     }
+    Ok(argv)
 }
 
 fn toolchain_env() -> BTreeMap<String, String> {
@@ -317,13 +637,45 @@ fn toolchain_env() -> BTreeMap<String, String> {
 }
 
 fn safe_join(root: &Path, relative: &str) -> AcResult<PathBuf> {
-    if relative.contains("..") || relative.starts_with('/') {
+    let root = fs::canonicalize(root)
+        .map_err(|error| AcError::validation("TOOL-PATH_RESOLUTION", error.to_string()))?;
+    let relative = Path::new(relative);
+    if relative.is_absolute()
+        || relative.components().any(|component| {
+            matches!(
+                component,
+                std::path::Component::ParentDir
+                    | std::path::Component::RootDir
+                    | std::path::Component::Prefix(_)
+            )
+        })
+    {
         return Err(AcError::policy_denied(
             "TOOL-PATH_ESCAPE",
             "tool path must stay inside workspace",
         ));
     }
-    Ok(root.join(relative))
+    let candidate = root.join(relative);
+    let resolved = if candidate.exists() {
+        fs::canonicalize(&candidate)
+            .map_err(|error| AcError::validation("TOOL-PATH_RESOLUTION", error.to_string()))?
+    } else {
+        let parent = candidate
+            .parent()
+            .ok_or_else(|| AcError::policy_denied("TOOL-PATH_ESCAPE", "tool path has no parent"))?;
+        let parent = fs::canonicalize(parent)
+            .map_err(|error| AcError::validation("TOOL-PATH_RESOLUTION", error.to_string()))?;
+        parent.join(candidate.file_name().ok_or_else(|| {
+            AcError::validation("TOOL-PATH_RESOLUTION", "tool path has no file name")
+        })?)
+    };
+    if !resolved.starts_with(&root) {
+        return Err(AcError::policy_denied(
+            "TOOL-PATH_SYMLINK_ESCAPE",
+            "resolved path escapes the workspace",
+        ));
+    }
+    Ok(resolved)
 }
 
 fn search_dir(
@@ -338,7 +690,12 @@ fn search_dir(
         let entry =
             entry.map_err(|err| AcError::validation("TOOL-SEARCH_FAILED", err.to_string()))?;
         let path = entry.path();
-        if path.is_dir() {
+        let metadata = fs::symlink_metadata(&path)
+            .map_err(|error| AcError::validation("TOOL-SEARCH_FAILED", error.to_string()))?;
+        if metadata.file_type().is_symlink() {
+            continue;
+        }
+        if metadata.is_dir() {
             search_dir(root, &path, needle, matches)?;
         } else if path.is_file() {
             let content = fs::read_to_string(&path).unwrap_or_default();
@@ -379,6 +736,12 @@ impl ToolBroker {
                 "tool id and version are required",
             ));
         }
+        if self.definitions.contains_key(&definition.id) {
+            return Err(AcError::conflict(
+                "TOOL-DUPLICATE_REGISTRATION",
+                "tool id is already registered",
+            ));
+        }
         self.executors.insert(definition.id.clone(), executor);
         self.definitions.insert(definition.id.clone(), definition);
         Ok(())
@@ -402,8 +765,7 @@ impl ToolBroker {
         let mut requested = definition.required_capabilities.clone();
         requested.extend(request.capabilities.clone());
         if self.policy.evaluate(&requested) != SecurityDecision::Allow {
-            let evidence_ref = evidence_store.append(
-                EvidenceKind::CommandOutput,
+            let evidence_ref = evidence_store.append_tool_output(
                 Provenance {
                     source: "tool-broker".to_string(),
                     commit: None,
@@ -412,6 +774,7 @@ impl ToolBroker {
                 },
                 format!("mem://tool/{}/denied", request.id),
                 "denied",
+                &[],
             )?;
             return Ok(ToolResult {
                 request_id: request.id,
@@ -427,8 +790,7 @@ impl ToolBroker {
         let observation = match executor.execute(&request) {
             Ok(observation) => observation,
             Err(error) => {
-                let evidence_ref = evidence_store.append(
-                    EvidenceKind::CommandOutput,
+                let evidence_ref = evidence_store.append_tool_output(
                     Provenance {
                         source: "tool-broker".to_string(),
                         commit: None,
@@ -436,7 +798,8 @@ impl ToolBroker {
                         tool: Some(request.tool_id.clone()),
                     },
                     format!("mem://tool/{}/failed", request.id),
-                    error.code(),
+                    error.to_string(),
+                    &[],
                 )?;
                 return Ok(ToolResult {
                     request_id: request.id,
@@ -447,8 +810,7 @@ impl ToolBroker {
                 });
             }
         };
-        let evidence_ref = evidence_store.append(
-            EvidenceKind::CommandOutput,
+        let evidence_ref = evidence_store.append_tool_output(
             Provenance {
                 source: "tool-broker".to_string(),
                 commit: None,
@@ -456,12 +818,8 @@ impl ToolBroker {
                 tool: Some(request.tool_id.clone()),
             },
             format!("mem://tool/{}/output", request.id),
-            format!(
-                "tool:{};params:{};len:{}",
-                request.tool_id,
-                request.payload.len(),
-                observation.len()
-            ),
+            observation.clone(),
+            &[],
         )?;
         Ok(ToolResult {
             request_id: request.id,
@@ -471,6 +829,159 @@ impl ToolBroker {
             finished_at: TimestampMillis::now(),
         })
     }
+
+    pub fn invoke_process_with_secrets(
+        &self,
+        manager: &ProcessManager,
+        secret_request: SecretProcessRequest<'_>,
+        secrets: &SecretBroker,
+        evidence_store: &mut EvidenceStore,
+    ) -> AcResult<ToolResult> {
+        let SecretProcessRequest {
+            request,
+            sandbox,
+            argv,
+            cwd,
+            timeout_ms,
+            secret_references,
+        } = secret_request;
+        let definition = self
+            .definitions
+            .get(&request.tool_id)
+            .ok_or_else(|| AcError::validation("TOOL-UNKNOWN_TOOL", "tool is not registered"))?;
+        let mut requested = definition.required_capabilities.clone();
+        requested.extend(request.capabilities.clone());
+        requested.extend(
+            secret_references
+                .values()
+                .cloned()
+                .map(Capability::SecretRead),
+        );
+        if self.policy.evaluate(&requested) != SecurityDecision::Allow {
+            return self.denied_result(request, evidence_store, "policy denied tool invocation");
+        }
+        let (plan, secret_values) = match sandbox.prepare_execution_with_secrets(
+            ExecRequest {
+                argv,
+                cwd,
+                env: toolchain_env(),
+                network: false,
+                timeout_ms,
+            },
+            secret_references,
+            secrets,
+        ) {
+            Ok(value) => value,
+            Err(error) => {
+                return self.failed_result(request, evidence_store, error.to_string(), &[])
+            }
+        };
+        match manager.run("secret-command", plan) {
+            Ok(output) => self.completed_result(
+                request,
+                evidence_store,
+                format!(
+                    "status:{}\nstdout:{}\nstderr:{}",
+                    output.exit_code.unwrap_or(-1),
+                    output.stdout,
+                    output.stderr
+                ),
+                &secret_values,
+            ),
+            Err(error) => {
+                self.failed_result(request, evidence_store, error.to_string(), &secret_values)
+            }
+        }
+    }
+
+    fn denied_result(
+        &self,
+        request: ToolRequest,
+        evidence_store: &mut EvidenceStore,
+        message: &str,
+    ) -> AcResult<ToolResult> {
+        let evidence_ref = evidence_store.append_tool_output(
+            EvidenceStore::new_provenance(&request.tool_id),
+            format!("mem://tool/{}/denied", request.id),
+            message,
+            &[],
+        )?;
+        Ok(ToolResult {
+            request_id: request.id,
+            status: ToolStatus::Denied,
+            observation: message.to_string(),
+            evidence_ref,
+            finished_at: TimestampMillis::now(),
+        })
+    }
+
+    fn failed_result(
+        &self,
+        request: ToolRequest,
+        evidence_store: &mut EvidenceStore,
+        message: String,
+        secrets: &[String],
+    ) -> AcResult<ToolResult> {
+        let evidence_ref = evidence_store.append_tool_output(
+            EvidenceStore::new_provenance(&request.tool_id),
+            format!("mem://tool/{}/failed", request.id),
+            message.clone(),
+            secrets,
+        )?;
+        Ok(ToolResult {
+            request_id: request.id,
+            status: ToolStatus::Failed,
+            observation: redact_for_agent(&message, secrets),
+            evidence_ref,
+            finished_at: TimestampMillis::now(),
+        })
+    }
+
+    fn completed_result(
+        &self,
+        request: ToolRequest,
+        evidence_store: &mut EvidenceStore,
+        observation: String,
+        secrets: &[String],
+    ) -> AcResult<ToolResult> {
+        let evidence_ref = evidence_store.append_tool_output(
+            EvidenceStore::new_provenance(&request.tool_id),
+            format!("mem://tool/{}/output", request.id),
+            observation.clone(),
+            secrets,
+        )?;
+        Ok(ToolResult {
+            request_id: request.id,
+            status: ToolStatus::Succeeded,
+            observation: redact_for_agent(&observation, secrets),
+            evidence_ref,
+            finished_at: TimestampMillis::now(),
+        })
+    }
+}
+
+trait ToolProvenance {
+    fn new_provenance(tool: &str) -> Provenance;
+}
+
+impl ToolProvenance for EvidenceStore {
+    fn new_provenance(tool: &str) -> Provenance {
+        Provenance {
+            source: "tool-broker".to_string(),
+            commit: None,
+            worktree: None,
+            tool: Some(tool.to_string()),
+        }
+    }
+}
+
+fn redact_for_agent(value: &str, secrets: &[String]) -> String {
+    secrets
+        .iter()
+        .filter(|secret| !secret.is_empty())
+        .fold(value.to_string(), |value, secret| {
+            value.replace(secret, "[REDACTED]")
+        })
 }
 
 pub struct CommandPlanner<'a> {
@@ -560,7 +1071,7 @@ mod tests {
                     id: StableId::new("toolreq"),
                     tool_id: "cmd.exec".to_string(),
                     tool_version: "1".to_string(),
-                    payload: "echo ok".to_string(),
+                    payload: "echo\nok".to_string(),
                     capabilities: vec![Capability::ProcessExec("echo".to_string())],
                 },
                 &mut evidence,
@@ -614,6 +1125,174 @@ mod tests {
         assert_eq!(result.status, ToolStatus::Succeeded);
         assert!(result.observation.contains("README.md"));
         assert_eq!(evidence.len(), 1);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    fn permitted_sandbox(root: PathBuf, timeout_ms: u64) -> SandboxManager {
+        SandboxManager::new(SandboxPolicy {
+            workspace_roots: vec![root],
+            capability_policy: CapabilityPolicy::new()
+                .allow(Capability::ProcessExec("*".to_string())),
+            network_default_allow: false,
+            max_timeout_ms: timeout_ms,
+        })
+    }
+
+    #[test]
+    fn workspace_guard_blocks_traversal_and_symlink_escapes() {
+        let root = std::env::temp_dir().join(format!("agentcode-guard-{}", StableId::new("t")));
+        let outside =
+            std::env::temp_dir().join(format!("agentcode-outside-{}", StableId::new("t")));
+        fs::create_dir_all(&root).unwrap();
+        fs::write(&outside, "outside").unwrap();
+        assert_eq!(
+            safe_join(&root, "../outside").unwrap_err().code(),
+            "TOOL-PATH_ESCAPE"
+        );
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(&outside, root.join("escape")).unwrap();
+            assert_eq!(
+                safe_join(&root, "escape").unwrap_err().code(),
+                "TOOL-PATH_SYMLINK_ESCAPE"
+            );
+        }
+        let _ = fs::remove_dir_all(root);
+        let _ = fs::remove_file(outside);
+    }
+
+    #[test]
+    fn process_manager_times_out_and_cancels_background_process() {
+        let root = std::env::temp_dir().join(format!("agentcode-process-{}", StableId::new("t")));
+        fs::create_dir_all(&root).unwrap();
+        let sandbox = permitted_sandbox(root.clone(), 1_000);
+        let manager = ProcessManager::default();
+        let timeout_plan = sandbox
+            .prepare_execution(ExecRequest {
+                argv: vec!["/bin/sleep".to_string(), "1".to_string()],
+                cwd: root.clone(),
+                env: BTreeMap::new(),
+                network: false,
+                timeout_ms: 20,
+            })
+            .unwrap();
+        assert_eq!(
+            manager.run("timeout", timeout_plan).unwrap_err().code(),
+            "TOOL-COMMAND_TIMEOUT"
+        );
+        let background_plan = sandbox
+            .prepare_execution(ExecRequest {
+                argv: vec!["/bin/sleep".to_string(), "1".to_string()],
+                cwd: root.clone(),
+                env: BTreeMap::new(),
+                network: false,
+                timeout_ms: 1_000,
+            })
+            .unwrap();
+        let id = manager
+            .start_background("background", background_plan)
+            .unwrap();
+        assert_eq!(manager.inspect(&id).unwrap().state, ProcessState::Running);
+        manager.cancel(&id).unwrap();
+        assert_eq!(manager.inspect(&id).unwrap().state, ProcessState::Cancelled);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn cancellation_is_structured_and_keeps_partial_output_evidence() {
+        let root = std::env::temp_dir().join(format!("agentcode-cancel-{}", StableId::new("t")));
+        fs::create_dir_all(&root).unwrap();
+        let sandbox = permitted_sandbox(root.clone(), 1_000);
+        let plan = sandbox
+            .prepare_execution(ExecRequest {
+                argv: vec!["/bin/sleep".to_string(), "1".to_string()],
+                cwd: root.clone(),
+                env: BTreeMap::new(),
+                network: false,
+                timeout_ms: 1_000,
+            })
+            .unwrap();
+        let manager = ProcessManager::default();
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let signal = cancelled.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(20));
+            signal.store(true, Ordering::Relaxed);
+        });
+        assert_eq!(
+            manager
+                .run_with_cancellation("cancel", plan, &cancelled)
+                .unwrap_err()
+                .code(),
+            "TOOL-COMMAND_CANCELLED"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn approved_secret_process_is_redacted_from_agent_result() {
+        let root = std::env::temp_dir().join(format!("agentcode-secret-{}", StableId::new("t")));
+        fs::create_dir_all(&root).unwrap();
+        let mut broker = ToolBroker::new(
+            CapabilityPolicy::new()
+                .allow(Capability::ProcessExec("*".to_string()))
+                .allow(Capability::SecretRead("*".to_string())),
+        );
+        broker
+            .register_tool(
+                ToolDefinition {
+                    id: "secret.exec".to_string(),
+                    version: "1".to_string(),
+                    required_capabilities: vec![Capability::ProcessExec("*".to_string())],
+                },
+                Box::new(EchoExecutor),
+            )
+            .unwrap();
+        let sandbox = SandboxManager::new(SandboxPolicy {
+            workspace_roots: vec![root.clone()],
+            capability_policy: CapabilityPolicy::new()
+                .allow(Capability::ProcessExec("*".to_string()))
+                .allow(Capability::SecretRead("*".to_string())),
+            network_default_allow: false,
+            max_timeout_ms: 1_000,
+        });
+        let mut secrets = SecretBroker::default();
+        secrets.insert("test.canary", "canary-secret").unwrap();
+        let refs = BTreeMap::from([(
+            "AGENTCODE_TEST_SECRET".to_string(),
+            "test.canary".to_string(),
+        )]);
+        let mut evidence = EvidenceStore::new();
+        let result = broker
+            .invoke_process_with_secrets(
+                &ProcessManager::default(),
+                SecretProcessRequest {
+                    request: ToolRequest {
+                        id: StableId::new("toolreq"),
+                        tool_id: "secret.exec".to_string(),
+                        tool_version: "1".to_string(),
+                        payload: String::new(),
+                        capabilities: vec![Capability::ProcessExec("/usr/bin/env".to_string())],
+                    },
+                    sandbox: &sandbox,
+                    argv: vec!["/usr/bin/env".to_string()],
+                    cwd: root.clone(),
+                    timeout_ms: 1_000,
+                    secret_references: &refs,
+                },
+                &secrets,
+                &mut evidence,
+            )
+            .unwrap();
+        assert_eq!(result.status, ToolStatus::Succeeded);
+        assert!(!result.observation.contains("canary-secret"));
+        assert!(evidence
+            .get(&result.evidence_ref)
+            .unwrap()
+            .raw_content
+            .as_ref()
+            .unwrap()
+            .contains("canary-secret"));
         let _ = fs::remove_dir_all(root);
     }
 }

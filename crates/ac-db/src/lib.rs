@@ -5,7 +5,7 @@ use ac_common::{AcError, AcResult, StableId, TimestampMillis};
 use ac_evidence::EvidenceRecord;
 use ac_git::{CheckpointRecord, WorktreeRecord};
 use ac_kernel::{KernelDecisionKind, KernelEvent, Mission, MissionState};
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OptionalExtension};
 
 pub struct ControlPlaneDb {
     connection: Connection,
@@ -215,6 +215,18 @@ pub struct RoutingDecisionRecord {
     pub output_tokens: u32,
     pub estimated_cost_micros: u64,
     pub created_at_ms: i64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ToolExecutionRecord {
+    pub id: String,
+    pub tool_call_id: String,
+    pub tool_id: String,
+    pub status: String,
+    pub manifest_json: String,
+    pub raw_output: String,
+    pub evidence_ref: String,
+    pub created_at_ms: u128,
 }
 
 impl ControlPlaneDb {
@@ -559,6 +571,26 @@ impl ControlPlaneDb {
         }
         Ok(None)
     }
+
+    pub fn save_tool_execution(&self, record: &ToolExecutionRecord) -> AcResult<()> {
+        self.connection.execute(
+            "INSERT INTO tool_execution_records (id, tool_call_id, tool_id, status, manifest_json, raw_output, evidence_ref, created_at_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+             ON CONFLICT(id) DO NOTHING",
+            params![record.id, record.tool_call_id, record.tool_id, record.status, record.manifest_json, record.raw_output, record.evidence_ref, record.created_at_ms as i64],
+        ).map_err(db_error)?;
+        Ok(())
+    }
+
+    pub fn tool_execution(&self, id: &str) -> AcResult<Option<ToolExecutionRecord>> {
+        self.connection.query_row(
+            "SELECT id, tool_call_id, tool_id, status, manifest_json, raw_output, evidence_ref, created_at_ms FROM tool_execution_records WHERE id = ?1",
+            [id],
+            |row| Ok(ToolExecutionRecord {
+                id: row.get(0)?, tool_call_id: row.get(1)?, tool_id: row.get(2)?, status: row.get(3)?, manifest_json: row.get(4)?, raw_output: row.get(5)?, evidence_ref: row.get(6)?, created_at_ms: row.get::<_, i64>(7)? as u128,
+            }),
+        ).optional().map_err(db_error)
+    }
 }
 
 fn millis(ts: TimestampMillis) -> i64 {
@@ -803,6 +835,32 @@ mod tests {
             assert_eq!(loaded.output_tokens, 11);
             assert!(!format!("{:?}", loaded).contains("SECRET"));
         }
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn tool_output_evidence_survives_reopen() {
+        let path =
+            std::env::temp_dir().join(format!("agentcode-tool-{}.sqlite", StableId::new("db")));
+        let record = ToolExecutionRecord {
+            id: StableId::new("toolrun").to_string(),
+            tool_call_id: StableId::new("toolreq").to_string(),
+            tool_id: "cmd.exec".to_string(),
+            status: "Succeeded".to_string(),
+            manifest_json: "argv:/usr/bin/env".to_string(),
+            raw_output: "status:0\nstdout:ok".to_string(),
+            evidence_ref: StableId::new("ev").to_string(),
+            created_at_ms: millis(TimestampMillis::now()) as u128,
+        };
+        {
+            let mut db = ControlPlaneDb::open(&path).unwrap();
+            db.migrate().unwrap();
+            db.save_tool_execution(&record).unwrap();
+        }
+        let db = ControlPlaneDb::open(&path).unwrap();
+        let loaded = db.tool_execution(&record.id).unwrap().unwrap();
+        assert_eq!(loaded.raw_output, record.raw_output);
+        assert_eq!(loaded.evidence_ref, record.evidence_ref);
         let _ = fs::remove_file(path);
     }
 

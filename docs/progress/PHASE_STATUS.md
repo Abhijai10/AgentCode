@@ -5,7 +5,7 @@ Doc 10 gates for the phase pass and completion evidence exists).
 
 Phase names are the EXACT canonical names from Doc 09 HC-P00..HC-P29 (no aliases).
 
-Last updated: 2026-08-21 (Phase 3 autonomous coding capability complete)
+Last updated: 2026-08-24 (Phase 5 native tool runtime closure)
 
 | Phase | Name (Doc 09 HC-*) | Status | Notes |
 |-------|--------------------|--------|-------|
@@ -14,7 +14,7 @@ Last updated: 2026-08-21 (Phase 3 autonomous coding capability complete)
 | P02 | Repository Skeleton & Development Infrastructure | COMPLETE | P02-WP01 ACCEPTED; P2-G1..P2-G8 PASS; evidence: docs/progress/phase-02-completion.md (+ .json) |
 | P03 | Background Daemon & Persistent Kernel Foundation | COMPLETE | P03-WP01 ACCEPTED for autonomous coding scope; SQLite persists Kernel mission/event state plus AgentSession, WorktreeRecord, ChangeSet, and checkpoint recovery evidence; completion evidence: docs/progress/phase-03-completion.md (+ .json) |
 | P04 | Model Broker & OmniRoute Provider Fabric | COMPLETE | P04-WP01..P04-WP12 ACCEPTED; ProviderRegistry owns OmniRoute-style routing, model catalog, provider connections, local Ollama route, health/circuit/fallback, cost policy, and persisted routing evidence; evidence: docs/progress/phase-04-completion.md (+ .json) |
-| P05 | Native Tool Runtime Foundation | COMPLETE | P05-WP01 ACCEPTED for autonomous coding scope; repository/development/file tools route through Tool Broker/Sandbox and emit evidence for planning, verification, repair, and benchmark execution |
+| P05 | Native Tool Runtime Foundation | COMPLETE | P05-WP01..P05-WP11 ACCEPTED; Brokered filesystem/process runtime enforces canonical workspace paths, capability/risk/role policy, secret redaction, structured raw evidence, persistent execution records, timeout/cancellation, and background process control; evidence: docs/progress/phase-05-completion.md (+ .json) |
 | P06 | Basic Worker Agent Loop | COMPLETE | P06-WP01 ACCEPTED; structured planning, context retrieval, Tool Broker execution, generated repair planning, ChangeSet artifact lifecycle, Kernel approval, and autonomous benchmark pass |
 | P07 | Git, Worktrees & Checkpointing | COMPLETE | P07-WP01 ACCEPTED; real git worktree create/checkpoint/recover/cleanup, controlled local merge, rejected merge, and conflict rollback are tested |
 | P08 | Code Intelligence Foundation | COMPLETE | P08-WP01 ACCEPTED for autonomous coding scope; ContextBuilder indexes isolated workspace files and ranks snippets as evidence/context; deeper graph/freshness work remains later roadmap scope |

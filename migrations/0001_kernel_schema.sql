@@ -81,3 +81,14 @@ CREATE TABLE IF NOT EXISTS provider_routing_decisions (
     estimated_cost_micros INTEGER NOT NULL,
     created_at_ms INTEGER NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS tool_execution_records (
+    id TEXT PRIMARY KEY,
+    tool_call_id TEXT NOT NULL,
+    tool_id TEXT NOT NULL,
+    status TEXT NOT NULL,
+    manifest_json TEXT NOT NULL,
+    raw_output TEXT NOT NULL,
+    evidence_ref TEXT NOT NULL,
+    created_at_ms INTEGER NOT NULL
+);
