@@ -84,6 +84,90 @@ pub struct ContextSnapshotRow {
     pub created_at_ms: i64,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ContextPackManifestRow {
+    pub id: String,
+    pub pack_id: String,
+    pub task_id: String,
+    pub role: String,
+    pub profile: String,
+    pub source_fragment_ids: String,
+    pub omitted_fragment_ids: String,
+    pub raw_evidence_refs: String,
+    pub cache_keys: String,
+    pub score_trace: String,
+    pub total_input_tokens: u32,
+    pub hard_ceiling: u32,
+    pub created_at_ms: i64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ContextCompressionReceiptRow {
+    pub id: String,
+    pub raw_evidence_ref: String,
+    pub command_class: String,
+    pub compressor_id: String,
+    pub raw_hash: String,
+    pub compressed_output: String,
+    pub raw_token_estimate: u32,
+    pub compressed_token_estimate: u32,
+    pub omitted_lines: u32,
+    pub created_at_ms: i64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ContextCacheEntryRow {
+    pub cache_key: String,
+    pub content_hash: String,
+    pub token_estimate: u32,
+    pub source_ref: String,
+    pub created_at_ms: i64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ContextRetrievalRecordRow {
+    pub id: String,
+    pub pack_id: String,
+    pub need: String,
+    pub reason: String,
+    pub query: String,
+    pub result_fragment_ids: String,
+    pub added_tokens: u32,
+    pub degraded: bool,
+    pub created_at_ms: i64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ContextPackMetricsRow {
+    pub id: String,
+    pub pack_id: String,
+    pub role: String,
+    pub selected_fragments: usize,
+    pub omitted_fragments: usize,
+    pub total_input_tokens: u32,
+    pub budget_target: u32,
+    pub hard_ceiling: u32,
+    pub deduped_fragments: usize,
+    pub redacted_fragments: usize,
+    pub retrieval_steps: usize,
+    pub cache_hits: usize,
+    pub created_at_ms: i64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ContextBenchmarkResultRow {
+    pub id: String,
+    pub task_name: String,
+    pub broad_tokens: u32,
+    pub targeted_tokens: u32,
+    pub broad_success: bool,
+    pub targeted_success: bool,
+    pub retry_delta: i32,
+    pub latency_delta_ms: i64,
+    pub passed: bool,
+    pub created_at_ms: i64,
+}
+
 impl ControlPlaneDb {
     pub fn open(path: impl AsRef<Path>) -> AcResult<Self> {
         let connection = Connection::open(path).map_err(db_error)?;
@@ -101,11 +185,11 @@ impl ControlPlaneDb {
 
     pub fn migrate(&mut self) -> AcResult<()> {
         let current_version = self.user_version()?;
-        if current_version > 5 {
+        if current_version > 6 {
             return Err(AcError::conflict(
                 "DB-FUTURE_VERSION",
                 format!(
-                    "database user_version {current_version} is newer than supported version 5"
+                    "database user_version {current_version} is newer than supported version 6"
                 ),
             ));
         }
@@ -136,7 +220,11 @@ impl ControlPlaneDb {
             ))
             .map_err(db_error)?;
         }
-        tx.pragma_update(None, "user_version", 5)
+        if current_version < 6 {
+            tx.execute_batch(include_str!("../../../migrations/0006_context_engine.sql"))
+                .map_err(db_error)?;
+        }
+        tx.pragma_update(None, "user_version", 6)
             .map_err(db_error)?;
         tx.commit().map_err(db_error)?;
         Ok(())
@@ -609,6 +697,321 @@ impl ControlPlaneDb {
                         content: row.get(6)?,
                         source_fact_ids: row.get(7)?,
                         decision_refs: row.get(8)?,
+                        created_at_ms: row.get(9)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(db_error)
+    }
+
+    pub fn save_context_pack_manifest(&self, manifest: &ContextPackManifestRow) -> AcResult<()> {
+        if manifest.source_fragment_ids.trim().is_empty() {
+            return Err(AcError::validation(
+                "DB-CONTEXT_MANIFEST_INVALID",
+                "context manifest requires source fragment provenance",
+            ));
+        }
+        self.connection
+            .execute(
+                "INSERT INTO context_pack_manifests VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+                params![
+                    manifest.id,
+                    manifest.pack_id,
+                    manifest.task_id,
+                    manifest.role,
+                    manifest.profile,
+                    manifest.source_fragment_ids,
+                    manifest.omitted_fragment_ids,
+                    manifest.raw_evidence_refs,
+                    manifest.cache_keys,
+                    manifest.score_trace,
+                    manifest.total_input_tokens,
+                    manifest.hard_ceiling,
+                    manifest.created_at_ms
+                ],
+            )
+            .map_err(db_error)?;
+        Ok(())
+    }
+
+    pub fn context_pack_manifest(&self, id: &str) -> AcResult<Option<ContextPackManifestRow>> {
+        self.connection
+            .query_row(
+                "SELECT id, pack_id, task_id, role, profile, source_fragment_ids,
+                        omitted_fragment_ids, raw_evidence_refs, cache_keys, score_trace,
+                        total_input_tokens, hard_ceiling, created_at_ms
+                 FROM context_pack_manifests WHERE id=?1",
+                params![id],
+                |row| {
+                    Ok(ContextPackManifestRow {
+                        id: row.get(0)?,
+                        pack_id: row.get(1)?,
+                        task_id: row.get(2)?,
+                        role: row.get(3)?,
+                        profile: row.get(4)?,
+                        source_fragment_ids: row.get(5)?,
+                        omitted_fragment_ids: row.get(6)?,
+                        raw_evidence_refs: row.get(7)?,
+                        cache_keys: row.get(8)?,
+                        score_trace: row.get(9)?,
+                        total_input_tokens: row.get(10)?,
+                        hard_ceiling: row.get(11)?,
+                        created_at_ms: row.get(12)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(db_error)
+    }
+
+    pub fn save_context_compression_receipt(
+        &self,
+        receipt: &ContextCompressionReceiptRow,
+    ) -> AcResult<()> {
+        self.connection
+            .execute(
+                "INSERT INTO context_compression_receipts VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                params![
+                    receipt.id,
+                    receipt.raw_evidence_ref,
+                    receipt.command_class,
+                    receipt.compressor_id,
+                    receipt.raw_hash,
+                    receipt.compressed_output,
+                    receipt.raw_token_estimate,
+                    receipt.compressed_token_estimate,
+                    receipt.omitted_lines,
+                    receipt.created_at_ms
+                ],
+            )
+            .map_err(db_error)?;
+        Ok(())
+    }
+
+    pub fn context_compression_receipt(
+        &self,
+        id: &str,
+    ) -> AcResult<Option<ContextCompressionReceiptRow>> {
+        self.connection
+            .query_row(
+                "SELECT id, raw_evidence_ref, command_class, compressor_id, raw_hash,
+                        compressed_output, raw_token_estimate, compressed_token_estimate,
+                        omitted_lines, created_at_ms
+                 FROM context_compression_receipts WHERE id=?1",
+                params![id],
+                |row| {
+                    Ok(ContextCompressionReceiptRow {
+                        id: row.get(0)?,
+                        raw_evidence_ref: row.get(1)?,
+                        command_class: row.get(2)?,
+                        compressor_id: row.get(3)?,
+                        raw_hash: row.get(4)?,
+                        compressed_output: row.get(5)?,
+                        raw_token_estimate: row.get(6)?,
+                        compressed_token_estimate: row.get(7)?,
+                        omitted_lines: row.get(8)?,
+                        created_at_ms: row.get(9)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(db_error)
+    }
+
+    pub fn save_context_cache_entry(&self, entry: &ContextCacheEntryRow) -> AcResult<()> {
+        self.connection
+            .execute(
+                "INSERT INTO context_cache_entries VALUES (?1, ?2, ?3, ?4, ?5)
+                 ON CONFLICT(cache_key) DO UPDATE SET
+                    content_hash=excluded.content_hash,
+                    token_estimate=excluded.token_estimate,
+                    source_ref=excluded.source_ref,
+                    created_at_ms=excluded.created_at_ms",
+                params![
+                    entry.cache_key,
+                    entry.content_hash,
+                    entry.token_estimate,
+                    entry.source_ref,
+                    entry.created_at_ms
+                ],
+            )
+            .map_err(db_error)?;
+        Ok(())
+    }
+
+    pub fn context_cache_entry(&self, cache_key: &str) -> AcResult<Option<ContextCacheEntryRow>> {
+        self.connection
+            .query_row(
+                "SELECT cache_key, content_hash, token_estimate, source_ref, created_at_ms
+                 FROM context_cache_entries WHERE cache_key=?1",
+                params![cache_key],
+                |row| {
+                    Ok(ContextCacheEntryRow {
+                        cache_key: row.get(0)?,
+                        content_hash: row.get(1)?,
+                        token_estimate: row.get(2)?,
+                        source_ref: row.get(3)?,
+                        created_at_ms: row.get(4)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(db_error)
+    }
+
+    pub fn save_context_retrieval_record(
+        &self,
+        record: &ContextRetrievalRecordRow,
+    ) -> AcResult<()> {
+        self.connection
+            .execute(
+                "INSERT INTO context_retrieval_records VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                params![
+                    record.id,
+                    record.pack_id,
+                    record.need,
+                    record.reason,
+                    record.query,
+                    record.result_fragment_ids,
+                    record.added_tokens,
+                    if record.degraded { 1_i64 } else { 0_i64 },
+                    record.created_at_ms
+                ],
+            )
+            .map_err(db_error)?;
+        Ok(())
+    }
+
+    pub fn context_retrieval_records(
+        &self,
+        pack_id: &str,
+    ) -> AcResult<Vec<ContextRetrievalRecordRow>> {
+        let mut stmt = self
+            .connection
+            .prepare(
+                "SELECT id, pack_id, need, reason, query, result_fragment_ids, added_tokens,
+                        degraded, created_at_ms
+                 FROM context_retrieval_records WHERE pack_id=?1 ORDER BY created_at_ms ASC",
+            )
+            .map_err(db_error)?;
+        let rows = stmt
+            .query_map(params![pack_id], |row| {
+                Ok(ContextRetrievalRecordRow {
+                    id: row.get(0)?,
+                    pack_id: row.get(1)?,
+                    need: row.get(2)?,
+                    reason: row.get(3)?,
+                    query: row.get(4)?,
+                    result_fragment_ids: row.get(5)?,
+                    added_tokens: row.get(6)?,
+                    degraded: row.get::<_, i64>(7)? != 0,
+                    created_at_ms: row.get(8)?,
+                })
+            })
+            .map_err(db_error)?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(db_error)
+    }
+
+    pub fn save_context_pack_metrics(&self, metrics: &ContextPackMetricsRow) -> AcResult<()> {
+        self.connection
+            .execute(
+                "INSERT INTO context_pack_metrics VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+                params![
+                    metrics.id,
+                    metrics.pack_id,
+                    metrics.role,
+                    metrics.selected_fragments as i64,
+                    metrics.omitted_fragments as i64,
+                    metrics.total_input_tokens,
+                    metrics.budget_target,
+                    metrics.hard_ceiling,
+                    metrics.deduped_fragments as i64,
+                    metrics.redacted_fragments as i64,
+                    metrics.retrieval_steps as i64,
+                    metrics.cache_hits as i64,
+                    metrics.created_at_ms
+                ],
+            )
+            .map_err(db_error)?;
+        Ok(())
+    }
+
+    pub fn context_pack_metrics(&self, pack_id: &str) -> AcResult<Option<ContextPackMetricsRow>> {
+        self.connection
+            .query_row(
+                "SELECT id, pack_id, role, selected_fragments, omitted_fragments,
+                        total_input_tokens, budget_target, hard_ceiling, deduped_fragments,
+                        redacted_fragments, retrieval_steps, cache_hits, created_at_ms
+                 FROM context_pack_metrics WHERE pack_id=?1",
+                params![pack_id],
+                |row| {
+                    Ok(ContextPackMetricsRow {
+                        id: row.get(0)?,
+                        pack_id: row.get(1)?,
+                        role: row.get(2)?,
+                        selected_fragments: row.get::<_, i64>(3)? as usize,
+                        omitted_fragments: row.get::<_, i64>(4)? as usize,
+                        total_input_tokens: row.get(5)?,
+                        budget_target: row.get(6)?,
+                        hard_ceiling: row.get(7)?,
+                        deduped_fragments: row.get::<_, i64>(8)? as usize,
+                        redacted_fragments: row.get::<_, i64>(9)? as usize,
+                        retrieval_steps: row.get::<_, i64>(10)? as usize,
+                        cache_hits: row.get::<_, i64>(11)? as usize,
+                        created_at_ms: row.get(12)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(db_error)
+    }
+
+    pub fn save_context_benchmark_result(
+        &self,
+        result: &ContextBenchmarkResultRow,
+    ) -> AcResult<()> {
+        self.connection
+            .execute(
+                "INSERT INTO context_benchmark_results VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                params![
+                    result.id,
+                    result.task_name,
+                    result.broad_tokens,
+                    result.targeted_tokens,
+                    if result.broad_success { 1_i64 } else { 0_i64 },
+                    if result.targeted_success { 1_i64 } else { 0_i64 },
+                    result.retry_delta,
+                    result.latency_delta_ms,
+                    if result.passed { 1_i64 } else { 0_i64 },
+                    result.created_at_ms
+                ],
+            )
+            .map_err(db_error)?;
+        Ok(())
+    }
+
+    pub fn context_benchmark_result(
+        &self,
+        id: &str,
+    ) -> AcResult<Option<ContextBenchmarkResultRow>> {
+        self.connection
+            .query_row(
+                "SELECT id, task_name, broad_tokens, targeted_tokens, broad_success,
+                        targeted_success, retry_delta, latency_delta_ms, passed, created_at_ms
+                 FROM context_benchmark_results WHERE id=?1",
+                params![id],
+                |row| {
+                    Ok(ContextBenchmarkResultRow {
+                        id: row.get(0)?,
+                        task_name: row.get(1)?,
+                        broad_tokens: row.get(2)?,
+                        targeted_tokens: row.get(3)?,
+                        broad_success: row.get::<_, i64>(4)? != 0,
+                        targeted_success: row.get::<_, i64>(5)? != 0,
+                        retry_delta: row.get(6)?,
+                        latency_delta_ms: row.get(7)?,
+                        passed: row.get::<_, i64>(8)? != 0,
                         created_at_ms: row.get(9)?,
                     })
                 },
@@ -1364,7 +1767,7 @@ mod tests {
     fn sqlite_store_persists_kernel_state() {
         let mut db = ControlPlaneDb::open_memory().unwrap();
         db.migrate().unwrap();
-        assert_eq!(db.user_version().unwrap(), 5);
+        assert_eq!(db.user_version().unwrap(), 6);
 
         let mut kernel = Kernel::new(AllowAllPolicy);
         kernel.start().unwrap();
@@ -1726,6 +2129,133 @@ mod tests {
                 .unwrap()
                 .content
                 .contains("not authority"));
+        }
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn context_engine_receipts_survive_reopen() {
+        let path =
+            std::env::temp_dir().join(format!("agentcode-context-{}.sqlite", StableId::new("db")));
+        let manifest = ContextPackManifestRow {
+            id: StableId::new("ctxmanifest").to_string(),
+            pack_id: StableId::new("ctx").to_string(),
+            task_id: "task-11".to_string(),
+            role: "WORKER".to_string(),
+            profile: "NORMAL".to_string(),
+            source_fragment_ids: "ctxfrag-1,ctxfrag-2".to_string(),
+            omitted_fragment_ids: "ctxfrag-3".to_string(),
+            raw_evidence_refs: "raw-1".to_string(),
+            cache_keys: "commit:abc:src/lib.rs".to_string(),
+            score_trace: "ctxfrag-1:TARGET_SOURCE:195".to_string(),
+            total_input_tokens: 320,
+            hard_ceiling: 500,
+            created_at_ms: millis(TimestampMillis::now()),
+        };
+        let compression = ContextCompressionReceiptRow {
+            id: StableId::new("ctxcompress").to_string(),
+            raw_evidence_ref: "raw-1".to_string(),
+            command_class: "tests".to_string(),
+            compressor_id: "agentcode-rtk-fallback-v1".to_string(),
+            raw_hash: "hash".to_string(),
+            compressed_output: "error: failed assertion".to_string(),
+            raw_token_estimate: 80,
+            compressed_token_estimate: 12,
+            omitted_lines: 9,
+            created_at_ms: millis(TimestampMillis::now()),
+        };
+        let cache = ContextCacheEntryRow {
+            cache_key: "commit:abc:src/lib.rs".to_string(),
+            content_hash: "hash".to_string(),
+            token_estimate: 120,
+            source_ref: "src-lib".to_string(),
+            created_at_ms: millis(TimestampMillis::now()),
+        };
+        let retrieval = ContextRetrievalRecordRow {
+            id: StableId::new("ctxret").to_string(),
+            pack_id: manifest.pack_id.clone(),
+            need: "need_related_tests".to_string(),
+            reason: "worker requested tests".to_string(),
+            query: "auth".to_string(),
+            result_fragment_ids: "ctxfrag-2".to_string(),
+            added_tokens: 30,
+            degraded: false,
+            created_at_ms: millis(TimestampMillis::now()),
+        };
+        let metrics = ContextPackMetricsRow {
+            id: StableId::new("ctxmetric").to_string(),
+            pack_id: manifest.pack_id.clone(),
+            role: "WORKER".to_string(),
+            selected_fragments: 2,
+            omitted_fragments: 1,
+            total_input_tokens: 320,
+            budget_target: 400,
+            hard_ceiling: 500,
+            deduped_fragments: 1,
+            redacted_fragments: 1,
+            retrieval_steps: 1,
+            cache_hits: 1,
+            created_at_ms: millis(TimestampMillis::now()),
+        };
+        let benchmark = ContextBenchmarkResultRow {
+            id: StableId::new("ctxbench").to_string(),
+            task_name: "cross-module bug".to_string(),
+            broad_tokens: 1_200,
+            targeted_tokens: 320,
+            broad_success: true,
+            targeted_success: true,
+            retry_delta: 0,
+            latency_delta_ms: -12,
+            passed: true,
+            created_at_ms: millis(TimestampMillis::now()),
+        };
+        {
+            let mut db = ControlPlaneDb::open(&path).unwrap();
+            db.migrate().unwrap();
+            db.save_context_pack_manifest(&manifest).unwrap();
+            db.save_context_compression_receipt(&compression).unwrap();
+            db.save_context_cache_entry(&cache).unwrap();
+            db.save_context_retrieval_record(&retrieval).unwrap();
+            db.save_context_pack_metrics(&metrics).unwrap();
+            db.save_context_benchmark_result(&benchmark).unwrap();
+        }
+        {
+            let db = ControlPlaneDb::open(&path).unwrap();
+            assert_eq!(
+                db.context_pack_manifest(&manifest.id).unwrap().unwrap(),
+                manifest
+            );
+            assert_eq!(
+                db.context_compression_receipt(&compression.id)
+                    .unwrap()
+                    .unwrap()
+                    .raw_evidence_ref,
+                "raw-1"
+            );
+            assert_eq!(
+                db.context_cache_entry(&cache.cache_key)
+                    .unwrap()
+                    .unwrap()
+                    .source_ref,
+                "src-lib"
+            );
+            assert_eq!(
+                db.context_retrieval_records(&metrics.pack_id).unwrap()[0].need,
+                "need_related_tests"
+            );
+            assert_eq!(
+                db.context_pack_metrics(&metrics.pack_id)
+                    .unwrap()
+                    .unwrap()
+                    .deduped_fragments,
+                1
+            );
+            assert!(
+                db.context_benchmark_result(&benchmark.id)
+                    .unwrap()
+                    .unwrap()
+                    .passed
+            );
         }
         let _ = fs::remove_file(path);
     }

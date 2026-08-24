@@ -69,6 +69,13 @@ pub const PERSISTENT_MEMORY_V5: Migration = Migration {
     sql: include_str!("../../../migrations/0005_persistent_memory.sql"),
 };
 
+pub const CONTEXT_ENGINE_V6: Migration = Migration {
+    id: "0006_context_engine",
+    description:
+        "context manifests, compression receipts, cache, retrieval, metrics, and benchmarks",
+    sql: include_str!("../../../migrations/0006_context_engine.sql"),
+};
+
 pub fn validate_migrations(migrations: &[Migration]) -> AcResult<()> {
     let mut seen = BTreeSet::new();
     for migration in migrations {
