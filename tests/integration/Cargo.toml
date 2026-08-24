@@ -1,0 +1,32 @@
+[package]
+name = "agentcode-integration-tests"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[test]]
+name = "autonomous_flow"
+path = "autonomous_flow.rs"
+
+[[test]]
+name = "security_boundary"
+path = "security_boundary.rs"
+
+[[test]]
+name = "recovery_flow"
+path = "recovery_flow.rs"
+
+[dev-dependencies]
+ac-agent = { path = "../../crates/ac-agent" }
+ac-changeset = { path = "../../crates/ac-changeset" }
+ac-common = { path = "../../crates/ac-common" }
+ac-daemon = { path = "../../crates/ac-daemon" }
+ac-db = { path = "../../crates/ac-db" }
+ac-evidence = { path = "../../crates/ac-evidence" }
+ac-kernel = { path = "../../crates/ac-kernel" }
+ac-runtime = { path = "../../crates/ac-runtime" }
+ac-sandbox = { path = "../../crates/ac-sandbox" }
+ac-security = { path = "../../crates/ac-security" }
+ac-tool = { path = "../../crates/ac-tool" }
+ac-verification = { path = "../../crates/ac-verification" }

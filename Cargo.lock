@@ -178,6 +178,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "agentcode-integration-tests"
+version = "0.1.0"
+dependencies = [
+ "ac-agent",
+ "ac-changeset",
+ "ac-common",
+ "ac-daemon",
+ "ac-db",
+ "ac-evidence",
+ "ac-kernel",
+ "ac-runtime",
+ "ac-sandbox",
+ "ac-security",
+ "ac-tool",
+ "ac-verification",
+]
+
+[[package]]
 name = "ahash"
 version = "0.8.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"

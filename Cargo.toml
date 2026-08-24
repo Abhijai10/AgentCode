@@ -20,6 +20,7 @@ members = [
     "crates/ac-runtime",
     "crates/ac-daemon",
     "apps/desktop-placeholder",
+    "tests/integration",
 ]
 resolver = "2"
 

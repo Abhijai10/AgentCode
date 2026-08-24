@@ -20,6 +20,15 @@ pub struct DaemonHealth {
     pub recovered_sessions: usize,
 }
 
+pub trait DaemonLifecycleRuntime {
+    fn start(&mut self) -> AcResult<()>;
+    fn stop(&mut self) -> AcResult<()>;
+    fn restart(&mut self) -> AcResult<()>;
+    fn recover(&mut self) -> AcResult<usize>;
+    fn heartbeat(&self) -> AcResult<DaemonHealth>;
+    fn shutdown(&mut self) -> AcResult<()>;
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum DaemonCommand {
     Health,
@@ -125,10 +134,37 @@ impl DaemonService {
         self.start()
     }
 
+    pub fn recover(&mut self) -> AcResult<usize> {
+        self.recovered = self.db.interrupted_sessions()?;
+        Ok(self.recovered.len())
+    }
+
     pub fn health(&self) -> DaemonHealth {
         DaemonHealth {
             lifecycle: self.lifecycle,
             recovered_sessions: self.recovered.len(),
+        }
+    }
+
+    pub fn heartbeat(&self) -> AcResult<DaemonHealth> {
+        if self.lifecycle != DaemonLifecycle::Running {
+            return Err(AcError::conflict(
+                "DAEMON-NOT_RUNNING",
+                "daemon heartbeat requires running lifecycle",
+            ));
+        }
+        Ok(self.health())
+    }
+
+    pub fn shutdown(&mut self) -> AcResult<()> {
+        match self.lifecycle {
+            DaemonLifecycle::Running => self.stop(),
+            DaemonLifecycle::Stopping | DaemonLifecycle::Stopped | DaemonLifecycle::Created => {
+                self.lock_file = None;
+                let _ = fs::remove_file(&self.lock_path);
+                self.lifecycle = DaemonLifecycle::Stopped;
+                Ok(())
+            }
         }
     }
 
@@ -199,6 +235,32 @@ impl DaemonService {
             })?;
         self.lock_file = Some(file);
         Ok(())
+    }
+}
+
+impl DaemonLifecycleRuntime for DaemonService {
+    fn start(&mut self) -> AcResult<()> {
+        DaemonService::start(self)
+    }
+
+    fn stop(&mut self) -> AcResult<()> {
+        DaemonService::stop(self)
+    }
+
+    fn restart(&mut self) -> AcResult<()> {
+        DaemonService::restart(self)
+    }
+
+    fn recover(&mut self) -> AcResult<usize> {
+        DaemonService::recover(self)
+    }
+
+    fn heartbeat(&self) -> AcResult<DaemonHealth> {
+        DaemonService::heartbeat(self)
+    }
+
+    fn shutdown(&mut self) -> AcResult<()> {
+        DaemonService::shutdown(self)
     }
 }
 
@@ -309,6 +371,24 @@ mod tests {
         restarted.start().unwrap();
         assert!(!restarted.recovered_sessions().is_empty());
         restarted.stop().unwrap();
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn lifecycle_contract_supports_recover_heartbeat_and_shutdown() {
+        let (dir, db, lock) = temp_paths();
+        let mut daemon = DaemonService::open(&db, &lock).unwrap();
+        assert!(daemon.heartbeat().is_err());
+        DaemonLifecycleRuntime::start(&mut daemon).unwrap();
+        assert_eq!(
+            DaemonLifecycleRuntime::heartbeat(&daemon)
+                .unwrap()
+                .lifecycle,
+            DaemonLifecycle::Running
+        );
+        assert_eq!(DaemonLifecycleRuntime::recover(&mut daemon).unwrap(), 0);
+        DaemonLifecycleRuntime::shutdown(&mut daemon).unwrap();
+        assert_eq!(daemon.health().lifecycle, DaemonLifecycle::Stopped);
         let _ = fs::remove_dir_all(dir);
     }
 }

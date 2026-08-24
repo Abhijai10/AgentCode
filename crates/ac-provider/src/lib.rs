@@ -238,6 +238,138 @@ pub enum ProviderStreamEvent {
     Finished,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StructuredAgentResponse {
+    pub plan: Vec<String>,
+    pub assumptions: Vec<String>,
+    pub actions: Vec<String>,
+    pub verification_requirements: Vec<String>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ProviderResponseFormat {
+    Structured,
+    LegacyFallback,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ValidatedProviderResponse {
+    pub response: StructuredAgentResponse,
+    pub format: ProviderResponseFormat,
+}
+
+impl StructuredAgentResponse {
+    pub fn validate(&self) -> AcResult<()> {
+        if self.plan.is_empty()
+            || self.actions.is_empty()
+            || self.verification_requirements.is_empty()
+            || self.plan.iter().any(|item| item.trim().is_empty())
+            || self.actions.iter().any(|item| item.trim().is_empty())
+            || self
+                .verification_requirements
+                .iter()
+                .any(|item| item.trim().is_empty())
+        {
+            return Err(AcError::validation(
+                "PROVIDER-INVALID_STRUCTURED_RESPONSE",
+                "structured provider output requires plan, actions, and verification requirements",
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn from_legacy_text(text: &str) -> AcResult<Self> {
+        let mut plan = Vec::new();
+        let mut assumptions = Vec::new();
+        let mut actions = Vec::new();
+        let mut verification_requirements = Vec::new();
+        for line in text.lines().map(str::trim).filter(|line| !line.is_empty()) {
+            if let Some(value) = line
+                .strip_prefix("plan=")
+                .or_else(|| line.strip_prefix("plan:"))
+            {
+                plan.push(value.trim().to_string());
+            } else if let Some(value) = line
+                .strip_prefix("assumption=")
+                .or_else(|| line.strip_prefix("assumption:"))
+            {
+                assumptions.push(value.trim().to_string());
+            } else if let Some(value) = line
+                .strip_prefix("action=")
+                .or_else(|| line.strip_prefix("action:"))
+            {
+                actions.push(value.trim().to_string());
+            } else if let Some(value) = line
+                .strip_prefix("verify=")
+                .or_else(|| line.strip_prefix("verification="))
+                .or_else(|| line.strip_prefix("verification_requirement="))
+            {
+                verification_requirements.push(value.trim().to_string());
+            }
+        }
+        if plan.is_empty() && !text.trim().is_empty() {
+            plan.push(text.trim().to_string());
+        }
+        if actions.is_empty() && !plan.is_empty() {
+            actions.push("review provider plan".to_string());
+        }
+        if verification_requirements.is_empty() && !plan.is_empty() {
+            verification_requirements.push("run configured verification profile".to_string());
+        }
+        let response = Self {
+            plan,
+            assumptions,
+            actions,
+            verification_requirements,
+        };
+        response.validate()?;
+        Ok(response)
+    }
+}
+
+pub fn parse_structured_agent_response(raw: &str) -> AcResult<StructuredAgentResponse> {
+    let raw = raw.trim();
+    if !(raw.starts_with('{') && raw.ends_with('}')) {
+        return Err(AcError::validation(
+            "PROVIDER-STRUCTURED_RESPONSE_REQUIRED",
+            "structured provider output must be a JSON object",
+        ));
+    }
+    let response = StructuredAgentResponse {
+        plan: extract_string_array(raw, "plan")?,
+        assumptions: extract_string_array(raw, "assumptions").unwrap_or_default(),
+        actions: extract_string_array(raw, "actions")?,
+        verification_requirements: extract_string_array(raw, "verification_requirements")?,
+    };
+    response.validate()?;
+    Ok(response)
+}
+
+pub fn validate_provider_events(
+    events: &[ProviderStreamEvent],
+    allow_legacy_fallback: bool,
+) -> AcResult<ValidatedProviderResponse> {
+    let raw = events
+        .iter()
+        .filter_map(|event| match event {
+            ProviderStreamEvent::Delta(text) => Some(text.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("");
+    match parse_structured_agent_response(&raw) {
+        Ok(response) => Ok(ValidatedProviderResponse {
+            response,
+            format: ProviderResponseFormat::Structured,
+        }),
+        Err(_) if allow_legacy_fallback => Ok(ValidatedProviderResponse {
+            response: StructuredAgentResponse::from_legacy_text(&raw)?,
+            format: ProviderResponseFormat::LegacyFallback,
+        }),
+        Err(error) => Err(error),
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ProviderFailureClass {
     RateLimited,
@@ -1260,6 +1392,59 @@ fn escape_json(value: &str) -> String {
         .replace('\n', "\\n")
 }
 
+fn extract_string_array(raw: &str, key: &str) -> AcResult<Vec<String>> {
+    let needle = format!("\"{}\"", key);
+    let after_key = raw
+        .split_once(&needle)
+        .map(|(_, after)| after)
+        .ok_or_else(|| {
+            AcError::validation(
+                "PROVIDER-MISSING_STRUCTURED_FIELD",
+                format!("structured provider output missing {key}"),
+            )
+        })?;
+    let after_colon = after_key
+        .split_once(':')
+        .map(|(_, after)| after)
+        .ok_or_else(|| {
+            AcError::validation(
+                "PROVIDER-MALFORMED_STRUCTURED_FIELD",
+                format!("structured provider output field {key} is malformed"),
+            )
+        })?;
+    let start = after_colon.find('[').ok_or_else(|| {
+        AcError::validation(
+            "PROVIDER-MALFORMED_STRUCTURED_FIELD",
+            format!("structured provider output field {key} must be an array"),
+        )
+    })?;
+    let array = &after_colon[start + 1..];
+    let end = array.find(']').ok_or_else(|| {
+        AcError::validation(
+            "PROVIDER-MALFORMED_STRUCTURED_FIELD",
+            format!("structured provider output field {key} must close its array"),
+        )
+    })?;
+    Ok(array[..end]
+        .split(',')
+        .filter_map(|value| {
+            let trimmed = value.trim();
+            if trimmed.starts_with('"') && trimmed.ends_with('"') && trimmed.len() >= 2 {
+                Some(
+                    trimmed[1..trimmed.len() - 1]
+                        .replace("\\\"", "\"")
+                        .replace("\\\\", "\\")
+                        .trim()
+                        .to_string(),
+                )
+            } else {
+                None
+            }
+        })
+        .filter(|value| !value.is_empty())
+        .collect())
+}
+
 fn extract_delta(body: &str) -> Option<String> {
     let trimmed = body.trim();
     if trimmed.is_empty() {
@@ -1616,6 +1801,32 @@ mod tests {
             events_from_http_parts(429, "rate limited", &request).unwrap_err(),
             ProviderFailureClass::RateLimited
         );
+    }
+
+    #[test]
+    fn structured_agent_response_validates_and_rejects_invalid_output() {
+        let raw = r#"{
+            "plan": ["inspect task"],
+            "assumptions": ["workspace is available"],
+            "actions": ["edit file"],
+            "verification_requirements": ["run tests"]
+        }"#;
+        let parsed = parse_structured_agent_response(raw).unwrap();
+        assert_eq!(parsed.plan, vec!["inspect task"]);
+        assert_eq!(parsed.actions, vec!["edit file"]);
+        assert!(parse_structured_agent_response(
+            r#"{"plan":["inspect"],"assumptions":[],"actions":[],"verification_requirements":[]}"#
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn provider_events_accept_legacy_fallback_without_breaking_scripted_provider() {
+        let events = successful_events("plan=fix bug\naction=patch file\nverify=cargo test");
+        let validated = validate_provider_events(&events, true).unwrap();
+        assert_eq!(validated.format, ProviderResponseFormat::LegacyFallback);
+        assert_eq!(validated.response.plan, vec!["fix bug"]);
+        assert!(validate_provider_events(&events, false).is_err());
     }
 
     #[test]
