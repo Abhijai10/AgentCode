@@ -168,6 +168,98 @@ pub struct AiSecurityReportRow {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DiscussSessionRow {
+    pub id: String,
+    pub repository_id: String,
+    pub title: String,
+    pub state: String,
+    pub context_manifest_refs: String,
+    pub accepted_decision_refs: String,
+    pub created_at_ms: i64,
+    pub updated_at_ms: i64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DiscussMessageRow {
+    pub id: String,
+    pub session_id: String,
+    pub role: String,
+    pub content: String,
+    pub context_ref: Option<String>,
+    pub evidence_refs: String,
+    pub created_at_ms: i64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DiscussDecisionCandidateRow {
+    pub id: String,
+    pub session_id: String,
+    pub decision: String,
+    pub rationale: String,
+    pub evidence_refs: String,
+    pub accepted_decision_ref: Option<String>,
+    pub created_at_ms: i64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DiscussPlanRow {
+    pub id: String,
+    pub session_id: String,
+    pub requirements: String,
+    pub tasks: String,
+    pub constraints_json: String,
+    pub open_questions: String,
+    pub accepted_decision_refs: String,
+    pub promoted_mission_id: Option<String>,
+    pub created_at_ms: i64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DesignSessionRow {
+    pub id: String,
+    pub repository_id: String,
+    pub product: String,
+    pub state: String,
+    pub hard_constraints: String,
+    pub created_at_ms: i64,
+    pub updated_at_ms: i64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DesignArtifactRow {
+    pub id: String,
+    pub session_id: String,
+    pub name: String,
+    pub artifact_type: String,
+    pub current_version: u32,
+    pub created_at_ms: i64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DesignArtifactVersionRow {
+    pub id: String,
+    pub artifact_id: String,
+    pub version: u32,
+    pub summary: String,
+    pub content_hash: String,
+    pub evidence_refs: String,
+    pub created_at_ms: i64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DesignVisualEvaluationRow {
+    pub id: String,
+    pub artifact_version_id: String,
+    pub passed: bool,
+    pub findings: String,
+    pub responsive_viewports: String,
+    pub accessibility_checks: String,
+    pub functional_flows: String,
+    pub evidence_refs: String,
+    pub created_at_ms: i64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ContextCacheEntryRow {
     pub cache_key: String,
     pub content_hash: String,

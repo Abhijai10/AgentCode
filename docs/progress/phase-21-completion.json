@@ -1,0 +1,62 @@
+{
+  "phase": "P21",
+  "status": "COMPLETE",
+  "base_commit": "af129752b32c6512ad991cd143e91406be1e1e5e",
+  "accepted_workpackages": [
+    "WP-P21-WP01",
+    "WP-P21-WP02",
+    "WP-P21-WP03",
+    "WP-P21-WP04",
+    "WP-P21-WP05",
+    "WP-P21-WP06",
+    "WP-P21-WP07",
+    "WP-P21-WP08",
+    "WP-P21-WP09",
+    "WP-P21-WP10",
+    "WP-P21-WP11",
+    "WP-P21-WP12",
+    "WP-P21-WP13",
+    "WP-P21-WP14"
+  ],
+  "capabilities": [
+    "product_analysis",
+    "design_brief",
+    "design_grammar",
+    "design_state",
+    "anti_slop_critic",
+    "ui_worker_tasks",
+    "preview_iteration",
+    "visual_responsive_accessibility_functional_qa",
+    "reference_principles",
+    "dom_source_mapping_prototype"
+  ],
+  "migration": "migrations/0014_discuss_design_modes.sql",
+  "tests": [
+    "cargo fmt --all",
+    "cargo check --workspace --all-targets",
+    "cargo test --workspace",
+    "cargo clippy --workspace --all-targets -- -D warnings",
+    "JSON validation",
+    "git diff --check"
+  ],
+  "limitations": [
+    "DOM-source mapping is optional V1 prototype with confidence/limitation output; visual model escalation has deterministic fallback."
+  ],
+  "evidence": [
+    "docs/progress/workpackages/WP-P21-WP01.md",
+    "docs/progress/workpackages/WP-P21-WP02.md",
+    "docs/progress/workpackages/WP-P21-WP03.md",
+    "docs/progress/workpackages/WP-P21-WP04.md",
+    "docs/progress/workpackages/WP-P21-WP05.md",
+    "docs/progress/workpackages/WP-P21-WP06.md",
+    "docs/progress/workpackages/WP-P21-WP07.md",
+    "docs/progress/workpackages/WP-P21-WP08.md",
+    "docs/progress/workpackages/WP-P21-WP09.md",
+    "docs/progress/workpackages/WP-P21-WP10.md",
+    "docs/progress/workpackages/WP-P21-WP11.md",
+    "docs/progress/workpackages/WP-P21-WP12.md",
+    "docs/progress/workpackages/WP-P21-WP13.md",
+    "docs/progress/workpackages/WP-P21-WP14.md",
+    "docs/progress/phase-21-completion.md"
+  ]
+}

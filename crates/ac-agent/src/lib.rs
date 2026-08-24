@@ -21,9 +21,17 @@ use ac_provider::{
     RoutingProfile, ScriptedProvider, TaskProfile,
 };
 use ac_runtime::{AgentSession, AgentSessionState};
-use ac_security::{Capability, CapabilityPolicy};
+use ac_security::{
+    Capability, CapabilityPolicy, PermissionContext, RiskClass, SecurityDecision, ToolRole,
+};
 use ac_tool::{ToolBroker, ToolRequest, ToolResult, ToolStatus};
-use ac_verification::{FinalAuditInput, ValidationRunReport, VerificationEngine};
+use ac_verification::{
+    DesignAccessibilityReport, DesignFunctionalReport, DesignResponsiveReport,
+    DesignVisualEvaluation, FinalAuditInput, ValidationRunReport, VerificationEngine,
+};
+
+include!("discuss.rs");
+include!("design.rs");
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Goal {
@@ -1500,6 +1508,184 @@ mod tests {
             GitCoordinator::new(),
             VerificationEngine::new(CapabilityPolicy::new()),
         )
+    }
+
+    fn source(path: &str, language: &str, content: &str) -> (SourceFileIdentity, String) {
+        (
+            SourceFileIdentity {
+                relative_path: path.to_string(),
+                language: language.to_string(),
+                content_hash: content_hash(content),
+                size_bytes: content.len() as u64,
+                symlink: false,
+                line_count: content.lines().count() as u32,
+                binary: false,
+                generated: false,
+                test: path.contains("test"),
+                config: path.contains("config"),
+                docs: path.ends_with(".md"),
+            },
+            content.to_string(),
+        )
+    }
+
+    fn scope(repo: &StableId) -> RepositoryScope {
+        RepositoryScope {
+            repository_id: repo.clone(),
+            worktree_id: StableId::new("wt"),
+            root: "fixture".to_string(),
+            commit: "abc123".to_string(),
+            trust_profile: "test".to_string(),
+        }
+    }
+
+    #[test]
+    fn discuss_answers_from_repo_context_and_promotes_without_transcript_replay() {
+        let repo = StableId::new("repo");
+        let mode = DiscussMode;
+        let mut session = mode
+            .start_session(repo.clone(), "Explain authority boundaries")
+            .unwrap();
+        let mut intel = CodeIntelligenceService::new();
+        let mut memory = MemoryService::new();
+        let mut evidence = EvidenceStore::new();
+        let files = vec![
+            source(
+                "crates/ac-kernel/src/lib.rs",
+                "rust",
+                "pub struct Kernel {}\nimpl Kernel { pub fn decide(&self) {} }",
+            ),
+            source(
+                "crates/ac-tool/src/lib.rs",
+                "rust",
+                "pub struct ToolBroker {}\nimpl ToolBroker { pub fn execute(&self) {} }",
+            ),
+        ];
+        let answer = mode
+            .answer_repository_question(
+                &mut session,
+                "Which file defines Kernel authority?",
+                &mut intel,
+                DiscussRepositoryContext {
+                    scope: scope(&repo),
+                    files,
+                },
+                &memory,
+                &mut evidence,
+            )
+            .unwrap();
+        assert!(answer.text.contains("crates/ac-kernel/src/lib.rs"));
+        assert_eq!(answer.sources[0].path, "crates/ac-kernel/src/lib.rs");
+        assert_eq!(
+            mode.evaluate_read_only(&[Capability::FilesystemWrite("src/lib.rs".to_string())]),
+            SecurityDecision::Deny
+        );
+        let candidate = mode
+            .decision_candidate(
+                &session,
+                "Kernel remains final authority",
+                "Discuss accepted this architecture boundary",
+                vec![answer.evidence_ref.clone()],
+            )
+            .unwrap();
+        let decision_id = mode
+            .accept_decision(&mut session, candidate, &mut memory)
+            .unwrap();
+        let plan = mode
+            .promote_to_plan(
+                &mut session,
+                vec!["Preserve Kernel authority".to_string()],
+                vec!["Implement standard mission".to_string()],
+                vec!["No write tools during discussion".to_string()],
+                Vec::new(),
+            )
+            .unwrap();
+        let mission = mode.promote_to_mission(&mut session, &plan).unwrap();
+        assert!(plan.accepted_decision_refs.contains(&decision_id));
+        assert!(!mission.transcript_replay_required);
+        assert_eq!(memory.decisions().len(), 1);
+    }
+
+    #[test]
+    fn design_studio_runs_analysis_critique_iteration_and_mapping() {
+        let repo = StableId::new("repo");
+        let studio = DesignStudio;
+        let mut session = studio
+            .start_session(
+                repo,
+                "Admin Review Console",
+                vec!["keep tables dense".to_string()],
+            )
+            .unwrap();
+        let files = vec![
+            source(
+                "apps/web/app/page.tsx",
+                "typescript",
+                "<nav><a href=\"/review\">Review</a></nav><main className=\"hero gradient card card card\">AI-powered workflow</main>",
+            ),
+            source(
+                "apps/web/components/ReviewPanel.tsx",
+                "typescript",
+                "export function ReviewPanel(){ return <section id=\"review-panel\" data-source=\"apps/web/components/ReviewPanel.tsx\"/> }",
+            ),
+            source(
+                "apps/web/styles.css",
+                "css",
+                ":root { --radius-md: 8px; --color-brand: #245; font-family: Inter; }",
+            ),
+        ];
+        let mut evidence = EvidenceStore::new();
+        let analysis = studio.analyze_product(&files, &mut evidence).unwrap();
+        assert_eq!(analysis.framework, Some("Next.js".to_string()));
+        assert!(!analysis.components.is_empty());
+        let brief = studio
+            .generate_brief(
+                &session,
+                &analysis,
+                "support operators",
+                "review queue triage",
+            )
+            .unwrap();
+        let grammar = studio.infer_grammar(&brief, &analysis);
+        assert!(grammar.color_roles[0].contains("Admin Review Console"));
+        let (mut artifact, version1) = studio
+            .create_artifact(
+                &session,
+                "Review screen",
+                "screen",
+                "first implementation",
+                vec![analysis.evidence_ref.clone()],
+            )
+            .unwrap();
+        let critique = studio.critique(&files[0].1, &brief);
+        assert!(critique.improvement_iteration_required);
+        let verification = VerificationEngine::new(CapabilityPolicy::new());
+        let iteration = studio
+            .run_preview_iteration(
+                &mut session,
+                &version1,
+                &critique,
+                &verification,
+                &mut evidence,
+            )
+            .unwrap();
+        assert!(iteration.repaired);
+        let version2 = studio
+            .revise_artifact(
+                &mut artifact,
+                "removed generic gradient hero and strengthened review workflow",
+                vec![iteration.visual_evaluation.evidence_ref.clone()],
+            )
+            .unwrap();
+        assert_eq!(version2.version, 2);
+        let state = studio.generate_design_state(&brief, &grammar, &analysis);
+        assert!(state.content.contains("DESIGN_STATE.md"));
+        let reference = studio
+            .extract_reference_principles(StableId::new("ev"), "high contrast dashboard rhythm")
+            .unwrap();
+        assert!(reference.limitation.contains("does not clone"));
+        let mapping = studio.map_dom_to_source("#review-panel", &files[1].1, &files);
+        assert_eq!(mapping.confidence, 90);
     }
 
     #[test]

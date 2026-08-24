@@ -5,7 +5,7 @@ Doc 10 gates for the phase pass and completion evidence exists).
 
 Phase names are the EXACT canonical names from Doc 09 HC-P00..HC-P29 (no aliases).
 
-Last updated: 2026-08-24 (Phase 18 advanced security and Phase 19 AI security closure)
+Last updated: 2026-08-24 (Phase 20 Discuss Mode and Phase 21 Design Studio closure)
 
 | Phase | Name (Doc 09 HC-*) | Status | Notes |
 |-------|--------------------|--------|-------|
@@ -29,8 +29,8 @@ Last updated: 2026-08-24 (Phase 18 advanced security and Phase 19 AI security cl
 | P17 | Baseline Security Platform | COMPLETE | P17-WP01..P17-WP14 ACCEPTED; threat model, unified findings, baseline adapters, redaction, grouping, triage, repair/regression and Markdown/JSON/SARIF reports pass P17-G1..G15; evidence: docs/progress/phase-17-completion.md (+ .json) |
 | P18 | Advanced AppSec, Cloud & Red-Team | COMPLETE | P18-WP01..P18-WP12 ACCEPTED; scoped active authorization, environment policy, ZAP/Nuclei-compatible native adapters, safe synthetic proof, attack-path graph, Prowler-compatible cloud posture, lab adapter lifecycle, stop conditions, cleanup evidence, reports and persistence pass P18-G1..G13 through deterministic production-facing APIs; evidence: docs/progress/phase-18-completion.md (+ .json) |
 | P19 | AI Security | COMPLETE | P19-WP01..P19-WP12 ACCEPTED; AI surface detection, trust-boundary graph, direct/indirect injection, RAG poisoning, tool/MCP abuse, secret leakage, excessive-agency/cross-agent fixtures, optional harness fallback statuses, common finding normalization, mitigation verification and persistence pass P19-G1..G10 through deterministic production-facing APIs; evidence: docs/progress/phase-19-completion.md (+ .json) |
-| P20 | Discuss Mode | NOT_STARTED | |
-| P21 | Design Studio | NOT_STARTED | |
+| P20 | Discuss Mode | COMPLETE | P20-WP01..P20-WP08 ACCEPTED; durable discussion sessions/messages/decisions/plans, repo-grounded context answers, read-only policy, routing, research fallback, decision/plan promotion and mission draft pass P20-G1..G7; evidence: docs/progress/phase-20-completion.md (+ .json) |
+| P21 | Design Studio | COMPLETE | P21-WP01..P21-WP14 ACCEPTED; product analysis, DesignBrief, DesignGrammar, DESIGN_STATE, anti-slop critic, UI tasks, preview iteration, visual/responsive/a11y/functional QA, reference principles and DOM-source prototype pass P21-G1..G12; evidence: docs/progress/phase-21-completion.md (+ .json) |
 | P22 | Minimal Desktop Product Experience | NOT_STARTED | |
 | P23 | Resource, Token & Cost Optimization | NOT_STARTED | |
 | P24 | Chaos Engineering & Recovery Validation | NOT_STARTED | |

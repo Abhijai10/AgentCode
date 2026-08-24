@@ -351,6 +351,42 @@ pub struct VisualQaReport {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DesignVisualEvaluation {
+    pub id: StableId,
+    pub artifact_version_id: StableId,
+    pub passed: bool,
+    pub findings: Vec<String>,
+    pub evidence_ref: StableId,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DesignResponsiveReport {
+    pub id: StableId,
+    pub artifact_version_id: StableId,
+    pub viewports: Vec<String>,
+    pub passed: bool,
+    pub evidence_ref: StableId,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DesignAccessibilityReport {
+    pub id: StableId,
+    pub artifact_version_id: StableId,
+    pub checks: Vec<String>,
+    pub passed: bool,
+    pub evidence_ref: StableId,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DesignFunctionalReport {
+    pub id: StableId,
+    pub artifact_version_id: StableId,
+    pub flows: Vec<String>,
+    pub passed: bool,
+    pub evidence_ref: StableId,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 struct PageState {
     url: String,
     html: String,
@@ -538,6 +574,158 @@ impl VerificationEngine {
             id: report.id.clone(),
             scanner: "ai-security".to_string(),
             findings: report.findings.len(),
+            evidence_ref,
+        })
+    }
+
+    pub fn record_design_visual_evaluation(
+        &self,
+        artifact_version_id: &StableId,
+        passed: bool,
+        findings: Vec<String>,
+        evidence_store: &mut EvidenceStore,
+    ) -> AcResult<DesignVisualEvaluation> {
+        if findings.iter().any(|finding| finding.trim().is_empty()) {
+            return Err(AcError::validation(
+                "VERIFY-DESIGN_VISUAL_EMPTY_FINDING",
+                "visual findings cannot be empty",
+            ));
+        }
+        let artifact = artifact_version_id.clone();
+        let summary = format!(
+            "artifact:{artifact};passed:{passed};findings:{}",
+            findings.len()
+        );
+        let evidence_ref = evidence_store.append(
+            EvidenceKind::TestReport,
+            Provenance {
+                source: "verification-engine".to_string(),
+                commit: None,
+                worktree: None,
+                tool: Some("design-visual-critic".to_string()),
+            },
+            format!("mem://design/visual/{}", StableId::new("dvisual")),
+            local_hash(&summary),
+        )?;
+        Ok(DesignVisualEvaluation {
+            id: StableId::new("dvisual"),
+            artifact_version_id: artifact,
+            passed,
+            findings,
+            evidence_ref,
+        })
+    }
+
+    pub fn record_design_responsive_report(
+        &self,
+        artifact_version_id: &StableId,
+        viewports: Vec<String>,
+        passed: bool,
+        evidence_store: &mut EvidenceStore,
+    ) -> AcResult<DesignResponsiveReport> {
+        if viewports.is_empty() {
+            return Err(AcError::validation(
+                "VERIFY-DESIGN_RESPONSIVE_NO_VIEWPORTS",
+                "responsive QA requires at least one viewport",
+            ));
+        }
+        let artifact = artifact_version_id.clone();
+        let summary = format!(
+            "artifact:{artifact};passed:{passed};viewports:{}",
+            viewports.join(",")
+        );
+        let evidence_ref = evidence_store.append(
+            EvidenceKind::TestReport,
+            Provenance {
+                source: "verification-engine".to_string(),
+                commit: None,
+                worktree: None,
+                tool: Some("design-responsive-qa".to_string()),
+            },
+            format!("mem://design/responsive/{}", StableId::new("dresponsive")),
+            local_hash(&summary),
+        )?;
+        Ok(DesignResponsiveReport {
+            id: StableId::new("dresponsive"),
+            artifact_version_id: artifact,
+            viewports,
+            passed,
+            evidence_ref,
+        })
+    }
+
+    pub fn record_design_accessibility_report(
+        &self,
+        artifact_version_id: &StableId,
+        passed: bool,
+        checks: Vec<String>,
+        evidence_store: &mut EvidenceStore,
+    ) -> AcResult<DesignAccessibilityReport> {
+        if checks.is_empty() {
+            return Err(AcError::validation(
+                "VERIFY-DESIGN_A11Y_NO_CHECKS",
+                "accessibility QA requires concrete checks",
+            ));
+        }
+        let artifact = artifact_version_id.clone();
+        let summary = format!(
+            "artifact:{artifact};passed:{passed};checks:{}",
+            checks.join(",")
+        );
+        let evidence_ref = evidence_store.append(
+            EvidenceKind::TestReport,
+            Provenance {
+                source: "verification-engine".to_string(),
+                commit: None,
+                worktree: None,
+                tool: Some("design-accessibility-qa".to_string()),
+            },
+            format!("mem://design/a11y/{}", StableId::new("da11y")),
+            local_hash(&summary),
+        )?;
+        Ok(DesignAccessibilityReport {
+            id: StableId::new("da11y"),
+            artifact_version_id: artifact,
+            checks,
+            passed,
+            evidence_ref,
+        })
+    }
+
+    pub fn record_design_functional_report(
+        &self,
+        artifact_version_id: &StableId,
+        passed: bool,
+        flows: Vec<String>,
+        evidence_store: &mut EvidenceStore,
+    ) -> AcResult<DesignFunctionalReport> {
+        if flows.is_empty() {
+            return Err(AcError::validation(
+                "VERIFY-DESIGN_FUNCTIONAL_NO_FLOWS",
+                "functional design QA requires at least one flow",
+            ));
+        }
+        let artifact = artifact_version_id.clone();
+        let summary = format!(
+            "artifact:{artifact};passed:{passed};flows:{}",
+            flows.join(",")
+        );
+        let evidence_ref = evidence_store.append(
+            EvidenceKind::TestReport,
+            Provenance {
+                source: "verification-engine".to_string(),
+                commit: None,
+                worktree: None,
+                tool: Some("design-functional-qa".to_string()),
+            },
+            format!("mem://design/functional/{}", StableId::new("dflow")),
+            local_hash(&summary),
+        )?;
+        Ok(DesignFunctionalReport {
+            id: StableId::new("dflow"),
+            artifact_version_id: artifact,
+            flows,
+            passed,
             evidence_ref,
         })
     }
@@ -1618,6 +1806,50 @@ mod tests {
             .capture_browser_observation("http://localhost", &mut evidence)
             .unwrap_err();
         assert_eq!(err.code(), "VERIFY-BROWSER_DENIED");
+    }
+
+    #[test]
+    fn design_qa_reports_record_append_only_evidence() {
+        let engine = VerificationEngine::new(CapabilityPolicy::new());
+        let mut evidence = EvidenceStore::new();
+        let version = StableId::new("dversion");
+        let visual = engine
+            .record_design_visual_evaluation(
+                &version,
+                false,
+                vec!["generic cards hide hierarchy".to_string()],
+                &mut evidence,
+            )
+            .unwrap();
+        let responsive = engine
+            .record_design_responsive_report(
+                &version,
+                vec!["mobile".to_string(), "desktop".to_string()],
+                true,
+                &mut evidence,
+            )
+            .unwrap();
+        let accessibility = engine
+            .record_design_accessibility_report(
+                &version,
+                true,
+                vec!["labels".to_string(), "focus".to_string()],
+                &mut evidence,
+            )
+            .unwrap();
+        let functional = engine
+            .record_design_functional_report(
+                &version,
+                true,
+                vec!["primary flow".to_string()],
+                &mut evidence,
+            )
+            .unwrap();
+        assert!(!visual.passed);
+        assert_eq!(responsive.viewports.len(), 2);
+        assert_eq!(accessibility.checks.len(), 2);
+        assert_eq!(functional.flows, vec!["primary flow".to_string()]);
+        assert_eq!(evidence.len(), 4);
     }
 
     #[test]

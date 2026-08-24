@@ -118,6 +118,12 @@ pub const ADVANCED_AI_SECURITY_V13: Migration = Migration {
     sql: include_str!("../../../migrations/0013_advanced_ai_security.sql"),
 };
 
+pub const DISCUSS_DESIGN_MODES_V14: Migration = Migration {
+    id: "0014_discuss_design_modes",
+    description: "discussion sessions and design studio artifacts, versions, and QA evaluations",
+    sql: include_str!("../../../migrations/0014_discuss_design_modes.sql"),
+};
+
 pub fn validate_migrations(migrations: &[Migration]) -> AcResult<()> {
     let mut seen = BTreeSet::new();
     for migration in migrations {

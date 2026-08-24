@@ -520,14 +520,52 @@
     {
       "id": "P20",
       "name": "Discuss Mode",
-      "status": "NOT_STARTED",
-      "evidence": []
+      "status": "COMPLETE",
+      "evidence": [
+        "crates/ac-agent/src/discuss.rs",
+        "crates/ac-provider/src/lib.rs",
+        "crates/ac-db/src/discuss_design.rs",
+        "migrations/0014_discuss_design_modes.sql",
+        "docs/progress/workpackages/WP-P20-WP01.md",
+        "docs/progress/workpackages/WP-P20-WP02.md",
+        "docs/progress/workpackages/WP-P20-WP03.md",
+        "docs/progress/workpackages/WP-P20-WP04.md",
+        "docs/progress/workpackages/WP-P20-WP05.md",
+        "docs/progress/workpackages/WP-P20-WP06.md",
+        "docs/progress/workpackages/WP-P20-WP07.md",
+        "docs/progress/workpackages/WP-P20-WP08.md",
+        "docs/progress/phase-20-completion.md",
+        "docs/progress/phase-20-completion.json"
+      ],
+      "notes": "P20-WP01..P20-WP08 accepted; durable discussion sessions/messages/decisions/plans, repository-grounded context answers, read-only policy, provider routing, research fallback, decision/plan promotion and standard mission draft pass P20-G1..G7"
     },
     {
       "id": "P21",
       "name": "Design Studio",
-      "status": "NOT_STARTED",
-      "evidence": []
+      "status": "COMPLETE",
+      "evidence": [
+        "crates/ac-agent/src/design.rs",
+        "crates/ac-verification/src/lib.rs",
+        "crates/ac-db/src/discuss_design.rs",
+        "migrations/0014_discuss_design_modes.sql",
+        "docs/progress/workpackages/WP-P21-WP01.md",
+        "docs/progress/workpackages/WP-P21-WP02.md",
+        "docs/progress/workpackages/WP-P21-WP03.md",
+        "docs/progress/workpackages/WP-P21-WP04.md",
+        "docs/progress/workpackages/WP-P21-WP05.md",
+        "docs/progress/workpackages/WP-P21-WP06.md",
+        "docs/progress/workpackages/WP-P21-WP07.md",
+        "docs/progress/workpackages/WP-P21-WP08.md",
+        "docs/progress/workpackages/WP-P21-WP09.md",
+        "docs/progress/workpackages/WP-P21-WP10.md",
+        "docs/progress/workpackages/WP-P21-WP11.md",
+        "docs/progress/workpackages/WP-P21-WP12.md",
+        "docs/progress/workpackages/WP-P21-WP13.md",
+        "docs/progress/workpackages/WP-P21-WP14.md",
+        "docs/progress/phase-21-completion.md",
+        "docs/progress/phase-21-completion.json"
+      ],
+      "notes": "P21-WP01..P21-WP14 accepted; product analysis, DesignBrief, DesignGrammar, DESIGN_STATE, anti-slop critic, UI task planning, preview iteration, visual/responsive/accessibility/functional QA, reference principles and guarded DOM-source prototype pass P21-G1..G12"
     },
     {
       "id": "P22",

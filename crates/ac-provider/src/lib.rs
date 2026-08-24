@@ -115,6 +115,44 @@ impl TaskProfile {
             max_input_cost_micros: None,
         }
     }
+
+    pub fn discuss(task_id: StableId, routing_profile: RoutingProfile) -> Self {
+        Self {
+            task_id,
+            role: "discussion".to_string(),
+            task_type: "repo_discussion".to_string(),
+            complexity: 4,
+            risk: 2,
+            required_context: 12_000,
+            requires_vision: false,
+            requires_tool_use: false,
+            requires_structured_output: true,
+            privacy: PrivacyClass::Standard,
+            routing_profile,
+            max_input_cost_micros: Some(2_000),
+        }
+    }
+
+    pub fn design(
+        task_id: StableId,
+        routing_profile: RoutingProfile,
+        requires_vision: bool,
+    ) -> Self {
+        Self {
+            task_id,
+            role: "design_critic".to_string(),
+            task_type: "design_studio".to_string(),
+            complexity: 6,
+            risk: 4,
+            required_context: 16_000,
+            requires_vision,
+            requires_tool_use: false,
+            requires_structured_output: true,
+            privacy: PrivacyClass::Standard,
+            routing_profile,
+            max_input_cost_micros: Some(4_000),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1673,6 +1711,19 @@ mod tests {
             .select_model(&[ProviderCapability::Vision])
             .unwrap_err();
         assert_eq!(err.code(), "PROVIDER-NO_CAPABLE_MODEL");
+    }
+
+    #[test]
+    fn phase20_21_profiles_express_discuss_and_design_routing_needs() {
+        let discuss = TaskProfile::discuss(StableId::new("task"), RoutingProfile::LocalFirst);
+        assert_eq!(discuss.task_type, "repo_discussion");
+        assert!(discuss.requires_structured_output);
+        assert!(!discuss.requires_tool_use);
+
+        let design = TaskProfile::design(StableId::new("task"), RoutingProfile::QualityFirst, true);
+        assert_eq!(design.task_type, "design_studio");
+        assert!(design.requires_vision);
+        assert!(design.role.contains("critic"));
     }
 
     #[test]

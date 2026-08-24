@@ -24,5 +24,6 @@ include!("evidence.rs");
 include!("verification.rs");
 include!("security.rs");
 include!("agent.rs");
+include!("discuss_design.rs");
 include!("git.rs");
 include!("tests.rs");

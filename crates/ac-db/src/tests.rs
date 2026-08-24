@@ -92,7 +92,7 @@ mod tests {
     fn sqlite_store_persists_kernel_state() {
         let mut db = ControlPlaneDb::open_memory().unwrap();
         db.migrate().unwrap();
-        assert_eq!(db.user_version().unwrap(), 13);
+        assert_eq!(db.user_version().unwrap(), 14);
 
         let mut kernel = Kernel::new(AllowAllPolicy);
         kernel.start().unwrap();
@@ -784,7 +784,7 @@ mod tests {
         {
             let mut db = ControlPlaneDb::open(&path).unwrap();
             db.migrate().unwrap();
-            assert_eq!(db.user_version().unwrap(), 13);
+            assert_eq!(db.user_version().unwrap(), 14);
             db.save_changeset_transaction(
                 &transaction,
                 Some("task-p13"),
@@ -863,7 +863,7 @@ mod tests {
         {
             let mut db = ControlPlaneDb::open(&path).unwrap();
             db.migrate().unwrap();
-            assert_eq!(db.user_version().unwrap(), 13);
+            assert_eq!(db.user_version().unwrap(), 14);
             db.save_verification_profile(&profile).unwrap();
             db.save_verification_manifest(
                 &manifest,
@@ -945,7 +945,7 @@ mod tests {
         {
             let mut db = ControlPlaneDb::open(&path).unwrap();
             db.migrate().unwrap();
-            assert_eq!(db.user_version().unwrap(), 13);
+            assert_eq!(db.user_version().unwrap(), 14);
             db.save_browser_process(&process).unwrap();
             db.save_browser_session(&session).unwrap();
             db.save_browser_dev_server(&dev_server).unwrap();
@@ -978,7 +978,7 @@ mod tests {
         {
             let mut db = ControlPlaneDb::open(&path).unwrap();
             db.migrate().unwrap();
-            assert_eq!(db.user_version().unwrap(), 13);
+            assert_eq!(db.user_version().unwrap(), 14);
             let skill = SkillManifest {
                 id: skill_id.clone(),
                 name: "Rust".to_string(),
@@ -1075,7 +1075,7 @@ mod tests {
         {
             let mut db = ControlPlaneDb::open(&path).unwrap();
             db.migrate().unwrap();
-            assert_eq!(db.user_version().unwrap(), 13);
+            assert_eq!(db.user_version().unwrap(), 14);
             let orchestrator = ac_security::BaselineSecurityOrchestrator::new(
                 ac_security::SecurityPolicy::baseline(),
             );
@@ -1107,6 +1107,136 @@ mod tests {
             assert!(findings
                 .iter()
                 .any(|finding| finding.root_cause == "vulnerable-dependency"));
+        }
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn phase20_21_discuss_and_design_state_survive_reopen() {
+        let path = std::env::temp_dir().join(format!(
+            "agentcode-phase20-21-{}.sqlite",
+            StableId::new("db")
+        ));
+        let discuss_id = StableId::new("discuss").to_string();
+        let message_id = StableId::new("dmsg").to_string();
+        let plan_id = StableId::new("dplan").to_string();
+        let design_id = StableId::new("design").to_string();
+        let artifact_id = StableId::new("dartifact").to_string();
+        let version_id = StableId::new("dversion").to_string();
+        {
+            let mut db = ControlPlaneDb::open(&path).unwrap();
+            db.migrate().unwrap();
+            assert_eq!(db.user_version().unwrap(), 14);
+            db.save_discuss_session(&DiscussSessionRow {
+                id: discuss_id.clone(),
+                repository_id: "repo-a".to_string(),
+                title: "Architecture discussion".to_string(),
+                state: "promoted_to_plan".to_string(),
+                context_manifest_refs: "ctx-a".to_string(),
+                accepted_decision_refs: "decision-a".to_string(),
+                created_at_ms: 1,
+                updated_at_ms: 2,
+            })
+            .unwrap();
+            db.save_discuss_message(&DiscussMessageRow {
+                id: message_id.clone(),
+                session_id: discuss_id.clone(),
+                role: "assistant".to_string(),
+                content: "Kernel owns mission truth".to_string(),
+                context_ref: Some("ctx-a".to_string()),
+                evidence_refs: "ev-a".to_string(),
+                created_at_ms: 3,
+            })
+            .unwrap();
+            db.save_discuss_decision_candidate(&DiscussDecisionCandidateRow {
+                id: "candidate-a".to_string(),
+                session_id: discuss_id.clone(),
+                decision: "Keep discuss read-only".to_string(),
+                rationale: "prevents silent edits".to_string(),
+                evidence_refs: "ev-a".to_string(),
+                accepted_decision_ref: Some("decision-a".to_string()),
+                created_at_ms: 4,
+            })
+            .unwrap();
+            db.save_discuss_plan(&DiscussPlanRow {
+                id: plan_id.clone(),
+                session_id: discuss_id.clone(),
+                requirements: "preserve context".to_string(),
+                tasks: "create mission".to_string(),
+                constraints_json: "read-only".to_string(),
+                open_questions: String::new(),
+                accepted_decision_refs: "decision-a".to_string(),
+                promoted_mission_id: Some("mission-a".to_string()),
+                created_at_ms: 5,
+            })
+            .unwrap();
+            db.save_design_session(&DesignSessionRow {
+                id: design_id.clone(),
+                repository_id: "repo-a".to_string(),
+                product: "Design Console".to_string(),
+                state: "iterating".to_string(),
+                hard_constraints: "preserve flow".to_string(),
+                created_at_ms: 6,
+                updated_at_ms: 7,
+            })
+            .unwrap();
+            db.save_design_artifact(&DesignArtifactRow {
+                id: artifact_id.clone(),
+                session_id: design_id.clone(),
+                name: "Review screen".to_string(),
+                artifact_type: "screen".to_string(),
+                current_version: 2,
+                created_at_ms: 8,
+            })
+            .unwrap();
+            db.save_design_artifact_version(&DesignArtifactVersionRow {
+                id: version_id.clone(),
+                artifact_id: artifact_id.clone(),
+                version: 1,
+                summary: "baseline".to_string(),
+                content_hash: "hash-a".to_string(),
+                evidence_refs: "ev-b".to_string(),
+                created_at_ms: 9,
+            })
+            .unwrap();
+            db.save_design_visual_evaluation(&DesignVisualEvaluationRow {
+                id: "eval-a".to_string(),
+                artifact_version_id: version_id.clone(),
+                passed: false,
+                findings: "generic hero".to_string(),
+                responsive_viewports: "mobile,desktop".to_string(),
+                accessibility_checks: "labels,focus".to_string(),
+                functional_flows: "primary flow".to_string(),
+                evidence_refs: "ev-c".to_string(),
+                created_at_ms: 10,
+            })
+            .unwrap();
+        }
+        {
+            let mut db = ControlPlaneDb::open(&path).unwrap();
+            db.migrate().unwrap();
+            let session = db.discuss_session(&discuss_id).unwrap().unwrap();
+            assert_eq!(session.accepted_decision_refs, "decision-a");
+            let messages = db.discuss_messages(&discuss_id).unwrap();
+            assert_eq!(messages[0].id, message_id);
+            assert_eq!(
+                db.discuss_plan(&plan_id)
+                    .unwrap()
+                    .unwrap()
+                    .promoted_mission_id,
+                Some("mission-a".to_string())
+            );
+            assert_eq!(
+                db.design_session(&design_id).unwrap().unwrap().product,
+                "Design Console"
+            );
+            assert_eq!(
+                db.design_artifact_versions(&artifact_id).unwrap()[0].id,
+                version_id
+            );
+            let evaluations = db.design_visual_evaluations(&version_id).unwrap();
+            assert!(!evaluations[0].passed);
+            assert_eq!(evaluations[0].functional_flows, "primary flow");
         }
         let _ = fs::remove_file(path);
     }
