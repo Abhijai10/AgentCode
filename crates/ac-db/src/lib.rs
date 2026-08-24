@@ -168,6 +168,68 @@ pub struct ContextBenchmarkResultRow {
     pub created_at_ms: i64,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MissionContractRevisionRow {
+    pub id: String,
+    pub mission_id: String,
+    pub revision: u32,
+    pub original_goal: String,
+    pub reason: String,
+    pub created_at_ms: i64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RequirementMatrixEntryRow {
+    pub id: String,
+    pub mission_id: String,
+    pub contract_revision: u32,
+    pub description: String,
+    pub requirement_type: String,
+    pub priority: u8,
+    pub source: String,
+    pub verification_strategy: String,
+    pub blocking: bool,
+    pub implementation_status: String,
+    pub verification_status: String,
+    pub evidence_refs: String,
+    pub linked_task_ids: String,
+    pub created_at_ms: i64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TaskLeaseRow {
+    pub task_id: String,
+    pub worker_id: String,
+    pub lease_epoch: u64,
+    pub expires_at_ms: i64,
+    pub heartbeat_interval_ms: i64,
+    pub state: String,
+    pub updated_at_ms: i64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AutonomyMailboxMessageRow {
+    pub id: String,
+    pub mission_id: String,
+    pub sender_worker_id: String,
+    pub recipient_worker_id: Option<String>,
+    pub message_type: String,
+    pub subject_id: Option<String>,
+    pub payload: String,
+    pub delivered: bool,
+    pub created_at_ms: i64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AutonomyRecordRow {
+    pub id: String,
+    pub mission_id: String,
+    pub category: String,
+    pub subject_id: Option<String>,
+    pub payload: String,
+    pub created_at_ms: i64,
+}
+
 impl ControlPlaneDb {
     pub fn open(path: impl AsRef<Path>) -> AcResult<Self> {
         let connection = Connection::open(path).map_err(db_error)?;
@@ -185,11 +247,11 @@ impl ControlPlaneDb {
 
     pub fn migrate(&mut self) -> AcResult<()> {
         let current_version = self.user_version()?;
-        if current_version > 6 {
+        if current_version > 7 {
             return Err(AcError::conflict(
                 "DB-FUTURE_VERSION",
                 format!(
-                    "database user_version {current_version} is newer than supported version 6"
+                    "database user_version {current_version} is newer than supported version 7"
                 ),
             ));
         }
@@ -224,7 +286,13 @@ impl ControlPlaneDb {
             tx.execute_batch(include_str!("../../../migrations/0006_context_engine.sql"))
                 .map_err(db_error)?;
         }
-        tx.pragma_update(None, "user_version", 6)
+        if current_version < 7 {
+            tx.execute_batch(include_str!(
+                "../../../migrations/0007_full_autonomy_kernel.sql"
+            ))
+            .map_err(db_error)?;
+        }
+        tx.pragma_update(None, "user_version", 7)
             .map_err(db_error)?;
         tx.commit().map_err(db_error)?;
         Ok(())
@@ -1684,6 +1752,257 @@ impl ControlPlaneDb {
             .map_err(db_error)?;
         rows.collect::<Result<Vec<_>, _>>().map_err(db_error)
     }
+
+    pub fn save_mission_contract_revision(&self, row: &MissionContractRevisionRow) -> AcResult<()> {
+        if row.original_goal.trim().is_empty() || row.reason.trim().is_empty() {
+            return Err(AcError::validation(
+                "DB-MISSION_CONTRACT_INVALID",
+                "mission contract revisions require original goal and reason",
+            ));
+        }
+        self.connection
+            .execute(
+                "INSERT INTO mission_contract_revisions VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![
+                    row.id,
+                    row.mission_id,
+                    row.revision,
+                    row.original_goal,
+                    row.reason,
+                    row.created_at_ms
+                ],
+            )
+            .map_err(db_error)?;
+        Ok(())
+    }
+
+    pub fn mission_contract_revisions(
+        &self,
+        mission_id: &str,
+    ) -> AcResult<Vec<MissionContractRevisionRow>> {
+        let mut stmt = self
+            .connection
+            .prepare(
+                "SELECT id, mission_id, revision, original_goal, reason, created_at_ms
+             FROM mission_contract_revisions WHERE mission_id=?1 ORDER BY revision ASC",
+            )
+            .map_err(db_error)?;
+        let rows = stmt
+            .query_map([mission_id], |row| {
+                Ok(MissionContractRevisionRow {
+                    id: row.get(0)?,
+                    mission_id: row.get(1)?,
+                    revision: row.get(2)?,
+                    original_goal: row.get(3)?,
+                    reason: row.get(4)?,
+                    created_at_ms: row.get(5)?,
+                })
+            })
+            .map_err(db_error)?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(db_error)
+    }
+
+    pub fn save_requirement_matrix_entry(&self, row: &RequirementMatrixEntryRow) -> AcResult<()> {
+        self.connection
+            .execute(
+                "INSERT INTO requirement_matrix_entries VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+                params![
+                    row.id,
+                    row.mission_id,
+                    row.contract_revision,
+                    row.description,
+                    row.requirement_type,
+                    row.priority,
+                    row.source,
+                    row.verification_strategy,
+                    if row.blocking { 1_i64 } else { 0_i64 },
+                    row.implementation_status,
+                    row.verification_status,
+                    row.evidence_refs,
+                    row.linked_task_ids,
+                    row.created_at_ms
+                ],
+            )
+            .map_err(db_error)?;
+        Ok(())
+    }
+
+    pub fn requirement_matrix_entries(
+        &self,
+        mission_id: &str,
+    ) -> AcResult<Vec<RequirementMatrixEntryRow>> {
+        let mut stmt = self
+            .connection
+            .prepare(
+                "SELECT id, mission_id, contract_revision, description, requirement_type, priority,
+                    source, verification_strategy, blocking, implementation_status,
+                    verification_status, evidence_refs, linked_task_ids, created_at_ms
+             FROM requirement_matrix_entries WHERE mission_id=?1 ORDER BY created_at_ms ASC",
+            )
+            .map_err(db_error)?;
+        let rows = stmt
+            .query_map([mission_id], |row| {
+                Ok(RequirementMatrixEntryRow {
+                    id: row.get(0)?,
+                    mission_id: row.get(1)?,
+                    contract_revision: row.get(2)?,
+                    description: row.get(3)?,
+                    requirement_type: row.get(4)?,
+                    priority: row.get(5)?,
+                    source: row.get(6)?,
+                    verification_strategy: row.get(7)?,
+                    blocking: row.get::<_, i64>(8)? != 0,
+                    implementation_status: row.get(9)?,
+                    verification_status: row.get(10)?,
+                    evidence_refs: row.get(11)?,
+                    linked_task_ids: row.get(12)?,
+                    created_at_ms: row.get(13)?,
+                })
+            })
+            .map_err(db_error)?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(db_error)
+    }
+
+    pub fn save_task_lease(&self, row: &TaskLeaseRow) -> AcResult<()> {
+        self.connection
+            .execute(
+                "INSERT INTO task_leases VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                 ON CONFLICT(task_id) DO UPDATE SET
+                    worker_id=excluded.worker_id,
+                    lease_epoch=excluded.lease_epoch,
+                    expires_at_ms=excluded.expires_at_ms,
+                    heartbeat_interval_ms=excluded.heartbeat_interval_ms,
+                    state=excluded.state,
+                    updated_at_ms=excluded.updated_at_ms",
+                params![
+                    row.task_id,
+                    row.worker_id,
+                    row.lease_epoch,
+                    row.expires_at_ms,
+                    row.heartbeat_interval_ms,
+                    row.state,
+                    row.updated_at_ms
+                ],
+            )
+            .map_err(db_error)?;
+        Ok(())
+    }
+
+    pub fn task_lease(&self, task_id: &str) -> AcResult<Option<TaskLeaseRow>> {
+        self.connection
+            .query_row(
+                "SELECT task_id, worker_id, lease_epoch, expires_at_ms, heartbeat_interval_ms,
+                        state, updated_at_ms FROM task_leases WHERE task_id=?1",
+                params![task_id],
+                |row| {
+                    Ok(TaskLeaseRow {
+                        task_id: row.get(0)?,
+                        worker_id: row.get(1)?,
+                        lease_epoch: row.get(2)?,
+                        expires_at_ms: row.get(3)?,
+                        heartbeat_interval_ms: row.get(4)?,
+                        state: row.get(5)?,
+                        updated_at_ms: row.get(6)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(db_error)
+    }
+
+    pub fn save_autonomy_mailbox_message(&self, row: &AutonomyMailboxMessageRow) -> AcResult<()> {
+        self.connection
+            .execute(
+                "INSERT INTO autonomy_mailbox_messages VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                params![
+                    row.id,
+                    row.mission_id,
+                    row.sender_worker_id,
+                    row.recipient_worker_id,
+                    row.message_type,
+                    row.subject_id,
+                    row.payload,
+                    if row.delivered { 1_i64 } else { 0_i64 },
+                    row.created_at_ms
+                ],
+            )
+            .map_err(db_error)?;
+        Ok(())
+    }
+
+    pub fn autonomy_mailbox_messages(
+        &self,
+        mission_id: &str,
+    ) -> AcResult<Vec<AutonomyMailboxMessageRow>> {
+        let mut stmt = self
+            .connection
+            .prepare(
+                "SELECT id, mission_id, sender_worker_id, recipient_worker_id, message_type,
+                    subject_id, payload, delivered, created_at_ms
+             FROM autonomy_mailbox_messages WHERE mission_id=?1 ORDER BY created_at_ms ASC",
+            )
+            .map_err(db_error)?;
+        let rows = stmt
+            .query_map([mission_id], |row| {
+                Ok(AutonomyMailboxMessageRow {
+                    id: row.get(0)?,
+                    mission_id: row.get(1)?,
+                    sender_worker_id: row.get(2)?,
+                    recipient_worker_id: row.get(3)?,
+                    message_type: row.get(4)?,
+                    subject_id: row.get(5)?,
+                    payload: row.get(6)?,
+                    delivered: row.get::<_, i64>(7)? != 0,
+                    created_at_ms: row.get(8)?,
+                })
+            })
+            .map_err(db_error)?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(db_error)
+    }
+
+    pub fn save_autonomy_record(&self, row: &AutonomyRecordRow) -> AcResult<()> {
+        self.connection
+            .execute(
+                "INSERT INTO autonomy_records VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![
+                    row.id,
+                    row.mission_id,
+                    row.category,
+                    row.subject_id,
+                    row.payload,
+                    row.created_at_ms
+                ],
+            )
+            .map_err(db_error)?;
+        Ok(())
+    }
+
+    pub fn autonomy_records(
+        &self,
+        mission_id: &str,
+        category: &str,
+    ) -> AcResult<Vec<AutonomyRecordRow>> {
+        let mut stmt = self
+            .connection
+            .prepare(
+                "SELECT id, mission_id, category, subject_id, payload, created_at_ms
+             FROM autonomy_records WHERE mission_id=?1 AND category=?2 ORDER BY created_at_ms ASC",
+            )
+            .map_err(db_error)?;
+        let rows = stmt
+            .query_map(params![mission_id, category], |row| {
+                Ok(AutonomyRecordRow {
+                    id: row.get(0)?,
+                    mission_id: row.get(1)?,
+                    category: row.get(2)?,
+                    subject_id: row.get(3)?,
+                    payload: row.get(4)?,
+                    created_at_ms: row.get(5)?,
+                })
+            })
+            .map_err(db_error)?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(db_error)
+    }
 }
 
 fn memory_fact_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<MemoryFactRow> {
@@ -1767,7 +2086,7 @@ mod tests {
     fn sqlite_store_persists_kernel_state() {
         let mut db = ControlPlaneDb::open_memory().unwrap();
         db.migrate().unwrap();
-        assert_eq!(db.user_version().unwrap(), 6);
+        assert_eq!(db.user_version().unwrap(), 7);
 
         let mut kernel = Kernel::new(AllowAllPolicy);
         kernel.start().unwrap();
@@ -2255,6 +2574,101 @@ mod tests {
                     .unwrap()
                     .unwrap()
                     .passed
+            );
+        }
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn phase12_autonomy_state_survives_reopen() {
+        let path =
+            std::env::temp_dir().join(format!("agentcode-p12-{}.sqlite", StableId::new("db")));
+        let contract = MissionContractRevisionRow {
+            id: StableId::new("contract").to_string(),
+            mission_id: "mission-p12".to_string(),
+            revision: 1,
+            original_goal: "complete long mission".to_string(),
+            reason: "initial extraction".to_string(),
+            created_at_ms: millis(TimestampMillis::now()),
+        };
+        let requirement = RequirementMatrixEntryRow {
+            id: StableId::new("req").to_string(),
+            mission_id: contract.mission_id.clone(),
+            contract_revision: 1,
+            description: "scheduler only runs ready tasks".to_string(),
+            requirement_type: "FUNCTIONAL".to_string(),
+            priority: 100,
+            source: "original_goal".to_string(),
+            verification_strategy: "unit test".to_string(),
+            blocking: true,
+            implementation_status: "IMPLEMENTED".to_string(),
+            verification_status: "VERIFIED".to_string(),
+            evidence_refs: "ev-1".to_string(),
+            linked_task_ids: "task-1".to_string(),
+            created_at_ms: millis(TimestampMillis::now()),
+        };
+        let lease = TaskLeaseRow {
+            task_id: "task-1".to_string(),
+            worker_id: "worker-1".to_string(),
+            lease_epoch: 1,
+            expires_at_ms: millis(TimestampMillis::now()) + 5000,
+            heartbeat_interval_ms: 1000,
+            state: "active".to_string(),
+            updated_at_ms: millis(TimestampMillis::now()),
+        };
+        let message = AutonomyMailboxMessageRow {
+            id: StableId::new("msg").to_string(),
+            mission_id: contract.mission_id.clone(),
+            sender_worker_id: "worker-1".to_string(),
+            recipient_worker_id: Some("verifier-1".to_string()),
+            message_type: "FINDING".to_string(),
+            subject_id: Some("task-1".to_string()),
+            payload: "review diff".to_string(),
+            delivered: false,
+            created_at_ms: millis(TimestampMillis::now()),
+        };
+        let record = AutonomyRecordRow {
+            id: StableId::new("autonomy").to_string(),
+            mission_id: contract.mission_id.clone(),
+            category: "RECOVERY".to_string(),
+            subject_id: Some("task-1".to_string()),
+            payload: "provider failure -> switch route".to_string(),
+            created_at_ms: millis(TimestampMillis::now()),
+        };
+        {
+            let mut db = ControlPlaneDb::open(&path).unwrap();
+            db.migrate().unwrap();
+            db.save_mission_contract_revision(&contract).unwrap();
+            db.save_requirement_matrix_entry(&requirement).unwrap();
+            db.save_task_lease(&lease).unwrap();
+            db.save_autonomy_mailbox_message(&message).unwrap();
+            db.save_autonomy_record(&record).unwrap();
+        }
+        {
+            let db = ControlPlaneDb::open(&path).unwrap();
+            assert_eq!(
+                db.mission_contract_revisions(&contract.mission_id)
+                    .unwrap()
+                    .len(),
+                1
+            );
+            assert_eq!(
+                db.requirement_matrix_entries(&contract.mission_id).unwrap()[0].verification_status,
+                "VERIFIED"
+            );
+            assert_eq!(
+                db.task_lease(&lease.task_id).unwrap().unwrap().worker_id,
+                "worker-1"
+            );
+            assert_eq!(
+                db.autonomy_mailbox_messages(&contract.mission_id).unwrap()[0].message_type,
+                "FINDING"
+            );
+            assert_eq!(
+                db.autonomy_records(&contract.mission_id, "RECOVERY")
+                    .unwrap()[0]
+                    .payload,
+                "provider failure -> switch route"
             );
         }
         let _ = fs::remove_file(path);

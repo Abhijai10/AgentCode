@@ -76,6 +76,12 @@ pub const CONTEXT_ENGINE_V6: Migration = Migration {
     sql: include_str!("../../../migrations/0006_context_engine.sql"),
 };
 
+pub const FULL_AUTONOMY_KERNEL_V7: Migration = Migration {
+    id: "0007_full_autonomy_kernel",
+    description: "mission contracts, requirement matrix, leases, mailbox, and autonomy records",
+    sql: include_str!("../../../migrations/0007_full_autonomy_kernel.sql"),
+};
+
 pub fn validate_migrations(migrations: &[Migration]) -> AcResult<()> {
     let mut seen = BTreeSet::new();
     for migration in migrations {
