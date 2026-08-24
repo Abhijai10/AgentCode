@@ -4,7 +4,9 @@ use std::path::Path;
 use std::path::PathBuf;
 
 use ac_changeset::{
-    ChangeOperation, ChangeSet, ChangeSetMetadata, ChangeSetState, FileChangeSummary, RollbackPlan,
+    content_hash, ChangeOperation, ChangeSet, ChangeSetMetadata, ChangeSetState, EditEngine,
+    EditPrecondition, EditRequest, EditStrategy, FileChangeSummary, LocalWorkspaceFileRepository,
+    RollbackPlan,
 };
 use ac_code_intel::{
     CodeIntelligenceService, ContextCandidate, RepositoryScope, SourceFileIdentity,
@@ -568,21 +570,26 @@ impl<P: PolicyBoundary> AutonomousAgent<P> {
                     self.state = AutonomousState::Executing;
                 }
                 PlanStepKind::PrepareChangeSet { path, content } => {
-                    let mut proposed = ChangeSet::propose(
-                        vec![ChangeOperation::WriteFile {
-                            path: path.clone(),
-                            expected_hash: None,
-                            new_hash: format!("len:{}", content.len()),
-                        }],
-                        Some(RollbackPlan {
-                            checkpoint_ref: self
-                                .checkpoints
-                                .last()
-                                .map(|checkpoint| checkpoint.id.to_string())
-                                .unwrap_or_else(|| "none".to_string()),
-                            description: "rollback to prior agent checkpoint".to_string(),
-                        }),
-                    )?;
+                    let mut proposed = self
+                        .prepare_advanced_changeset(path, content)
+                        .unwrap_or_else(|_| {
+                            ChangeSet::propose(
+                                vec![ChangeOperation::WriteFile {
+                                    path: path.clone(),
+                                    expected_hash: None,
+                                    new_hash: format!("len:{}", content.len()),
+                                }],
+                                Some(RollbackPlan {
+                                    checkpoint_ref: self
+                                        .checkpoints
+                                        .last()
+                                        .map(|checkpoint| checkpoint.id.to_string())
+                                        .unwrap_or_else(|| "none".to_string()),
+                                    description: "rollback to prior agent checkpoint".to_string(),
+                                }),
+                            )
+                            .expect("fallback changeset is valid")
+                        });
                     let (files_changed, additions, removals) = self
                         .session
                         .worker()
@@ -785,6 +792,37 @@ impl<P: PolicyBoundary> AutonomousAgent<P> {
             self.session.run_until_idle()?;
         }
         last.ok_or_else(|| AcError::conflict("AGENT-NO_TOOL_ATTEMPT", "tool was not attempted"))
+    }
+
+    fn prepare_advanced_changeset(&self, path: &str, content: &str) -> AcResult<ChangeSet> {
+        let worktree = self
+            .session
+            .worker()
+            .workspace_ref
+            .as_ref()
+            .and_then(|worktree_id| self.git.worktree(worktree_id))
+            .ok_or_else(|| AcError::validation("AGENT-NO_WORKTREE", "agent has no worktree"))?;
+        let repo =
+            LocalWorkspaceFileRepository::new(worktree.path.clone(), worktree.base_commit.clone());
+        let current = std::fs::read_to_string(worktree.path.join(path)).map_err(|error| {
+            AcError::validation("AGENT-EDIT_PREPARE_READ_FAILED", error.to_string())
+        })?;
+        let transaction = EditEngine.prepare(
+            &repo,
+            vec![EditRequest {
+                path: path.to_string(),
+                precondition: EditPrecondition {
+                    path: path.to_string(),
+                    expected_hash: content_hash(&current),
+                    base_revision: worktree.base_commit.clone(),
+                    symbol_fingerprint: None,
+                },
+                strategy: EditStrategy::WholeFile {
+                    content: content.to_string(),
+                },
+            }],
+        )?;
+        Ok(transaction.changeset)
     }
 
     fn verify_with_repair(
@@ -1719,6 +1757,14 @@ mod tests {
         );
         let changeset = report.changeset.as_ref().unwrap();
         assert_eq!(changeset.state, ChangeSetState::Approved);
+        assert!(matches!(
+            &changeset.operations[0],
+            ChangeOperation::WriteFile {
+                expected_hash: Some(hash),
+                new_hash,
+                ..
+            } if hash.starts_with("fnv1a64:") && new_hash.starts_with("fnv1a64:")
+        ));
         let metadata = changeset.metadata.as_ref().unwrap();
         assert_eq!(metadata.verification_passed, Some(true));
         assert!(metadata

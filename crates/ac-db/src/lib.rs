@@ -1,6 +1,6 @@
 use std::path::Path;
 
-use ac_changeset::ChangeSet;
+use ac_changeset::{ChangeSet, ChangeSetTransaction};
 use ac_common::{AcError, AcResult, StableId, TimestampMillis};
 use ac_evidence::EvidenceRecord;
 use ac_git::{CheckpointRecord, WorktreeRecord};
@@ -230,6 +230,61 @@ pub struct AutonomyRecordRow {
     pub created_at_ms: i64,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EditTransactionRow {
+    pub id: String,
+    pub changeset_id: String,
+    pub task_id: Option<String>,
+    pub worktree_id: Option<String>,
+    pub base_revision: String,
+    pub state: String,
+    pub formatter: Option<String>,
+    pub degraded_reason: Option<String>,
+    pub created_at_ms: i64,
+    pub updated_at_ms: i64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EditOperationRow {
+    pub id: String,
+    pub transaction_id: String,
+    pub path: String,
+    pub strategy: String,
+    pub before_hash: String,
+    pub after_hash: String,
+    pub symbol_fingerprint: Option<String>,
+    pub additions: u32,
+    pub removals: u32,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EditJournalEntryRow {
+    pub id: String,
+    pub transaction_id: String,
+    pub path: String,
+    pub state: String,
+    pub before_hash: String,
+    pub after_hash: String,
+    pub created_at_ms: i64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EditStrategyMetricRow {
+    pub id: String,
+    pub transaction_id: String,
+    pub task_id: Option<String>,
+    pub model_id: Option<String>,
+    pub language: String,
+    pub strategy: String,
+    pub first_apply_success: bool,
+    pub syntax_failures: u32,
+    pub retries: u32,
+    pub unrelated_diff_files: u32,
+    pub verification_rejections: u32,
+    pub degraded: bool,
+    pub created_at_ms: i64,
+}
+
 impl ControlPlaneDb {
     pub fn open(path: impl AsRef<Path>) -> AcResult<Self> {
         let connection = Connection::open(path).map_err(db_error)?;
@@ -247,11 +302,11 @@ impl ControlPlaneDb {
 
     pub fn migrate(&mut self) -> AcResult<()> {
         let current_version = self.user_version()?;
-        if current_version > 7 {
+        if current_version > 8 {
             return Err(AcError::conflict(
                 "DB-FUTURE_VERSION",
                 format!(
-                    "database user_version {current_version} is newer than supported version 7"
+                    "database user_version {current_version} is newer than supported version 8"
                 ),
             ));
         }
@@ -292,7 +347,13 @@ impl ControlPlaneDb {
             ))
             .map_err(db_error)?;
         }
-        tx.pragma_update(None, "user_version", 7)
+        if current_version < 8 {
+            tx.execute_batch(include_str!(
+                "../../../migrations/0008_advanced_edit_engine.sql"
+            ))
+            .map_err(db_error)?;
+        }
+        tx.pragma_update(None, "user_version", 8)
             .map_err(db_error)?;
         tx.commit().map_err(db_error)?;
         Ok(())
@@ -1168,6 +1229,298 @@ impl ControlPlaneDb {
             )
             .map_err(db_error)?;
         Ok(())
+    }
+
+    pub fn save_edit_transaction(
+        &self,
+        transaction: &EditTransactionRow,
+        operations: &[EditOperationRow],
+        journal: &[EditJournalEntryRow],
+        metrics: &[EditStrategyMetricRow],
+    ) -> AcResult<()> {
+        if transaction.base_revision.trim().is_empty() || operations.is_empty() {
+            return Err(AcError::validation(
+                "DB-EDIT_TRANSACTION_INVALID",
+                "edit transactions require base revision and operations",
+            ));
+        }
+        self.connection
+            .execute(
+                "INSERT INTO edit_transactions (
+                    id, changeset_id, task_id, worktree_id, base_revision, state, formatter,
+                    degraded_reason, created_at_ms, updated_at_ms
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+                 ON CONFLICT(id) DO UPDATE SET
+                    state=excluded.state,
+                    formatter=excluded.formatter,
+                    degraded_reason=excluded.degraded_reason,
+                    updated_at_ms=excluded.updated_at_ms",
+                params![
+                    transaction.id,
+                    transaction.changeset_id,
+                    transaction.task_id,
+                    transaction.worktree_id,
+                    transaction.base_revision,
+                    transaction.state,
+                    transaction.formatter,
+                    transaction.degraded_reason,
+                    transaction.created_at_ms,
+                    transaction.updated_at_ms
+                ],
+            )
+            .map_err(db_error)?;
+        for table in [
+            "edit_operations",
+            "edit_journal_entries",
+            "edit_strategy_metrics",
+        ] {
+            self.connection
+                .execute(
+                    &format!("DELETE FROM {table} WHERE transaction_id=?1"),
+                    params![transaction.id],
+                )
+                .map_err(db_error)?;
+        }
+        for row in operations {
+            self.connection
+                .execute(
+                    "INSERT INTO edit_operations VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                    params![
+                        row.id,
+                        row.transaction_id,
+                        row.path,
+                        row.strategy,
+                        row.before_hash,
+                        row.after_hash,
+                        row.symbol_fingerprint,
+                        row.additions,
+                        row.removals
+                    ],
+                )
+                .map_err(db_error)?;
+        }
+        for row in journal {
+            self.connection
+                .execute(
+                    "INSERT INTO edit_journal_entries VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                    params![
+                        row.id,
+                        row.transaction_id,
+                        row.path,
+                        row.state,
+                        row.before_hash,
+                        row.after_hash,
+                        row.created_at_ms
+                    ],
+                )
+                .map_err(db_error)?;
+        }
+        for row in metrics {
+            self.connection
+                .execute(
+                    "INSERT INTO edit_strategy_metrics VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+                    params![
+                        row.id,
+                        row.transaction_id,
+                        row.task_id,
+                        row.model_id,
+                        row.language,
+                        row.strategy,
+                        if row.first_apply_success { 1_i64 } else { 0_i64 },
+                        row.syntax_failures,
+                        row.retries,
+                        row.unrelated_diff_files,
+                        row.verification_rejections,
+                        if row.degraded { 1_i64 } else { 0_i64 },
+                        row.created_at_ms
+                    ],
+                )
+                .map_err(db_error)?;
+        }
+        Ok(())
+    }
+
+    pub fn save_changeset_transaction(
+        &self,
+        transaction: &ChangeSetTransaction,
+        task_id: Option<&str>,
+        worktree_id: Option<&str>,
+        base_revision: &str,
+        language: &str,
+    ) -> AcResult<()> {
+        let now = millis(TimestampMillis::now());
+        let row = EditTransactionRow {
+            id: transaction.id.to_string(),
+            changeset_id: transaction.changeset.id.to_string(),
+            task_id: task_id.map(ToString::to_string),
+            worktree_id: worktree_id.map(ToString::to_string),
+            base_revision: base_revision.to_string(),
+            state: format!("{:?}", transaction.changeset.state),
+            formatter: transaction.format_plan.formatter.clone(),
+            degraded_reason: transaction.format_plan.degraded_reason.clone(),
+            created_at_ms: millis(transaction.changeset.created_at),
+            updated_at_ms: now,
+        };
+        let operations = transaction
+            .edits
+            .iter()
+            .map(|edit| EditOperationRow {
+                id: StableId::new("editop").to_string(),
+                transaction_id: row.id.clone(),
+                path: edit.path.clone(),
+                strategy: format!("{:?}", edit.strategy),
+                before_hash: edit.before_hash.clone(),
+                after_hash: edit.after_hash.clone(),
+                symbol_fingerprint: edit.symbol_fingerprint.clone(),
+                additions: edit.additions,
+                removals: edit.removals,
+            })
+            .collect::<Vec<_>>();
+        let journal = transaction
+            .journal
+            .entries
+            .iter()
+            .map(|entry| EditJournalEntryRow {
+                id: entry.id.to_string(),
+                transaction_id: row.id.clone(),
+                path: entry.path.clone(),
+                state: format!("{:?}", entry.state),
+                before_hash: entry.before_hash.clone(),
+                after_hash: entry.after_hash.clone(),
+                created_at_ms: millis(entry.created_at),
+            })
+            .collect::<Vec<_>>();
+        let metrics = vec![EditStrategyMetricRow {
+            id: StableId::new("editmetric").to_string(),
+            transaction_id: row.id.clone(),
+            task_id: task_id.map(ToString::to_string),
+            model_id: None,
+            language: language.to_string(),
+            strategy: format!("{:?}", transaction.metrics.strategy),
+            first_apply_success: transaction.metrics.first_apply_success,
+            syntax_failures: transaction.metrics.syntax_failures,
+            retries: transaction.metrics.retries,
+            unrelated_diff_files: transaction.metrics.unrelated_diff_files,
+            verification_rejections: transaction.metrics.verification_rejections,
+            degraded: transaction.metrics.degraded,
+            created_at_ms: now,
+        }];
+        self.save_edit_transaction(&row, &operations, &journal, &metrics)
+    }
+
+    pub fn edit_transaction(&self, id: &str) -> AcResult<Option<EditTransactionRow>> {
+        self.connection
+            .query_row(
+                "SELECT id, changeset_id, task_id, worktree_id, base_revision, state, formatter,
+                        degraded_reason, created_at_ms, updated_at_ms
+                 FROM edit_transactions WHERE id=?1",
+                params![id],
+                |row| {
+                    Ok(EditTransactionRow {
+                        id: row.get(0)?,
+                        changeset_id: row.get(1)?,
+                        task_id: row.get(2)?,
+                        worktree_id: row.get(3)?,
+                        base_revision: row.get(4)?,
+                        state: row.get(5)?,
+                        formatter: row.get(6)?,
+                        degraded_reason: row.get(7)?,
+                        created_at_ms: row.get(8)?,
+                        updated_at_ms: row.get(9)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(db_error)
+    }
+
+    pub fn edit_journal_entries(&self, transaction_id: &str) -> AcResult<Vec<EditJournalEntryRow>> {
+        let mut stmt = self
+            .connection
+            .prepare(
+                "SELECT id, transaction_id, path, state, before_hash, after_hash, created_at_ms
+                 FROM edit_journal_entries WHERE transaction_id=?1 ORDER BY created_at_ms ASC",
+            )
+            .map_err(db_error)?;
+        let rows = stmt
+            .query_map(params![transaction_id], |row| {
+                Ok(EditJournalEntryRow {
+                    id: row.get(0)?,
+                    transaction_id: row.get(1)?,
+                    path: row.get(2)?,
+                    state: row.get(3)?,
+                    before_hash: row.get(4)?,
+                    after_hash: row.get(5)?,
+                    created_at_ms: row.get(6)?,
+                })
+            })
+            .map_err(db_error)?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(db_error)
+    }
+
+    pub fn pending_edit_transactions(&self) -> AcResult<Vec<EditTransactionRow>> {
+        let mut stmt = self
+            .connection
+            .prepare(
+                "SELECT id, changeset_id, task_id, worktree_id, base_revision, state, formatter,
+                        degraded_reason, created_at_ms, updated_at_ms
+                 FROM edit_transactions
+                 WHERE state IN ('Applying', 'RollingBack', 'UnknownEffect')
+                 ORDER BY updated_at_ms ASC",
+            )
+            .map_err(db_error)?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok(EditTransactionRow {
+                    id: row.get(0)?,
+                    changeset_id: row.get(1)?,
+                    task_id: row.get(2)?,
+                    worktree_id: row.get(3)?,
+                    base_revision: row.get(4)?,
+                    state: row.get(5)?,
+                    formatter: row.get(6)?,
+                    degraded_reason: row.get(7)?,
+                    created_at_ms: row.get(8)?,
+                    updated_at_ms: row.get(9)?,
+                })
+            })
+            .map_err(db_error)?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(db_error)
+    }
+
+    pub fn edit_strategy_metrics(
+        &self,
+        transaction_id: &str,
+    ) -> AcResult<Vec<EditStrategyMetricRow>> {
+        let mut stmt = self
+            .connection
+            .prepare(
+                "SELECT id, transaction_id, task_id, model_id, language, strategy,
+                        first_apply_success, syntax_failures, retries, unrelated_diff_files,
+                        verification_rejections, degraded, created_at_ms
+                 FROM edit_strategy_metrics WHERE transaction_id=?1 ORDER BY created_at_ms ASC",
+            )
+            .map_err(db_error)?;
+        let rows = stmt
+            .query_map(params![transaction_id], |row| {
+                Ok(EditStrategyMetricRow {
+                    id: row.get(0)?,
+                    transaction_id: row.get(1)?,
+                    task_id: row.get(2)?,
+                    model_id: row.get(3)?,
+                    language: row.get(4)?,
+                    strategy: row.get(5)?,
+                    first_apply_success: row.get::<_, i64>(6)? != 0,
+                    syntax_failures: row.get(7)?,
+                    retries: row.get(8)?,
+                    unrelated_diff_files: row.get(9)?,
+                    verification_rejections: row.get(10)?,
+                    degraded: row.get::<_, i64>(11)? != 0,
+                    created_at_ms: row.get(12)?,
+                })
+            })
+            .map_err(db_error)?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(db_error)
     }
 
     fn configure(&self) -> AcResult<()> {
@@ -2086,7 +2439,7 @@ mod tests {
     fn sqlite_store_persists_kernel_state() {
         let mut db = ControlPlaneDb::open_memory().unwrap();
         db.migrate().unwrap();
-        assert_eq!(db.user_version().unwrap(), 7);
+        assert_eq!(db.user_version().unwrap(), 8);
 
         let mut kernel = Kernel::new(AllowAllPolicy);
         kernel.start().unwrap();
@@ -2669,6 +3022,69 @@ mod tests {
                     .unwrap()[0]
                     .payload,
                 "provider failure -> switch route"
+            );
+        }
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn phase13_edit_transactions_survive_reopen_and_expose_recovery_rows() {
+        let path =
+            std::env::temp_dir().join(format!("agentcode-p13-{}.sqlite", StableId::new("db")));
+        let mut repo = ac_changeset::MemoryFileRepository::new("rev-p13");
+        repo.put("src/lib.rs", "pub fn answer() -> u32 { 41 }\n");
+        let request = ac_changeset::EditRequest {
+            path: "src/lib.rs".to_string(),
+            precondition: ac_changeset::EditPrecondition {
+                path: "src/lib.rs".to_string(),
+                expected_hash: repo.hash("src/lib.rs").unwrap(),
+                base_revision: "rev-p13".to_string(),
+                symbol_fingerprint: None,
+            },
+            strategy: ac_changeset::EditStrategy::SearchReplace {
+                search: "41".to_string(),
+                replace: "42".to_string(),
+                expected_matches: 1,
+            },
+        };
+        let mut transaction = ac_changeset::EditEngine
+            .prepare(&repo, vec![request])
+            .unwrap();
+        ac_changeset::EditEngine
+            .apply(&mut repo, &mut transaction)
+            .unwrap();
+        transaction.changeset.mark_validating().unwrap();
+        {
+            let mut db = ControlPlaneDb::open(&path).unwrap();
+            db.migrate().unwrap();
+            assert_eq!(db.user_version().unwrap(), 8);
+            db.save_changeset_transaction(
+                &transaction,
+                Some("task-p13"),
+                Some("worktree-p13"),
+                "rev-p13",
+                "rust",
+            )
+            .unwrap();
+        }
+        {
+            let db = ControlPlaneDb::open(&path).unwrap();
+            let saved = db
+                .edit_transaction(&transaction.id.to_string())
+                .unwrap()
+                .unwrap();
+            assert_eq!(saved.state, "Validating");
+            assert_eq!(
+                db.edit_journal_entries(&transaction.id.to_string())
+                    .unwrap()[0]
+                    .state,
+                "Applied"
+            );
+            assert_eq!(
+                db.edit_strategy_metrics(&transaction.id.to_string())
+                    .unwrap()[0]
+                    .strategy,
+                "SearchReplace"
             );
         }
         let _ = fs::remove_file(path);

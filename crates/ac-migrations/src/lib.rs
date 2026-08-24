@@ -82,6 +82,12 @@ pub const FULL_AUTONOMY_KERNEL_V7: Migration = Migration {
     sql: include_str!("../../../migrations/0007_full_autonomy_kernel.sql"),
 };
 
+pub const ADVANCED_EDIT_ENGINE_V8: Migration = Migration {
+    id: "0008_advanced_edit_engine",
+    description: "advanced edit transactions, operations, journal, and strategy metrics",
+    sql: include_str!("../../../migrations/0008_advanced_edit_engine.sql"),
+};
+
 pub fn validate_migrations(migrations: &[Migration]) -> AcResult<()> {
     let mut seen = BTreeSet::new();
     for migration in migrations {
