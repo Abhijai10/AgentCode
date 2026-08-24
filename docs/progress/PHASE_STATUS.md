@@ -5,7 +5,7 @@ Doc 10 gates for the phase pass and completion evidence exists).
 
 Phase names are the EXACT canonical names from Doc 09 HC-P00..HC-P29 (no aliases).
 
-Last updated: 2026-08-24 (Phase 16 skills/hooks/MCP closure)
+Last updated: 2026-08-24 (Phase 17 baseline security closure)
 
 | Phase | Name (Doc 09 HC-*) | Status | Notes |
 |-------|--------------------|--------|-------|
@@ -26,7 +26,7 @@ Last updated: 2026-08-24 (Phase 16 skills/hooks/MCP closure)
 | P14 | Verification & Evidence Engine | COMPLETE | P14-WP01..P14-WP14 ACCEPTED; verification profiles, command detection, mechanical gates, test registry/selection, evidence manifests, requirement links, independent verifier, adversarial/tampering checks, freshness invalidation, integration verification, final audit and completion gate pass P14-G1..G14; evidence: docs/progress/phase-14-completion.md (+ .json) |
 | P15 | Browser Runtime & Visual Verification | COMPLETE | P15-WP01..P15-WP11 ACCEPTED; adapter abstraction, process/session registry, page actions, DOM/a11y extraction, diagnostics, screenshots, dev-server records, responsive profiles, visual QA and crash recovery pass P15-G1..G11 plus behavioral browser flow; evidence: docs/progress/phase-15-completion.md (+ .json) |
 | P16 | Skills, Hooks & MCP | COMPLETE | P16-WP01..P16-WP13 ACCEPTED; skill manifests/registry/discovery/progressive loading/importers, hook registry/dispatch/failure safety, MCP lifecycle/discovery/tool routing/trust pass P16-G1..G15; evidence: docs/progress/phase-16-completion.md (+ .json) |
-| P17 | Baseline Security Platform | NOT_STARTED | |
+| P17 | Baseline Security Platform | COMPLETE | P17-WP01..P17-WP14 ACCEPTED; threat model, unified findings, baseline adapters, redaction, grouping, triage, repair/regression and Markdown/JSON/SARIF reports pass P17-G1..G15; evidence: docs/progress/phase-17-completion.md (+ .json) |
 | P18 | Advanced AppSec, Cloud & Red-Team | NOT_STARTED | |
 | P19 | AI Security | NOT_STARTED | |
 | P20 | Discuss Mode | NOT_STARTED | |

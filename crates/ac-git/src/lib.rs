@@ -930,6 +930,9 @@ mod tests {
         let source = std::env::temp_dir().join(format!("agentcode-src-{}", StableId::new("tmp")));
         let one = std::env::temp_dir().join(format!("agentcode-wt-{}", StableId::new("tmp")));
         let two = std::env::temp_dir().join(format!("agentcode-wt-{}", StableId::new("tmp")));
+        let _ = fs::remove_dir_all(&source);
+        let _ = fs::remove_dir_all(&one);
+        let _ = fs::remove_dir_all(&two);
         fs::create_dir_all(&source).unwrap();
         fs::write(source.join("a.txt"), "base\n").unwrap();
         run_git(&source, ["init"]);
@@ -995,6 +998,8 @@ mod tests {
     fn dirty_base_is_preserved_and_integration_conflicts_are_structured() {
         let source = std::env::temp_dir().join(format!("agentcode-src-{}", StableId::new("tmp")));
         let worktree = std::env::temp_dir().join(format!("agentcode-wt-{}", StableId::new("tmp")));
+        let _ = fs::remove_dir_all(&source);
+        let _ = fs::remove_dir_all(&worktree);
         fs::create_dir_all(&source).unwrap();
         fs::write(source.join("a.txt"), "base\n").unwrap();
         run_git(&source, ["init"]);
@@ -1043,6 +1048,7 @@ mod tests {
             .unwrap();
         let other_path =
             std::env::temp_dir().join(format!("agentcode-wt-{}", StableId::new("tmp")));
+        let _ = fs::remove_dir_all(&other_path);
         let other = git
             .create_task_workspace(
                 source.clone(),

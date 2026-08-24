@@ -106,6 +106,12 @@ pub const EXTENSIONS_SKILLS_HOOKS_MCP_V11: Migration = Migration {
     sql: include_str!("../../../migrations/0011_extensions_skills_hooks_mcp.sql"),
 };
 
+pub const BASELINE_SECURITY_V12: Migration = Migration {
+    id: "0012_baseline_security",
+    description: "baseline security threat models, scans, findings, and reports",
+    sql: include_str!("../../../migrations/0012_baseline_security.sql"),
+};
+
 pub fn validate_migrations(migrations: &[Migration]) -> AcResult<()> {
     let mut seen = BTreeSet::new();
     for migration in migrations {

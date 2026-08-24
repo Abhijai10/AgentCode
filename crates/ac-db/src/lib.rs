@@ -7,7 +7,7 @@ use ac_git::{CheckpointRecord, WorktreeRecord};
 use ac_kernel::{KernelDecisionKind, KernelEvent, Mission, MissionState};
 use ac_security::{
     HookInvocation, HookManifest, McpInvocationRecord, McpServerRecord, McpToolRecord,
-    SkillManifest,
+    SecurityReportBundle, SecurityScanInput, SecurityScanReport, SkillManifest,
 };
 use ac_verification::{
     BrowserProcessRecord, BrowserSessionRecord, DevServerRecord, FinalAuditReport,
@@ -147,6 +147,22 @@ pub struct McpServerRow {
     pub name: String,
     pub health: String,
     pub restart_count: u32,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SecurityScanRow {
+    pub id: String,
+    pub repository_id: String,
+    pub commit_ref: String,
+    pub threat_model_id: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SecurityFindingRow {
+    pub id: String,
+    pub root_cause: String,
+    pub severity: String,
+    pub status: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -406,11 +422,11 @@ impl ControlPlaneDb {
 
     pub fn migrate(&mut self) -> AcResult<()> {
         let current_version = self.user_version()?;
-        if current_version > 11 {
+        if current_version > 12 {
             return Err(AcError::conflict(
                 "DB-FUTURE_VERSION",
                 format!(
-                    "database user_version {current_version} is newer than supported version 11"
+                    "database user_version {current_version} is newer than supported version 12"
                 ),
             ));
         }
@@ -473,7 +489,13 @@ impl ControlPlaneDb {
             ))
             .map_err(db_error)?;
         }
-        tx.pragma_update(None, "user_version", 11)
+        if current_version < 12 {
+            tx.execute_batch(include_str!(
+                "../../../migrations/0012_baseline_security.sql"
+            ))
+            .map_err(db_error)?;
+        }
+        tx.pragma_update(None, "user_version", 12)
             .map_err(db_error)?;
         tx.commit().map_err(db_error)?;
         Ok(())
@@ -2182,6 +2204,143 @@ impl ControlPlaneDb {
             .map_err(db_error)
     }
 
+    pub fn save_security_scan(
+        &self,
+        input: &SecurityScanInput,
+        report: &SecurityScanReport,
+    ) -> AcResult<()> {
+        self.connection
+            .execute(
+                "INSERT INTO security_threat_models VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+                 ON CONFLICT(id) DO UPDATE SET evidence_refs=excluded.evidence_refs",
+                params![
+                    report.threat_model.id.to_string(),
+                    input.repository_id.to_string(),
+                    input.commit,
+                    report.threat_model.entry_points.join(","),
+                    report.threat_model.auth_boundaries.join(","),
+                    report.threat_model.data_stores.join(","),
+                    report.threat_model.admin_operations.join(","),
+                    report.threat_model.cloud_configuration.join(","),
+                    report.threat_model.sensitive_assets.join(","),
+                    stable_ids_csv(&report.threat_model.evidence_refs)
+                ],
+            )
+            .map_err(db_error)?;
+        self.connection
+            .execute(
+                "INSERT INTO security_scan_reports VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                 ON CONFLICT(id) DO UPDATE SET missing_adapters=excluded.missing_adapters",
+                params![
+                    report.id.to_string(),
+                    input.repository_id.to_string(),
+                    input.commit,
+                    format!("{:?}", report.adapters_run),
+                    report.missing_adapters.join(","),
+                    report.threat_model.id.to_string()
+                ],
+            )
+            .map_err(db_error)?;
+        for item in &report.instances {
+            self.connection
+                .execute(
+                    "INSERT INTO security_finding_instances VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+                     ON CONFLICT(id) DO NOTHING",
+                    params![
+                        item.id.to_string(),
+                        report.id.to_string(),
+                        format!("{:?}", item.adapter),
+                        item.rule_id,
+                        format!("{:?}", item.severity),
+                        item.confidence,
+                        format!("{:?}", item.proof_level),
+                        item.file_path,
+                        item.line,
+                        item.fingerprint,
+                        item.redacted_evidence,
+                        item.raw_evidence_ref.to_string()
+                    ],
+                )
+                .map_err(db_error)?;
+        }
+        for finding in &report.findings {
+            self.connection
+                .execute(
+                    "INSERT INTO security_findings VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+                     ON CONFLICT(id) DO UPDATE SET status=excluded.status",
+                    params![
+                        finding.id.to_string(),
+                        report.id.to_string(),
+                        finding.root_cause,
+                        format!("{:?}", finding.severity),
+                        finding.confidence,
+                        finding.exploitability,
+                        format!("{:?}", finding.status),
+                        finding.affected_code.join(","),
+                        stable_ids_csv(&finding.evidence_refs),
+                        finding.remediation,
+                        stable_ids_csv(&finding.instance_ids)
+                    ],
+                )
+                .map_err(db_error)?;
+        }
+        Ok(())
+    }
+
+    pub fn save_security_reports(
+        &self,
+        scan_id: &StableId,
+        bundle: &SecurityReportBundle,
+    ) -> AcResult<()> {
+        self.connection
+            .execute(
+                "INSERT INTO security_reports VALUES (?1, ?2, ?3, ?4)
+                 ON CONFLICT(scan_id) DO UPDATE SET markdown=excluded.markdown, json_report=excluded.json_report, sarif=excluded.sarif",
+                params![scan_id.to_string(), bundle.markdown, bundle.json, bundle.sarif],
+            )
+            .map_err(db_error)?;
+        Ok(())
+    }
+
+    pub fn security_scan(&self, id: &str) -> AcResult<Option<SecurityScanRow>> {
+        self.connection
+            .query_row(
+                "SELECT id, repository_id, commit_ref, threat_model_id FROM security_scan_reports WHERE id=?1",
+                params![id],
+                |row| {
+                    Ok(SecurityScanRow {
+                        id: row.get(0)?,
+                        repository_id: row.get(1)?,
+                        commit_ref: row.get(2)?,
+                        threat_model_id: row.get(3)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(db_error)
+    }
+
+    pub fn security_findings(&self, scan_id: &str) -> AcResult<Vec<SecurityFindingRow>> {
+        let mut stmt = self
+            .connection
+            .prepare(
+                "SELECT id, root_cause, severity, status FROM security_findings
+                 WHERE scan_id=?1 ORDER BY root_cause",
+            )
+            .map_err(db_error)?;
+        let rows = stmt
+            .query_map(params![scan_id], |row| {
+                Ok(SecurityFindingRow {
+                    id: row.get(0)?,
+                    root_cause: row.get(1)?,
+                    severity: row.get(2)?,
+                    status: row.get(3)?,
+                })
+            })
+            .map_err(db_error)?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(db_error)
+    }
+
     fn configure(&self) -> AcResult<()> {
         self.connection
             .pragma_update(None, "foreign_keys", "ON")
@@ -3043,6 +3202,13 @@ fn millis(ts: TimestampMillis) -> i64 {
     ts.as_millis().min(i64::MAX as u128) as i64
 }
 
+fn stable_ids_csv(ids: &[StableId]) -> String {
+    ids.iter()
+        .map(StableId::to_string)
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
 fn mission_state(state: MissionState) -> &'static str {
     match state {
         MissionState::Created => "created",
@@ -3099,7 +3265,7 @@ mod tests {
     fn sqlite_store_persists_kernel_state() {
         let mut db = ControlPlaneDb::open_memory().unwrap();
         db.migrate().unwrap();
-        assert_eq!(db.user_version().unwrap(), 11);
+        assert_eq!(db.user_version().unwrap(), 12);
 
         let mut kernel = Kernel::new(AllowAllPolicy);
         kernel.start().unwrap();
@@ -3717,7 +3883,7 @@ mod tests {
         {
             let mut db = ControlPlaneDb::open(&path).unwrap();
             db.migrate().unwrap();
-            assert_eq!(db.user_version().unwrap(), 11);
+            assert_eq!(db.user_version().unwrap(), 12);
             db.save_changeset_transaction(
                 &transaction,
                 Some("task-p13"),
@@ -3796,7 +3962,7 @@ mod tests {
         {
             let mut db = ControlPlaneDb::open(&path).unwrap();
             db.migrate().unwrap();
-            assert_eq!(db.user_version().unwrap(), 11);
+            assert_eq!(db.user_version().unwrap(), 12);
             db.save_verification_profile(&profile).unwrap();
             db.save_verification_manifest(
                 &manifest,
@@ -3878,7 +4044,7 @@ mod tests {
         {
             let mut db = ControlPlaneDb::open(&path).unwrap();
             db.migrate().unwrap();
-            assert_eq!(db.user_version().unwrap(), 11);
+            assert_eq!(db.user_version().unwrap(), 12);
             db.save_browser_process(&process).unwrap();
             db.save_browser_session(&session).unwrap();
             db.save_browser_dev_server(&dev_server).unwrap();
@@ -3911,7 +4077,7 @@ mod tests {
         {
             let mut db = ControlPlaneDb::open(&path).unwrap();
             db.migrate().unwrap();
-            assert_eq!(db.user_version().unwrap(), 11);
+            assert_eq!(db.user_version().unwrap(), 12);
             let skill = SkillManifest {
                 id: skill_id.clone(),
                 name: "Rust".to_string(),
@@ -3995,6 +4161,51 @@ mod tests {
             let server = db.mcp_server(server_id.as_str()).unwrap().unwrap();
             assert_eq!(server.health, "Connected");
             assert_eq!(server.restart_count, 1);
+        }
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn phase17_security_scan_state_survives_reopen() {
+        let path =
+            std::env::temp_dir().join(format!("agentcode-phase17-{}.sqlite", StableId::new("db")));
+        let repo_id = StableId::new("repo");
+        let scan_id;
+        {
+            let mut db = ControlPlaneDb::open(&path).unwrap();
+            db.migrate().unwrap();
+            assert_eq!(db.user_version().unwrap(), 12);
+            let orchestrator = ac_security::BaselineSecurityOrchestrator::new(
+                ac_security::SecurityPolicy::baseline(),
+            );
+            let input = ac_security::SecurityScanInput {
+                repository_id: repo_id.clone(),
+                commit: "abc123".to_string(),
+                files: vec![(
+                    "src/api.rs".to_string(),
+                    "fn handler() { let token = \"SECRET=value\"; }".to_string(),
+                )],
+                dependency_manifest: Some("vulnerable-package = \"0.1.0\"".to_string()),
+                include_iac: false,
+            };
+            let report = orchestrator.run(&input).unwrap();
+            let bundle = orchestrator.reports(&report);
+            scan_id = report.id.clone();
+            db.save_security_scan(&input, &report).unwrap();
+            db.save_security_reports(&report.id, &bundle).unwrap();
+        }
+        {
+            let mut db = ControlPlaneDb::open(&path).unwrap();
+            db.migrate().unwrap();
+            let scan = db.security_scan(scan_id.as_str()).unwrap().unwrap();
+            assert_eq!(scan.repository_id, repo_id.to_string());
+            let findings = db.security_findings(scan_id.as_str()).unwrap();
+            assert!(findings
+                .iter()
+                .any(|finding| finding.root_cause == "secret-exposure"));
+            assert!(findings
+                .iter()
+                .any(|finding| finding.root_cause == "vulnerable-dependency"));
         }
         let _ = fs::remove_file(path);
     }
