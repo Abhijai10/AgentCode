@@ -100,6 +100,12 @@ pub const BROWSER_RUNTIME_V10: Migration = Migration {
     sql: include_str!("../../../migrations/0010_browser_runtime.sql"),
 };
 
+pub const EXTENSIONS_SKILLS_HOOKS_MCP_V11: Migration = Migration {
+    id: "0011_extensions_skills_hooks_mcp",
+    description: "skill registry, hook lifecycle, and MCP extension metadata",
+    sql: include_str!("../../../migrations/0011_extensions_skills_hooks_mcp.sql"),
+};
+
 pub fn validate_migrations(migrations: &[Migration]) -> AcResult<()> {
     let mut seen = BTreeSet::new();
     for migration in migrations {

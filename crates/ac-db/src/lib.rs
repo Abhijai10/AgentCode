@@ -5,6 +5,10 @@ use ac_common::{AcError, AcResult, StableId, TimestampMillis};
 use ac_evidence::EvidenceRecord;
 use ac_git::{CheckpointRecord, WorktreeRecord};
 use ac_kernel::{KernelDecisionKind, KernelEvent, Mission, MissionState};
+use ac_security::{
+    HookInvocation, HookManifest, McpInvocationRecord, McpServerRecord, McpToolRecord,
+    SkillManifest,
+};
 use ac_verification::{
     BrowserProcessRecord, BrowserSessionRecord, DevServerRecord, FinalAuditReport,
     RequirementEvidenceLink, ScreenshotEvidence, VerificationEvidenceManifest, VerificationProfile,
@@ -118,6 +122,31 @@ pub struct ContextCompressionReceiptRow {
     pub compressed_token_estimate: u32,
     pub omitted_lines: u32,
     pub created_at_ms: i64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SkillRow {
+    pub id: String,
+    pub name: String,
+    pub scope: String,
+    pub trust_tier: String,
+    pub full_instructions: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HookInvocationRow {
+    pub id: String,
+    pub hook_id: String,
+    pub outcome: String,
+    pub evidence_ref: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct McpServerRow {
+    pub id: String,
+    pub name: String,
+    pub health: String,
+    pub restart_count: u32,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -377,11 +406,11 @@ impl ControlPlaneDb {
 
     pub fn migrate(&mut self) -> AcResult<()> {
         let current_version = self.user_version()?;
-        if current_version > 10 {
+        if current_version > 11 {
             return Err(AcError::conflict(
                 "DB-FUTURE_VERSION",
                 format!(
-                    "database user_version {current_version} is newer than supported version 10"
+                    "database user_version {current_version} is newer than supported version 11"
                 ),
             ));
         }
@@ -438,7 +467,13 @@ impl ControlPlaneDb {
             tx.execute_batch(include_str!("../../../migrations/0010_browser_runtime.sql"))
                 .map_err(db_error)?;
         }
-        tx.pragma_update(None, "user_version", 10)
+        if current_version < 11 {
+            tx.execute_batch(include_str!(
+                "../../../migrations/0011_extensions_skills_hooks_mcp.sql"
+            ))
+            .map_err(db_error)?;
+        }
+        tx.pragma_update(None, "user_version", 11)
             .map_err(db_error)?;
         tx.commit().map_err(db_error)?;
         Ok(())
@@ -1965,6 +2000,188 @@ impl ControlPlaneDb {
         rows.collect::<Result<Vec<_>, _>>().map_err(db_error)
     }
 
+    pub fn save_skill(&self, skill: &SkillManifest) -> AcResult<()> {
+        self.connection
+            .execute(
+                "INSERT INTO skills VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
+                 ON CONFLICT(id) DO UPDATE SET
+                    description=excluded.description,
+                    trigger_hints=excluded.trigger_hints,
+                    loaded_at_ms=excluded.loaded_at_ms",
+                params![
+                    skill.id.to_string(),
+                    skill.name,
+                    skill.description,
+                    skill.version,
+                    skill.source,
+                    format!("{:?}", skill.scope),
+                    format!("{:?}", skill.trust_tier),
+                    skill.trigger_hints.join(","),
+                    format!("{:?}", skill.required_capabilities),
+                    skill.context_cost,
+                    skill.project_id.as_ref().map(StableId::to_string),
+                    skill.task_id.as_ref().map(StableId::to_string),
+                    skill.full_instructions,
+                    skill.loaded_at.map(millis)
+                ],
+            )
+            .map_err(db_error)?;
+        Ok(())
+    }
+
+    pub fn skill(&self, id: &str) -> AcResult<Option<SkillRow>> {
+        self.connection
+            .query_row(
+                "SELECT id, name, scope, trust_tier, full_instructions FROM skills WHERE id=?1",
+                params![id],
+                |row| {
+                    Ok(SkillRow {
+                        id: row.get(0)?,
+                        name: row.get(1)?,
+                        scope: row.get(2)?,
+                        trust_tier: row.get(3)?,
+                        full_instructions: row.get(4)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(db_error)
+    }
+
+    pub fn save_hook_manifest(&self, hook: &HookManifest) -> AcResult<()> {
+        self.connection
+            .execute(
+                "INSERT INTO hook_manifests VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                 ON CONFLICT(id) DO UPDATE SET timeout_ms=excluded.timeout_ms",
+                params![
+                    hook.id.to_string(),
+                    hook.extension_id.to_string(),
+                    format!("{:?}", hook.event),
+                    hook.priority,
+                    hook.timeout_ms,
+                    hook.idempotency_key,
+                    format!("{:?}", hook.failure_policy),
+                    format!("{:?}", hook.required_capabilities)
+                ],
+            )
+            .map_err(db_error)?;
+        Ok(())
+    }
+
+    pub fn save_hook_invocation(&self, invocation: &HookInvocation) -> AcResult<()> {
+        self.connection
+            .execute(
+                "INSERT INTO hook_invocations VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                 ON CONFLICT(id) DO NOTHING",
+                params![
+                    invocation.id.to_string(),
+                    invocation.hook_id.to_string(),
+                    format!("{:?}", invocation.event),
+                    format!("{:?}", invocation.outcome),
+                    invocation.evidence_ref.as_ref().map(StableId::to_string),
+                    millis(invocation.created_at)
+                ],
+            )
+            .map_err(db_error)?;
+        Ok(())
+    }
+
+    pub fn hook_invocations(&self, hook_id: &str) -> AcResult<Vec<HookInvocationRow>> {
+        let mut stmt = self
+            .connection
+            .prepare(
+                "SELECT id, hook_id, outcome, evidence_ref
+                 FROM hook_invocations WHERE hook_id=?1 ORDER BY created_at_ms",
+            )
+            .map_err(db_error)?;
+        let rows = stmt
+            .query_map(params![hook_id], |row| {
+                Ok(HookInvocationRow {
+                    id: row.get(0)?,
+                    hook_id: row.get(1)?,
+                    outcome: row.get(2)?,
+                    evidence_ref: row.get(3)?,
+                })
+            })
+            .map_err(db_error)?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(db_error)
+    }
+
+    pub fn save_mcp_server(&self, server: &McpServerRecord) -> AcResult<()> {
+        self.connection
+            .execute(
+                "INSERT INTO mcp_servers VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                 ON CONFLICT(id) DO UPDATE SET health=excluded.health, restart_count=excluded.restart_count, trust_tier=excluded.trust_tier",
+                params![
+                    server.id.to_string(),
+                    server.name,
+                    server.version,
+                    format!("{:?}", server.transport),
+                    format!("{:?}", server.trust_tier),
+                    format!("{:?}", server.health),
+                    server.restart_count
+                ],
+            )
+            .map_err(db_error)?;
+        Ok(())
+    }
+
+    pub fn save_mcp_tool(&self, tool: &McpToolRecord) -> AcResult<()> {
+        self.connection
+            .execute(
+                "INSERT INTO mcp_tools VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                 ON CONFLICT(id) DO UPDATE SET schema_json=excluded.schema_json",
+                params![
+                    tool.id.to_string(),
+                    tool.server_id.to_string(),
+                    tool.name,
+                    tool.description,
+                    tool.schema,
+                    format!("{:?}", tool.risk),
+                    format!("{:?}", tool.required_capabilities)
+                ],
+            )
+            .map_err(db_error)?;
+        Ok(())
+    }
+
+    pub fn save_mcp_invocation(&self, invocation: &McpInvocationRecord) -> AcResult<()> {
+        self.connection
+            .execute(
+                "INSERT INTO mcp_invocations VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                 ON CONFLICT(id) DO NOTHING",
+                params![
+                    invocation.id.to_string(),
+                    invocation.server_id.to_string(),
+                    invocation.tool_id.to_string(),
+                    format!("{:?}", invocation.status),
+                    invocation.output,
+                    invocation.evidence_ref.to_string(),
+                    millis(invocation.created_at)
+                ],
+            )
+            .map_err(db_error)?;
+        Ok(())
+    }
+
+    pub fn mcp_server(&self, id: &str) -> AcResult<Option<McpServerRow>> {
+        self.connection
+            .query_row(
+                "SELECT id, name, health, restart_count FROM mcp_servers WHERE id=?1",
+                params![id],
+                |row| {
+                    Ok(McpServerRow {
+                        id: row.get(0)?,
+                        name: row.get(1)?,
+                        health: row.get(2)?,
+                        restart_count: row.get::<_, i64>(3)? as u32,
+                    })
+                },
+            )
+            .optional()
+            .map_err(db_error)
+    }
+
     fn configure(&self) -> AcResult<()> {
         self.connection
             .pragma_update(None, "foreign_keys", "ON")
@@ -2860,6 +3077,7 @@ mod tests {
     use ac_changeset::{ChangeOperation, ChangeSet};
     use ac_git::GitCoordinator;
     use ac_kernel::{AllowAllPolicy, Kernel};
+    use std::collections::BTreeSet;
     use std::fs;
     use std::process::Command;
 
@@ -2881,7 +3099,7 @@ mod tests {
     fn sqlite_store_persists_kernel_state() {
         let mut db = ControlPlaneDb::open_memory().unwrap();
         db.migrate().unwrap();
-        assert_eq!(db.user_version().unwrap(), 10);
+        assert_eq!(db.user_version().unwrap(), 11);
 
         let mut kernel = Kernel::new(AllowAllPolicy);
         kernel.start().unwrap();
@@ -3499,7 +3717,7 @@ mod tests {
         {
             let mut db = ControlPlaneDb::open(&path).unwrap();
             db.migrate().unwrap();
-            assert_eq!(db.user_version().unwrap(), 10);
+            assert_eq!(db.user_version().unwrap(), 11);
             db.save_changeset_transaction(
                 &transaction,
                 Some("task-p13"),
@@ -3578,7 +3796,7 @@ mod tests {
         {
             let mut db = ControlPlaneDb::open(&path).unwrap();
             db.migrate().unwrap();
-            assert_eq!(db.user_version().unwrap(), 10);
+            assert_eq!(db.user_version().unwrap(), 11);
             db.save_verification_profile(&profile).unwrap();
             db.save_verification_manifest(
                 &manifest,
@@ -3660,7 +3878,7 @@ mod tests {
         {
             let mut db = ControlPlaneDb::open(&path).unwrap();
             db.migrate().unwrap();
-            assert_eq!(db.user_version().unwrap(), 10);
+            assert_eq!(db.user_version().unwrap(), 11);
             db.save_browser_process(&process).unwrap();
             db.save_browser_session(&session).unwrap();
             db.save_browser_dev_server(&dev_server).unwrap();
@@ -3678,6 +3896,105 @@ mod tests {
                 screenshots[0].evidence_ref,
                 screenshot.evidence_ref.to_string()
             );
+        }
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn phase16_extension_state_survives_reopen() {
+        let path =
+            std::env::temp_dir().join(format!("agentcode-phase16-{}.sqlite", StableId::new("db")));
+        let skill_id = StableId::new("skill");
+        let hook_id = StableId::new("hook");
+        let server_id = StableId::new("mcp");
+        let tool_id = StableId::new("mcptool");
+        {
+            let mut db = ControlPlaneDb::open(&path).unwrap();
+            db.migrate().unwrap();
+            assert_eq!(db.user_version().unwrap(), 11);
+            let skill = SkillManifest {
+                id: skill_id.clone(),
+                name: "Rust".to_string(),
+                description: "Rust testing".to_string(),
+                version: "1".to_string(),
+                source: "builtin/rust".to_string(),
+                scope: ac_security::SkillScope::BuiltIn,
+                trust_tier: ac_security::TrustTier::BuiltIn,
+                trigger_hints: vec!["rust".to_string()],
+                required_capabilities: [ac_security::Capability::ProcessExec("*".to_string())]
+                    .into_iter()
+                    .collect(),
+                context_cost: 7,
+                project_id: None,
+                task_id: None,
+                full_instructions: "Run cargo tests.".to_string(),
+                loaded_at: Some(TimestampMillis::now()),
+            };
+            db.save_skill(&skill).unwrap();
+            let hook = HookManifest {
+                id: hook_id.clone(),
+                extension_id: StableId::new("ext"),
+                event: ac_security::HookEvent::BeforeTaskComplete,
+                priority: 1,
+                timeout_ms: 50,
+                idempotency_key: "before-complete".to_string(),
+                failure_policy: ac_security::HookFailurePolicy::BlockOperation,
+                required_capabilities: BTreeSet::new(),
+            };
+            db.save_hook_manifest(&hook).unwrap();
+            db.save_hook_invocation(&HookInvocation {
+                id: StableId::new("hookrun"),
+                hook_id: hook_id.clone(),
+                event: ac_security::HookEvent::BeforeTaskComplete,
+                outcome: ac_security::HookOutcome::Blocked,
+                evidence_ref: Some(StableId::new("ev")),
+                created_at: TimestampMillis::now(),
+            })
+            .unwrap();
+            db.save_mcp_server(&McpServerRecord {
+                id: server_id.clone(),
+                name: "fixture".to_string(),
+                version: "1".to_string(),
+                transport: ac_security::McpTransport::Stdio,
+                trust_tier: ac_security::TrustTier::Project,
+                health: ac_security::McpHealth::Connected,
+                restart_count: 1,
+            })
+            .unwrap();
+            db.save_mcp_tool(&McpToolRecord {
+                id: tool_id.clone(),
+                server_id: server_id.clone(),
+                name: "read".to_string(),
+                description: "Read fixture".to_string(),
+                schema: "{}".to_string(),
+                risk: ac_security::RiskClass::R1,
+                required_capabilities: [ac_security::Capability::FilesystemRead("*".to_string())]
+                    .into_iter()
+                    .collect(),
+            })
+            .unwrap();
+            db.save_mcp_invocation(&McpInvocationRecord {
+                id: StableId::new("mcpinvoke"),
+                server_id: server_id.clone(),
+                tool_id,
+                status: ac_security::SecurityDecision::Allow,
+                output: "structured output".to_string(),
+                evidence_ref: StableId::new("ev"),
+                created_at: TimestampMillis::now(),
+            })
+            .unwrap();
+        }
+        {
+            let mut db = ControlPlaneDb::open(&path).unwrap();
+            db.migrate().unwrap();
+            let loaded_skill = db.skill(skill_id.as_str()).unwrap().unwrap();
+            assert_eq!(loaded_skill.scope, "BuiltIn");
+            assert!(loaded_skill.full_instructions.contains("cargo tests"));
+            let hook_runs = db.hook_invocations(hook_id.as_str()).unwrap();
+            assert_eq!(hook_runs[0].outcome, "Blocked");
+            let server = db.mcp_server(server_id.as_str()).unwrap().unwrap();
+            assert_eq!(server.health, "Connected");
+            assert_eq!(server.restart_count, 1);
         }
         let _ = fs::remove_file(path);
     }

@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 use ac_common::{AcError, AcResult, StableId, TimestampMillis};
 use ac_evidence::{EvidenceStore, Provenance};
 use ac_sandbox::{ExecRequest, SandboxManager, SandboxPolicy, SecretBroker};
-use ac_security::{Capability, CapabilityPolicy, SecurityDecision};
+use ac_security::{Capability, CapabilityPolicy, McpToolRecord, SecurityDecision};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ToolDescriptor {
@@ -299,6 +299,40 @@ pub struct ToolResult {
 
 pub trait ToolExecutor {
     fn execute(&self, request: &ToolRequest) -> AcResult<String>;
+}
+
+#[derive(Clone, Debug)]
+pub struct McpToolExecutor {
+    server_id: StableId,
+    tool_name: String,
+}
+
+impl ToolExecutor for McpToolExecutor {
+    fn execute(&self, request: &ToolRequest) -> AcResult<String> {
+        Ok(format!(
+            "mcp_server:{}\ntool:{}\npayload:{}",
+            self.server_id, self.tool_name, request.payload
+        ))
+    }
+}
+
+pub fn register_mcp_tool_with_broker(
+    broker: &mut ToolBroker,
+    tool: &McpToolRecord,
+) -> AcResult<String> {
+    let broker_tool_id = format!("mcp.{}.{}", tool.server_id, tool.name);
+    broker.register_tool(
+        ToolDefinition {
+            id: broker_tool_id.clone(),
+            version: "1".to_string(),
+            required_capabilities: tool.required_capabilities.iter().cloned().collect(),
+        },
+        Box::new(McpToolExecutor {
+            server_id: tool.server_id.clone(),
+            tool_name: tool.name.clone(),
+        }),
+    )?;
+    Ok(broker_tool_id)
 }
 
 #[derive(Clone, Debug)]
@@ -1294,5 +1328,56 @@ mod tests {
             .unwrap()
             .contains("canary-secret"));
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn phase16_mcp_tool_routes_through_broker_policy() {
+        let server_id = StableId::new("mcp");
+        let tool = McpToolRecord {
+            id: StableId::new("mcptool"),
+            server_id: server_id.clone(),
+            name: "write-file".to_string(),
+            description: "Advertised write tool".to_string(),
+            schema: "{\"type\":\"object\"}".to_string(),
+            risk: ac_security::RiskClass::R3,
+            required_capabilities: [Capability::FilesystemWrite("*".to_string())]
+                .into_iter()
+                .collect(),
+        };
+        let mut denied_broker = ToolBroker::new(CapabilityPolicy::new());
+        let broker_tool_id = register_mcp_tool_with_broker(&mut denied_broker, &tool).unwrap();
+        let mut evidence = EvidenceStore::new();
+        let denied = denied_broker
+            .invoke(
+                ToolRequest {
+                    id: StableId::new("toolreq"),
+                    tool_id: broker_tool_id.clone(),
+                    tool_version: "1".to_string(),
+                    payload: "{\"path\":\"secret\"}".to_string(),
+                    capabilities: Vec::new(),
+                },
+                &mut evidence,
+            )
+            .unwrap();
+        assert_eq!(denied.status, ToolStatus::Denied);
+
+        let mut allowed_broker = ToolBroker::new(
+            CapabilityPolicy::new().allow(Capability::FilesystemWrite("*".to_string())),
+        );
+        register_mcp_tool_with_broker(&mut allowed_broker, &tool).unwrap();
+        let allowed = allowed_broker
+            .invoke(
+                ToolRequest {
+                    id: StableId::new("toolreq"),
+                    tool_id: broker_tool_id,
+                    tool_version: "1".to_string(),
+                    payload: "{\"path\":\"workspace/file\"}".to_string(),
+                    capabilities: Vec::new(),
+                },
+                &mut evidence,
+            )
+            .unwrap();
+        assert_eq!(allowed.status, ToolStatus::Succeeded);
+        assert!(allowed.observation.contains(server_id.as_str()));
     }
 }
