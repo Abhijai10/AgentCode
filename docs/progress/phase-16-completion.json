@@ -3,7 +3,7 @@
   "name": "Skills, Hooks & MCP",
   "status": "COMPLETE",
   "starting_commit": "6264cd3",
-  "implementation_commit": "pending final commit",
+  "implementation_commit": "7abea9b",
   "workpackages": [
     "P16-WP01",
     "P16-WP02",
