@@ -1,9 +1,11 @@
 use std::collections::{BTreeMap, VecDeque};
+use std::io::Read;
 use std::time::Duration;
 
 use ac_common::{AcError, AcResult, StableId, TimestampMillis};
 use reqwest::blocking::{Client, Response};
-use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION, CONTENT_TYPE};
+use reqwest::header::{HeaderMap, HeaderName, HeaderValue, AUTHORIZATION, CONTENT_TYPE};
+use reqwest::Url;
 use serde_json::{json, Value};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -71,6 +73,21 @@ pub struct ModelIdentity {
     pub input_cost_micros: u32,
     pub output_cost_micros: u32,
     pub privacy: PrivacyClass,
+    pub metadata_source: ModelMetadataSource,
+    pub pricing_unit: PricingUnit,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ModelMetadataSource {
+    Configured,
+    Discovered,
+    DefaultUnknown,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PricingUnit {
+    PerTokenMicrosUsd,
+    Unknown,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -178,7 +195,10 @@ pub struct RoutingDecision {
     pub latency_ms: u64,
     pub input_tokens: u32,
     pub output_tokens: u32,
+    pub total_tokens: u32,
+    pub usage_source: UsageSource,
     pub estimated_cost_micros: u64,
+    pub cost_known: bool,
     pub created_at: TimestampMillis,
 }
 
@@ -256,7 +276,9 @@ impl CircuitBreaker {
                 | NormalizedProviderFailure::ProviderUnavailable
         ) {
             self.transient_failures += 1;
-            self.cooldown_until_ms = Some(TimestampMillis::now().as_millis() + 10 * 60 * 1000);
+            if self.transient_failures >= 2 {
+                self.cooldown_until_ms = Some(TimestampMillis::now().as_millis() + 10 * 60 * 1000);
+            }
         }
     }
 }
@@ -296,6 +318,10 @@ pub enum ProviderStreamEvent {
         payload: String,
     },
     Usage {
+        input_tokens: u32,
+        output_tokens: u32,
+    },
+    EstimatedUsage {
         input_tokens: u32,
         output_tokens: u32,
     },
@@ -439,13 +465,39 @@ pub enum ProviderFailureClass {
     RateLimited,
     Timeout,
     ServerError,
+    Network,
     StreamAborted,
     MalformedResponse,
+    InvalidRequest,
     Auth,
     Permission,
     ContextOverflow,
     UnsupportedCapability,
+    ModelUnavailable,
     Cancelled,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum UsageSource {
+    ProviderReported,
+    Estimated,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TokenUsage {
+    pub input_tokens: u32,
+    pub output_tokens: u32,
+    pub total_tokens: u32,
+    pub source: UsageSource,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CostEstimate {
+    pub model_identity_id: StableId,
+    pub input_cost_micros: u32,
+    pub output_cost_micros: u32,
+    pub unit: PricingUnit,
+    pub calculated_cost_micros: Option<u64>,
 }
 
 pub trait ProviderAdapter {
@@ -492,26 +544,13 @@ impl ConfiguredProviderAdapter {
 impl ProviderAdapter for ConfiguredProviderAdapter {
     fn stream(
         &self,
-        request: &NormalizedInferenceRequest,
+        _request: &NormalizedInferenceRequest,
         cancel: &dyn Fn() -> bool,
     ) -> Result<Vec<ProviderStreamEvent>, ProviderFailureClass> {
         if cancel() {
             return Err(ProviderFailureClass::Cancelled);
         }
-        if request.prompt.trim().is_empty() {
-            return Err(ProviderFailureClass::MalformedResponse);
-        }
-        Ok(vec![
-            ProviderStreamEvent::Delta(format!(
-                "provider_config:{}\nmodel:{}\nstructured_plan:requested",
-                self.endpoint_ref, self.model_name
-            )),
-            ProviderStreamEvent::Usage {
-                input_tokens: estimate_token_count(&request.prompt),
-                output_tokens: 3,
-            },
-            ProviderStreamEvent::Finished,
-        ])
+        Err(ProviderFailureClass::UnsupportedCapability)
     }
 }
 
@@ -521,7 +560,38 @@ pub struct HttpProviderAdapter {
     pub credential_env: Option<String>,
     pub model_name: String,
     pub timeout_ms: u64,
+    pub connect_timeout_ms: u64,
+    pub max_response_bytes: usize,
+    pub custom_headers: Vec<(String, String)>,
+    pub allow_plain_http_remote: bool,
     provider_kind: HttpProviderKind,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HttpProviderOptions {
+    pub endpoint: String,
+    pub credential_env: Option<String>,
+    pub model_name: String,
+    pub connect_timeout_ms: u64,
+    pub read_timeout_ms: u64,
+    pub max_response_bytes: usize,
+    pub custom_headers: Vec<(String, String)>,
+    pub allow_plain_http_remote: bool,
+}
+
+impl HttpProviderOptions {
+    pub fn new(endpoint: impl Into<String>, model_name: impl Into<String>) -> Self {
+        Self {
+            endpoint: endpoint.into(),
+            credential_env: None,
+            model_name: model_name.into(),
+            connect_timeout_ms: 10_000,
+            read_timeout_ms: 60_000,
+            max_response_bytes: 2 * 1024 * 1024,
+            custom_headers: Vec::new(),
+            allow_plain_http_remote: false,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -542,12 +612,18 @@ impl OpenAIProviderAdapter {
     pub fn new(endpoint: impl Into<String>, model_name: impl Into<String>) -> AcResult<Self> {
         Ok(Self {
             inner: HttpProviderAdapter::new_kind(
-                endpoint,
-                Some("OPENAI_API_KEY".to_string()),
-                model_name,
-                60_000,
+                HttpProviderOptions {
+                    credential_env: Some("OPENAI_API_KEY".to_string()),
+                    ..HttpProviderOptions::new(endpoint, model_name)
+                },
                 HttpProviderKind::OpenAiChatCompletions,
             )?,
+        })
+    }
+
+    pub fn with_options(options: HttpProviderOptions) -> AcResult<Self> {
+        Ok(Self {
+            inner: HttpProviderAdapter::new_kind(options, HttpProviderKind::OpenAiChatCompletions)?,
         })
     }
 }
@@ -571,12 +647,18 @@ impl AnthropicProviderAdapter {
     pub fn new(endpoint: impl Into<String>, model_name: impl Into<String>) -> AcResult<Self> {
         Ok(Self {
             inner: HttpProviderAdapter::new_kind(
-                endpoint,
-                Some("ANTHROPIC_API_KEY".to_string()),
-                model_name,
-                60_000,
+                HttpProviderOptions {
+                    credential_env: Some("ANTHROPIC_API_KEY".to_string()),
+                    ..HttpProviderOptions::new(endpoint, model_name)
+                },
                 HttpProviderKind::AnthropicMessages,
             )?,
+        })
+    }
+
+    pub fn with_options(options: HttpProviderOptions) -> AcResult<Self> {
+        Ok(Self {
+            inner: HttpProviderAdapter::new_kind(options, HttpProviderKind::AnthropicMessages)?,
         })
     }
 }
@@ -600,12 +682,18 @@ impl GeminiProviderAdapter {
     pub fn new(endpoint: impl Into<String>, model_name: impl Into<String>) -> AcResult<Self> {
         Ok(Self {
             inner: HttpProviderAdapter::new_kind(
-                endpoint,
-                Some("GEMINI_API_KEY".to_string()),
-                model_name,
-                60_000,
+                HttpProviderOptions {
+                    credential_env: Some("GEMINI_API_KEY".to_string()),
+                    ..HttpProviderOptions::new(endpoint, model_name)
+                },
                 HttpProviderKind::GeminiGenerateContent,
             )?,
+        })
+    }
+
+    pub fn with_options(options: HttpProviderOptions) -> AcResult<Self> {
+        Ok(Self {
+            inner: HttpProviderAdapter::new_kind(options, HttpProviderKind::GeminiGenerateContent)?,
         })
     }
 }
@@ -629,12 +717,15 @@ impl OllamaProviderAdapter {
     pub fn new(endpoint: impl Into<String>, model_name: impl Into<String>) -> AcResult<Self> {
         Ok(Self {
             inner: HttpProviderAdapter::new_kind(
-                endpoint,
-                None,
-                model_name,
-                60_000,
+                HttpProviderOptions::new(endpoint, model_name),
                 HttpProviderKind::OllamaChat,
             )?,
+        })
+    }
+
+    pub fn with_options(options: HttpProviderOptions) -> AcResult<Self> {
+        Ok(Self {
+            inner: HttpProviderAdapter::new_kind(options, HttpProviderKind::OllamaChat)?,
         })
     }
 }
@@ -658,12 +749,15 @@ impl LMStudioProviderAdapter {
     pub fn new(endpoint: impl Into<String>, model_name: impl Into<String>) -> AcResult<Self> {
         Ok(Self {
             inner: HttpProviderAdapter::new_kind(
-                endpoint,
-                None,
-                model_name,
-                60_000,
+                HttpProviderOptions::new(endpoint, model_name),
                 HttpProviderKind::OpenAiCompatible,
             )?,
+        })
+    }
+
+    pub fn with_options(options: HttpProviderOptions) -> AcResult<Self> {
+        Ok(Self {
+            inner: HttpProviderAdapter::new_kind(options, HttpProviderKind::OpenAiCompatible)?,
         })
     }
 }
@@ -686,37 +780,37 @@ impl HttpProviderAdapter {
         timeout_ms: u64,
     ) -> AcResult<Self> {
         Self::new_kind(
-            endpoint,
-            credential_env,
-            model_name,
-            timeout_ms,
+            HttpProviderOptions {
+                credential_env,
+                read_timeout_ms: timeout_ms,
+                ..HttpProviderOptions::new(endpoint, model_name)
+            },
             HttpProviderKind::OpenAiCompatible,
         )
     }
 
-    fn new_kind(
-        endpoint: impl Into<String>,
-        credential_env: Option<String>,
-        model_name: impl Into<String>,
-        timeout_ms: u64,
-        provider_kind: HttpProviderKind,
-    ) -> AcResult<Self> {
-        let endpoint = endpoint.into();
-        let model_name = model_name.into();
-        if !(endpoint.starts_with("http://") || endpoint.starts_with("https://"))
-            || model_name.trim().is_empty()
-            || timeout_ms == 0
+    fn new_kind(options: HttpProviderOptions, provider_kind: HttpProviderKind) -> AcResult<Self> {
+        validate_endpoint(&options.endpoint, options.allow_plain_http_remote)?;
+        if options.model_name.trim().is_empty()
+            || options.connect_timeout_ms == 0
+            || options.read_timeout_ms == 0
+            || options.max_response_bytes == 0
         {
             return Err(AcError::validation(
                 "PROVIDER-INVALID_HTTP_CONFIG",
-                "http(s) endpoint, model name, and timeout are required",
+                "endpoint, model name, non-zero timeouts, and response bound are required",
             ));
         }
+        validate_custom_headers(&options.custom_headers)?;
         Ok(Self {
-            endpoint,
-            credential_env,
-            model_name,
-            timeout_ms,
+            endpoint: options.endpoint,
+            credential_env: options.credential_env,
+            model_name: options.model_name,
+            timeout_ms: options.read_timeout_ms,
+            connect_timeout_ms: options.connect_timeout_ms,
+            max_response_bytes: options.max_response_bytes,
+            custom_headers: options.custom_headers,
+            allow_plain_http_remote: options.allow_plain_http_remote,
             provider_kind,
         })
     }
@@ -750,6 +844,13 @@ impl HttpProviderAdapter {
     pub fn auth_headers(&self) -> Result<HeaderMap, ProviderFailureClass> {
         let mut headers = HeaderMap::new();
         headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+        for (name, value) in &self.custom_headers {
+            headers.insert(
+                HeaderName::from_bytes(name.as_bytes())
+                    .map_err(|_| ProviderFailureClass::InvalidRequest)?,
+                HeaderValue::from_str(value).map_err(|_| ProviderFailureClass::InvalidRequest)?,
+            );
+        }
         if let Some(env_name) = &self.credential_env {
             let key = std::env::var(env_name).map_err(|_| ProviderFailureClass::Auth)?;
             match self.provider_kind {
@@ -789,6 +890,7 @@ impl ProviderAdapter for HttpProviderAdapter {
             return Err(ProviderFailureClass::Cancelled);
         }
         let client = Client::builder()
+            .connect_timeout(Duration::from_millis(self.connect_timeout_ms))
             .timeout(Duration::from_millis(self.timeout_ms))
             .build()
             .map_err(|_| ProviderFailureClass::ServerError)?;
@@ -801,7 +903,12 @@ impl ProviderAdapter for HttpProviderAdapter {
         if cancel() {
             return Err(ProviderFailureClass::Cancelled);
         }
-        let events = events_from_response(response, self.provider_kind)?;
+        let events = events_from_response(
+            response,
+            self.provider_kind,
+            self.max_response_bytes,
+            cancel,
+        )?;
         Ok(ensure_usage_event(events, &request.prompt))
     }
 }
@@ -1027,6 +1134,12 @@ impl ProviderRegistry {
                 input_cost_micros,
                 output_cost_micros,
                 privacy,
+                metadata_source: ModelMetadataSource::Configured,
+                pricing_unit: if input_cost_micros == 0 && output_cost_micros == 0 {
+                    PricingUnit::Unknown
+                } else {
+                    PricingUnit::PerTokenMicrosUsd
+                },
             },
         );
         Ok(id)
@@ -1320,74 +1433,94 @@ impl ProviderRegistry {
                 required: required_from_profile(profile),
                 max_output_tokens,
             };
-            let attempt_id = self
-                .start_attempt(&request)
-                .map_err(|_| ProviderFailureClass::MalformedResponse)?;
-            let started = TimestampMillis::now();
-            let result = {
-                let adapter = self
-                    .adapters
-                    .get(&candidate.provider_id)
-                    .ok_or(ProviderFailureClass::UnsupportedCapability)?;
-                adapter.stream(&request, cancel)
-            };
-            let latency_ms = TimestampMillis::now()
-                .as_millis()
-                .saturating_sub(started.as_millis()) as u64;
-            match result {
-                Ok(events) if matches!(events.last(), Some(ProviderStreamEvent::Finished)) => {
-                    for event in &events {
-                        self.record_event(&attempt_id, event.clone())
-                            .map_err(|_| ProviderFailureClass::MalformedResponse)?;
+            for attempt_index in 0..2 {
+                let attempt_id = self
+                    .start_attempt(&request)
+                    .map_err(|_| ProviderFailureClass::MalformedResponse)?;
+                let started = TimestampMillis::now();
+                let result = {
+                    let adapter = self
+                        .adapters
+                        .get(&candidate.provider_id)
+                        .ok_or(ProviderFailureClass::UnsupportedCapability)?;
+                    adapter.stream(&request, cancel)
+                };
+                let latency_ms = TimestampMillis::now()
+                    .as_millis()
+                    .saturating_sub(started.as_millis()) as u64;
+                match result {
+                    Ok(events) if matches!(events.last(), Some(ProviderStreamEvent::Finished)) => {
+                        for event in &events {
+                            self.record_event(&attempt_id, event.clone())
+                                .map_err(|_| ProviderFailureClass::MalformedResponse)?;
+                        }
+                        self.record_route_success(&candidate.connection_id, latency_ms);
+                        let usage = token_usage(&events);
+                        let cost = self.estimate_cost(
+                            &candidate.model_identity_id,
+                            usage.input_tokens,
+                            usage.output_tokens,
+                        );
+                        let decision = self.routing_decision(
+                            profile,
+                            candidates,
+                            rejected,
+                            Some(candidate),
+                            fallback_reason,
+                            latency_ms,
+                            usage,
+                            cost,
+                        );
+                        self.routing_decisions.push(decision.clone());
+                        return Ok(RouteExecution { events, decision });
                     }
-                    self.record_route_success(&candidate.connection_id, latency_ms);
-                    let (input_tokens, output_tokens) = token_usage(&events);
-                    let estimated_cost_micros = self.estimate_cost(
-                        &candidate.model_identity_id,
-                        input_tokens,
-                        output_tokens,
-                    );
-                    let decision = self.routing_decision(
-                        profile,
-                        candidates,
-                        rejected,
-                        Some(candidate),
-                        fallback_reason,
-                        latency_ms,
-                        input_tokens,
-                        output_tokens,
-                        estimated_cost_micros,
-                    );
-                    self.routing_decisions.push(decision.clone());
-                    return Ok(RouteExecution { events, decision });
-                }
-                Ok(events) => {
-                    for event in &events {
-                        self.record_event(&attempt_id, event.clone())
+                    Ok(events) => {
+                        for event in &events {
+                            self.record_event(&attempt_id, event.clone())
+                                .map_err(|_| ProviderFailureClass::MalformedResponse)?;
+                        }
+                        self.finish_failed(&attempt_id, ProviderFailureClass::StreamAborted)
                             .map_err(|_| ProviderFailureClass::MalformedResponse)?;
+                        let normalized = normalize_failure(ProviderFailureClass::StreamAborted);
+                        self.record_route_failure(
+                            &candidate.connection_id,
+                            normalized.clone(),
+                            latency_ms,
+                        );
+                        fallback_reason = Some(format!(
+                            "{}:{:?}:attempt{}",
+                            candidate.connection_id,
+                            normalized,
+                            attempt_index + 1
+                        ));
+                        last_failure = Some(ProviderFailureClass::StreamAborted);
+                        if !is_retryable(ProviderFailureClass::StreamAborted) || attempt_index == 1
+                        {
+                            break;
+                        }
+                        bounded_backoff(attempt_index);
                     }
-                    self.finish_failed(&attempt_id, ProviderFailureClass::StreamAborted)
-                        .map_err(|_| ProviderFailureClass::MalformedResponse)?;
-                    let normalized = normalize_failure(ProviderFailureClass::StreamAborted);
-                    self.record_route_failure(
-                        &candidate.connection_id,
-                        normalized.clone(),
-                        latency_ms,
-                    );
-                    fallback_reason = Some(format!("{}:{:?}", candidate.connection_id, normalized));
-                    last_failure = Some(ProviderFailureClass::StreamAborted);
-                }
-                Err(failure) => {
-                    self.finish_failed(&attempt_id, failure)
-                        .map_err(|_| ProviderFailureClass::MalformedResponse)?;
-                    let normalized = normalize_failure(failure);
-                    self.record_route_failure(
-                        &candidate.connection_id,
-                        normalized.clone(),
-                        latency_ms,
-                    );
-                    fallback_reason = Some(format!("{}:{:?}", candidate.connection_id, normalized));
-                    last_failure = Some(failure);
+                    Err(failure) => {
+                        self.finish_failed(&attempt_id, failure)
+                            .map_err(|_| ProviderFailureClass::MalformedResponse)?;
+                        let normalized = normalize_failure(failure);
+                        self.record_route_failure(
+                            &candidate.connection_id,
+                            normalized.clone(),
+                            latency_ms,
+                        );
+                        fallback_reason = Some(format!(
+                            "{}:{:?}:attempt{}",
+                            candidate.connection_id,
+                            normalized,
+                            attempt_index + 1
+                        ));
+                        last_failure = Some(failure);
+                        if !is_retryable(failure) || attempt_index == 1 {
+                            break;
+                        }
+                        bounded_backoff(attempt_index);
+                    }
                 }
             }
         }
@@ -1398,9 +1531,19 @@ impl ProviderRegistry {
             None,
             fallback_reason,
             0,
-            0,
-            0,
-            0,
+            TokenUsage {
+                input_tokens: 0,
+                output_tokens: 0,
+                total_tokens: 0,
+                source: UsageSource::Estimated,
+            },
+            CostEstimate {
+                model_identity_id: StableId::new("model-family"),
+                input_cost_micros: 0,
+                output_cost_micros: 0,
+                unit: PricingUnit::Unknown,
+                calculated_cost_micros: None,
+            },
         );
         self.routing_decisions.push(decision);
         Err(last_failure.unwrap_or(ProviderFailureClass::UnsupportedCapability))
@@ -1427,9 +1570,8 @@ impl ProviderRegistry {
         selected: Option<RouteCandidate>,
         fallback_reason: Option<String>,
         latency_ms: u64,
-        input_tokens: u32,
-        output_tokens: u32,
-        estimated_cost_micros: u64,
+        usage: TokenUsage,
+        cost: CostEstimate,
     ) -> RoutingDecision {
         RoutingDecision {
             id: StableId::new("routing"),
@@ -1439,9 +1581,12 @@ impl ProviderRegistry {
             rejected,
             fallback_reason,
             latency_ms,
-            input_tokens,
-            output_tokens,
-            estimated_cost_micros,
+            input_tokens: usage.input_tokens,
+            output_tokens: usage.output_tokens,
+            total_tokens: usage.total_tokens,
+            usage_source: usage.source,
+            estimated_cost_micros: cost.calculated_cost_micros.unwrap_or(0),
+            cost_known: cost.calculated_cost_micros.is_some(),
             created_at: TimestampMillis::now(),
         }
     }
@@ -1582,14 +1727,30 @@ impl ProviderRegistry {
         model_identity_id: &StableId,
         input_tokens: u32,
         output_tokens: u32,
-    ) -> u64 {
+    ) -> CostEstimate {
         self.model_identities
             .get(model_identity_id)
             .map(|identity| {
-                input_tokens as u64 * identity.input_cost_micros as u64
-                    + output_tokens as u64 * identity.output_cost_micros as u64
+                let calculated_cost_micros =
+                    (identity.pricing_unit == PricingUnit::PerTokenMicrosUsd).then(|| {
+                        input_tokens as u64 * identity.input_cost_micros as u64
+                            + output_tokens as u64 * identity.output_cost_micros as u64
+                    });
+                CostEstimate {
+                    model_identity_id: identity.id.clone(),
+                    input_cost_micros: identity.input_cost_micros,
+                    output_cost_micros: identity.output_cost_micros,
+                    unit: identity.pricing_unit,
+                    calculated_cost_micros,
+                }
             })
-            .unwrap_or(0)
+            .unwrap_or(CostEstimate {
+                model_identity_id: model_identity_id.clone(),
+                input_cost_micros: 0,
+                output_cost_micros: 0,
+                unit: PricingUnit::Unknown,
+                calculated_cost_micros: None,
+            })
     }
 }
 
@@ -1599,22 +1760,34 @@ fn is_retryable(failure: ProviderFailureClass) -> bool {
         ProviderFailureClass::RateLimited
             | ProviderFailureClass::Timeout
             | ProviderFailureClass::ServerError
+            | ProviderFailureClass::Network
             | ProviderFailureClass::StreamAborted
     )
+}
+
+fn bounded_backoff(attempt_index: usize) {
+    let millis = 5_u64.saturating_mul(1_u64 << attempt_index.min(3));
+    std::thread::sleep(Duration::from_millis(millis));
 }
 
 pub fn normalize_failure(failure: ProviderFailureClass) -> NormalizedProviderFailure {
     match failure {
         ProviderFailureClass::RateLimited => NormalizedProviderFailure::RateLimit,
         ProviderFailureClass::Timeout => NormalizedProviderFailure::Timeout,
-        ProviderFailureClass::ServerError => NormalizedProviderFailure::ProviderUnavailable,
+        ProviderFailureClass::ServerError | ProviderFailureClass::Network => {
+            NormalizedProviderFailure::ProviderUnavailable
+        }
         ProviderFailureClass::StreamAborted => NormalizedProviderFailure::ProviderUnavailable,
-        ProviderFailureClass::MalformedResponse => NormalizedProviderFailure::BadResponse,
+        ProviderFailureClass::MalformedResponse | ProviderFailureClass::InvalidRequest => {
+            NormalizedProviderFailure::BadResponse
+        }
         ProviderFailureClass::Auth | ProviderFailureClass::Permission => {
             NormalizedProviderFailure::AuthFailed
         }
         ProviderFailureClass::ContextOverflow => NormalizedProviderFailure::ContextLimit,
-        ProviderFailureClass::UnsupportedCapability => NormalizedProviderFailure::ModelUnavailable,
+        ProviderFailureClass::UnsupportedCapability | ProviderFailureClass::ModelUnavailable => {
+            NormalizedProviderFailure::ModelUnavailable
+        }
         ProviderFailureClass::Cancelled => NormalizedProviderFailure::ProviderUnavailable,
     }
 }
@@ -1651,8 +1824,8 @@ fn cost_tier_rank(tier: CostTier) -> u8 {
     }
 }
 
-fn token_usage(events: &[ProviderStreamEvent]) -> (u32, u32) {
-    events
+fn token_usage(events: &[ProviderStreamEvent]) -> TokenUsage {
+    let (input_tokens, output_tokens, source) = events
         .iter()
         .find_map(|event| {
             if let ProviderStreamEvent::Usage {
@@ -1660,22 +1833,36 @@ fn token_usage(events: &[ProviderStreamEvent]) -> (u32, u32) {
                 output_tokens,
             } = event
             {
-                Some((*input_tokens, *output_tokens))
+                Some((*input_tokens, *output_tokens, UsageSource::ProviderReported))
+            } else if let ProviderStreamEvent::EstimatedUsage {
+                input_tokens,
+                output_tokens,
+            } = event
+            {
+                Some((*input_tokens, *output_tokens, UsageSource::Estimated))
             } else {
                 None
             }
         })
-        .unwrap_or((0, 0))
+        .unwrap_or((0, 0, UsageSource::Estimated));
+    TokenUsage {
+        input_tokens,
+        output_tokens,
+        total_tokens: input_tokens.saturating_add(output_tokens),
+        source,
+    }
 }
 
 fn ensure_usage_event(
     mut events: Vec<ProviderStreamEvent>,
     prompt: &str,
 ) -> Vec<ProviderStreamEvent> {
-    if events
-        .iter()
-        .any(|event| matches!(event, ProviderStreamEvent::Usage { .. }))
-    {
+    if events.iter().any(|event| {
+        matches!(
+            event,
+            ProviderStreamEvent::Usage { .. } | ProviderStreamEvent::EstimatedUsage { .. }
+        )
+    }) {
         return events;
     }
     let output = events
@@ -1695,7 +1882,7 @@ fn ensure_usage_event(
         .unwrap_or(events.len());
     events.insert(
         insert_at,
-        ProviderStreamEvent::Usage {
+        ProviderStreamEvent::EstimatedUsage {
             input_tokens: estimate_token_count(prompt),
             output_tokens: estimate_token_count(&output),
         },
@@ -1706,6 +1893,72 @@ fn ensure_usage_event(
 fn estimate_token_count(text: &str) -> u32 {
     let chars = text.chars().count();
     u32::try_from(chars.div_ceil(4)).unwrap_or(u32::MAX).max(1)
+}
+
+fn validate_endpoint(endpoint: &str, allow_plain_http_remote: bool) -> AcResult<()> {
+    let url = Url::parse(endpoint).map_err(|_| {
+        AcError::validation(
+            "PROVIDER-INVALID_HTTP_CONFIG",
+            "provider endpoint must be a valid URL",
+        )
+    })?;
+    match url.scheme() {
+        "https" => Ok(()),
+        "http" if is_local_endpoint(&url) || allow_plain_http_remote => Ok(()),
+        "http" => Err(AcError::validation(
+            "PROVIDER-INSECURE_REMOTE_ENDPOINT",
+            "remote provider endpoints must use HTTPS unless explicitly enabled",
+        )),
+        _ => Err(AcError::validation(
+            "PROVIDER-INVALID_HTTP_CONFIG",
+            "provider endpoint must use http or https",
+        )),
+    }
+}
+
+fn is_local_endpoint(url: &Url) -> bool {
+    let Some(host) = url.host_str() else {
+        return false;
+    };
+    host == "localhost"
+        || host == "127.0.0.1"
+        || host == "::1"
+        || host.starts_with("10.")
+        || host.starts_with("192.168.")
+        || host
+            .strip_prefix("172.")
+            .and_then(|rest| rest.split('.').next())
+            .and_then(|octet| octet.parse::<u8>().ok())
+            .is_some_and(|octet| (16..=31).contains(&octet))
+}
+
+fn validate_custom_headers(headers: &[(String, String)]) -> AcResult<()> {
+    for (name, value) in headers {
+        let normalized = name.to_ascii_lowercase();
+        if normalized == "authorization"
+            || normalized == "x-api-key"
+            || normalized == "x-goog-api-key"
+            || normalized == "cookie"
+        {
+            return Err(AcError::validation(
+                "PROVIDER-UNSAFE_CUSTOM_HEADER",
+                "custom provider headers may not contain credentials",
+            ));
+        }
+        HeaderName::from_bytes(name.as_bytes()).map_err(|_| {
+            AcError::validation(
+                "PROVIDER-INVALID_HTTP_CONFIG",
+                "custom provider header names must be valid HTTP header names",
+            )
+        })?;
+        HeaderValue::from_str(value).map_err(|_| {
+            AcError::validation(
+                "PROVIDER-INVALID_HTTP_CONFIG",
+                "custom provider header values must be valid HTTP header values",
+            )
+        })?;
+    }
+    Ok(())
 }
 
 fn extract_string_array(raw: &str, key: &str) -> AcResult<Vec<String>> {
@@ -1766,23 +2019,42 @@ fn map_reqwest_error(error: reqwest::Error) -> ProviderFailureClass {
         ProviderFailureClass::Timeout
     } else if error.is_builder() {
         ProviderFailureClass::MalformedResponse
+    } else if error.is_connect() || error.is_request() {
+        ProviderFailureClass::Network
     } else {
         ProviderFailureClass::ServerError
     }
 }
 
 fn events_from_response(
-    response: Response,
+    mut response: Response,
     provider_kind: HttpProviderKind,
+    max_response_bytes: usize,
+    cancel: &dyn Fn() -> bool,
 ) -> Result<Vec<ProviderStreamEvent>, ProviderFailureClass> {
     let status = response.status().as_u16();
-    let body = response.text().map_err(|error| {
-        if error.is_timeout() {
-            ProviderFailureClass::Timeout
-        } else {
-            ProviderFailureClass::MalformedResponse
+    let mut body = Vec::new();
+    let mut chunk = [0_u8; 256];
+    loop {
+        if cancel() {
+            return Err(ProviderFailureClass::Cancelled);
         }
-    })?;
+        let read = response.read(&mut chunk).map_err(|error| {
+            if error.kind() == std::io::ErrorKind::TimedOut {
+                ProviderFailureClass::Timeout
+            } else {
+                ProviderFailureClass::StreamAborted
+            }
+        })?;
+        if read == 0 {
+            break;
+        }
+        body.extend_from_slice(&chunk[..read]);
+        if body.len() > max_response_bytes {
+            return Err(ProviderFailureClass::MalformedResponse);
+        }
+    }
+    let body = String::from_utf8(body).map_err(|_| ProviderFailureClass::MalformedResponse)?;
     events_from_status_and_body(status, &body, provider_kind)
 }
 
@@ -1796,7 +2068,22 @@ fn events_from_status_and_body(
         401 | 403 => Err(ProviderFailureClass::Auth),
         408 | 504 => Err(ProviderFailureClass::Timeout),
         429 => Err(ProviderFailureClass::RateLimited),
-        400..=499 => Err(ProviderFailureClass::MalformedResponse),
+        400 => provider_error_class(body).map_err(|failure| {
+            if failure == ProviderFailureClass::MalformedResponse {
+                ProviderFailureClass::InvalidRequest
+            } else {
+                failure
+            }
+        }),
+        404 => provider_error_class(body).map_err(|failure| {
+            if failure == ProviderFailureClass::MalformedResponse {
+                ProviderFailureClass::ModelUnavailable
+            } else {
+                failure
+            }
+        }),
+        413 => Err(ProviderFailureClass::ContextOverflow),
+        status if (400..=499).contains(&status) => provider_error_class(body),
         _ => Err(ProviderFailureClass::ServerError),
     }
 }
@@ -1825,20 +2112,51 @@ fn parse_sse_body(
     provider_kind: HttpProviderKind,
 ) -> Result<Vec<ProviderStreamEvent>, ProviderFailureClass> {
     let mut events = Vec::new();
-    for line in body.lines().map(str::trim) {
-        let Some(payload) = line.strip_prefix("data:") else {
-            continue;
-        };
-        let payload = payload.trim();
-        if payload == "[DONE]" {
-            events.push(ProviderStreamEvent::Finished);
-            continue;
+    let mut data_fields = Vec::new();
+    for line in body.lines() {
+        let line = line.trim_end_matches('\r');
+        if line.is_empty() {
+            flush_sse_data(&mut events, &mut data_fields, provider_kind)?;
+        } else if let Some(payload) = line.strip_prefix("data:") {
+            if sse_payload_complete(&data_fields) {
+                flush_sse_data(&mut events, &mut data_fields, provider_kind)?;
+            }
+            data_fields.push(payload.trim_start().to_string());
         }
-        let value: Value =
-            serde_json::from_str(payload).map_err(|_| ProviderFailureClass::MalformedResponse)?;
-        append_json_events(&mut events, &value, provider_kind)?;
     }
+    flush_sse_data(&mut events, &mut data_fields, provider_kind)?;
     finish_events(events)
+}
+
+fn flush_sse_data(
+    events: &mut Vec<ProviderStreamEvent>,
+    data_fields: &mut Vec<String>,
+    provider_kind: HttpProviderKind,
+) -> Result<(), ProviderFailureClass> {
+    if data_fields.is_empty() {
+        return Ok(());
+    }
+    let payload = data_fields.join("\n");
+    data_fields.clear();
+    let payload = payload.trim();
+    if payload == "[DONE]" {
+        events.push(ProviderStreamEvent::Finished);
+        return Ok(());
+    }
+    let value: Value =
+        serde_json::from_str(payload).map_err(|_| ProviderFailureClass::MalformedResponse)?;
+    if let Some(failure) = provider_error_class_from_value(&value) {
+        return Err(failure);
+    }
+    append_json_events(events, &value, provider_kind)
+}
+
+fn sse_payload_complete(data_fields: &[String]) -> bool {
+    if data_fields.is_empty() {
+        return false;
+    }
+    let payload = data_fields.join("\n");
+    payload.trim() == "[DONE]" || serde_json::from_str::<Value>(&payload).is_ok()
 }
 
 fn parse_json_lines(
@@ -1849,6 +2167,9 @@ fn parse_json_lines(
     for line in body.lines().map(str::trim).filter(|line| !line.is_empty()) {
         let value: Value =
             serde_json::from_str(line).map_err(|_| ProviderFailureClass::MalformedResponse)?;
+        if let Some(failure) = provider_error_class_from_value(&value) {
+            return Err(failure);
+        }
         append_json_events(&mut events, &value, provider_kind)?;
     }
     finish_events(events)
@@ -1859,6 +2180,9 @@ fn events_from_json_value(
     provider_kind: HttpProviderKind,
 ) -> Result<Vec<ProviderStreamEvent>, ProviderFailureClass> {
     let mut events = Vec::new();
+    if let Some(failure) = provider_error_class_from_value(value) {
+        return Err(failure);
+    }
     append_json_events(&mut events, value, provider_kind)?;
     finish_events(events)
 }
@@ -1898,6 +2222,51 @@ fn finish_events(
         events.push(ProviderStreamEvent::Finished);
     }
     Ok(events)
+}
+
+fn provider_error_class(body: &str) -> Result<Vec<ProviderStreamEvent>, ProviderFailureClass> {
+    let Ok(value) = serde_json::from_str::<Value>(body) else {
+        return Err(ProviderFailureClass::MalformedResponse);
+    };
+    Err(provider_error_class_from_value(&value).unwrap_or(ProviderFailureClass::MalformedResponse))
+}
+
+fn provider_error_class_from_value(value: &Value) -> Option<ProviderFailureClass> {
+    let error = value.get("error")?;
+    let code = error
+        .get("code")
+        .or_else(|| error.get("type"))
+        .or_else(|| error.get("status"))
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let message = error
+        .get("message")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let combined = format!("{code} {message}");
+    if combined.contains("auth")
+        || combined.contains("permission")
+        || combined.contains("api key")
+        || combined.contains("unauthorized")
+    {
+        Some(ProviderFailureClass::Auth)
+    } else if combined.contains("rate") || combined.contains("quota") {
+        Some(ProviderFailureClass::RateLimited)
+    } else if combined.contains("context")
+        || combined.contains("token") && combined.contains("limit")
+    {
+        Some(ProviderFailureClass::ContextOverflow)
+    } else if combined.contains("model")
+        && (combined.contains("not found") || combined.contains("unavailable"))
+    {
+        Some(ProviderFailureClass::ModelUnavailable)
+    } else if combined.contains("invalid") || combined.contains("bad request") {
+        Some(ProviderFailureClass::InvalidRequest)
+    } else {
+        Some(ProviderFailureClass::MalformedResponse)
+    }
 }
 
 fn extract_provider_text(value: &Value, provider_kind: HttpProviderKind) -> Option<String> {
@@ -2307,7 +2676,7 @@ mod tests {
     }
 
     #[test]
-    fn configured_provider_adapter_uses_references_not_secrets() {
+    fn configured_provider_adapter_is_not_a_production_fake_completion() {
         let adapter = ConfiguredProviderAdapter::new(
             "config:provider.endpoint",
             "credential:provider_key_ref",
@@ -2320,13 +2689,11 @@ mod tests {
             required: vec![ProviderCapability::Chat],
             max_output_tokens: 16,
         };
-        let events = adapter.stream(&request, &|| false).unwrap();
-        assert!(matches!(events.last(), Some(ProviderStreamEvent::Finished)));
-        assert!(matches!(
-            &events[0],
-            ProviderStreamEvent::Delta(text)
-                if text.contains("config:provider.endpoint") && !text.contains("provider.key=")
-        ));
+        assert_eq!(
+            adapter.stream(&request, &|| false).unwrap_err(),
+            ProviderFailureClass::UnsupportedCapability
+        );
+        assert!(!format!("{adapter:?}").contains("provider.key="));
     }
 
     #[test]
@@ -2352,7 +2719,9 @@ data: [DONE]\n";
         assert!(
             matches!(&events[0], ProviderStreamEvent::Delta(text) if text.contains("goal=fix"))
         );
-        assert_eq!(token_usage(&events), (4, 6));
+        let usage = token_usage(&events);
+        assert_eq!((usage.input_tokens, usage.output_tokens), (4, 6));
+        assert_eq!(usage.source, UsageSource::ProviderReported);
     }
 
     #[test]
@@ -2402,28 +2771,32 @@ data: [DONE]\n";
             HttpProviderKind::OpenAiChatCompletions,
         )
         .unwrap();
-        assert_eq!(token_usage(&openai), (2, 3));
+        let usage = token_usage(&openai);
+        assert_eq!((usage.input_tokens, usage.output_tokens), (2, 3));
         let anthropic = events_from_status_and_body(
             200,
             "{\"content\":[{\"text\":\"plan=anthropic\"}],\"usage\":{\"input_tokens\":5,\"output_tokens\":7},\"type\":\"message_stop\"}",
             HttpProviderKind::AnthropicMessages,
         )
         .unwrap();
-        assert_eq!(token_usage(&anthropic), (5, 7));
+        let usage = token_usage(&anthropic);
+        assert_eq!((usage.input_tokens, usage.output_tokens), (5, 7));
         let gemini = events_from_status_and_body(
             200,
             "{\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"plan=gemini\"}]},\"finishReason\":\"STOP\"}],\"usageMetadata\":{\"promptTokenCount\":11,\"candidatesTokenCount\":13}}",
             HttpProviderKind::GeminiGenerateContent,
         )
         .unwrap();
-        assert_eq!(token_usage(&gemini), (11, 13));
+        let usage = token_usage(&gemini);
+        assert_eq!((usage.input_tokens, usage.output_tokens), (11, 13));
         let ollama = events_from_status_and_body(
             200,
             "{\"message\":{\"content\":\"plan=ollama\"},\"done\":true,\"prompt_eval_count\":17,\"eval_count\":19}",
             HttpProviderKind::OllamaChat,
         )
         .unwrap();
-        assert_eq!(token_usage(&ollama), (17, 19));
+        let usage = token_usage(&ollama);
+        assert_eq!((usage.input_tokens, usage.output_tokens), (17, 19));
         assert_eq!(
             events_from_status_and_body(429, "rate limited", HttpProviderKind::OpenAiCompatible)
                 .unwrap_err(),
@@ -2433,6 +2806,53 @@ data: [DONE]\n";
             events_from_status_and_body(200, "not json", HttpProviderKind::OpenAiCompatible)
                 .unwrap_err(),
             ProviderFailureClass::MalformedResponse
+        );
+    }
+
+    #[test]
+    fn streaming_parsers_handle_multiline_sse_errors_and_ndjson() {
+        let multiline = "data: {\"choices\":[{\"delta\":{\"content\":\"hello\"},\n\
+data: \"finish_reason\":\"stop\"}]}\n\n\
+data: [DONE]\n\n";
+        let events = parse_sse_body(multiline, HttpProviderKind::OpenAiChatCompletions).unwrap();
+        assert!(matches!(&events[0], ProviderStreamEvent::Delta(text) if text == "hello"));
+
+        let provider_error =
+            "data: {\"error\":{\"type\":\"rate_limit_error\",\"message\":\"try later\"}}\n\n";
+        assert_eq!(
+            parse_sse_body(provider_error, HttpProviderKind::OpenAiChatCompletions).unwrap_err(),
+            ProviderFailureClass::RateLimited
+        );
+
+        let ndjson = "{\"message\":{\"content\":\"one\"},\"done\":false}\n\
+{\"message\":{\"content\":\"two\"},\"done\":true,\"prompt_eval_count\":3,\"eval_count\":4}\n";
+        let events = parse_json_lines(ndjson, HttpProviderKind::OllamaChat).unwrap();
+        assert_eq!(token_usage(&events).total_tokens, 7);
+        assert!(matches!(events.last(), Some(ProviderStreamEvent::Finished)));
+
+        assert_eq!(
+            parse_sse_body("data: {not-json}\n\n", HttpProviderKind::OpenAiCompatible).unwrap_err(),
+            ProviderFailureClass::MalformedResponse
+        );
+    }
+
+    #[test]
+    fn http_provider_config_rejects_unsafe_remote_http_and_secret_headers() {
+        assert_eq!(
+            HttpProviderAdapter::new("http://api.example.test/v1/chat", None, "model", 1_000)
+                .unwrap_err()
+                .code(),
+            "PROVIDER-INSECURE_REMOTE_ENDPOINT"
+        );
+        let mut options = HttpProviderOptions::new("https://api.example.test/v1/chat", "model");
+        options
+            .custom_headers
+            .push(("Authorization".to_string(), "secret".to_string()));
+        assert_eq!(
+            HttpProviderAdapter::new_kind(options, HttpProviderKind::OpenAiCompatible)
+                .unwrap_err()
+                .code(),
+            "PROVIDER-UNSAFE_CUSTOM_HEADER"
         );
     }
 
@@ -2554,7 +2974,85 @@ data: [DONE]\n";
             &execution.events[0],
             ProviderStreamEvent::Delta(text) if text == "recovered"
         ));
-        assert_eq!(fabric.registry.attempts().len(), 2);
+        assert_eq!(fabric.registry.attempts().len(), 3);
+        assert!(fabric
+            .registry
+            .circuit_breaker(&fabric.free_connection)
+            .unwrap()
+            .is_open());
+    }
+
+    #[test]
+    fn successful_recovery_closes_open_circuit_and_restores_health() {
+        let mut fabric = phase4_fabric(
+            Box::new(ScriptedProvider::new(vec![Ok(successful_events("free"))])),
+            Box::new(ScriptedProvider::new(vec![Ok(successful_events("paid"))])),
+        );
+        let breaker = fabric
+            .registry
+            .circuit_breakers
+            .get_mut(&fabric.free_connection)
+            .unwrap();
+        breaker.transient_failures = 2;
+        breaker.cooldown_until_ms = None;
+        let execution = fabric
+            .registry
+            .request_model(
+                &TaskProfile::coding(StableId::new("task"), RoutingProfile::FreeFirst),
+                "recover",
+                128,
+                &|| false,
+            )
+            .unwrap();
+        assert_eq!(
+            execution.decision.selected.as_ref().unwrap().connection_id,
+            fabric.free_connection
+        );
+        let breaker = fabric
+            .registry
+            .circuit_breaker(&fabric.free_connection)
+            .unwrap();
+        assert_eq!(breaker.transient_failures, 0);
+        assert!(!breaker.is_open());
+    }
+
+    #[test]
+    fn estimated_usage_and_unknown_remote_cost_are_recorded_honestly() {
+        let mut registry = ProviderRegistry::new();
+        let (_, _, _) = register_route(
+            &mut registry,
+            "unknown-price",
+            Box::new(ScriptedProvider::new(vec![Ok(vec![
+                ProviderStreamEvent::Delta("response without usage".to_string()),
+                ProviderStreamEvent::EstimatedUsage {
+                    input_tokens: 5,
+                    output_tokens: 6,
+                },
+                ProviderStreamEvent::Finished,
+            ])])),
+            "unknown-price-family",
+            "unknown-price-model",
+            80,
+            80,
+            true,
+            false,
+        );
+        for identity in registry.model_identities.values_mut() {
+            identity.pricing_unit = PricingUnit::Unknown;
+            identity.input_cost_micros = 0;
+            identity.output_cost_micros = 0;
+        }
+        let execution = registry
+            .request_model(
+                &TaskProfile::coding(StableId::new("task"), RoutingProfile::PaidAllowed),
+                "usage",
+                128,
+                &|| false,
+            )
+            .unwrap();
+        assert_eq!(execution.decision.usage_source, UsageSource::Estimated);
+        assert_eq!(execution.decision.total_tokens, 11);
+        assert!(!execution.decision.cost_known);
     }
 
     #[test]
