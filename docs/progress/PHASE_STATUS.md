@@ -5,7 +5,7 @@ Doc 10 gates for the phase pass and completion evidence exists).
 
 Phase names are the EXACT canonical names from Doc 09 HC-P00..HC-P29 (no aliases).
 
-Last updated: 2026-08-24 (Phase 5 native tool runtime closure)
+Last updated: 2026-08-24 (Phase 7 Git/worktree closure)
 
 | Phase | Name (Doc 09 HC-*) | Status | Notes |
 |-------|--------------------|--------|-------|
@@ -16,7 +16,7 @@ Last updated: 2026-08-24 (Phase 5 native tool runtime closure)
 | P04 | Model Broker & OmniRoute Provider Fabric | COMPLETE | P04-WP01..P04-WP12 ACCEPTED; ProviderRegistry owns OmniRoute-style routing, model catalog, provider connections, local Ollama route, health/circuit/fallback, cost policy, and persisted routing evidence; evidence: docs/progress/phase-04-completion.md (+ .json) |
 | P05 | Native Tool Runtime Foundation | COMPLETE | P05-WP01..P05-WP11 ACCEPTED; Brokered filesystem/process runtime enforces canonical workspace paths, capability/risk/role policy, secret redaction, structured raw evidence, persistent execution records, timeout/cancellation, and background process control; evidence: docs/progress/phase-05-completion.md (+ .json) |
 | P06 | Basic Worker Agent Loop | COMPLETE | P06-WP01..P06-WP09 ACCEPTED; durable worker/task/attempt graph, retry and recovery state, context/provider/tool/verification/repair loop, evidence-backed completion request, and real autonomous benchmark pass; evidence: docs/progress/phase-06-completion.md (+ .json) |
-| P07 | Git, Worktrees & Checkpointing | COMPLETE | P07-WP01 ACCEPTED; real git worktree create/checkpoint/recover/cleanup, controlled local merge, rejected merge, and conflict rollback are tested |
+| P07 | Git, Worktrees & Checkpointing | COMPLETE | P07-WP01..P07-WP09 ACCEPTED; durable lease fencing, dirty-base protection, task checkpoints, replacement recovery, safe cleanup/reconciliation, integration branches, and structured conflicts pass P7-G1..G9; evidence: docs/progress/phase-07-completion.md (+ .json) |
 | P08 | Code Intelligence Foundation | COMPLETE | P08-WP01 ACCEPTED for autonomous coding scope; ContextBuilder indexes isolated workspace files and ranks snippets as evidence/context; deeper graph/freshness work remains later roadmap scope |
 | P09 | Semantic Intelligence & Repository Graph | NOT_STARTED | |
 | P10 | Persistent Memory & Knowledge Freshness | NOT_STARTED | |

@@ -28,18 +28,24 @@ impl ControlPlaneDb {
 
     pub fn migrate(&mut self) -> AcResult<()> {
         let current_version = self.user_version()?;
-        if current_version > 1 {
+        if current_version > 2 {
             return Err(AcError::conflict(
                 "DB-FUTURE_VERSION",
                 format!(
-                    "database user_version {current_version} is newer than supported version 1"
+                    "database user_version {current_version} is newer than supported version 2"
                 ),
             ));
         }
         let tx = self.connection.transaction().map_err(db_error)?;
         tx.execute_batch(include_str!("../../../migrations/0001_kernel_schema.sql"))
             .map_err(db_error)?;
-        tx.pragma_update(None, "user_version", 1)
+        if current_version < 2 {
+            tx.execute_batch(include_str!(
+                "../../../migrations/0002_git_worktree_hardening.sql"
+            ))
+            .map_err(db_error)?;
+        }
+        tx.pragma_update(None, "user_version", 2)
             .map_err(db_error)?;
         tx.commit().map_err(db_error)?;
         Ok(())
@@ -175,6 +181,7 @@ pub struct PersistedWorktree {
     pub repository_id: String,
     pub owner_mission_id: String,
     pub owner_worker_id: String,
+    pub lease_epoch: u64,
     pub path: String,
     pub branch: String,
     pub base_commit: String,
@@ -199,6 +206,10 @@ pub struct PersistedGitCheckpoint {
     pub worktree_id: String,
     pub commit_ref: String,
     pub reason: String,
+    pub task_attempt_id: Option<String>,
+    pub test_summary: Option<String>,
+    pub context_ref: Option<String>,
+    pub blocker: Option<String>,
     pub created_at_ms: i64,
 }
 
@@ -400,11 +411,13 @@ impl ControlPlaneDb {
         self.connection
             .execute(
                 "INSERT INTO worktrees (
-                    id, repository_id, owner_mission_id, owner_worker_id, path, branch,
+                    id, repository_id, owner_mission_id, owner_worker_id, lease_epoch, path, branch,
                     base_commit, current_commit, status, created_at_ms
                  )
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
                  ON CONFLICT(id) DO UPDATE SET
+                    owner_worker_id = excluded.owner_worker_id,
+                    lease_epoch = excluded.lease_epoch,
                     current_commit = excluded.current_commit,
                     status = excluded.status",
                 params![
@@ -412,6 +425,7 @@ impl ControlPlaneDb {
                     worktree.repository_id.as_str(),
                     worktree.owner_mission_id.as_str(),
                     worktree.owner_worker_id.as_str(),
+                    worktree.lease_epoch,
                     worktree.path.display().to_string(),
                     worktree.branch.as_str(),
                     worktree.base_commit.as_str(),
@@ -428,7 +442,7 @@ impl ControlPlaneDb {
         let mut stmt = self
             .connection
             .prepare(
-                "SELECT id, repository_id, owner_mission_id, owner_worker_id, path, branch,
+                "SELECT id, repository_id, owner_mission_id, owner_worker_id, lease_epoch, path, branch,
                         base_commit, current_commit, status, created_at_ms
                  FROM worktrees
                  WHERE id = ?1",
@@ -441,12 +455,13 @@ impl ControlPlaneDb {
                 repository_id: row.get(1).map_err(db_error)?,
                 owner_mission_id: row.get(2).map_err(db_error)?,
                 owner_worker_id: row.get(3).map_err(db_error)?,
-                path: row.get(4).map_err(db_error)?,
-                branch: row.get(5).map_err(db_error)?,
-                base_commit: row.get(6).map_err(db_error)?,
-                current_commit: row.get(7).map_err(db_error)?,
-                status: row.get(8).map_err(db_error)?,
-                created_at_ms: row.get(9).map_err(db_error)?,
+                lease_epoch: row.get(4).map_err(db_error)?,
+                path: row.get(5).map_err(db_error)?,
+                branch: row.get(6).map_err(db_error)?,
+                base_commit: row.get(7).map_err(db_error)?,
+                current_commit: row.get(8).map_err(db_error)?,
+                status: row.get(9).map_err(db_error)?,
+                created_at_ms: row.get(10).map_err(db_error)?,
             }));
         }
         Ok(None)
@@ -455,13 +470,17 @@ impl ControlPlaneDb {
     pub fn save_git_checkpoint(&self, checkpoint: &CheckpointRecord) -> AcResult<()> {
         self.connection
             .execute(
-                "INSERT INTO worktree_checkpoints (id, worktree_id, commit_ref, reason, created_at_ms)
-                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                "INSERT INTO worktree_checkpoints (id, worktree_id, commit_ref, reason, task_attempt_id, test_summary, context_ref, blocker, created_at_ms)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
                 params![
                     checkpoint.id.as_str(),
                     checkpoint.worktree_id.as_str(),
                     checkpoint.commit_ref.as_str(),
                     checkpoint.reason.as_str(),
+                    checkpoint.task_attempt_id.as_ref().map(StableId::as_str),
+                    checkpoint.test_summary.as_deref(),
+                    checkpoint.context_ref.as_ref().map(StableId::as_str),
+                    checkpoint.blocker.as_deref(),
                     millis(checkpoint.created_at)
                 ],
             )
@@ -476,7 +495,7 @@ impl ControlPlaneDb {
         let mut stmt = self
             .connection
             .prepare(
-                "SELECT id, worktree_id, commit_ref, reason, created_at_ms
+                "SELECT id, worktree_id, commit_ref, reason, task_attempt_id, test_summary, context_ref, blocker, created_at_ms
                  FROM worktree_checkpoints
                  WHERE worktree_id = ?1
                  ORDER BY created_at_ms ASC",
@@ -489,7 +508,11 @@ impl ControlPlaneDb {
                     worktree_id: row.get(1)?,
                     commit_ref: row.get(2)?,
                     reason: row.get(3)?,
-                    created_at_ms: row.get(4)?,
+                    task_attempt_id: row.get(4)?,
+                    test_summary: row.get(5)?,
+                    context_ref: row.get(6)?,
+                    blocker: row.get(7)?,
+                    created_at_ms: row.get(8)?,
                 })
             })
             .map_err(db_error)?;
@@ -759,7 +782,7 @@ mod tests {
     fn sqlite_store_persists_kernel_state() {
         let mut db = ControlPlaneDb::open_memory().unwrap();
         db.migrate().unwrap();
-        assert_eq!(db.user_version().unwrap(), 1);
+        assert_eq!(db.user_version().unwrap(), 2);
 
         let mut kernel = Kernel::new(AllowAllPolicy);
         kernel.start().unwrap();

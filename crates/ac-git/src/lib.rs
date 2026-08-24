@@ -17,6 +17,7 @@ pub struct RepositoryRecord {
 pub enum WorktreeStatus {
     Active,
     Degraded,
+    Missing,
     Cleaned,
 }
 
@@ -26,6 +27,7 @@ pub struct WorktreeRecord {
     pub repository_id: StableId,
     pub owner_mission_id: StableId,
     pub owner_worker_id: StableId,
+    pub lease_epoch: u64,
     pub path: PathBuf,
     pub branch: String,
     pub base_commit: String,
@@ -40,6 +42,10 @@ pub struct CheckpointRecord {
     pub worktree_id: StableId,
     pub commit_ref: String,
     pub reason: String,
+    pub task_attempt_id: Option<StableId>,
+    pub test_summary: Option<String>,
+    pub context_ref: Option<StableId>,
+    pub blocker: Option<String>,
     pub created_at: TimestampMillis,
 }
 
@@ -66,11 +72,29 @@ pub struct MergeReview {
     pub cleaned_up: bool,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MergeConflict {
+    pub files: Vec<String>,
+    pub base: String,
+    pub ours: String,
+    pub theirs: String,
+    pub related_tasks: Vec<StableId>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct IntegrationBranch {
+    pub mission_id: StableId,
+    pub repository_id: StableId,
+    pub branch: String,
+    pub base_commit: String,
+}
+
 #[derive(Default)]
 pub struct GitCoordinator {
     repositories: BTreeMap<StableId, RepositoryRecord>,
     worktrees: BTreeMap<StableId, WorktreeRecord>,
     checkpoints: BTreeMap<StableId, CheckpointRecord>,
+    integrations: BTreeMap<StableId, IntegrationBranch>,
 }
 
 impl GitCoordinator {
@@ -138,6 +162,7 @@ impl GitCoordinator {
                 repository_id: repository_id.clone(),
                 owner_mission_id,
                 owner_worker_id,
+                lease_epoch: 1,
                 path,
                 branch,
                 current_commit: base_commit.clone(),
@@ -177,10 +202,77 @@ impl GitCoordinator {
                 worktree_id: worktree_id.clone(),
                 commit_ref,
                 reason,
+                task_attempt_id: None,
+                test_summary: None,
+                context_ref: None,
+                blocker: None,
                 created_at: TimestampMillis::now(),
             },
         );
         Ok(id)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn checkpoint_with_metadata(
+        &mut self,
+        worktree_id: &StableId,
+        commit_ref: impl Into<String>,
+        reason: impl Into<String>,
+        task_attempt_id: Option<StableId>,
+        test_summary: Option<String>,
+        context_ref: Option<StableId>,
+        blocker: Option<String>,
+    ) -> AcResult<StableId> {
+        let id = self.checkpoint(worktree_id, commit_ref, reason)?;
+        let checkpoint = self
+            .checkpoints
+            .get_mut(&id)
+            .expect("created checkpoint exists");
+        checkpoint.task_attempt_id = task_attempt_id;
+        checkpoint.test_summary = test_summary;
+        checkpoint.context_ref = context_ref;
+        checkpoint.blocker = blocker;
+        Ok(id)
+    }
+
+    pub fn transfer_worktree_lease(
+        &mut self,
+        worktree_id: &StableId,
+        expected_epoch: u64,
+        replacement_worker_id: StableId,
+    ) -> AcResult<u64> {
+        let worktree = self
+            .worktrees
+            .get_mut(worktree_id)
+            .ok_or_else(|| AcError::validation("GIT-UNKNOWN_WORKTREE", "worktree not found"))?;
+        if worktree.lease_epoch != expected_epoch {
+            return Err(AcError::conflict(
+                "GIT-STALE_WORKTREE_LEASE",
+                "worktree lease is stale",
+            ));
+        }
+        worktree.owner_worker_id = replacement_worker_id;
+        worktree.lease_epoch += 1;
+        Ok(worktree.lease_epoch)
+    }
+
+    fn require_lease(
+        &self,
+        worktree_id: &StableId,
+        worker_id: &StableId,
+        epoch: u64,
+    ) -> AcResult<()> {
+        let worktree = self
+            .worktrees
+            .get(worktree_id)
+            .ok_or_else(|| AcError::validation("GIT-UNKNOWN_WORKTREE", "worktree not found"))?;
+        if &worktree.owner_worker_id != worker_id || worktree.lease_epoch != epoch {
+            return Err(AcError::conflict(
+                "GIT-STALE_WORKTREE_LEASE",
+                "worker no longer owns this worktree",
+            ));
+        }
+        Ok(())
     }
 
     pub fn checkpoint_current(
@@ -216,6 +308,17 @@ impl GitCoordinator {
         self.checkpoint(worktree_id, commit, reason)
     }
 
+    pub fn checkpoint_current_owned(
+        &mut self,
+        worktree_id: &StableId,
+        worker_id: &StableId,
+        lease_epoch: u64,
+        reason: impl Into<String>,
+    ) -> AcResult<StableId> {
+        self.require_lease(worktree_id, worker_id, lease_epoch)?;
+        self.checkpoint_current(worktree_id, reason)
+    }
+
     pub fn recover_worktree(&mut self, checkpoint_id: &StableId) -> AcResult<StableId> {
         let checkpoint = self
             .checkpoints
@@ -235,6 +338,20 @@ impl GitCoordinator {
         Ok(worktree.id.clone())
     }
 
+    pub fn restore_to_base(&mut self, worktree_id: &StableId) -> AcResult<StableId> {
+        let worktree = self
+            .worktrees
+            .get_mut(worktree_id)
+            .ok_or_else(|| AcError::validation("GIT-UNKNOWN_WORKTREE", "worktree not found"))?;
+        git_output(
+            &worktree.path,
+            ["reset", "--hard", worktree.base_commit.as_str()],
+        )?;
+        worktree.current_commit = worktree.base_commit.clone();
+        worktree.status = WorktreeStatus::Active;
+        Ok(worktree.id.clone())
+    }
+
     pub fn worktree(&self, id: &StableId) -> Option<&WorktreeRecord> {
         self.worktrees.get(id)
     }
@@ -250,6 +367,12 @@ impl GitCoordinator {
         owner_mission_id: StableId,
         owner_worker_id: StableId,
     ) -> AcResult<StableId> {
+        if !git_output(&source_root, ["status", "--porcelain"])?.is_empty() {
+            return Err(AcError::conflict(
+                "GIT-DIRTY_BASE",
+                "source repository has uncommitted user changes",
+            ));
+        }
         let base_commit = git_output(&source_root, ["rev-parse", "HEAD"])?;
         let default_branch = git_output(&source_root, ["branch", "--show-current"])
             .unwrap_or_else(|_| "main".to_string());
@@ -331,12 +454,24 @@ impl GitCoordinator {
             .repositories
             .get(&worktree.repository_id)
             .ok_or_else(|| AcError::validation("GIT-UNKNOWN_REPOSITORY", "repository not found"))?;
+        if !worktree.path.exists() {
+            worktree.status = WorktreeStatus::Missing;
+            return Err(AcError::conflict(
+                "GIT-WORKTREE_MISSING",
+                "worktree directory is missing",
+            ));
+        }
+        if !git_output(&worktree.path, ["status", "--porcelain"])?.is_empty() {
+            return Err(AcError::conflict(
+                "GIT-WORKTREE_DIRTY_CLEANUP",
+                "refusing to delete uncommitted work",
+            ));
+        }
         git_output(
             &repository.root,
             [
                 "worktree",
                 "remove",
-                "--force",
                 worktree.path.to_str().ok_or_else(|| {
                     AcError::validation("GIT-WORKTREE_PATH_UTF8", "worktree path must be UTF-8")
                 })?,
@@ -344,6 +479,119 @@ impl GitCoordinator {
         )?;
         worktree.status = WorktreeStatus::Cleaned;
         Ok(())
+    }
+
+    pub fn reconcile_worktree(&mut self, worktree_id: &StableId) -> AcResult<WorktreeStatus> {
+        let worktree = self
+            .worktrees
+            .get_mut(worktree_id)
+            .ok_or_else(|| AcError::validation("GIT-UNKNOWN_WORKTREE", "worktree not found"))?;
+        if !worktree.path.exists() {
+            worktree.status = WorktreeStatus::Missing;
+        } else if worktree.status == WorktreeStatus::Missing {
+            worktree.status = WorktreeStatus::Active;
+        }
+        Ok(worktree.status)
+    }
+
+    pub fn create_integration_branch(
+        &mut self,
+        repository_id: &StableId,
+        mission_id: StableId,
+    ) -> AcResult<IntegrationBranch> {
+        let repository = self
+            .repositories
+            .get(repository_id)
+            .ok_or_else(|| AcError::validation("GIT-UNKNOWN_REPOSITORY", "repository not found"))?
+            .clone();
+        let branch = format!("agentcode/mission-{mission_id}/integration");
+        validate_branch(&branch)?;
+        git_output(
+            &repository.root,
+            ["branch", branch.as_str(), repository.head.as_str()],
+        )?;
+        let integration = IntegrationBranch {
+            mission_id: mission_id.clone(),
+            repository_id: repository_id.clone(),
+            branch,
+            base_commit: repository.head,
+        };
+        self.integrations.insert(mission_id, integration.clone());
+        Ok(integration)
+    }
+
+    pub fn integrate_worktree(
+        &mut self,
+        worktree_id: &StableId,
+        mission_id: &StableId,
+        approved_by_kernel: bool,
+    ) -> AcResult<Option<MergeConflict>> {
+        if !approved_by_kernel {
+            return Err(AcError::policy_denied(
+                "GIT-MERGE_REQUIRES_KERNEL_APPROVAL",
+                "integration requires Kernel approval",
+            ));
+        }
+        let worktree = self
+            .worktrees
+            .get(worktree_id)
+            .ok_or_else(|| AcError::validation("GIT-UNKNOWN_WORKTREE", "worktree not found"))?
+            .clone();
+        let integration = self
+            .integrations
+            .get(mission_id)
+            .ok_or_else(|| {
+                AcError::validation("GIT-UNKNOWN_INTEGRATION", "integration branch not found")
+            })?
+            .clone();
+        let repository = self
+            .repositories
+            .get(&worktree.repository_id)
+            .ok_or_else(|| AcError::validation("GIT-UNKNOWN_REPOSITORY", "repository not found"))?
+            .clone();
+        let previous = git_output(&repository.root, ["rev-parse", "HEAD"])?;
+        let previous_branch = git_output(&repository.root, ["branch", "--show-current"])?;
+        git_output(&repository.root, ["checkout", integration.branch.as_str()])?;
+        let merge = Command::new("git")
+            .args([
+                "-c",
+                "user.name=AgentCode",
+                "-c",
+                "user.email=agentcode@example.test",
+                "merge",
+                "--no-ff",
+                "--no-edit",
+                worktree.branch.as_str(),
+            ])
+            .current_dir(&repository.root)
+            .output()
+            .map_err(|e| AcError::validation("GIT-COMMAND_FAILED", e.to_string()))?;
+        if merge.status.success() {
+            return Ok(None);
+        }
+        let files = git_output(&repository.root, ["diff", "--name-only", "--diff-filter=U"])
+            .unwrap_or_default()
+            .lines()
+            .map(str::to_owned)
+            .collect();
+        let base = git_output(
+            &repository.root,
+            ["merge-base", "HEAD", worktree.branch.as_str()],
+        )
+        .unwrap_or_else(|_| worktree.base_commit.clone());
+        let _ = Command::new("git")
+            .args(["merge", "--abort"])
+            .current_dir(&repository.root)
+            .output();
+        let _ = git_output(&repository.root, ["checkout", previous_branch.as_str()]);
+        let _ = git_output(&repository.root, ["reset", "--hard", previous.as_str()]);
+        Ok(Some(MergeConflict {
+            files,
+            base,
+            ours: previous,
+            theirs: worktree.current_commit,
+            related_tasks: vec![worktree.owner_mission_id],
+        }))
     }
 
     pub fn prepare_merge_review(
@@ -674,6 +922,151 @@ mod tests {
             "source change\n"
         );
         git.cleanup_worktree(&worktree_id).unwrap();
+        let _ = fs::remove_dir_all(source);
+    }
+
+    #[test]
+    fn phase_seven_isolates_workers_replaces_owner_and_detects_missing_worktree() {
+        let source = std::env::temp_dir().join(format!("agentcode-src-{}", StableId::new("tmp")));
+        let one = std::env::temp_dir().join(format!("agentcode-wt-{}", StableId::new("tmp")));
+        let two = std::env::temp_dir().join(format!("agentcode-wt-{}", StableId::new("tmp")));
+        fs::create_dir_all(&source).unwrap();
+        fs::write(source.join("a.txt"), "base\n").unwrap();
+        run_git(&source, ["init"]);
+        run_git(&source, ["add", "."]);
+        run_git(
+            &source,
+            [
+                "-c",
+                "user.name=AgentCode Test",
+                "-c",
+                "user.email=agentcode@example.test",
+                "commit",
+                "-m",
+                "base",
+            ],
+        );
+        let mission = StableId::new("mission");
+        let worker_a = StableId::new("worker");
+        let worker_b = StableId::new("worker");
+        let mut git = GitCoordinator::new();
+        let first = git
+            .create_task_workspace(
+                source.clone(),
+                one.clone(),
+                mission.clone(),
+                worker_a.clone(),
+            )
+            .unwrap();
+        let second = git
+            .create_task_workspace(
+                source.clone(),
+                two.clone(),
+                mission.clone(),
+                worker_b.clone(),
+            )
+            .unwrap();
+        fs::write(one.join("a.txt"), "one\n").unwrap();
+        assert!(!git.worktree_status(&second).unwrap().contains("a.txt"));
+        let checkpoint = git
+            .checkpoint_current_owned(&first, &worker_a, 1, "worker a checkpoint")
+            .unwrap();
+        let epoch = git
+            .transfer_worktree_lease(&first, 1, worker_b.clone())
+            .unwrap();
+        assert_eq!(
+            git.checkpoint_current_owned(&first, &worker_a, 1, "zombie")
+                .unwrap_err()
+                .code(),
+            "GIT-STALE_WORKTREE_LEASE"
+        );
+        git.recover_worktree(&checkpoint).unwrap();
+        assert_eq!(git.worktree(&first).unwrap().lease_epoch, epoch);
+        fs::remove_dir_all(&two).unwrap();
+        assert_eq!(
+            git.reconcile_worktree(&second).unwrap(),
+            WorktreeStatus::Missing
+        );
+        git.cleanup_worktree(&first).unwrap();
+        let _ = fs::remove_dir_all(source);
+    }
+
+    #[test]
+    fn dirty_base_is_preserved_and_integration_conflicts_are_structured() {
+        let source = std::env::temp_dir().join(format!("agentcode-src-{}", StableId::new("tmp")));
+        let worktree = std::env::temp_dir().join(format!("agentcode-wt-{}", StableId::new("tmp")));
+        fs::create_dir_all(&source).unwrap();
+        fs::write(source.join("a.txt"), "base\n").unwrap();
+        run_git(&source, ["init"]);
+        run_git(&source, ["add", "."]);
+        run_git(
+            &source,
+            [
+                "-c",
+                "user.name=AgentCode Test",
+                "-c",
+                "user.email=agentcode@example.test",
+                "commit",
+                "-m",
+                "base",
+            ],
+        );
+        fs::write(source.join("a.txt"), "manual\n").unwrap();
+        let mut git = GitCoordinator::new();
+        assert_eq!(
+            git.create_task_workspace(
+                source.clone(),
+                worktree.clone(),
+                StableId::new("mission"),
+                StableId::new("worker")
+            )
+            .unwrap_err()
+            .code(),
+            "GIT-DIRTY_BASE"
+        );
+        assert_eq!(
+            fs::read_to_string(source.join("a.txt")).unwrap(),
+            "manual\n"
+        );
+        run_git(&source, ["restore", "a.txt"]);
+        let mission = StableId::new("mission");
+        let id = git
+            .create_task_workspace(
+                source.clone(),
+                worktree.clone(),
+                mission.clone(),
+                StableId::new("worker"),
+            )
+            .unwrap();
+        let repo = git.worktree(&id).unwrap().repository_id.clone();
+        git.create_integration_branch(&repo, mission.clone())
+            .unwrap();
+        let other_path =
+            std::env::temp_dir().join(format!("agentcode-wt-{}", StableId::new("tmp")));
+        let other = git
+            .create_task_workspace(
+                source.clone(),
+                other_path.clone(),
+                mission.clone(),
+                StableId::new("worker"),
+            )
+            .unwrap();
+        fs::write(other_path.join("a.txt"), "other\n").unwrap();
+        git.checkpoint_current(&other, "other").unwrap();
+        assert!(git
+            .integrate_worktree(&other, &mission, true)
+            .unwrap()
+            .is_none());
+        fs::write(worktree.join("a.txt"), "task\n").unwrap();
+        git.checkpoint_current(&id, "task").unwrap();
+        let conflict = git
+            .integrate_worktree(&id, &mission, true)
+            .unwrap()
+            .unwrap();
+        assert_eq!(conflict.files, vec!["a.txt"]);
+        assert_eq!(fs::read_to_string(source.join("a.txt")).unwrap(), "other\n");
+        git.cleanup_worktree(&id).unwrap();
+        git.cleanup_worktree(&other).unwrap();
         let _ = fs::remove_dir_all(source);
     }
 }
