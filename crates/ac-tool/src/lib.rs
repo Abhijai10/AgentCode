@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 use std::fs;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -8,7 +9,7 @@ use std::time::{Duration, Instant};
 
 use ac_common::{AcError, AcResult, StableId, TimestampMillis};
 use ac_evidence::{EvidenceStore, Provenance};
-use ac_sandbox::{ExecRequest, SandboxManager, SandboxPolicy, SecretBroker};
+use ac_sandbox::{ExecRequest, SandboxEvidence, SandboxManager, SandboxPolicy, SecretBroker};
 use ac_security::{Capability, CapabilityPolicy, McpToolRecord, SecurityDecision};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -61,6 +62,7 @@ pub struct ProcessRecord {
     pub pid: u32,
     pub state: ProcessState,
     pub started_at: TimestampMillis,
+    pub sandbox: SandboxEvidence,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -69,6 +71,8 @@ pub struct NativeProcessResult {
     pub exit_code: Option<i32>,
     pub stdout: String,
     pub stderr: String,
+    pub stdout_truncated: bool,
+    pub stderr_truncated: bool,
 }
 
 pub struct SecretProcessRequest<'a> {
@@ -105,17 +109,28 @@ impl ProcessManager {
             argv: plan.argv.clone(),
             cwd: plan.cwd.clone(),
             timeout_ms: plan.timeout_ms,
-            network: false,
+            network: matches!(
+                plan.sandbox_evidence.network_policy,
+                ac_sandbox::NetworkPolicy::AllowAll
+            ),
         };
-        let mut child = Command::new(&plan.argv[0])
-            .args(&plan.argv[1..])
+        let mut command = Command::new(&plan.backend_argv[0]);
+        command
+            .args(&plan.backend_argv[1..])
             .current_dir(&plan.cwd)
             .env_clear()
             .envs(&plan.allowed_env)
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
+            .stderr(Stdio::piped());
+        configure_process_group(&mut command);
+        let mut child = command
             .spawn()
             .map_err(|error| AcError::validation("TOOL-COMMAND_SPAWN_FAILED", error.to_string()))?;
+        let stdout = child.stdout.take();
+        let stderr = child.stderr.take();
+        let max_output_bytes = plan.max_output_bytes;
+        let stdout_reader = stdout.map(|pipe| read_limited_in_thread(pipe, max_output_bytes));
+        let stderr_reader = stderr.map(|pipe| read_limited_in_thread(pipe, max_output_bytes));
         let id = plan.id;
         let record = ProcessRecord {
             id: id.clone(),
@@ -124,6 +139,7 @@ impl ProcessManager {
             pid: child.id(),
             state: ProcessState::Running,
             started_at: TimestampMillis::now(),
+            sandbox: plan.sandbox_evidence.clone(),
         };
         self.records
             .lock()
@@ -135,9 +151,9 @@ impl ProcessManager {
                 AcError::validation("TOOL-COMMAND_WAIT_FAILED", error.to_string())
             })? {
                 Some(status) => {
-                    let output = child.wait_with_output().map_err(|error| {
-                        AcError::validation("TOOL-COMMAND_OUTPUT_FAILED", error.to_string())
-                    })?;
+                    let _ = child.wait();
+                    let (stdout, stdout_truncated) = join_output(stdout_reader)?;
+                    let (stderr, stderr_truncated) = join_output(stderr_reader)?;
                     let mut finished = record.clone();
                     finished.state = if status.success() {
                         ProcessState::Finished
@@ -151,12 +167,14 @@ impl ProcessManager {
                     return Ok(NativeProcessResult {
                         record: finished,
                         exit_code: status.code(),
-                        stdout: String::from_utf8_lossy(&output.stdout).to_string(),
-                        stderr: String::from_utf8_lossy(&output.stderr).to_string(),
+                        stdout,
+                        stderr,
+                        stdout_truncated,
+                        stderr_truncated,
                     });
                 }
                 None if cancelled.load(Ordering::Relaxed) => {
-                    let _ = child.kill();
+                    terminate_process_tree(child.id());
                     let _ = child.wait();
                     let mut cancelled_record = record.clone();
                     cancelled_record.state = ProcessState::Cancelled;
@@ -172,7 +190,7 @@ impl ProcessManager {
                     ));
                 }
                 None if Instant::now() >= deadline => {
-                    let _ = child.kill();
+                    terminate_process_tree(child.id());
                     let _ = child.wait();
                     let mut timed_out = record.clone();
                     timed_out.state = ProcessState::TimedOut;
@@ -201,15 +219,21 @@ impl ProcessManager {
             argv: plan.argv.clone(),
             cwd: plan.cwd.clone(),
             timeout_ms: plan.timeout_ms,
-            network: false,
+            network: matches!(
+                plan.sandbox_evidence.network_policy,
+                ac_sandbox::NetworkPolicy::AllowAll
+            ),
         };
-        let child = Command::new(&plan.argv[0])
-            .args(&plan.argv[1..])
+        let mut command = Command::new(&plan.backend_argv[0]);
+        command
+            .args(&plan.backend_argv[1..])
             .current_dir(&plan.cwd)
             .env_clear()
             .envs(&plan.allowed_env)
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
+            .stderr(Stdio::null());
+        configure_process_group(&mut command);
+        let child = command
             .spawn()
             .map_err(|error| AcError::validation("TOOL-COMMAND_SPAWN_FAILED", error.to_string()))?;
         let id = plan.id;
@@ -220,6 +244,7 @@ impl ProcessManager {
             pid: child.id(),
             state: ProcessState::Running,
             started_at: TimestampMillis::now(),
+            sandbox: plan.sandbox_evidence,
         };
         self.children
             .lock()
@@ -252,9 +277,7 @@ impl ProcessManager {
                     "background process is not registered",
                 )
             })?;
-        child.kill().map_err(|error| {
-            AcError::validation("TOOL-PROCESS_CANCEL_FAILED", error.to_string())
-        })?;
+        terminate_process_tree(child.id());
         let _ = child.wait();
         let mut records = self.records.lock().expect("process records lock");
         let record = records.get_mut(id).ok_or_else(|| {
@@ -264,6 +287,81 @@ impl ProcessManager {
         Ok(())
     }
 }
+
+fn read_limited_in_thread<R: Read + Send + 'static>(
+    mut reader: R,
+    max_output_bytes: usize,
+) -> std::thread::JoinHandle<AcResult<(String, bool)>> {
+    std::thread::spawn(move || {
+        let mut buffer = Vec::new();
+        let mut chunk = [0_u8; 4096];
+        let mut truncated = false;
+        loop {
+            let read = reader.read(&mut chunk).map_err(|error| {
+                AcError::validation("TOOL-COMMAND_OUTPUT_FAILED", error.to_string())
+            })?;
+            if read == 0 {
+                break;
+            }
+            let remaining = max_output_bytes.saturating_sub(buffer.len());
+            if remaining == 0 {
+                truncated = true;
+                continue;
+            }
+            let keep = read.min(remaining);
+            buffer.extend_from_slice(&chunk[..keep]);
+            if keep < read {
+                truncated = true;
+            }
+        }
+        Ok((String::from_utf8_lossy(&buffer).to_string(), truncated))
+    })
+}
+
+fn join_output(
+    reader: Option<std::thread::JoinHandle<AcResult<(String, bool)>>>,
+) -> AcResult<(String, bool)> {
+    reader
+        .map(|reader| {
+            reader.join().unwrap_or_else(|_| {
+                Err(AcError::validation(
+                    "TOOL-COMMAND_OUTPUT_FAILED",
+                    "output reader thread panicked",
+                ))
+            })
+        })
+        .unwrap_or_else(|| Ok((String::new(), false)))
+}
+
+#[cfg(unix)]
+fn configure_process_group(command: &mut Command) {
+    use std::os::unix::process::CommandExt;
+    command.process_group(0);
+}
+
+#[cfg(not(unix))]
+fn configure_process_group(_command: &mut Command) {}
+
+#[cfg(unix)]
+fn terminate_process_tree(pid: u32) {
+    let group = format!("-{}", pid);
+    let _ = Command::new("/bin/kill")
+        .args(["-TERM", &group])
+        .env_clear()
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+    std::thread::sleep(Duration::from_millis(25));
+    let _ = Command::new("/bin/kill")
+        .args(["-KILL", &group])
+        .env_clear()
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+}
+
+#[cfg(not(unix))]
+fn terminate_process_tree(_pid: u32) {}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ToolDefinition {
@@ -431,6 +529,8 @@ impl WorkspaceTools {
                         .allow(Capability::ProcessExec("*".to_string())),
                     network_default_allow: false,
                     max_timeout_ms: 30_000,
+                    required_isolation: ac_sandbox::IsolationLevel::ProcessRestricted,
+                    ..SandboxPolicy::new(vec![self.root.clone()])
                 }),
                 cwd: self.root.clone(),
                 manager: ProcessManager::default(),
@@ -457,6 +557,8 @@ impl WorkspaceTools {
                             .allow(Capability::ProcessExec("*".to_string())),
                         network_default_allow: false,
                         max_timeout_ms: 30_000,
+                        required_isolation: ac_sandbox::IsolationLevel::ProcessRestricted,
+                        ..SandboxPolicy::new(vec![self.root.clone()])
                     }),
                     cwd: self.root.clone(),
                     argv: command.iter().map(ToString::to_string).collect(),
@@ -635,12 +737,31 @@ fn run_sandboxed_command(
         timeout_ms,
     })?;
     let result = manager.run("tool-command", plan)?;
-    Ok(format!(
-        "status:{}\nstdout:{}\nstderr:{}",
+    Ok(format_process_observation(&result))
+}
+
+fn format_process_observation(result: &NativeProcessResult) -> String {
+    format!(
+        "sandbox_backend:{}\nachieved_isolation:{:?}\nnetwork_policy:{:?}\nworkspace_roots:{}\ntimeout_ms:{}\nmax_output_bytes:{}\nstdout_truncated:{}\nstderr_truncated:{}\nstatus:{}\nstdout:{}\nstderr:{}",
+        result.record.sandbox.backend_name,
+        result.record.sandbox.achieved_isolation,
+        result.record.sandbox.network_policy,
+        result
+            .record
+            .sandbox
+            .workspace_roots
+            .iter()
+            .map(|path| path.display().to_string())
+            .collect::<Vec<_>>()
+            .join(","),
+        result.record.sandbox.timeout_ms,
+        result.record.sandbox.max_output_bytes,
+        result.stdout_truncated,
+        result.stderr_truncated,
         result.exit_code.unwrap_or(-1),
         result.stdout,
         result.stderr
-    ))
+    )
 }
 
 fn parse_argv(payload: &str) -> AcResult<Vec<String>> {
@@ -914,12 +1035,7 @@ impl ToolBroker {
             Ok(output) => self.completed_result(
                 request,
                 evidence_store,
-                format!(
-                    "status:{}\nstdout:{}\nstderr:{}",
-                    output.exit_code.unwrap_or(-1),
-                    output.stdout,
-                    output.stderr
-                ),
+                format_process_observation(&output),
                 &secret_values,
             ),
             Err(error) => {
@@ -1164,11 +1280,13 @@ mod tests {
 
     fn permitted_sandbox(root: PathBuf, timeout_ms: u64) -> SandboxManager {
         SandboxManager::new(SandboxPolicy {
-            workspace_roots: vec![root],
+            workspace_roots: vec![root.clone()],
             capability_policy: CapabilityPolicy::new()
                 .allow(Capability::ProcessExec("*".to_string())),
             network_default_allow: false,
             max_timeout_ms: timeout_ms,
+            required_isolation: ac_sandbox::IsolationLevel::ProcessRestricted,
+            ..SandboxPolicy::new(vec![root])
         })
     }
 
@@ -1264,6 +1382,62 @@ mod tests {
     }
 
     #[test]
+    fn process_env_is_minimized_and_allowed_env_survives() {
+        let root = std::env::temp_dir().join(format!("agentcode-env-{}", StableId::new("t")));
+        fs::create_dir_all(&root).unwrap();
+        std::env::set_var("AGENTCODE_PARENT_CANARY", "parent-secret");
+        let sandbox = permitted_sandbox(root.clone(), 1_000);
+        let plan = sandbox
+            .prepare_execution(ExecRequest {
+                argv: vec!["/usr/bin/env".to_string()],
+                cwd: root.clone(),
+                env: BTreeMap::from([("AGENTCODE_ALLOWED".to_string(), "visible".to_string())]),
+                network: false,
+                timeout_ms: 1_000,
+            })
+            .unwrap();
+        let result = ProcessManager::default().run("env", plan).unwrap();
+        assert!(result.stdout.contains("AGENTCODE_ALLOWED=visible"));
+        assert!(!result.stdout.contains("AGENTCODE_PARENT_CANARY"));
+        assert_eq!(
+            result.record.sandbox.achieved_isolation,
+            ac_sandbox::IsolationLevel::ProcessRestricted
+        );
+        std::env::remove_var("AGENTCODE_PARENT_CANARY");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn process_output_is_bounded_and_truncated_marker_is_recorded() {
+        let root = std::env::temp_dir().join(format!("agentcode-output-{}", StableId::new("t")));
+        fs::create_dir_all(&root).unwrap();
+        let sandbox = SandboxManager::new(SandboxPolicy {
+            workspace_roots: vec![root.clone()],
+            capability_policy: CapabilityPolicy::new()
+                .allow(Capability::ProcessExec("*".to_string())),
+            network_default_allow: false,
+            max_timeout_ms: 1_000,
+            required_isolation: ac_sandbox::IsolationLevel::ProcessRestricted,
+            max_output_bytes: 4,
+        });
+        let plan = sandbox
+            .prepare_execution(ExecRequest {
+                argv: vec!["/bin/echo".to_string(), "abcdef".to_string()],
+                cwd: root.clone(),
+                env: BTreeMap::new(),
+                network: false,
+                timeout_ms: 1_000,
+            })
+            .unwrap();
+        let result = ProcessManager::default().run("output", plan).unwrap();
+        assert_eq!(result.stdout, "abcd");
+        assert!(result.stdout_truncated);
+        let observation = format_process_observation(&result);
+        assert!(observation.contains("stdout_truncated:true"));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn approved_secret_process_is_redacted_from_agent_result() {
         let root = std::env::temp_dir().join(format!("agentcode-secret-{}", StableId::new("t")));
         fs::create_dir_all(&root).unwrap();
@@ -1289,6 +1463,8 @@ mod tests {
                 .allow(Capability::SecretRead("*".to_string())),
             network_default_allow: false,
             max_timeout_ms: 1_000,
+            required_isolation: ac_sandbox::IsolationLevel::ProcessRestricted,
+            ..SandboxPolicy::new(vec![root.clone()])
         });
         let mut secrets = SecretBroker::default();
         secrets.insert("test.canary", "canary-secret").unwrap();
