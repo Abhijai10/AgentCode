@@ -42,6 +42,109 @@ pub enum IndexReadiness {
     Degraded,
     Rebuilding,
 }
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SourceRange {
+    pub start_line: u32,
+    pub end_line: u32,
+}
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AstNode {
+    pub kind: String,
+    pub text: String,
+    pub range: SourceRange,
+}
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ParseResult {
+    pub language: String,
+    pub nodes: Vec<AstNode>,
+    pub errors: Vec<String>,
+}
+pub trait ParserEngine {
+    fn parse(&self, language: &str, source: &str) -> ParseResult;
+}
+#[derive(Default)]
+pub struct FallbackParser;
+impl ParserEngine for FallbackParser {
+    fn parse(&self, language: &str, source: &str) -> ParseResult {
+        let mut nodes = Vec::new();
+        let mut errors = Vec::new();
+        for (i, line) in source.lines().enumerate() {
+            let t = line.trim();
+            if t.contains("<<<") {
+                errors.push(format!("line {} malformed", i + 1));
+            }
+            if [
+                "fn ",
+                "pub fn ",
+                "struct ",
+                "pub struct ",
+                "class ",
+                "def ",
+                "function ",
+                "export ",
+            ]
+            .iter()
+            .any(|p| t.starts_with(p))
+            {
+                nodes.push(AstNode {
+                    kind: "declaration".into(),
+                    text: t.into(),
+                    range: SourceRange {
+                        start_line: (i + 1) as u32,
+                        end_line: (i + 1) as u32,
+                    },
+                });
+            }
+        }
+        ParseResult {
+            language: language.into(),
+            nodes,
+            errors,
+        }
+    }
+}
+pub trait StructuralSearchEngine {
+    fn search(&self, language: &str, pattern: &str, source: &str) -> AcResult<Vec<AstNode>>;
+}
+#[derive(Default)]
+pub struct PatternMatcher;
+impl StructuralSearchEngine for PatternMatcher {
+    fn search(&self, language: &str, pattern: &str, source: &str) -> AcResult<Vec<AstNode>> {
+        if language.is_empty() {
+            return Err(AcError::validation(
+                "CODEINTEL-LANGUAGE",
+                "language is required",
+            ));
+        }
+        Ok(FallbackParser::default()
+            .parse(language, source)
+            .nodes
+            .into_iter()
+            .filter(|n| n.text.contains(pattern))
+            .collect())
+    }
+}
+#[derive(Default)]
+pub struct PollingWatcher {
+    hashes: BTreeMap<String, String>,
+}
+pub trait ChangeWatcher {
+    fn observe(&mut self, path: &str, content: Option<&str>) -> bool;
+}
+impl ChangeWatcher for PollingWatcher {
+    fn observe(&mut self, path: &str, content: Option<&str>) -> bool {
+        match content {
+            Some(content) => self.changed(path, content),
+            None => self.hashes.remove(path).is_some(),
+        }
+    }
+}
+impl PollingWatcher {
+    pub fn changed(&mut self, path: &str, content: &str) -> bool {
+        let hash = hash_text(content);
+        self.hashes.insert(path.into(), hash.clone()).as_deref() != Some(hash.as_str())
+    }
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SymbolOccurrence {
@@ -93,6 +196,15 @@ impl CodeIntelligenceService {
                 "repository scope requires root and commit",
             ));
         }
+        let present = files
+            .iter()
+            .map(|(file, _)| file.relative_path.clone())
+            .collect::<Vec<_>>();
+        self.files.retain(|path, _| present.contains(path));
+        self.snippets.retain(|path, _| present.contains(path));
+        self.symbols
+            .retain(|symbol| present.contains(&symbol.file_path));
+        self.imports.retain(|edge| present.contains(&edge.from));
         let mut degraded = false;
         let mut count = 0;
         for (file, content) in files {
@@ -233,6 +345,13 @@ impl CodeIntelligenceService {
             .iter()
             .filter(|symbol| symbol.name.contains(name))
             .cloned()
+            .collect()
+    }
+    pub fn affected_files(&self, target: &str) -> Vec<String> {
+        self.imports
+            .iter()
+            .filter(|e| e.to.contains(target))
+            .map(|e| e.from.clone())
             .collect()
     }
 
@@ -409,5 +528,22 @@ mod tests {
             .unwrap();
         assert!(receipt.degraded);
         assert!(service.query_symbols("hidden").is_empty());
+    }
+    #[test]
+    fn fallback_parser_search_and_watcher_are_deterministic() {
+        let source = "use crate::api;\npub fn run() {}\n";
+        let parsed = FallbackParser::default().parse("rust", source);
+        assert_eq!(parsed.nodes.len(), 1);
+        assert_eq!(
+            PatternMatcher::default()
+                .search("rust", "run", source)
+                .unwrap()
+                .len(),
+            1
+        );
+        let mut watcher = PollingWatcher::default();
+        assert!(watcher.changed("a.rs", source));
+        assert!(!watcher.changed("a.rs", source));
+        assert!(watcher.changed("a.rs", "pub fn changed() {}"));
     }
 }
