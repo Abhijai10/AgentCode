@@ -23,6 +23,8 @@ pub enum ProofLevel {
     Secret,
     Manual,
     Rescan,
+    ActiveValidation,
+    AiFixture,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -32,6 +34,16 @@ pub enum SecurityAdapter {
     Trivy,
     Semgrep,
     Checkov,
+    Zap,
+    Nuclei,
+    Prowler,
+    Stratus,
+    CloudGoat,
+    Pacu,
+    AiNative,
+    Promptfoo,
+    Garak,
+    PyRit,
     Manual,
 }
 
@@ -506,6 +518,20 @@ fn remediation_for(fingerprint: &str) -> String {
         "vulnerable-dependency" => "upgrade vulnerable dependency".to_string(),
         "injection-pattern" => "parameterize user-controlled query or sanitize sink".to_string(),
         "iac-public-exposure" => "restrict public infrastructure exposure".to_string(),
+        "seeded-web-authorization-bypass" => {
+            "enforce ownership checks and verify with synthetic user canary".to_string()
+        }
+        "cloud-public-or-wildcard-permission" => {
+            "restrict public access and least-privilege wildcard permissions".to_string()
+        }
+        "ai-direct-prompt-injection" => "separate instructions from user content and enforce policy refusal".to_string(),
+        "ai-indirect-prompt-injection" => {
+            "treat retrieved/tool content as untrusted and require source-bound policy checks".to_string()
+        }
+        "ai-rag-poisoning" => "score retrieval trust and quarantine poisoned documents".to_string(),
+        "ai-tool-abuse" => "intersect tool requests with Kernel capability policy".to_string(),
+        "ai-secret-leakage" => "redact synthetic secrets before model/report exposure".to_string(),
+        "ai-excessive-agency" => "require explicit approval for external or destructive agency".to_string(),
         _ => "review and remediate security finding".to_string(),
     }
 }

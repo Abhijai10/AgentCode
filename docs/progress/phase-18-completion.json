@@ -1,0 +1,112 @@
+{
+  "schema_version": 1,
+  "phase": "P18",
+  "name": "Advanced AppSec, Cloud & Red-Team",
+  "status": "COMPLETE",
+  "base_commit": "5df5bcba794186790b61fafd12459259b7d0b068",
+  "workpackages": [
+    {
+      "id": "P18-WP01",
+      "name": "Authorization and active-test scope model",
+      "status": "ACCEPTED"
+    },
+    {
+      "id": "P18-WP02",
+      "name": "Environment classifier and execution policy",
+      "status": "ACCEPTED"
+    },
+    {
+      "id": "P18-WP03",
+      "name": "ZAP adapter",
+      "status": "ACCEPTED"
+    },
+    {
+      "id": "P18-WP04",
+      "name": "Nuclei adapter and template provenance",
+      "status": "ACCEPTED"
+    },
+    {
+      "id": "P18-WP05",
+      "name": "Safe validation engine",
+      "status": "ACCEPTED"
+    },
+    {
+      "id": "P18-WP06",
+      "name": "Attack-path graph",
+      "status": "ACCEPTED"
+    },
+    {
+      "id": "P18-WP07",
+      "name": "Prowler cloud posture adapter",
+      "status": "ACCEPTED"
+    },
+    {
+      "id": "P18-WP08",
+      "name": "Cloud credential scope and read-only policy",
+      "status": "ACCEPTED"
+    },
+    {
+      "id": "P18-WP09",
+      "name": "Disposable security lab manager",
+      "status": "ACCEPTED"
+    },
+    {
+      "id": "P18-WP10",
+      "name": "Stratus and CloudGoat optional lab adapters",
+      "status": "ACCEPTED"
+    },
+    {
+      "id": "P18-WP11",
+      "name": "Active-test stop conditions and cleanup evidence",
+      "status": "ACCEPTED"
+    },
+    {
+      "id": "P18-WP12",
+      "name": "Advanced-security reporting and repair integration",
+      "status": "ACCEPTED"
+    }
+  ],
+  "gates": "P18-G1..P18-G13",
+  "implementation_files": [
+    "crates/ac-security/src/active.rs",
+    "crates/ac-security/src/ai.rs",
+    "crates/ac-security/src/scanner.rs",
+    "crates/ac-security/src/tests.rs",
+    "crates/ac-verification/src/lib.rs",
+    "crates/ac-db/src/security.rs",
+    "crates/ac-db/src/models.rs",
+    "crates/ac-db/src/migrations.rs",
+    "crates/ac-db/src/tests.rs",
+    "crates/ac-migrations/src/lib.rs",
+    "migrations/0013_advanced_ai_security.sql",
+    "tests/integration/security_boundary.rs"
+  ],
+  "migration": "migrations/0013_advanced_ai_security.sql",
+  "tests": [
+    "cargo fmt --all",
+    "cargo check --workspace --all-targets",
+    "cargo test --workspace",
+    "cargo clippy --workspace --all-targets -- -D warnings",
+    "JSON validation",
+    "git diff --check"
+  ],
+  "evidence": [
+    "docs/progress/workpackages/WP-P18-WP01.md",
+    "docs/progress/workpackages/WP-P18-WP02.md",
+    "docs/progress/workpackages/WP-P18-WP03.md",
+    "docs/progress/workpackages/WP-P18-WP04.md",
+    "docs/progress/workpackages/WP-P18-WP05.md",
+    "docs/progress/workpackages/WP-P18-WP06.md",
+    "docs/progress/workpackages/WP-P18-WP07.md",
+    "docs/progress/workpackages/WP-P18-WP08.md",
+    "docs/progress/workpackages/WP-P18-WP09.md",
+    "docs/progress/workpackages/WP-P18-WP10.md",
+    "docs/progress/workpackages/WP-P18-WP11.md",
+    "docs/progress/workpackages/WP-P18-WP12.md",
+    "docs/progress/phase-18-completion.md",
+    "docs/progress/phase-18-completion.json"
+  ],
+  "limitations": [
+    "External advanced scanners/harnesses are represented by native deterministic fallback/degraded adapter records until admitted by ADR-0008 dependency/tool policy."
+  ]
+}

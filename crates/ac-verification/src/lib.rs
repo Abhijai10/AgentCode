@@ -4,7 +4,9 @@ use std::path::{Path, PathBuf};
 
 use ac_common::{AcError, AcResult, StableId, TimestampMillis};
 use ac_evidence::{EvidenceKind, EvidenceStore, Provenance};
-use ac_security::{Capability, CapabilityPolicy, SecurityDecision};
+use ac_security::{
+    ActiveSecurityReport, AiSecurityReport, Capability, CapabilityPolicy, SecurityDecision,
+};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct BrowserObservation {
@@ -466,6 +468,76 @@ impl VerificationEngine {
             id: StableId::new("scan"),
             scanner,
             findings,
+            evidence_ref,
+        })
+    }
+
+    pub fn record_active_security_report(
+        &self,
+        report: &ActiveSecurityReport,
+        evidence_store: &mut EvidenceStore,
+    ) -> AcResult<SecurityScanReport> {
+        if self.policy.evaluate(&[Capability::SecurityScan]) != SecurityDecision::Allow {
+            return Err(AcError::policy_denied(
+                "VERIFY-ACTIVE_SECURITY_DENIED",
+                "active security evidence requires security scan capability approval",
+            ));
+        }
+        let evidence_ref = evidence_store.append(
+            EvidenceKind::TestReport,
+            Provenance {
+                source: "verification-engine".to_string(),
+                commit: Some(report.commit.clone()),
+                worktree: None,
+                tool: Some("advanced-security".to_string()),
+            },
+            format!("mem://security/active/{}", report.id),
+            format!(
+                "findings:{};stops:{};cleanup:{}",
+                report.findings.len(),
+                report.stop_reasons.len(),
+                report.cleanup.teardown_verified
+            ),
+        )?;
+        Ok(SecurityScanReport {
+            id: report.id.clone(),
+            scanner: "advanced-security".to_string(),
+            findings: report.findings.len(),
+            evidence_ref,
+        })
+    }
+
+    pub fn record_ai_security_report(
+        &self,
+        report: &AiSecurityReport,
+        evidence_store: &mut EvidenceStore,
+    ) -> AcResult<SecurityScanReport> {
+        if self.policy.evaluate(&[Capability::SecurityScan]) != SecurityDecision::Allow {
+            return Err(AcError::policy_denied(
+                "VERIFY-AI_SECURITY_DENIED",
+                "AI security evidence requires security scan capability approval",
+            ));
+        }
+        let evidence_ref = evidence_store.append(
+            EvidenceKind::TestReport,
+            Provenance {
+                source: "verification-engine".to_string(),
+                commit: Some(report.commit.clone()),
+                worktree: None,
+                tool: Some("ai-security".to_string()),
+            },
+            format!("mem://security/ai/{}", report.id),
+            format!(
+                "surfaces:{};cases:{};findings:{}",
+                report.surfaces.len(),
+                report.attack_cases.len(),
+                report.findings.len()
+            ),
+        )?;
+        Ok(SecurityScanReport {
+            id: report.id.clone(),
+            scanner: "ai-security".to_string(),
+            findings: report.findings.len(),
             evidence_ref,
         })
     }
@@ -1532,6 +1604,11 @@ fn local_hash(content: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ac_security::{
+        ActiveAuthorization, ActiveEnvironment, ActiveSecurityAction, ActiveSecurityInput,
+        ActiveValidationFixture, AiHarnessKind, AiSecurityInput, BaselineSecurityOrchestrator,
+        SecurityPolicy,
+    };
 
     #[test]
     fn browser_capture_requires_capability() {
@@ -1622,6 +1699,73 @@ mod tests {
             .unwrap();
         assert!(integration.passed);
         assert!(integration.ran_broad_tests);
+    }
+
+    #[test]
+    fn phase18_phase19_security_reports_are_evidence_gated_by_capability() {
+        let orchestrator = BaselineSecurityOrchestrator::new(SecurityPolicy::baseline());
+        let active_input = ActiveSecurityInput {
+            repository_id: StableId::new("repo"),
+            commit: "verify-p18".to_string(),
+            authorization: ActiveAuthorization {
+                id: StableId::new("authz"),
+                target: "http://fixture.local".to_string(),
+                environment: ActiveEnvironment::AuthorizedLab,
+                allowed_targets: vec!["http://fixture.local".to_string()],
+                cloud_accounts: Vec::new(),
+                credential_ref: None,
+                rate_limit_per_minute: 10,
+                concurrency_limit: 1,
+                forbidden_actions: vec!["destructive-production-change".to_string()],
+                expires_at: TimestampMillis::from_millis(
+                    TimestampMillis::now().as_millis() + 60_000,
+                ),
+                cleanup_required: true,
+            },
+            requested_actions: vec![ActiveSecurityAction::DastSpider],
+            fixture: Some(ActiveValidationFixture {
+                id: StableId::new("fixture"),
+                vulnerable_route: "http://fixture.local/admin".to_string(),
+                synthetic_account: "user-a".to_string(),
+                canary_record: "canary".to_string(),
+            }),
+            redirect_observations: Vec::new(),
+            cloud_resources: Vec::new(),
+        };
+        let active_report = orchestrator.run_active_security(&active_input).unwrap();
+        let ai_report = orchestrator
+            .run_ai_security(&AiSecurityInput {
+                repository_id: StableId::new("repo"),
+                commit: "verify-p19".to_string(),
+                files: vec![(
+                    "src/agent.rs".to_string(),
+                    "openai user_prompt rag tool_call mcp agent SECRET=synthetic".to_string(),
+                )],
+                selected_harnesses: vec![AiHarnessKind::Promptfoo],
+            })
+            .unwrap();
+
+        let denied = VerificationEngine::new(CapabilityPolicy::new());
+        let mut evidence = EvidenceStore::new();
+        assert_eq!(
+            denied
+                .record_active_security_report(&active_report, &mut evidence)
+                .unwrap_err()
+                .code(),
+            "VERIFY-ACTIVE_SECURITY_DENIED"
+        );
+
+        let allowed =
+            VerificationEngine::new(CapabilityPolicy::new().allow(Capability::SecurityScan));
+        let active_evidence = allowed
+            .record_active_security_report(&active_report, &mut evidence)
+            .unwrap();
+        assert_eq!(active_evidence.scanner, "advanced-security");
+        let ai_evidence = allowed
+            .record_ai_security_report(&ai_report, &mut evidence)
+            .unwrap();
+        assert_eq!(ai_evidence.scanner, "ai-security");
+        assert!(ai_evidence.findings > 0);
     }
 
     #[test]

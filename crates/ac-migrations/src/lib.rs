@@ -112,6 +112,12 @@ pub const BASELINE_SECURITY_V12: Migration = Migration {
     sql: include_str!("../../../migrations/0012_baseline_security.sql"),
 };
 
+pub const ADVANCED_AI_SECURITY_V13: Migration = Migration {
+    id: "0013_advanced_ai_security",
+    description: "advanced active security authorizations, reports, and AI security evidence",
+    sql: include_str!("../../../migrations/0013_advanced_ai_security.sql"),
+};
+
 pub fn validate_migrations(migrations: &[Migration]) -> AcResult<()> {
     let mut seen = BTreeSet::new();
     for migration in migrations {

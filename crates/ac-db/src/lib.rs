@@ -6,8 +6,9 @@ use ac_evidence::EvidenceRecord;
 use ac_git::{CheckpointRecord, WorktreeRecord};
 use ac_kernel::{KernelDecisionKind, KernelEvent, Mission, MissionState};
 use ac_security::{
-    HookInvocation, HookManifest, McpInvocationRecord, McpServerRecord, McpToolRecord,
-    SecurityReportBundle, SecurityScanInput, SecurityScanReport, SkillManifest,
+    ActiveSecurityInput, ActiveSecurityReport, AiSecurityReport, HookInvocation, HookManifest,
+    McpInvocationRecord, McpServerRecord, McpToolRecord, SecurityAdapter, SecurityReportBundle,
+    SecurityScanInput, SecurityScanReport, SkillManifest, ThreatModel,
 };
 use ac_verification::{
     BrowserProcessRecord, BrowserSessionRecord, DevServerRecord, FinalAuditReport,

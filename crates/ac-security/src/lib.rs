@@ -8,4 +8,6 @@ include!("hooks.rs");
 include!("mcp.rs");
 include!("findings.rs");
 include!("scanner.rs");
+include!("active.rs");
+include!("ai.rs");
 include!("tests.rs");

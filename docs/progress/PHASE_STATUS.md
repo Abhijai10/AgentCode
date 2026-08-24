@@ -5,7 +5,7 @@ Doc 10 gates for the phase pass and completion evidence exists).
 
 Phase names are the EXACT canonical names from Doc 09 HC-P00..HC-P29 (no aliases).
 
-Last updated: 2026-08-24 (Phase 17 baseline security closure)
+Last updated: 2026-08-24 (Phase 18 advanced security and Phase 19 AI security closure)
 
 | Phase | Name (Doc 09 HC-*) | Status | Notes |
 |-------|--------------------|--------|-------|
@@ -27,8 +27,8 @@ Last updated: 2026-08-24 (Phase 17 baseline security closure)
 | P15 | Browser Runtime & Visual Verification | COMPLETE | P15-WP01..P15-WP11 ACCEPTED; adapter abstraction, process/session registry, page actions, DOM/a11y extraction, diagnostics, screenshots, dev-server records, responsive profiles, visual QA and crash recovery pass P15-G1..G11 plus behavioral browser flow; evidence: docs/progress/phase-15-completion.md (+ .json) |
 | P16 | Skills, Hooks & MCP | COMPLETE | P16-WP01..P16-WP13 ACCEPTED; skill manifests/registry/discovery/progressive loading/importers, hook registry/dispatch/failure safety, MCP lifecycle/discovery/tool routing/trust pass P16-G1..G15; evidence: docs/progress/phase-16-completion.md (+ .json) |
 | P17 | Baseline Security Platform | COMPLETE | P17-WP01..P17-WP14 ACCEPTED; threat model, unified findings, baseline adapters, redaction, grouping, triage, repair/regression and Markdown/JSON/SARIF reports pass P17-G1..G15; evidence: docs/progress/phase-17-completion.md (+ .json) |
-| P18 | Advanced AppSec, Cloud & Red-Team | NOT_STARTED | |
-| P19 | AI Security | NOT_STARTED | |
+| P18 | Advanced AppSec, Cloud & Red-Team | COMPLETE | P18-WP01..P18-WP12 ACCEPTED; scoped active authorization, environment policy, ZAP/Nuclei-compatible native adapters, safe synthetic proof, attack-path graph, Prowler-compatible cloud posture, lab adapter lifecycle, stop conditions, cleanup evidence, reports and persistence pass P18-G1..G13 through deterministic production-facing APIs; evidence: docs/progress/phase-18-completion.md (+ .json) |
+| P19 | AI Security | COMPLETE | P19-WP01..P19-WP12 ACCEPTED; AI surface detection, trust-boundary graph, direct/indirect injection, RAG poisoning, tool/MCP abuse, secret leakage, excessive-agency/cross-agent fixtures, optional harness fallback statuses, common finding normalization, mitigation verification and persistence pass P19-G1..G10 through deterministic production-facing APIs; evidence: docs/progress/phase-19-completion.md (+ .json) |
 | P20 | Discuss Mode | NOT_STARTED | |
 | P21 | Design Studio | NOT_STARTED | |
 | P22 | Minimal Desktop Product Experience | NOT_STARTED | |

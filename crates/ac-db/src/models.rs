@@ -148,6 +148,26 @@ pub struct SecurityFindingRow {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ActiveSecurityReportRow {
+    pub id: String,
+    pub repository_id: String,
+    pub commit_ref: String,
+    pub authorization_id: String,
+    pub environment: String,
+    pub cleanup_verified: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AiSecurityReportRow {
+    pub id: String,
+    pub repository_id: String,
+    pub commit_ref: String,
+    pub surfaces: String,
+    pub findings_count: u32,
+    pub mitigations_verified: u32,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ContextCacheEntryRow {
     pub cache_key: String,
     pub content_hash: String,

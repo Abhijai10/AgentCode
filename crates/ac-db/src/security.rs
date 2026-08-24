@@ -318,6 +318,237 @@ impl ControlPlaneDb {
         rows.collect::<Result<Vec<_>, _>>().map_err(db_error)
     }
 
+    pub fn save_active_security_report(
+        &self,
+        input: &ActiveSecurityInput,
+        report: &ActiveSecurityReport,
+    ) -> AcResult<()> {
+        self.connection
+            .execute(
+                "INSERT INTO active_security_authorizations VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+                 ON CONFLICT(id) DO UPDATE SET expires_at_ms=excluded.expires_at_ms",
+                params![
+                    input.authorization.id.to_string(),
+                    input.repository_id.to_string(),
+                    input.authorization.target,
+                    format!("{:?}", input.authorization.environment),
+                    input.authorization.allowed_targets.join(","),
+                    input.authorization.cloud_accounts.join(","),
+                    input.authorization.credential_ref.as_ref().map(StableId::to_string),
+                    input.authorization.rate_limit_per_minute,
+                    input.authorization.concurrency_limit,
+                    input.authorization.forbidden_actions.join(","),
+                    millis(input.authorization.expires_at),
+                    input.authorization.cleanup_required as i64
+                ],
+            )
+            .map_err(db_error)?;
+        self.connection
+            .execute(
+                "INSERT INTO active_security_reports VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+                 ON CONFLICT(id) DO UPDATE SET cleanup_verified=excluded.cleanup_verified",
+                params![
+                    report.id.to_string(),
+                    report.repository_id.to_string(),
+                    report.commit,
+                    report.authorization_id.to_string(),
+                    format!("{:?}", report.environment),
+                    report
+                        .adapter_evidence
+                        .iter()
+                        .map(|adapter| format!("{:?}:{:?}", adapter.adapter, adapter.status))
+                        .collect::<Vec<_>>()
+                        .join(","),
+                    report.findings.len() as i64,
+                    report.attack_graph.nodes.len() as i64,
+                    report.attack_graph.edges.len() as i64,
+                    report.stop_reasons.join("|"),
+                    report.cleanup.teardown_verified as i64,
+                    report.degraded.join("|")
+                ],
+            )
+            .map_err(db_error)?;
+        Ok(())
+    }
+
+    pub fn active_security_report(
+        &self,
+        id: &str,
+    ) -> AcResult<Option<ActiveSecurityReportRow>> {
+        self.connection
+            .query_row(
+                "SELECT id, repository_id, commit_ref, authorization_id, environment, cleanup_verified
+                 FROM active_security_reports WHERE id=?1",
+                params![id],
+                |row| {
+                    Ok(ActiveSecurityReportRow {
+                        id: row.get(0)?,
+                        repository_id: row.get(1)?,
+                        commit_ref: row.get(2)?,
+                        authorization_id: row.get(3)?,
+                        environment: row.get(4)?,
+                        cleanup_verified: row.get::<_, i64>(5)? != 0,
+                    })
+                },
+            )
+            .optional()
+            .map_err(db_error)
+    }
+
+    pub fn save_ai_security_report(&self, report: &AiSecurityReport) -> AcResult<()> {
+        let threat_model = ThreatModel {
+            id: StableId::new("threat"),
+            entry_points: report
+                .surfaces
+                .iter()
+                .map(|surface| surface.path.clone())
+                .collect(),
+            auth_boundaries: report.trust_graph.untrusted_flows.clone(),
+            data_stores: Vec::new(),
+            admin_operations: Vec::new(),
+            cloud_configuration: Vec::new(),
+            sensitive_assets: report
+                .surfaces
+                .iter()
+                .filter(|surface| format!("{:?}", surface.kind) == "SecretSource")
+                .map(|surface| surface.path.clone())
+                .collect(),
+            evidence_refs: vec![StableId::new("evidence")],
+        };
+        self.connection
+            .execute(
+                "INSERT INTO security_threat_models VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+                 ON CONFLICT(id) DO UPDATE SET evidence_refs=excluded.evidence_refs",
+                params![
+                    threat_model.id.to_string(),
+                    report.repository_id.to_string(),
+                    report.commit,
+                    threat_model.entry_points.join(","),
+                    threat_model.auth_boundaries.join(","),
+                    threat_model.data_stores.join(","),
+                    threat_model.admin_operations.join(","),
+                    threat_model.cloud_configuration.join(","),
+                    threat_model.sensitive_assets.join(","),
+                    stable_ids_csv(&threat_model.evidence_refs)
+                ],
+            )
+            .map_err(db_error)?;
+        self.connection
+            .execute(
+                "INSERT INTO security_scan_reports VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                 ON CONFLICT(id) DO UPDATE SET missing_adapters=excluded.missing_adapters",
+                params![
+                    report.id.to_string(),
+                    report.repository_id.to_string(),
+                    report.commit,
+                    format!("{:?}", [SecurityAdapter::AiNative]),
+                    report
+                        .harnesses
+                        .iter()
+                        .filter(|harness| format!("{:?}", harness.status).contains("Unavailable"))
+                        .map(|harness| format!("{:?}", harness.harness))
+                        .collect::<Vec<_>>()
+                        .join(","),
+                    threat_model.id.to_string()
+                ],
+            )
+            .map_err(db_error)?;
+        for finding in &report.findings {
+            self.connection
+                .execute(
+                    "INSERT INTO security_findings VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+                     ON CONFLICT(id) DO UPDATE SET status=excluded.status",
+                    params![
+                        finding.id.to_string(),
+                        report.id.to_string(),
+                        finding.root_cause,
+                        format!("{:?}", finding.severity),
+                        finding.confidence,
+                        finding.exploitability,
+                        format!("{:?}", finding.status),
+                        finding.affected_code.join(","),
+                        stable_ids_csv(&finding.evidence_refs),
+                        finding.remediation,
+                        stable_ids_csv(&finding.instance_ids)
+                    ],
+                )
+                .map_err(db_error)?;
+        }
+        self.connection
+            .execute(
+                "INSERT INTO ai_security_reports VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+                 ON CONFLICT(id) DO UPDATE SET findings_count=excluded.findings_count",
+                params![
+                    report.id.to_string(),
+                    report.repository_id.to_string(),
+                    report.commit,
+                    report
+                        .surfaces
+                        .iter()
+                        .map(|surface| format!("{:?}:{}", surface.kind, surface.path))
+                        .collect::<Vec<_>>()
+                        .join(","),
+                    report
+                        .harnesses
+                        .iter()
+                        .map(|harness| format!("{:?}:{:?}", harness.harness, harness.status))
+                        .collect::<Vec<_>>()
+                        .join(","),
+                    report.attack_cases.len() as i64,
+                    report.attack_results.len() as i64,
+                    report.findings.len() as i64,
+                    report.mitigations.iter().filter(|item| item.passed).count() as i64
+                ],
+            )
+            .map_err(db_error)?;
+        for case in &report.attack_cases {
+            let result = report
+                .attack_results
+                .iter()
+                .find(|result| result.case_id == case.id);
+            self.connection
+                .execute(
+                    "INSERT INTO ai_attack_cases VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                     ON CONFLICT(id) DO NOTHING",
+                    params![
+                        case.id.to_string(),
+                        report.id.to_string(),
+                        format!("{:?}", case.category),
+                        case.fixture,
+                        case.expected_policy,
+                        case.synthetic as i64,
+                        result.map(|item| item.blocked).unwrap_or(false) as i64,
+                        result
+                            .map(|item| item.evidence_ref.to_string())
+                            .unwrap_or_else(|| StableId::new("evidence").to_string())
+                    ],
+                )
+                .map_err(db_error)?;
+        }
+        Ok(())
+    }
+
+    pub fn ai_security_report(&self, id: &str) -> AcResult<Option<AiSecurityReportRow>> {
+        self.connection
+            .query_row(
+                "SELECT id, repository_id, commit_ref, surfaces, findings_count, mitigations_verified
+                 FROM ai_security_reports WHERE id=?1",
+                params![id],
+                |row| {
+                    Ok(AiSecurityReportRow {
+                        id: row.get(0)?,
+                        repository_id: row.get(1)?,
+                        commit_ref: row.get(2)?,
+                        surfaces: row.get(3)?,
+                        findings_count: row.get::<_, i64>(4)? as u32,
+                        mitigations_verified: row.get::<_, i64>(5)? as u32,
+                    })
+                },
+            )
+            .optional()
+            .map_err(db_error)
+    }
+
     fn configure(&self) -> AcResult<()> {
         self.connection
             .pragma_update(None, "foreign_keys", "ON")

@@ -342,4 +342,163 @@ mod tests {
         assert!(bundle.json.contains("\"findings\""));
         assert!(bundle.sarif.contains("\"version\":\"2.1.0\""));
     }
+
+    fn active_authorization(environment: ActiveEnvironment) -> ActiveAuthorization {
+        ActiveAuthorization {
+            id: StableId::new("authz"),
+            target: "http://fixture.local/app".to_string(),
+            environment,
+            allowed_targets: vec!["http://fixture.local".to_string()],
+            cloud_accounts: vec!["acct-lab".to_string()],
+            credential_ref: Some(StableId::new("cred")),
+            rate_limit_per_minute: 30,
+            concurrency_limit: 2,
+            forbidden_actions: vec!["destructive-production-change".to_string()],
+            expires_at: TimestampMillis::from_millis(
+                TimestampMillis::now().as_millis() + 60_000,
+            ),
+            cleanup_required: true,
+        }
+    }
+
+    #[test]
+    fn phase18_active_security_scope_graph_cloud_and_cleanup_work() {
+        let orchestrator = BaselineSecurityOrchestrator::new(SecurityPolicy::baseline());
+        let input = ActiveSecurityInput {
+            repository_id: StableId::new("repo"),
+            commit: "p18abc".to_string(),
+            authorization: active_authorization(ActiveEnvironment::AuthorizedLab),
+            requested_actions: vec![
+                ActiveSecurityAction::DastSpider,
+                ActiveSecurityAction::TemplateProbe,
+                ActiveSecurityAction::CloudReadOnlyAudit,
+                ActiveSecurityAction::LabTechnique,
+            ],
+            fixture: Some(ActiveValidationFixture {
+                id: StableId::new("fixture"),
+                vulnerable_route: "http://fixture.local/app/admin".to_string(),
+                synthetic_account: "user-a".to_string(),
+                canary_record: "canary-1".to_string(),
+            }),
+            redirect_observations: vec!["http://fixture.local/app/next".to_string()],
+            cloud_resources: vec![CloudResource {
+                provider: "aws".to_string(),
+                account: "acct-lab".to_string(),
+                resource_id: "s3://fixture-bucket".to_string(),
+                permissions: vec!["*".to_string()],
+                public: true,
+            }],
+        };
+        let report = orchestrator.run_active_security(&input).unwrap();
+        assert!(report.stop_reasons.is_empty());
+        assert!(report.cleanup.teardown_verified);
+        assert!(report.attack_graph.nodes.len() >= 3);
+        assert!(!report.attack_graph.edges.is_empty());
+        assert!(report
+            .adapter_evidence
+            .iter()
+            .any(|adapter| adapter.adapter == SecurityAdapter::Nuclei
+                && adapter.provenance.contains("template_commit")));
+        assert!(report
+            .findings
+            .iter()
+            .any(|finding| finding.root_cause == "seeded-web-authorization-bypass"));
+        assert!(report
+            .findings
+            .iter()
+            .any(|finding| finding.root_cause == "cloud-public-or-wildcard-permission"));
+        let bundle = orchestrator.active_security_reports(&report);
+        assert!(bundle.json.contains("\"cleanup_verified\":true"));
+    }
+
+    #[test]
+    fn phase18_active_security_blocks_out_of_scope_and_production_active_actions() {
+        let orchestrator = BaselineSecurityOrchestrator::new(SecurityPolicy::baseline());
+        let mut authorization = active_authorization(ActiveEnvironment::ProductionReadOnly);
+        authorization.target = "http://evil.test".to_string();
+        let err = orchestrator
+            .run_active_security(&ActiveSecurityInput {
+                repository_id: StableId::new("repo"),
+                commit: "p18def".to_string(),
+                authorization,
+                requested_actions: vec![ActiveSecurityAction::DastSpider],
+                fixture: None,
+                redirect_observations: Vec::new(),
+                cloud_resources: Vec::new(),
+            })
+            .unwrap_err();
+        assert_eq!(err.code(), "ACTIVE-SECURITY_TARGET_OUT_OF_SCOPE");
+
+        let report = orchestrator
+            .run_active_security(&ActiveSecurityInput {
+                repository_id: StableId::new("repo"),
+                commit: "p18ghi".to_string(),
+                authorization: active_authorization(ActiveEnvironment::ProductionReadOnly),
+                requested_actions: vec![ActiveSecurityAction::DastSpider],
+                fixture: None,
+                redirect_observations: vec!["http://outside.test/path".to_string()],
+                cloud_resources: Vec::new(),
+            })
+            .unwrap();
+        assert!(report
+            .stop_reasons
+            .iter()
+            .any(|reason| reason.contains("production-read-only")));
+        assert!(report
+            .stop_reasons
+            .iter()
+            .any(|reason| reason.contains("outside approved scope")));
+    }
+
+    #[test]
+    fn phase19_ai_security_detects_surfaces_runs_fixtures_and_normalizes() {
+        let orchestrator = BaselineSecurityOrchestrator::new(SecurityPolicy::baseline());
+        let report = orchestrator
+            .run_ai_security(&AiSecurityInput {
+                repository_id: StableId::new("repo"),
+                commit: "p19abc".to_string(),
+                files: vec![(
+                    "src/agent.rs".to_string(),
+                    "openai model user_prompt rag retrieve vector tool_call mcp agent memory SECRET=synthetic"
+                        .to_string(),
+                )],
+                selected_harnesses: vec![
+                    AiHarnessKind::Promptfoo,
+                    AiHarnessKind::Garak,
+                    AiHarnessKind::PyRit,
+                ],
+            })
+            .unwrap();
+        assert!(report
+            .surfaces
+            .iter()
+            .any(|surface| surface.kind == AiSurfaceKind::ModelGateway));
+        assert!(report.attack_cases.len() >= 9);
+        assert!(report
+            .attack_results
+            .iter()
+            .any(|result| result.category == AiAttackCategory::DirectInjection && result.blocked));
+        assert!(report
+            .findings
+            .iter()
+            .any(|finding| finding.root_cause == "ai-tool-abuse"));
+        assert!(report
+            .findings
+            .iter()
+            .any(|finding| finding.root_cause == "ai-secret-leakage"));
+        assert!(report
+            .harnesses
+            .iter()
+            .any(|harness| harness.harness == AiHarnessKind::Promptfoo
+                && harness.status == AiHarnessStatus::NativeFallback));
+        assert!(report
+            .harnesses
+            .iter()
+            .any(|harness| harness.harness == AiHarnessKind::PyRit
+                && harness.status == AiHarnessStatus::OptionalUnavailable));
+        assert!(report.mitigations.iter().all(|mitigation| mitigation.passed));
+        let bundle = orchestrator.ai_security_reports(&report);
+        assert!(bundle.markdown.contains("AI Security Report"));
+        assert!(bundle.sarif.contains("AgentCode AI Security"));
+    }
 }

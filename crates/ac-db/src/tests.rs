@@ -65,6 +65,11 @@ mod tests {
     use ac_changeset::{ChangeOperation, ChangeSet};
     use ac_git::GitCoordinator;
     use ac_kernel::{AllowAllPolicy, Kernel};
+    use ac_security::{
+        ActiveAuthorization, ActiveEnvironment, ActiveSecurityAction, ActiveSecurityInput,
+        ActiveValidationFixture, AiHarnessKind, AiSecurityInput, BaselineSecurityOrchestrator,
+        SecurityPolicy,
+    };
     use std::collections::BTreeSet;
     use std::fs;
     use std::process::Command;
@@ -87,7 +92,7 @@ mod tests {
     fn sqlite_store_persists_kernel_state() {
         let mut db = ControlPlaneDb::open_memory().unwrap();
         db.migrate().unwrap();
-        assert_eq!(db.user_version().unwrap(), 12);
+        assert_eq!(db.user_version().unwrap(), 13);
 
         let mut kernel = Kernel::new(AllowAllPolicy);
         kernel.start().unwrap();
@@ -296,6 +301,80 @@ mod tests {
         let loaded = db.tool_execution(&record.id).unwrap().unwrap();
         assert_eq!(loaded.raw_output, record.raw_output);
         assert_eq!(loaded.evidence_ref, record.evidence_ref);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn phase18_phase19_security_reports_survive_reopen_and_ai_enters_common_findings() {
+        let path =
+            std::env::temp_dir().join(format!("agentcode-security-{}.sqlite", StableId::new("db")));
+        let orchestrator = BaselineSecurityOrchestrator::new(SecurityPolicy::baseline());
+        let active_input = ActiveSecurityInput {
+            repository_id: StableId::new("repo"),
+            commit: "p18db".to_string(),
+            authorization: ActiveAuthorization {
+                id: StableId::new("authz"),
+                target: "http://fixture.local".to_string(),
+                environment: ActiveEnvironment::AuthorizedLab,
+                allowed_targets: vec!["http://fixture.local".to_string()],
+                cloud_accounts: vec!["acct-lab".to_string()],
+                credential_ref: Some(StableId::new("cred")),
+                rate_limit_per_minute: 20,
+                concurrency_limit: 1,
+                forbidden_actions: vec!["destructive-production-change".to_string()],
+                expires_at: TimestampMillis::from_millis(
+                    TimestampMillis::now().as_millis() + 60_000,
+                ),
+                cleanup_required: true,
+            },
+            requested_actions: vec![
+                ActiveSecurityAction::DastSpider,
+                ActiveSecurityAction::TemplateProbe,
+                ActiveSecurityAction::LabTechnique,
+            ],
+            fixture: Some(ActiveValidationFixture {
+                id: StableId::new("fixture"),
+                vulnerable_route: "http://fixture.local/admin".to_string(),
+                synthetic_account: "synthetic-user".to_string(),
+                canary_record: "canary-db".to_string(),
+            }),
+            redirect_observations: Vec::new(),
+            cloud_resources: Vec::new(),
+        };
+        let active_report = orchestrator.run_active_security(&active_input).unwrap();
+        let ai_report = orchestrator
+            .run_ai_security(&AiSecurityInput {
+                repository_id: StableId::new("repo"),
+                commit: "p19db".to_string(),
+                files: vec![(
+                    "src/agent.rs".to_string(),
+                    "openai user_prompt rag tool_call mcp agent memory SECRET=synthetic"
+                        .to_string(),
+                )],
+                selected_harnesses: vec![AiHarnessKind::Promptfoo],
+            })
+            .unwrap();
+        let active_id = active_report.id.to_string();
+        let ai_id = ai_report.id.to_string();
+        {
+            let mut db = ControlPlaneDb::open(&path).unwrap();
+            db.migrate().unwrap();
+            db.save_active_security_report(&active_input, &active_report)
+                .unwrap();
+            db.save_ai_security_report(&ai_report).unwrap();
+        }
+        {
+            let db = ControlPlaneDb::open(&path).unwrap();
+            let loaded_active = db.active_security_report(&active_id).unwrap().unwrap();
+            assert!(loaded_active.cleanup_verified);
+            let loaded_ai = db.ai_security_report(&ai_id).unwrap().unwrap();
+            assert!(loaded_ai.surfaces.contains("ModelGateway"));
+            assert!(loaded_ai.findings_count > 0);
+            let common_findings = db.security_findings(&ai_id).unwrap();
+            assert!(common_findings
+                .iter()
+                .any(|finding| finding.root_cause == "ai-tool-abuse"));
+        }
         let _ = fs::remove_file(path);
     }
 
@@ -705,7 +784,7 @@ mod tests {
         {
             let mut db = ControlPlaneDb::open(&path).unwrap();
             db.migrate().unwrap();
-            assert_eq!(db.user_version().unwrap(), 12);
+            assert_eq!(db.user_version().unwrap(), 13);
             db.save_changeset_transaction(
                 &transaction,
                 Some("task-p13"),
@@ -784,7 +863,7 @@ mod tests {
         {
             let mut db = ControlPlaneDb::open(&path).unwrap();
             db.migrate().unwrap();
-            assert_eq!(db.user_version().unwrap(), 12);
+            assert_eq!(db.user_version().unwrap(), 13);
             db.save_verification_profile(&profile).unwrap();
             db.save_verification_manifest(
                 &manifest,
@@ -866,7 +945,7 @@ mod tests {
         {
             let mut db = ControlPlaneDb::open(&path).unwrap();
             db.migrate().unwrap();
-            assert_eq!(db.user_version().unwrap(), 12);
+            assert_eq!(db.user_version().unwrap(), 13);
             db.save_browser_process(&process).unwrap();
             db.save_browser_session(&session).unwrap();
             db.save_browser_dev_server(&dev_server).unwrap();
@@ -899,7 +978,7 @@ mod tests {
         {
             let mut db = ControlPlaneDb::open(&path).unwrap();
             db.migrate().unwrap();
-            assert_eq!(db.user_version().unwrap(), 12);
+            assert_eq!(db.user_version().unwrap(), 13);
             let skill = SkillManifest {
                 id: skill_id.clone(),
                 name: "Rust".to_string(),
@@ -996,7 +1075,7 @@ mod tests {
         {
             let mut db = ControlPlaneDb::open(&path).unwrap();
             db.migrate().unwrap();
-            assert_eq!(db.user_version().unwrap(), 12);
+            assert_eq!(db.user_version().unwrap(), 13);
             let orchestrator = ac_security::BaselineSecurityOrchestrator::new(
                 ac_security::SecurityPolicy::baseline(),
             );

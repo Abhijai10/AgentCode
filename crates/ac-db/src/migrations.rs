@@ -15,11 +15,11 @@ impl ControlPlaneDb {
 
     pub fn migrate(&mut self) -> AcResult<()> {
         let current_version = self.user_version()?;
-        if current_version > 12 {
+        if current_version > 13 {
             return Err(AcError::conflict(
                 "DB-FUTURE_VERSION",
                 format!(
-                    "database user_version {current_version} is newer than supported version 12"
+                    "database user_version {current_version} is newer than supported version 13"
                 ),
             ));
         }
@@ -88,7 +88,13 @@ impl ControlPlaneDb {
             ))
             .map_err(db_error)?;
         }
-        tx.pragma_update(None, "user_version", 12)
+        if current_version < 13 {
+            tx.execute_batch(include_str!(
+                "../../../migrations/0013_advanced_ai_security.sql"
+            ))
+            .map_err(db_error)?;
+        }
+        tx.pragma_update(None, "user_version", 13)
             .map_err(db_error)?;
         tx.commit().map_err(db_error)?;
         Ok(())
