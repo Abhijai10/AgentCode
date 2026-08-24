@@ -3,7 +3,7 @@
   "name": "Browser Runtime & Visual Verification",
   "status": "COMPLETE",
   "starting_commit": "fd49e70",
-  "implementation_commit": "pending final commit",
+  "implementation_commit": "ac47d08",
   "workpackages": [
     "P15-WP01",
     "P15-WP02",

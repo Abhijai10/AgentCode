@@ -4,7 +4,7 @@ Status: COMPLETE
 
 Starting commit: `fd49e70`
 
-Implementation commit: pending final commit
+Implementation commit: `ac47d08`
 
 Completed work packages: P15-WP01 through P15-WP11 are ACCEPTED.
 
