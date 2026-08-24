@@ -28,11 +28,11 @@ impl ControlPlaneDb {
 
     pub fn migrate(&mut self) -> AcResult<()> {
         let current_version = self.user_version()?;
-        if current_version > 2 {
+        if current_version > 3 {
             return Err(AcError::conflict(
                 "DB-FUTURE_VERSION",
                 format!(
-                    "database user_version {current_version} is newer than supported version 2"
+                    "database user_version {current_version} is newer than supported version 3"
                 ),
             ));
         }
@@ -45,7 +45,13 @@ impl ControlPlaneDb {
             ))
             .map_err(db_error)?;
         }
-        tx.pragma_update(None, "user_version", 2)
+        if current_version < 3 {
+            tx.execute_batch(include_str!(
+                "../../../migrations/0003_code_intelligence.sql"
+            ))
+            .map_err(db_error)?;
+        }
+        tx.pragma_update(None, "user_version", 3)
             .map_err(db_error)?;
         tx.commit().map_err(db_error)?;
         Ok(())
@@ -54,6 +60,71 @@ impl ControlPlaneDb {
     pub fn user_version(&self) -> AcResult<u32> {
         self.connection
             .pragma_query_value(None, "user_version", |row| row.get(0))
+            .map_err(db_error)
+    }
+
+    pub fn save_code_index(
+        &self,
+        repository_id: &str,
+        root: &str,
+        commit: &str,
+        files: &[(String, String, String)],
+        symbols: &[(String, String, String, u32)],
+        imports: &[(String, String, u32)],
+    ) -> AcResult<()> {
+        self.connection.execute("INSERT INTO code_repositories (id, root, commit_ref, indexed_at_ms) VALUES (?1, ?2, ?3, ?4) ON CONFLICT(id) DO UPDATE SET root=excluded.root, commit_ref=excluded.commit_ref, indexed_at_ms=excluded.indexed_at_ms", params![repository_id, root, commit, millis(TimestampMillis::now())]).map_err(db_error)?;
+        self.connection
+            .execute(
+                "DELETE FROM code_files WHERE repository_id=?1",
+                params![repository_id],
+            )
+            .map_err(db_error)?;
+        self.connection
+            .execute(
+                "DELETE FROM code_symbols WHERE repository_id=?1",
+                params![repository_id],
+            )
+            .map_err(db_error)?;
+        self.connection
+            .execute(
+                "DELETE FROM code_imports WHERE repository_id=?1",
+                params![repository_id],
+            )
+            .map_err(db_error)?;
+        for (path, hash, language) in files {
+            self.connection
+                .execute(
+                    "INSERT INTO code_files VALUES (?1, ?2, ?3, ?4, '{}')",
+                    params![repository_id, path, hash, language],
+                )
+                .map_err(db_error)?;
+        }
+        for (path, name, kind, line) in symbols {
+            self.connection
+                .execute(
+                    "INSERT INTO code_symbols VALUES (?1, ?2, ?3, ?4, ?5)",
+                    params![repository_id, path, name, kind, line],
+                )
+                .map_err(db_error)?;
+        }
+        for (path, target, line) in imports {
+            self.connection
+                .execute(
+                    "INSERT INTO code_imports VALUES (?1, ?2, ?3, ?4)",
+                    params![repository_id, path, target, line],
+                )
+                .map_err(db_error)?;
+        }
+        Ok(())
+    }
+
+    pub fn code_symbol_count(&self, repository_id: &str) -> AcResult<u64> {
+        self.connection
+            .query_row(
+                "SELECT COUNT(*) FROM code_symbols WHERE repository_id=?1",
+                params![repository_id],
+                |row| row.get(0),
+            )
             .map_err(db_error)
     }
 
@@ -782,7 +853,7 @@ mod tests {
     fn sqlite_store_persists_kernel_state() {
         let mut db = ControlPlaneDb::open_memory().unwrap();
         db.migrate().unwrap();
-        assert_eq!(db.user_version().unwrap(), 2);
+        assert_eq!(db.user_version().unwrap(), 3);
 
         let mut kernel = Kernel::new(AllowAllPolicy);
         kernel.start().unwrap();

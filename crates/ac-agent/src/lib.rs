@@ -1304,6 +1304,9 @@ fn collect_source_files_inner(
                 continue;
             }
             let content = fs::read_to_string(&path).unwrap_or_default();
+            let test = relative.contains("test");
+            let config = relative.ends_with(".toml");
+            let docs = relative.ends_with(".md");
             let metadata = fs::symlink_metadata(&path)
                 .map_err(|err| AcError::validation("AGENT-CONTEXT_STAT_FAILED", err.to_string()))?;
             files.push((
@@ -1313,6 +1316,12 @@ fn collect_source_files_inner(
                     content_hash: format!("len:{}", content.len()),
                     size_bytes: metadata.len(),
                     symlink: metadata.file_type().is_symlink(),
+                    line_count: content.lines().count() as u32,
+                    binary: false,
+                    generated: false,
+                    test,
+                    config,
+                    docs,
                 },
                 content,
             ));
