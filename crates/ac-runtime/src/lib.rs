@@ -13,6 +13,7 @@ include!("tasks.rs");
 include!("workers.rs");
 include!("scheduler.rs");
 include!("autonomy.rs");
+include!("optimization.rs");
 include!("recovery.rs");
 include!("session.rs");
 include!("tests.rs");

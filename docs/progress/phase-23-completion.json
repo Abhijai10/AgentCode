@@ -1,0 +1,59 @@
+{
+  "phase": "P23",
+  "status": "COMPLETE",
+  "base_commit": "49ae6f0d0d88c964f9b67723b6ddcd957362803e",
+  "accepted_workpackages": [
+    "WP-P23-WP01",
+    "WP-P23-WP02",
+    "WP-P23-WP03",
+    "WP-P23-WP04",
+    "WP-P23-WP05",
+    "WP-P23-WP06",
+    "WP-P23-WP07",
+    "WP-P23-WP08",
+    "WP-P23-WP09",
+    "WP-P23-WP10",
+    "WP-P23-WP11",
+    "WP-P23-WP12"
+  ],
+  "capabilities": [
+    "resource_telemetry",
+    "token_usage",
+    "cost_accounting",
+    "resource_governor",
+    "adaptive_concurrency",
+    "local_model_lifecycle",
+    "lsp_lifecycle",
+    "index_policy",
+    "context_optimization",
+    "cost_aware_provider_routing",
+    "optimization_reports"
+  ],
+  "migration": "migrations/0015_desktop_optimization.sql",
+  "tests": [
+    "cargo fmt --all",
+    "cargo check --workspace --all-targets",
+    "cargo test --workspace",
+    "cargo clippy --workspace --all-targets -- -D warnings",
+    "JSON validation",
+    "git diff --check"
+  ],
+  "limitations": [
+    "8 GB Mac threshold is policy/telemetry represented; exact OS pressure behavior depends on hardware/runtime."
+  ],
+  "evidence": [
+    "docs/progress/workpackages/WP-P23-WP01.md",
+    "docs/progress/workpackages/WP-P23-WP02.md",
+    "docs/progress/workpackages/WP-P23-WP03.md",
+    "docs/progress/workpackages/WP-P23-WP04.md",
+    "docs/progress/workpackages/WP-P23-WP05.md",
+    "docs/progress/workpackages/WP-P23-WP06.md",
+    "docs/progress/workpackages/WP-P23-WP07.md",
+    "docs/progress/workpackages/WP-P23-WP08.md",
+    "docs/progress/workpackages/WP-P23-WP09.md",
+    "docs/progress/workpackages/WP-P23-WP10.md",
+    "docs/progress/workpackages/WP-P23-WP11.md",
+    "docs/progress/workpackages/WP-P23-WP12.md",
+    "docs/progress/phase-23-completion.md"
+  ]
+}

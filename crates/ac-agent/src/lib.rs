@@ -32,6 +32,7 @@ use ac_verification::{
 
 include!("discuss.rs");
 include!("design.rs");
+include!("desktop.rs");
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Goal {
@@ -1686,6 +1687,87 @@ mod tests {
         assert!(reference.limitation.contains("does not clone"));
         let mapping = studio.map_dom_to_source("#review-panel", &files[1].1, &files);
         assert_eq!(mapping.confidence, 90);
+    }
+
+    #[test]
+    fn desktop_experience_opens_project_runs_projection_and_records_approval() {
+        let mut desktop = DesktopExperience::new();
+        let mut session = desktop.create_session(DesktopPreferences::default());
+        let project = desktop
+            .open_project(
+                &mut session,
+                "/workspace/app",
+                "AgentCode App",
+                StableId::new("repo"),
+            )
+            .unwrap();
+        assert_eq!(session.active_project_id, Some(project.id.clone()));
+        let goal = desktop.compose_goal("Improve onboarding").unwrap();
+        let mission_id = StableId::new("mission");
+        desktop.attach_mission(&mut session, mission_id.clone(), DesktopView::Mission);
+        let projection = desktop.mission_projection(
+            mission_id.clone(),
+            goal.text,
+            MissionState::Active,
+            Some("Inspect project".to_string()),
+            None,
+            None,
+        );
+        assert_eq!(projection.current_phase, "running");
+        let activity = desktop
+            .compress_activity("Inspected 17 files", vec![StableId::new("ev")], "info")
+            .unwrap();
+        let change = desktop
+            .record_change_group(
+                StableId::new("task"),
+                "src/main.rs",
+                "verified",
+                4,
+                1,
+                vec![StableId::new("ev")],
+            )
+            .unwrap();
+        let approval = desktop
+            .request_approval(
+                mission_id.clone(),
+                ApprovalKind::ChangeSet,
+                "Apply verified changes",
+                vec!["approve".to_string(), "deny".to_string()],
+                "approve",
+                vec![StableId::new("ev")],
+            )
+            .unwrap();
+        let decision = desktop
+            .decide_approval(&approval.id, ApprovalDecision::Approved)
+            .unwrap();
+        assert_eq!(decision.decision, ApprovalDecision::Approved);
+        desktop.close_window(&mut session);
+        assert!(!session.window_open);
+        desktop.restore_window(&mut session);
+        assert!(session.window_open);
+        let notification = desktop
+            .notify(
+                mission_id.clone(),
+                "mission_complete",
+                "Mission complete",
+                &session.preferences,
+            )
+            .unwrap();
+        assert_eq!(notification.sound, Some("completion-subtle".to_string()));
+        assert!(desktop
+            .notify(
+                mission_id,
+                "provider_failover",
+                "Provider recovered",
+                &session.preferences,
+            )
+            .is_none());
+        let snapshot = desktop.snapshot(session, vec![projection], Vec::new());
+        assert_eq!(snapshot.recent_projects.len(), 1);
+        assert_eq!(snapshot.activity, vec![activity]);
+        assert_eq!(snapshot.changes, vec![change]);
+        assert!(snapshot.details_available);
+        assert!(desktop.approval_records().len() == 1);
     }
 
     #[test]

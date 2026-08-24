@@ -214,6 +214,17 @@ pub struct ContextPack {
     pub omitted_count: usize,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ContextOptimizationReport {
+    pub id: StableId,
+    pub original_nodes: usize,
+    pub retained_nodes: usize,
+    pub original_tokens: u32,
+    pub retained_tokens: u32,
+    pub redundant_removed: usize,
+    pub compression_ratio: u8,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ContextRole {
     Planner,
@@ -949,6 +960,76 @@ impl ContextEngine {
             nodes,
             budget,
         })
+    }
+
+    pub fn optimize_context_pack(
+        &self,
+        pack: &ContextPack,
+        target_tokens: u32,
+    ) -> AcResult<(ContextPack, ContextOptimizationReport)> {
+        if target_tokens == 0 {
+            return Err(AcError::validation(
+                "CONTEXT-OPTIMIZATION_INVALID_TARGET",
+                "context optimization target must be positive",
+            ));
+        }
+        let original_tokens = pack.nodes.iter().map(|node| node.token_estimate).sum();
+        let mut seen = BTreeSet::new();
+        let mut deduped = Vec::new();
+        let mut redundant_removed = 0;
+        for node in &pack.nodes {
+            let key = format!("{}:{}", node.authority as u8, node.content);
+            if seen.insert(key) {
+                deduped.push(node.clone());
+            } else {
+                redundant_removed += 1;
+            }
+        }
+        deduped.sort_by_key(|node| {
+            (
+                !node.protected,
+                match node.authority {
+                    AuthorityClass::KernelState => 0,
+                    AuthorityClass::RawEvidence => 1,
+                    AuthorityClass::AcceptedMemory => 2,
+                    AuthorityClass::DerivedSummary => 3,
+                    AuthorityClass::RuntimeContext => 4,
+                    AuthorityClass::RetrievalAccelerator => 5,
+                },
+            )
+        });
+        let mut retained = Vec::new();
+        let mut retained_tokens = 0_u32;
+        for node in deduped {
+            if node.protected
+                || retained_tokens.saturating_add(node.token_estimate) <= target_tokens
+            {
+                retained_tokens = retained_tokens.saturating_add(node.token_estimate);
+                retained.push(node);
+            }
+        }
+        let compression_ratio = if original_tokens == 0 {
+            100
+        } else {
+            ((u64::from(retained_tokens) * 100) / u64::from(original_tokens)).min(100) as u8
+        };
+        let omitted_count = pack.nodes.len().saturating_sub(retained.len());
+        let optimized = ContextPack {
+            id: StableId::new("ctxopt"),
+            nodes: retained,
+            budget: target_tokens,
+            omitted_count,
+        };
+        let report = ContextOptimizationReport {
+            id: StableId::new("ctxoptreport"),
+            original_nodes: pack.nodes.len(),
+            retained_nodes: optimized.nodes.len(),
+            original_tokens,
+            retained_tokens,
+            redundant_removed,
+            compression_ratio,
+        };
+        Ok((optimized, report))
     }
 
     pub fn build_context_pack_for_request(
@@ -1778,6 +1859,53 @@ mod tests {
         assert_eq!(receipt.retrieval_records.len(), 1);
         assert!(receipt.metrics.deduped_fragments >= 1);
         assert!(receipt.metrics.redacted_fragments >= 1);
+    }
+
+    #[test]
+    fn phase23_context_optimization_trims_redundant_context() {
+        let engine = ContextEngine;
+        let protected = ContextNode {
+            id: StableId::new("node"),
+            source_ref: StableId::new("ev"),
+            authority: AuthorityClass::KernelState,
+            content: "mission requirement".to_string(),
+            token_estimate: 80,
+            protected: true,
+            degraded: false,
+        };
+        let repeated = ContextNode {
+            id: StableId::new("node"),
+            source_ref: StableId::new("ev"),
+            authority: AuthorityClass::RawEvidence,
+            content: "same log line".to_string(),
+            token_estimate: 60,
+            protected: false,
+            degraded: false,
+        };
+        let pack = ContextPack {
+            id: StableId::new("ctx"),
+            nodes: vec![
+                protected.clone(),
+                repeated.clone(),
+                repeated,
+                ContextNode {
+                    id: StableId::new("node"),
+                    source_ref: StableId::new("ev"),
+                    authority: AuthorityClass::RetrievalAccelerator,
+                    content: "optional search hit".to_string(),
+                    token_estimate: 90,
+                    protected: false,
+                    degraded: false,
+                },
+            ],
+            budget: 500,
+            omitted_count: 0,
+        };
+        let (optimized, report) = engine.optimize_context_pack(&pack, 140).unwrap();
+        assert!(optimized.nodes.contains(&protected));
+        assert_eq!(report.redundant_removed, 1);
+        assert!(report.retained_tokens <= 140);
+        assert!(report.compression_ratio < 100);
     }
 
     #[test]

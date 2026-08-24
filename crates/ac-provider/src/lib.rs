@@ -187,6 +187,31 @@ pub struct RouteExecution {
     pub decision: RoutingDecision,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CostTier {
+    Free,
+    Cheap,
+    Standard,
+    Premium,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ModelSelectionRequirement {
+    pub task_id: StableId,
+    pub min_quality: u8,
+    pub max_cost_tier: CostTier,
+    pub prefer_low_latency: bool,
+    pub requires_vision: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CostOptimizedRoute {
+    pub candidate: RouteCandidate,
+    pub cost_tier: CostTier,
+    pub estimated_latency_ms: u64,
+    pub quality_score: u8,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct HealthObservation {
     pub connection_id: StableId,
@@ -1038,6 +1063,56 @@ impl ProviderRegistry {
         candidates
     }
 
+    pub fn select_cost_optimized_route(
+        &self,
+        requirement: &ModelSelectionRequirement,
+    ) -> AcResult<CostOptimizedRoute> {
+        let routing_profile = match requirement.max_cost_tier {
+            CostTier::Free => RoutingProfile::FreeOnly,
+            CostTier::Cheap => RoutingProfile::FreeFirst,
+            CostTier::Standard => RoutingProfile::LocalFirst,
+            CostTier::Premium => RoutingProfile::QualityFirst,
+        };
+        let mut profile = TaskProfile::coding(requirement.task_id.clone(), routing_profile);
+        profile.requires_vision = requirement.requires_vision;
+        profile.complexity = requirement.min_quality.min(10);
+        let mut candidates = self
+            .ranked_candidates(&profile)
+            .into_iter()
+            .filter_map(|candidate| {
+                let identity = self.model_identities.get(&candidate.model_identity_id)?;
+                let connection = self.connections.get(&candidate.connection_id)?;
+                let quality_score = identity.coding_score.max(identity.reasoning_score);
+                let tier = cost_tier(identity.input_cost_micros, connection.paid);
+                (quality_score >= requirement.min_quality
+                    && cost_tier_rank(tier) <= cost_tier_rank(requirement.max_cost_tier))
+                .then_some(CostOptimizedRoute {
+                    estimated_latency_ms: if connection.local { 250 } else { 900 },
+                    candidate,
+                    cost_tier: tier,
+                    quality_score,
+                })
+            })
+            .collect::<Vec<_>>();
+        candidates.sort_by_key(|route| {
+            (
+                cost_tier_rank(route.cost_tier),
+                if requirement.prefer_low_latency {
+                    route.estimated_latency_ms
+                } else {
+                    0
+                },
+                std::cmp::Reverse(route.quality_score),
+            )
+        });
+        candidates.into_iter().next().ok_or_else(|| {
+            AcError::validation(
+                "PROVIDER-NO_COST_OPTIMIZED_ROUTE",
+                "no route satisfies quality, capability, and cost requirements",
+            )
+        })
+    }
+
     pub fn request_model(
         &mut self,
         profile: &TaskProfile,
@@ -1378,6 +1453,27 @@ fn required_from_profile(profile: &TaskProfile) -> Vec<ProviderCapability> {
         required.push(ProviderCapability::Vision);
     }
     required
+}
+
+fn cost_tier(input_cost_micros: u32, paid: bool) -> CostTier {
+    if !paid {
+        CostTier::Free
+    } else if input_cost_micros <= 1_000 {
+        CostTier::Cheap
+    } else if input_cost_micros <= 5_000 {
+        CostTier::Standard
+    } else {
+        CostTier::Premium
+    }
+}
+
+fn cost_tier_rank(tier: CostTier) -> u8 {
+    match tier {
+        CostTier::Free => 0,
+        CostTier::Cheap => 1,
+        CostTier::Standard => 2,
+        CostTier::Premium => 3,
+    }
 }
 
 fn token_usage(events: &[ProviderStreamEvent]) -> (u32, u32) {
@@ -1724,6 +1820,26 @@ mod tests {
         assert_eq!(design.task_type, "design_studio");
         assert!(design.requires_vision);
         assert!(design.role.contains("critic"));
+    }
+
+    #[test]
+    fn phase23_cost_optimized_selection_prefers_affordable_capable_routes() {
+        let fabric = phase4_fabric(
+            Box::new(ScriptedProvider::new(vec![Ok(successful_events("free"))])),
+            Box::new(ScriptedProvider::new(vec![Ok(successful_events("paid"))])),
+        );
+        let route = fabric
+            .registry
+            .select_cost_optimized_route(&ModelSelectionRequirement {
+                task_id: StableId::new("task"),
+                min_quality: 70,
+                max_cost_tier: CostTier::Free,
+                prefer_low_latency: true,
+                requires_vision: false,
+            })
+            .unwrap();
+        assert_eq!(route.cost_tier, CostTier::Free);
+        assert!(route.quality_score >= 70);
     }
 
     #[test]

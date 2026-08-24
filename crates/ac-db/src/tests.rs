@@ -92,7 +92,7 @@ mod tests {
     fn sqlite_store_persists_kernel_state() {
         let mut db = ControlPlaneDb::open_memory().unwrap();
         db.migrate().unwrap();
-        assert_eq!(db.user_version().unwrap(), 14);
+        assert_eq!(db.user_version().unwrap(), 15);
 
         let mut kernel = Kernel::new(AllowAllPolicy);
         kernel.start().unwrap();
@@ -784,7 +784,7 @@ mod tests {
         {
             let mut db = ControlPlaneDb::open(&path).unwrap();
             db.migrate().unwrap();
-            assert_eq!(db.user_version().unwrap(), 14);
+            assert_eq!(db.user_version().unwrap(), 15);
             db.save_changeset_transaction(
                 &transaction,
                 Some("task-p13"),
@@ -863,7 +863,7 @@ mod tests {
         {
             let mut db = ControlPlaneDb::open(&path).unwrap();
             db.migrate().unwrap();
-            assert_eq!(db.user_version().unwrap(), 14);
+            assert_eq!(db.user_version().unwrap(), 15);
             db.save_verification_profile(&profile).unwrap();
             db.save_verification_manifest(
                 &manifest,
@@ -945,7 +945,7 @@ mod tests {
         {
             let mut db = ControlPlaneDb::open(&path).unwrap();
             db.migrate().unwrap();
-            assert_eq!(db.user_version().unwrap(), 14);
+            assert_eq!(db.user_version().unwrap(), 15);
             db.save_browser_process(&process).unwrap();
             db.save_browser_session(&session).unwrap();
             db.save_browser_dev_server(&dev_server).unwrap();
@@ -978,7 +978,7 @@ mod tests {
         {
             let mut db = ControlPlaneDb::open(&path).unwrap();
             db.migrate().unwrap();
-            assert_eq!(db.user_version().unwrap(), 14);
+            assert_eq!(db.user_version().unwrap(), 15);
             let skill = SkillManifest {
                 id: skill_id.clone(),
                 name: "Rust".to_string(),
@@ -1075,7 +1075,7 @@ mod tests {
         {
             let mut db = ControlPlaneDb::open(&path).unwrap();
             db.migrate().unwrap();
-            assert_eq!(db.user_version().unwrap(), 14);
+            assert_eq!(db.user_version().unwrap(), 15);
             let orchestrator = ac_security::BaselineSecurityOrchestrator::new(
                 ac_security::SecurityPolicy::baseline(),
             );
@@ -1126,7 +1126,7 @@ mod tests {
         {
             let mut db = ControlPlaneDb::open(&path).unwrap();
             db.migrate().unwrap();
-            assert_eq!(db.user_version().unwrap(), 14);
+            assert_eq!(db.user_version().unwrap(), 15);
             db.save_discuss_session(&DiscussSessionRow {
                 id: discuss_id.clone(),
                 repository_id: "repo-a".to_string(),
@@ -1237,6 +1237,131 @@ mod tests {
             let evaluations = db.design_visual_evaluations(&version_id).unwrap();
             assert!(!evaluations[0].passed);
             assert_eq!(evaluations[0].functional_flows, "primary flow");
+        }
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn phase22_23_desktop_and_optimization_state_survive_reopen() {
+        let path = std::env::temp_dir().join(format!(
+            "agentcode-phase22-23-{}.sqlite",
+            StableId::new("db")
+        ));
+        let session_id = StableId::new("desktop").to_string();
+        let project_id = StableId::new("project").to_string();
+        let mission_id = StableId::new("mission").to_string();
+        let task_id = StableId::new("task").to_string();
+        {
+            let mut db = ControlPlaneDb::open(&path).unwrap();
+            db.migrate().unwrap();
+            assert_eq!(db.user_version().unwrap(), 15);
+            db.save_desktop_session(&DesktopSessionRow {
+                id: session_id.clone(),
+                active_project_id: Some(project_id.clone()),
+                active_mission_id: Some(mission_id.clone()),
+                selected_view: "mission".to_string(),
+                window_open: false,
+                daemon_connected: true,
+                created_at_ms: 1,
+                updated_at_ms: 2,
+            })
+            .unwrap();
+            db.save_desktop_project(&DesktopProjectRow {
+                id: project_id.clone(),
+                name: "AgentCode".to_string(),
+                path: "/repo".to_string(),
+                repository_id: "repo-a".to_string(),
+                last_opened_at_ms: 3,
+            })
+            .unwrap();
+            db.save_desktop_preference(&DesktopPreferenceRow {
+                session_id: session_id.clone(),
+                appearance: "dark".to_string(),
+                notifications_enabled: true,
+                completion_sound_enabled: false,
+                reduced_motion: true,
+                budget_limit_micros: Some(10_000),
+            })
+            .unwrap();
+            db.save_desktop_ui_state(&DesktopUiStateRow {
+                session_id: session_id.clone(),
+                serialized_state: "view=mission".to_string(),
+                updated_at_ms: 4,
+            })
+            .unwrap();
+            db.save_desktop_approval_record(&DesktopApprovalRecordRow {
+                id: "approval-record-a".to_string(),
+                approval_id: "approval-a".to_string(),
+                mission_id: mission_id.clone(),
+                approval_kind: "changeset".to_string(),
+                decision: "approved".to_string(),
+                explanation: "apply verified changes".to_string(),
+                evidence_refs: "ev-a".to_string(),
+                created_at_ms: 5,
+            })
+            .unwrap();
+            db.save_token_usage_record(&TokenUsageRecordRow {
+                id: "usage-a".to_string(),
+                task_id: task_id.clone(),
+                provider_call_id: Some("routing-a".to_string()),
+                input_tokens: 100,
+                output_tokens: 50,
+                context_tokens: 400,
+                compressed_tokens: 200,
+                estimated_cost_micros: 900,
+                verified: true,
+                created_at_ms: 6,
+            })
+            .unwrap();
+            db.save_resource_telemetry_record(&ResourceTelemetryRecordRow {
+                id: "resource-a".to_string(),
+                component: "runtime".to_string(),
+                rss_bytes: 700_000_000,
+                cpu_millis: 42,
+                disk_bytes: 1024,
+                process_count: 5,
+                worker_count: 2,
+                browser_sessions: 1,
+                lsp_sessions: 2,
+                local_model_loaded: true,
+                created_at_ms: 7,
+            })
+            .unwrap();
+            db.save_optimization_report(&OptimizationReportRow {
+                id: "report-a".to_string(),
+                total_tokens: 550,
+                verified_tokens: 550,
+                total_cost_micros: 900,
+                cost_per_verified_task_micros: Some(900),
+                average_compression_ratio: 50,
+                before_after: "before 800; after 550".to_string(),
+                created_at_ms: 8,
+            })
+            .unwrap();
+        }
+        {
+            let mut db = ControlPlaneDb::open(&path).unwrap();
+            db.migrate().unwrap();
+            let session = db.desktop_session(&session_id).unwrap().unwrap();
+            assert!(!session.window_open);
+            assert_eq!(session.active_mission_id, Some(mission_id.clone()));
+            assert_eq!(db.recent_desktop_projects().unwrap()[0].path, "/repo");
+            assert_eq!(
+                db.desktop_preference(&session_id)
+                    .unwrap()
+                    .unwrap()
+                    .appearance,
+                "dark"
+            );
+            assert_eq!(
+                db.desktop_approval_records(&mission_id).unwrap()[0].decision,
+                "approved"
+            );
+            assert!(db.token_usage_records(&task_id).unwrap()[0].verified);
+            assert_eq!(
+                db.resource_telemetry_records("runtime").unwrap()[0].worker_count,
+                2
+            );
         }
         let _ = fs::remove_file(path);
     }

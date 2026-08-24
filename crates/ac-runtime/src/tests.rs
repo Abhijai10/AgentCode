@@ -358,4 +358,73 @@ mod tests {
             "RUNTIME-ESCALATION_NOT_ALLOWED"
         );
     }
+
+    #[test]
+    fn phase23_optimization_records_metrics_and_reduces_resources() {
+        let mut optimization = OptimizationEngine::new();
+        let snapshot = ResourceSnapshot {
+            memory_pressure: MemoryPressure::Pressure,
+            cpu_busy: true,
+            active_builds: 1,
+            browser_sessions: 1,
+            lsp_sessions: 2,
+            local_model_loaded: true,
+        };
+        let telemetry = optimization
+            .record_resource_telemetry(
+                "runtime",
+                &snapshot,
+                ResourceTelemetryInput {
+                    rss_bytes: 700_000_000,
+                    cpu_millis: 42,
+                    disk_bytes: 1024,
+                    process_count: 5,
+                    worker_count: 3,
+                },
+            )
+            .unwrap();
+        assert_eq!(telemetry.browser_sessions, 1);
+        let task_id = StableId::new("task");
+        let usage = optimization
+            .record_token_usage(
+                task_id.clone(),
+                Some(StableId::new("routing")),
+                TokenUsageInput {
+                    input_tokens: 100,
+                    output_tokens: 50,
+                    context_tokens: 400,
+                    compressed_tokens: 200,
+                    estimated_cost_micros: 900,
+                    verified: true,
+                },
+            )
+            .unwrap();
+        assert_eq!(usage.compression_ratio(), 50);
+        let decision = optimization.govern(
+            &ResourcePolicy {
+                max_workers: 4,
+                max_rss_bytes: 1_000_000_000,
+                max_cpu_busy_workers: 1,
+                budget_limit_micros: Some(800),
+            },
+            &snapshot,
+            3,
+            900,
+        );
+        assert!(decision.degraded_mode);
+        assert_eq!(decision.admitted_workers, 1);
+        assert!(optimization
+            .local_model_lifecycle(&snapshot, 10 * 60 * 1000, 5 * 60 * 1000)
+            .unload);
+        let lsp = optimization.lsp_lifecycle(&snapshot, 6 * 60 * 1000, true);
+        assert!(lsp.stop_idle);
+        assert!(lsp.restart_unhealthy);
+        assert!(!optimization
+            .heavy_index_policy("zoekt", 100, 1, &snapshot)
+            .enabled);
+        let report = optimization.report(vec!["before 800 tokens; after 550 tokens".to_string()]);
+        assert_eq!(report.verified_tokens, usage.total_tokens());
+        assert_eq!(report.cost_per_verified_task_micros, Some(900));
+        assert_eq!(optimization.token_usage()[0].task_id, task_id);
+    }
 }

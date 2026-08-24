@@ -39,6 +39,12 @@ pub enum DaemonCommand {
         session_id: StableId,
         next_step: u32,
     },
+    DesktopWindowClosed {
+        desktop_session_id: StableId,
+    },
+    ReconnectDesktop {
+        desktop_session_id: StableId,
+    },
     Stop,
 }
 
@@ -51,6 +57,13 @@ pub enum DaemonResponse {
     },
     CheckpointSaved {
         checkpoint_id: StableId,
+    },
+    DesktopWindowClosed {
+        daemon_active: bool,
+    },
+    DesktopReconnected {
+        health: DaemonHealth,
+        recovered_sessions: usize,
     },
     Stopped,
 }
@@ -205,6 +218,13 @@ impl DaemonService {
                 self.db.update_session_state(&session_id, "executing")?;
                 Ok(DaemonResponse::CheckpointSaved { checkpoint_id })
             }
+            DaemonCommand::DesktopWindowClosed { .. } => Ok(DaemonResponse::DesktopWindowClosed {
+                daemon_active: self.lifecycle == DaemonLifecycle::Running,
+            }),
+            DaemonCommand::ReconnectDesktop { .. } => Ok(DaemonResponse::DesktopReconnected {
+                health: self.health(),
+                recovered_sessions: self.recovered.len(),
+            }),
             DaemonCommand::Stop => {
                 self.stop()?;
                 Ok(DaemonResponse::Stopped)
@@ -324,6 +344,40 @@ mod tests {
                 lifecycle: DaemonLifecycle::Running,
                 ..
             })
+        ));
+        assert_eq!(
+            ipc.send(DaemonCommand::Stop).unwrap(),
+            DaemonResponse::Stopped
+        );
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn desktop_close_does_not_stop_daemon_and_reopen_reconnects() {
+        let (dir, db, lock) = temp_paths();
+        let mut daemon = DaemonService::open(&db, &lock).unwrap();
+        daemon.start().unwrap();
+        let mut ipc = LocalIpc::new(&mut daemon);
+        let desktop_session_id = StableId::new("desktop");
+        assert_eq!(
+            ipc.send(DaemonCommand::DesktopWindowClosed {
+                desktop_session_id: desktop_session_id.clone()
+            })
+            .unwrap(),
+            DaemonResponse::DesktopWindowClosed {
+                daemon_active: true
+            }
+        );
+        assert!(matches!(
+            ipc.send(DaemonCommand::ReconnectDesktop { desktop_session_id })
+                .unwrap(),
+            DaemonResponse::DesktopReconnected {
+                health: DaemonHealth {
+                    lifecycle: DaemonLifecycle::Running,
+                    ..
+                },
+                ..
+            }
         ));
         assert_eq!(
             ipc.send(DaemonCommand::Stop).unwrap(),

@@ -124,6 +124,12 @@ pub const DISCUSS_DESIGN_MODES_V14: Migration = Migration {
     sql: include_str!("../../../migrations/0014_discuss_design_modes.sql"),
 };
 
+pub const DESKTOP_OPTIMIZATION_V15: Migration = Migration {
+    id: "0015_desktop_optimization",
+    description: "desktop session state and resource/token/cost optimization telemetry",
+    sql: include_str!("../../../migrations/0015_desktop_optimization.sql"),
+};
+
 pub fn validate_migrations(migrations: &[Migration]) -> AcResult<()> {
     let mut seen = BTreeSet::new();
     for migration in migrations {

@@ -5,7 +5,7 @@ Doc 10 gates for the phase pass and completion evidence exists).
 
 Phase names are the EXACT canonical names from Doc 09 HC-P00..HC-P29 (no aliases).
 
-Last updated: 2026-08-24 (Phase 20 Discuss Mode and Phase 21 Design Studio closure)
+Last updated: 2026-08-24 (Phase 22 desktop product and Phase 23 optimization closure)
 
 | Phase | Name (Doc 09 HC-*) | Status | Notes |
 |-------|--------------------|--------|-------|
@@ -31,8 +31,8 @@ Last updated: 2026-08-24 (Phase 20 Discuss Mode and Phase 21 Design Studio closu
 | P19 | AI Security | COMPLETE | P19-WP01..P19-WP12 ACCEPTED; AI surface detection, trust-boundary graph, direct/indirect injection, RAG poisoning, tool/MCP abuse, secret leakage, excessive-agency/cross-agent fixtures, optional harness fallback statuses, common finding normalization, mitigation verification and persistence pass P19-G1..G10 through deterministic production-facing APIs; evidence: docs/progress/phase-19-completion.md (+ .json) |
 | P20 | Discuss Mode | COMPLETE | P20-WP01..P20-WP08 ACCEPTED; durable discussion sessions/messages/decisions/plans, repo-grounded context answers, read-only policy, routing, research fallback, decision/plan promotion and mission draft pass P20-G1..G7; evidence: docs/progress/phase-20-completion.md (+ .json) |
 | P21 | Design Studio | COMPLETE | P21-WP01..P21-WP14 ACCEPTED; product analysis, DesignBrief, DesignGrammar, DESIGN_STATE, anti-slop critic, UI tasks, preview iteration, visual/responsive/a11y/functional QA, reference principles and DOM-source prototype pass P21-G1..G12; evidence: docs/progress/phase-21-completion.md (+ .json) |
-| P22 | Minimal Desktop Product Experience | NOT_STARTED | |
-| P23 | Resource, Token & Cost Optimization | NOT_STARTED | |
+| P22 | Minimal Desktop Product Experience | COMPLETE | P22-WP01..P22-WP18 ACCEPTED; desktop/session projection, project open, goal composition, mission status, activity/changes/details, Discuss/Design/Security routing, settings, notifications/sounds, daemon reconnect and accessibility/theme state pass P22-G1..G18; evidence: docs/progress/phase-22-completion.md (+ .json) |
+| P23 | Resource, Token & Cost Optimization | COMPLETE | P23-WP01..P23-WP12 ACCEPTED; telemetry, token/cost accounting, resource governor, adaptive concurrency, local model/LSP/index policies, context optimization, compression tracking, cost-aware routing and reports pass P23-G1..G7; evidence: docs/progress/phase-23-completion.md (+ .json) |
 | P24 | Chaos Engineering & Recovery Validation | NOT_STARTED | |
 | P25 | AgentCode Dogfooding | NOT_STARTED | |
 | P26 | Security & Licensing Hardening | NOT_STARTED | |

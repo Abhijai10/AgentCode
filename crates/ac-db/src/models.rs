@@ -260,6 +260,97 @@ pub struct DesignVisualEvaluationRow {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DesktopSessionRow {
+    pub id: String,
+    pub active_project_id: Option<String>,
+    pub active_mission_id: Option<String>,
+    pub selected_view: String,
+    pub window_open: bool,
+    pub daemon_connected: bool,
+    pub created_at_ms: i64,
+    pub updated_at_ms: i64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DesktopProjectRow {
+    pub id: String,
+    pub name: String,
+    pub path: String,
+    pub repository_id: String,
+    pub last_opened_at_ms: i64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DesktopPreferenceRow {
+    pub session_id: String,
+    pub appearance: String,
+    pub notifications_enabled: bool,
+    pub completion_sound_enabled: bool,
+    pub reduced_motion: bool,
+    pub budget_limit_micros: Option<u64>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DesktopUiStateRow {
+    pub session_id: String,
+    pub serialized_state: String,
+    pub updated_at_ms: i64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DesktopApprovalRecordRow {
+    pub id: String,
+    pub approval_id: String,
+    pub mission_id: String,
+    pub approval_kind: String,
+    pub decision: String,
+    pub explanation: String,
+    pub evidence_refs: String,
+    pub created_at_ms: i64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TokenUsageRecordRow {
+    pub id: String,
+    pub task_id: String,
+    pub provider_call_id: Option<String>,
+    pub input_tokens: u32,
+    pub output_tokens: u32,
+    pub context_tokens: u32,
+    pub compressed_tokens: u32,
+    pub estimated_cost_micros: u64,
+    pub verified: bool,
+    pub created_at_ms: i64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ResourceTelemetryRecordRow {
+    pub id: String,
+    pub component: String,
+    pub rss_bytes: u64,
+    pub cpu_millis: u64,
+    pub disk_bytes: u64,
+    pub process_count: u32,
+    pub worker_count: u32,
+    pub browser_sessions: u32,
+    pub lsp_sessions: u32,
+    pub local_model_loaded: bool,
+    pub created_at_ms: i64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OptimizationReportRow {
+    pub id: String,
+    pub total_tokens: u32,
+    pub verified_tokens: u32,
+    pub total_cost_micros: u64,
+    pub cost_per_verified_task_micros: Option<u64>,
+    pub average_compression_ratio: u8,
+    pub before_after: String,
+    pub created_at_ms: i64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ContextCacheEntryRow {
     pub cache_key: String,
     pub content_hash: String,
