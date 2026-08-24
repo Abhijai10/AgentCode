@@ -4,7 +4,7 @@ Status: COMPLETE
 
 Starting commit: `db8199c`
 
-Implementation commit: pending final commit
+Implementation commit: `7f15db2`
 
 Completed work packages: P17-WP01 through P17-WP14 are ACCEPTED.
 

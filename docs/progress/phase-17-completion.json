@@ -3,7 +3,7 @@
   "name": "Baseline Security Platform",
   "status": "COMPLETE",
   "starting_commit": "db8199c",
-  "implementation_commit": "pending final commit",
+  "implementation_commit": "7f15db2",
   "workpackages": [
     "P17-WP01",
     "P17-WP02",
