@@ -1,8 +1,15 @@
 use std::collections::BTreeMap;
 use std::fs;
+use std::io::{BufRead, BufReader, Read, Write};
 use std::path::Path;
+use std::process::{Child, ChildStdin, Command, Stdio};
+use std::time::{Duration, Instant};
 
 use ac_common::{AcError, AcResult, StableId, TimestampMillis};
+use ac_sandbox::{ExecRequest, IsolationLevel, SandboxManager, SandboxPolicy};
+use ac_security::{Capability, CapabilityPolicy};
+use serde_json::{json, Value};
+use tree_sitter::{Language, Node, Parser, Point, Tree};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RepositoryScope {
@@ -55,7 +62,7 @@ impl LspServerKind {
 
     fn for_language(language: &str) -> Option<Self> {
         match language {
-            "javascript" => Some(Self::TypeScript),
+            "javascript" | "typescript" | "tsx" => Some(Self::TypeScript),
             "python" => Some(Self::Python),
             "rust" => Some(Self::Rust),
             "go" => Some(Self::Go),
@@ -67,7 +74,12 @@ impl LspServerKind {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum LspSessionState {
     Starting,
+    Available,
+    Ready,
     Running,
+    Failed,
+    Unavailable,
+    Restarting,
     Degraded,
     Stopped,
 }
@@ -76,7 +88,12 @@ impl LspSessionState {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Starting => "starting",
+            Self::Available => "available",
+            Self::Ready => "ready",
             Self::Running => "running",
+            Self::Failed => "failed",
+            Self::Unavailable => "unavailable",
+            Self::Restarting => "restarting",
             Self::Degraded => "degraded",
             Self::Stopped => "stopped",
         }
@@ -93,6 +110,292 @@ pub struct LspServerSession {
     pub restart_count: u8,
     pub last_activity: TimestampMillis,
     pub degraded_reason: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LspTextEdit {
+    pub file_path: String,
+    pub range: SourceRange,
+    pub start_character: u32,
+    pub end_character: u32,
+    pub new_text: String,
+    pub provenance: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LspWorkspaceEdit {
+    pub server: LspServerKind,
+    pub edits: Vec<LspTextEdit>,
+}
+
+pub struct LspClient {
+    server: LspServerKind,
+    workspace_root: String,
+    child: Child,
+    stdin: ChildStdin,
+    stdout: BufReader<std::process::ChildStdout>,
+    next_id: u64,
+    document_versions: BTreeMap<String, i32>,
+}
+
+impl LspClient {
+    pub fn start(server: LspServerKind, workspace_root: impl Into<String>) -> AcResult<Self> {
+        let workspace_root = workspace_root.into();
+        let executable = discover_lsp_executable(server).ok_or_else(|| {
+            AcError::new(
+                "CODEINTEL-LANGUAGE_SERVER_UNAVAILABLE",
+                format!("{} language server is not installed", server.as_str()),
+                ac_common::ErrorKind::Unavailable,
+                ac_common::Retryability::NotRetryable,
+            )
+        })?;
+        let cwd = Path::new(&workspace_root)
+            .canonicalize()
+            .map_err(|error| AcError::validation("CODEINTEL-LSP_WORKSPACE", error.to_string()))?;
+        let sandbox = SandboxManager::new(SandboxPolicy {
+            capability_policy: CapabilityPolicy::new()
+                .allow(Capability::ProcessExec("*".to_string())),
+            required_isolation: IsolationLevel::ProcessRestricted,
+            ..SandboxPolicy::new(vec![cwd.clone()])
+        });
+        let plan = sandbox.prepare_execution(ExecRequest {
+            argv: vec![executable],
+            cwd,
+            env: toolchain_env(),
+            network: false,
+            timeout_ms: 30_000,
+        })?;
+        let mut command = Command::new(&plan.backend_argv[0]);
+        command
+            .args(&plan.backend_argv[1..])
+            .current_dir(&plan.cwd)
+            .env_clear()
+            .envs(&plan.allowed_env)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null());
+        let mut child = command.spawn().map_err(|error| {
+            AcError::new(
+                "CODEINTEL-LANGUAGE_SERVER_STARTUP_FAILED",
+                error.to_string(),
+                ac_common::ErrorKind::Unavailable,
+                ac_common::Retryability::Retryable,
+            )
+        })?;
+        let stdin = child.stdin.take().ok_or_else(|| {
+            AcError::validation("CODEINTEL-LSP_STDIN", "language server stdin unavailable")
+        })?;
+        let stdout = child.stdout.take().ok_or_else(|| {
+            AcError::validation("CODEINTEL-LSP_STDOUT", "language server stdout unavailable")
+        })?;
+        let mut client = Self {
+            server,
+            workspace_root,
+            child,
+            stdin,
+            stdout: BufReader::new(stdout),
+            next_id: 1,
+            document_versions: BTreeMap::new(),
+        };
+        client.initialize()?;
+        Ok(client)
+    }
+
+    pub fn initialize(&mut self) -> AcResult<()> {
+        let root_uri = file_uri(Path::new(&self.workspace_root))?;
+        let id = self.request(
+            "initialize",
+            json!({
+                "processId": null,
+                "rootUri": root_uri,
+                "capabilities": {
+                    "textDocument": {
+                        "definition": {},
+                        "references": {},
+                        "rename": { "prepareSupport": true },
+                        "publishDiagnostics": {}
+                    },
+                    "workspace": { "workspaceEdit": { "documentChanges": true } }
+                }
+            }),
+        )?;
+        let _ = self.wait_response(id, Duration::from_secs(10))?;
+        self.notify("initialized", json!({}))?;
+        Ok(())
+    }
+
+    pub fn did_open(&mut self, path: &Path, language: SourceLanguage, text: &str) -> AcResult<i32> {
+        let version = self
+            .document_versions
+            .get(&path.display().to_string())
+            .copied()
+            .unwrap_or(0)
+            + 1;
+        self.document_versions
+            .insert(path.display().to_string(), version);
+        self.notify(
+            "textDocument/didOpen",
+            json!({
+                "textDocument": {
+                    "uri": file_uri(path)?,
+                    "languageId": language.lsp_language_id(),
+                    "version": version,
+                    "text": text
+                }
+            }),
+        )?;
+        Ok(version)
+    }
+
+    pub fn definition(&mut self, path: &Path, line: u32, character: u32) -> AcResult<Value> {
+        self.position_request("textDocument/definition", path, line, character)
+    }
+
+    pub fn references(&mut self, path: &Path, line: u32, character: u32) -> AcResult<Value> {
+        let id = self.request(
+            "textDocument/references",
+            json!({
+                "textDocument": { "uri": file_uri(path)? },
+                "position": { "line": line, "character": character },
+                "context": { "includeDeclaration": true }
+            }),
+        )?;
+        self.wait_response(id, Duration::from_secs(10))
+    }
+
+    pub fn rename(
+        &mut self,
+        path: &Path,
+        line: u32,
+        character: u32,
+        new_name: &str,
+    ) -> AcResult<LspWorkspaceEdit> {
+        let id = self.request(
+            "textDocument/rename",
+            json!({
+                "textDocument": { "uri": file_uri(path)? },
+                "position": { "line": line, "character": character },
+                "newName": new_name
+            }),
+        )?;
+        let response = self.wait_response(id, Duration::from_secs(15))?;
+        workspace_edit_from_lsp(self.server, &response)
+    }
+
+    pub fn shutdown(mut self) -> AcResult<()> {
+        let id = self.request("shutdown", Value::Null)?;
+        let _ = self.wait_response(id, Duration::from_secs(5));
+        let _ = self.notify("exit", Value::Null);
+        let _ = self.child.wait();
+        Ok(())
+    }
+
+    fn position_request(
+        &mut self,
+        method: &str,
+        path: &Path,
+        line: u32,
+        character: u32,
+    ) -> AcResult<Value> {
+        let id = self.request(
+            method,
+            json!({
+                "textDocument": { "uri": file_uri(path)? },
+                "position": { "line": line, "character": character }
+            }),
+        )?;
+        self.wait_response(id, Duration::from_secs(10))
+    }
+
+    fn request(&mut self, method: &str, params: Value) -> AcResult<u64> {
+        let id = self.next_id;
+        self.next_id += 1;
+        self.write_message(json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": method,
+            "params": params
+        }))?;
+        Ok(id)
+    }
+
+    fn notify(&mut self, method: &str, params: Value) -> AcResult<()> {
+        self.write_message(json!({
+            "jsonrpc": "2.0",
+            "method": method,
+            "params": params
+        }))
+    }
+
+    fn write_message(&mut self, message: Value) -> AcResult<()> {
+        let body = serde_json::to_vec(&message)
+            .map_err(|error| AcError::validation("CODEINTEL-LSP_JSON", error.to_string()))?;
+        write!(self.stdin, "Content-Length: {}\r\n\r\n", body.len())
+            .and_then(|_| self.stdin.write_all(&body))
+            .and_then(|_| self.stdin.flush())
+            .map_err(|error| AcError::validation("CODEINTEL-LSP_WRITE", error.to_string()))
+    }
+
+    fn wait_response(&mut self, id: u64, timeout: Duration) -> AcResult<Value> {
+        let deadline = Instant::now() + timeout;
+        while Instant::now() < deadline {
+            let message = self.read_message()?;
+            if message.get("id").and_then(Value::as_u64) != Some(id) {
+                continue;
+            }
+            if let Some(error) = message.get("error") {
+                return Err(AcError::validation(
+                    "CODEINTEL-LSP_RESPONSE_ERROR",
+                    error.to_string(),
+                ));
+            }
+            return Ok(message.get("result").cloned().unwrap_or(Value::Null));
+        }
+        Err(AcError::new(
+            "CODEINTEL-LANGUAGE_SERVER_TIMEOUT",
+            "language server request timed out",
+            ac_common::ErrorKind::Unavailable,
+            ac_common::Retryability::Retryable,
+        ))
+    }
+
+    fn read_message(&mut self) -> AcResult<Value> {
+        let mut content_length = None;
+        loop {
+            let mut line = String::new();
+            let read = self
+                .stdout
+                .read_line(&mut line)
+                .map_err(|error| AcError::validation("CODEINTEL-LSP_READ", error.to_string()))?;
+            if read == 0 {
+                return Err(AcError::new(
+                    "CODEINTEL-LANGUAGE_SERVER_CRASHED",
+                    "language server stdout closed",
+                    ac_common::ErrorKind::Unavailable,
+                    ac_common::Retryability::Retryable,
+                ));
+            }
+            let trimmed = line.trim_end();
+            if trimmed.is_empty() {
+                break;
+            }
+            if let Some(value) = trimmed.strip_prefix("Content-Length:") {
+                content_length = Some(value.trim().parse::<usize>().map_err(|error| {
+                    AcError::validation("CODEINTEL-LSP_FRAME", error.to_string())
+                })?);
+            }
+        }
+        let length = content_length.ok_or_else(|| {
+            AcError::validation("CODEINTEL-LSP_FRAME", "missing Content-Length header")
+        })?;
+        let mut body = vec![0; length];
+        self.stdout
+            .read_exact(&mut body)
+            .map_err(|error| AcError::validation("CODEINTEL-LSP_READ", error.to_string()))?;
+        serde_json::from_slice(&body).map_err(|error| {
+            AcError::validation("CODEINTEL-INVALID_LSP_RESPONSE", error.to_string())
+        })
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -189,17 +492,49 @@ pub struct SourceRange {
     pub start_line: u32,
     pub end_line: u32,
 }
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ParseStatus {
+    Parsed,
+    SyntaxErrors,
+    Unsupported,
+    Failed,
+}
+
+impl ParseStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Parsed => "Parsed",
+            Self::SyntaxErrors => "SyntaxErrors",
+            Self::Unsupported => "Unsupported",
+            Self::Failed => "Failed",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ByteRange {
+    pub start_byte: usize,
+    pub end_byte: usize,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AstNode {
     pub kind: String,
     pub text: String,
     pub range: SourceRange,
+    pub byte_range: ByteRange,
+    pub name: Option<String>,
+    pub role: String,
+    pub provenance: String,
 }
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ParseResult {
     pub language: String,
     pub nodes: Vec<AstNode>,
     pub errors: Vec<String>,
+    pub status: ParseStatus,
+    pub provenance: String,
 }
 pub trait ParserEngine {
     fn parse(&self, language: &str, source: &str) -> ParseResult;
@@ -235,6 +570,13 @@ impl ParserEngine for FallbackParser {
                         start_line: (i + 1) as u32,
                         end_line: (i + 1) as u32,
                     },
+                    byte_range: ByteRange {
+                        start_byte: 0,
+                        end_byte: t.len(),
+                    },
+                    name: None,
+                    role: "text-fallback-declaration".to_string(),
+                    provenance: "TextFallback".to_string(),
                 });
             }
         }
@@ -242,7 +584,92 @@ impl ParserEngine for FallbackParser {
             language: language.into(),
             nodes,
             errors,
+            status: ParseStatus::Parsed,
+            provenance: "TextFallback".to_string(),
         }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SourceLanguage {
+    Rust,
+    Python,
+    JavaScript,
+    TypeScript,
+    Tsx,
+    Go,
+    Unknown,
+}
+
+impl SourceLanguage {
+    pub fn from_path(path: &str) -> Self {
+        match path.rsplit('.').next().unwrap_or("") {
+            "rs" => Self::Rust,
+            "py" => Self::Python,
+            "js" | "jsx" => Self::JavaScript,
+            "ts" => Self::TypeScript,
+            "tsx" => Self::Tsx,
+            "go" => Self::Go,
+            _ => Self::Unknown,
+        }
+    }
+
+    pub fn from_name(language: &str) -> Self {
+        match language {
+            "rust" => Self::Rust,
+            "python" => Self::Python,
+            "javascript" => Self::JavaScript,
+            "typescript" => Self::TypeScript,
+            "tsx" => Self::Tsx,
+            "go" => Self::Go,
+            _ => Self::Unknown,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Rust => "rust",
+            Self::Python => "python",
+            Self::JavaScript => "javascript",
+            Self::TypeScript => "typescript",
+            Self::Tsx => "tsx",
+            Self::Go => "go",
+            Self::Unknown => "unknown",
+        }
+    }
+
+    fn tree_sitter_language(self) -> Option<Language> {
+        match self {
+            Self::Rust => Some(tree_sitter_rust::LANGUAGE.into()),
+            Self::Python => Some(tree_sitter_python::LANGUAGE.into()),
+            Self::JavaScript => Some(tree_sitter_javascript::LANGUAGE.into()),
+            Self::TypeScript => Some(tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into()),
+            Self::Tsx => Some(tree_sitter_typescript::LANGUAGE_TSX.into()),
+            Self::Go => Some(tree_sitter_go::LANGUAGE.into()),
+            Self::Unknown => None,
+        }
+    }
+
+    fn lsp_language_id(self) -> &'static str {
+        match self {
+            Self::Rust => "rust",
+            Self::Python => "python",
+            Self::JavaScript => "javascript",
+            Self::TypeScript => "typescript",
+            Self::Tsx => "typescriptreact",
+            Self::Go => "go",
+            Self::Unknown => "plaintext",
+        }
+    }
+}
+
+#[derive(Default)]
+pub struct TreeSitterParser;
+
+impl ParserEngine for TreeSitterParser {
+    fn parse(&self, language: &str, source: &str) -> ParseResult {
+        let source_language = SourceLanguage::from_name(language);
+        parse_tree_sitter(source_language, source)
     }
 }
 pub trait StructuralSearchEngine {
@@ -258,13 +685,374 @@ impl StructuralSearchEngine for PatternMatcher {
                 "language is required",
             ));
         }
-        Ok(FallbackParser
+        Ok(TreeSitterParser
             .parse(language, source)
             .nodes
             .into_iter()
-            .filter(|n| n.text.contains(pattern))
+            .filter(|n| structural_pattern_matches(n, pattern))
             .collect())
     }
+}
+
+pub fn structural_rewrite(
+    language: &str,
+    source: &str,
+    pattern: &str,
+    rewrite: &str,
+) -> AcResult<String> {
+    if pattern.trim().is_empty() {
+        return Err(AcError::validation(
+            "CODEINTEL-INVALID_STRUCTURAL_PATTERN",
+            "structural pattern cannot be empty",
+        ));
+    }
+    let parsed = TreeSitterParser.parse(language, source);
+    if parsed.status == ParseStatus::Unsupported {
+        return Err(AcError::validation(
+            "CODEINTEL-UNSUPPORTED_LANGUAGE",
+            format!("no Tree-sitter grammar is registered for {language}"),
+        ));
+    }
+    if parsed.status == ParseStatus::Failed || parsed.status == ParseStatus::SyntaxErrors {
+        return Err(AcError::validation(
+            "CODEINTEL-PARSE_FAILED",
+            parsed.errors.join("; "),
+        ));
+    }
+    let mut matches = parsed
+        .nodes
+        .into_iter()
+        .filter(|node| structural_pattern_matches(node, pattern))
+        .collect::<Vec<_>>();
+    if matches.is_empty() {
+        return Err(AcError::conflict(
+            "CODEINTEL-STRUCTURAL_MATCH_NOT_FOUND",
+            "structural rewrite found no AST matches",
+        ));
+    }
+    matches.sort_by_key(|node| std::cmp::Reverse(node.byte_range.start_byte));
+    let mut output = source.to_string();
+    for node in matches {
+        output.replace_range(
+            node.byte_range.start_byte..node.byte_range.end_byte,
+            rewrite,
+        );
+    }
+    Ok(output)
+}
+
+fn parse_tree_sitter(language: SourceLanguage, source: &str) -> ParseResult {
+    let Some(ts_language) = language.tree_sitter_language() else {
+        return ParseResult {
+            language: language.as_str().to_string(),
+            nodes: Vec::new(),
+            errors: vec![format!("unsupported language {}", language.as_str())],
+            status: ParseStatus::Unsupported,
+            provenance: "Unsupported".to_string(),
+        };
+    };
+    let mut parser = Parser::new();
+    if let Err(error) = parser.set_language(&ts_language) {
+        return ParseResult {
+            language: language.as_str().to_string(),
+            nodes: Vec::new(),
+            errors: vec![error.to_string()],
+            status: ParseStatus::Failed,
+            provenance: "TreeSitter".to_string(),
+        };
+    }
+    let Some(tree) = parser.parse(source, None) else {
+        return ParseResult {
+            language: language.as_str().to_string(),
+            nodes: Vec::new(),
+            errors: vec!["parser returned no tree".to_string()],
+            status: ParseStatus::Failed,
+            provenance: "TreeSitter".to_string(),
+        };
+    };
+    let mut nodes = Vec::new();
+    let mut errors = Vec::new();
+    collect_tree_sitter_nodes(
+        language,
+        source,
+        &tree,
+        tree.root_node(),
+        &mut nodes,
+        &mut errors,
+    );
+    ParseResult {
+        language: language.as_str().to_string(),
+        nodes,
+        errors,
+        status: if tree.root_node().has_error() {
+            ParseStatus::SyntaxErrors
+        } else {
+            ParseStatus::Parsed
+        },
+        provenance: "TreeSitter".to_string(),
+    }
+}
+
+fn collect_tree_sitter_nodes(
+    language: SourceLanguage,
+    source: &str,
+    _tree: &Tree,
+    node: Node<'_>,
+    output: &mut Vec<AstNode>,
+    errors: &mut Vec<String>,
+) {
+    if node.is_error() || node.is_missing() {
+        errors.push(format!(
+            "{} node at line {}",
+            node.kind(),
+            node.start_position().row + 1
+        ));
+    }
+    if let Some((role, name_node)) = structural_node(language, node) {
+        let text = node.utf8_text(source.as_bytes()).unwrap_or("").to_string();
+        let name = name_node
+            .utf8_text(source.as_bytes())
+            .ok()
+            .map(ToString::to_string);
+        output.push(AstNode {
+            kind: node.kind().to_string(),
+            text,
+            range: source_range(node.start_position(), node.end_position()),
+            byte_range: ByteRange {
+                start_byte: node.start_byte(),
+                end_byte: node.end_byte(),
+            },
+            name,
+            role: role.to_string(),
+            provenance: "TreeSitter".to_string(),
+        });
+    }
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        collect_tree_sitter_nodes(language, source, _tree, child, output, errors);
+    }
+}
+
+fn structural_node<'a>(
+    language: SourceLanguage,
+    node: Node<'a>,
+) -> Option<(&'static str, Node<'a>)> {
+    let kind = node.kind();
+    let name = node.child_by_field_name("name");
+    match language {
+        SourceLanguage::Rust => match kind {
+            "function_item" => name.map(|node| ("function", node)),
+            "struct_item" => name.map(|node| ("struct", node)),
+            "enum_item" => name.map(|node| ("enum", node)),
+            "trait_item" => name.map(|node| ("trait", node)),
+            "mod_item" => name.map(|node| ("module", node)),
+            "const_item" => name.map(|node| ("constant", node)),
+            "static_item" => name.map(|node| ("static", node)),
+            "use_declaration" => Some(("import", node)),
+            "call_expression" => node.child(0).map(|node| ("call", node)),
+            _ => None,
+        },
+        SourceLanguage::Python => match kind {
+            "function_definition" => name.map(|node| ("function", node)),
+            "class_definition" => name.map(|node| ("class", node)),
+            "import_statement" | "import_from_statement" => Some(("import", node)),
+            "call" => node.child(0).map(|node| ("call", node)),
+            _ => None,
+        },
+        SourceLanguage::JavaScript | SourceLanguage::TypeScript | SourceLanguage::Tsx => match kind
+        {
+            "function_declaration" => name.map(|node| ("function", node)),
+            "method_definition" => name.map(|node| ("method", node)),
+            "class_declaration" => name.map(|node| ("class", node)),
+            "interface_declaration" => name.map(|node| ("interface", node)),
+            "lexical_declaration" | "variable_declaration" => Some(("declaration", node)),
+            "import_statement" | "export_statement" => Some(("import", node)),
+            "call_expression" => node
+                .child_by_field_name("function")
+                .map(|node| ("call", node)),
+            _ => None,
+        },
+        SourceLanguage::Go => match kind {
+            "function_declaration" | "method_declaration" => name.map(|node| ("function", node)),
+            "type_declaration" => Some(("type", node)),
+            "import_declaration" => Some(("import", node)),
+            "call_expression" => node
+                .child_by_field_name("function")
+                .map(|node| ("call", node)),
+            _ => None,
+        },
+        SourceLanguage::Unknown => None,
+    }
+}
+
+fn source_range(start: Point, end: Point) -> SourceRange {
+    SourceRange {
+        start_line: (start.row + 1) as u32,
+        end_line: (end.row + 1) as u32,
+    }
+}
+
+fn structural_pattern_matches(node: &AstNode, pattern: &str) -> bool {
+    let pattern = pattern.trim();
+    if let Some((role, name)) = pattern.split_once(':') {
+        return node.role == role
+            && node
+                .name
+                .as_deref()
+                .map(|candidate| candidate == name || name == "*")
+                .unwrap_or_else(|| name == "*" || node.text.contains(name));
+    }
+    node.role == pattern
+        || node.kind == pattern
+        || node.name.as_deref() == Some(pattern)
+        || node.text.trim() == pattern
+}
+
+pub fn discover_lsp_executable(server: LspServerKind) -> Option<String> {
+    let env_key = match server {
+        LspServerKind::Rust => "AGENTCODE_RUST_ANALYZER",
+        LspServerKind::TypeScript => "AGENTCODE_TYPESCRIPT_LANGUAGE_SERVER",
+        LspServerKind::Python => "AGENTCODE_PYRIGHT",
+        LspServerKind::Go => "AGENTCODE_GOPLS",
+    };
+    if let Ok(path) = std::env::var(env_key) {
+        if Path::new(&path).is_file() && lsp_executable_usable(&path) {
+            return Some(path);
+        }
+    }
+    let candidates: &[&str] = match server {
+        LspServerKind::Rust => &["rust-analyzer"],
+        LspServerKind::TypeScript => &["typescript-language-server"],
+        LspServerKind::Python => &["pyright-langserver", "basedpyright-langserver", "pyright"],
+        LspServerKind::Go => &["gopls"],
+    };
+    let path = std::env::var_os("PATH")?;
+    for dir in std::env::split_paths(&path) {
+        for candidate in candidates {
+            let executable = dir.join(candidate);
+            if executable.is_file() && lsp_executable_usable(&executable.display().to_string()) {
+                return Some(executable.display().to_string());
+            }
+        }
+    }
+    None
+}
+
+fn lsp_executable_usable(executable: &str) -> bool {
+    Command::new(executable)
+        .arg("--version")
+        .env_clear()
+        .envs(toolchain_env())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false)
+}
+
+fn file_uri(path: &Path) -> AcResult<String> {
+    let path = path
+        .canonicalize()
+        .map_err(|error| AcError::validation("CODEINTEL-LSP_URI", error.to_string()))?;
+    Ok(format!(
+        "file://{}",
+        path.display().to_string().replace(' ', "%20")
+    ))
+}
+
+fn path_from_uri(uri: &str) -> AcResult<String> {
+    let path = uri
+        .strip_prefix("file://")
+        .ok_or_else(|| AcError::validation("CODEINTEL-LSP_URI", "only file:// URIs are supported"))?
+        .replace("%20", " ");
+    Ok(path)
+}
+
+fn workspace_edit_from_lsp(server: LspServerKind, result: &Value) -> AcResult<LspWorkspaceEdit> {
+    let mut edits = Vec::new();
+    if let Some(changes) = result.get("changes").and_then(Value::as_object) {
+        for (uri, file_edits) in changes {
+            collect_lsp_text_edits(server, uri, file_edits, &mut edits)?;
+        }
+    }
+    if let Some(changes) = result.get("documentChanges").and_then(Value::as_array) {
+        for change in changes {
+            if let Some(uri) = change
+                .get("textDocument")
+                .and_then(|doc| doc.get("uri"))
+                .and_then(Value::as_str)
+            {
+                if let Some(file_edits) = change.get("edits") {
+                    collect_lsp_text_edits(server, uri, file_edits, &mut edits)?;
+                }
+            }
+        }
+    }
+    if edits.is_empty() {
+        return Err(AcError::conflict(
+            "CODEINTEL-LSP_WORKSPACE_EDIT_EMPTY",
+            "language server returned no rename edits",
+        ));
+    }
+    Ok(LspWorkspaceEdit { server, edits })
+}
+
+fn collect_lsp_text_edits(
+    server: LspServerKind,
+    uri: &str,
+    value: &Value,
+    output: &mut Vec<LspTextEdit>,
+) -> AcResult<()> {
+    let file_path = path_from_uri(uri)?;
+    let edits = value.as_array().ok_or_else(|| {
+        AcError::validation("CODEINTEL-INVALID_LSP_RESPONSE", "edits must be an array")
+    })?;
+    for edit in edits {
+        let range = edit.get("range").ok_or_else(|| {
+            AcError::validation("CODEINTEL-INVALID_LSP_RESPONSE", "edit range is missing")
+        })?;
+        let start = range.get("start").ok_or_else(|| {
+            AcError::validation("CODEINTEL-INVALID_LSP_RESPONSE", "range start is missing")
+        })?;
+        let end = range.get("end").ok_or_else(|| {
+            AcError::validation("CODEINTEL-INVALID_LSP_RESPONSE", "range end is missing")
+        })?;
+        let start_position = lsp_types::Position {
+            line: start.get("line").and_then(Value::as_u64).unwrap_or(0) as u32,
+            character: start.get("character").and_then(Value::as_u64).unwrap_or(0) as u32,
+        };
+        let end_position = lsp_types::Position {
+            line: end.get("line").and_then(Value::as_u64).unwrap_or(0) as u32,
+            character: end.get("character").and_then(Value::as_u64).unwrap_or(0) as u32,
+        };
+        output.push(LspTextEdit {
+            file_path: file_path.clone(),
+            range: SourceRange {
+                start_line: start_position.line + 1,
+                end_line: end_position.line + 1,
+            },
+            start_character: start_position.character,
+            end_character: end_position.character,
+            new_text: edit
+                .get("newText")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string(),
+            provenance: format!("Lsp:{}", server.as_str()),
+        });
+    }
+    Ok(())
+}
+
+fn toolchain_env() -> BTreeMap<String, String> {
+    ["PATH", "HOME", "CARGO_HOME", "RUSTUP_HOME", "RUSTC_WRAPPER"]
+        .iter()
+        .filter_map(|key| {
+            std::env::var(key)
+                .ok()
+                .map(|value| ((*key).to_string(), value))
+        })
+        .collect()
 }
 #[derive(Default)]
 pub struct PollingWatcher {
@@ -320,6 +1108,7 @@ pub struct CodeIntelligenceService {
     symbols: Vec<SymbolOccurrence>,
     imports: Vec<ImportEdge>,
     snippets: BTreeMap<String, String>,
+    parse_statuses: BTreeMap<String, ParseStatus>,
     lsp_sessions: Vec<LspServerSession>,
     semantic_edges: Vec<SemanticEdge>,
     diagnostics: Vec<SemanticDiagnostic>,
@@ -352,6 +1141,7 @@ impl CodeIntelligenceService {
         self.symbols
             .retain(|symbol| present.contains(&symbol.file_path));
         self.imports.retain(|edge| present.contains(&edge.from));
+        self.parse_statuses.retain(|path, _| present.contains(path));
         let mut degraded = false;
         let mut count = 0;
         for (file, content) in files {
@@ -367,8 +1157,7 @@ impl CodeIntelligenceService {
             {
                 continue;
             }
-            self.extract_symbols(&file.relative_path, &content);
-            self.extract_imports(&file.relative_path, &content);
+            self.extract_tree_sitter_facts(&file.relative_path, &file.language, &content);
             self.snippets.insert(file.relative_path.clone(), content);
             self.files.insert(file.relative_path.clone(), file);
             count += 1;
@@ -444,10 +1233,16 @@ impl CodeIntelligenceService {
             server,
             workspace_root: workspace_root.to_string(),
             pid: None,
-            state: LspSessionState::Running,
+            state: if discover_lsp_executable(server).is_some() {
+                LspSessionState::Available
+            } else {
+                LspSessionState::Unavailable
+            },
             restart_count: 0,
             last_activity: TimestampMillis::now(),
-            degraded_reason: None,
+            degraded_reason: discover_lsp_executable(server)
+                .is_none()
+                .then(|| "language server executable not found".to_string()),
         };
         self.lsp_sessions.push(session.clone());
         Ok(session)
@@ -465,7 +1260,7 @@ impl CodeIntelligenceService {
             session.state = LspSessionState::Degraded;
             session.degraded_reason = Some(reason.to_string());
         } else {
-            session.state = LspSessionState::Running;
+            session.state = LspSessionState::Restarting;
             session.degraded_reason = Some(format!("restarted after {reason}"));
         }
         Ok(())
@@ -554,7 +1349,26 @@ impl CodeIntelligenceService {
                 "structural pattern is required",
             ));
         }
-        Ok(self.search_text(pattern))
+        let mut candidates = Vec::new();
+        for (path, content) in &self.snippets {
+            let language = self
+                .files
+                .get(path)
+                .map(|file| file.language.as_str())
+                .unwrap_or("unknown");
+            for node in PatternMatcher.search(language, pattern, content)? {
+                candidates.push(ContextCandidate {
+                    source_path: path.clone(),
+                    snippet: node.text.lines().next().unwrap_or("").to_string(),
+                    score: 100 + node.text.len() as u32,
+                    evidence_note: format!(
+                        "TreeSitter structural match; role={}; provenance={}",
+                        node.role, node.provenance
+                    ),
+                });
+            }
+        }
+        Ok(candidates)
     }
 
     pub fn repo_map(&self) -> String {
@@ -701,6 +1515,11 @@ impl CodeIntelligenceService {
             .cloned()
             .collect()
     }
+
+    pub fn parse_status(&self, path: &str) -> Option<ParseStatus> {
+        self.parse_statuses.get(path).copied()
+    }
+
     pub fn affected_files(&self, target: &str) -> Vec<String> {
         self.imports
             .iter()
@@ -726,57 +1545,41 @@ impl CodeIntelligenceService {
             .collect()
     }
 
-    fn extract_symbols(&mut self, path: &str, content: &str) {
+    fn extract_tree_sitter_facts(&mut self, path: &str, language: &str, content: &str) {
         self.symbols.retain(|symbol| symbol.file_path != path);
-        for (idx, line) in content.lines().enumerate() {
-            let trimmed = line.trim_start();
-            for prefix in [
-                "fn ",
-                "pub fn ",
-                "struct ",
-                "pub struct ",
-                "enum ",
-                "trait ",
-                "def ",
-                "class ",
-                "function ",
-                "export function ",
-                "export async function ",
-            ] {
-                if let Some(rest) = trimmed.strip_prefix(prefix) {
-                    let name = rest
-                        .split(|ch: char| !(ch.is_ascii_alphanumeric() || ch == '_'))
-                        .next()
-                        .unwrap_or("");
-                    if !name.is_empty() {
-                        self.symbols.push(SymbolOccurrence {
-                            file_path: path.to_string(),
-                            name: name.to_string(),
-                            kind: prefix.trim().to_string(),
-                            line: (idx + 1) as u32,
-                            confidence: 70,
-                        });
-                    }
-                }
-            }
-            if let Some(rest) = trimmed.strip_prefix("func ") {
-                let name = rest
-                    .split(|ch: char| !(ch.is_ascii_alphanumeric() || ch == '_'))
-                    .next()
-                    .unwrap_or("");
-                if !name.is_empty() {
-                    self.symbols.push(SymbolOccurrence {
-                        file_path: path.to_string(),
-                        name: name.to_string(),
-                        kind: "func".to_string(),
-                        line: (idx + 1) as u32,
-                        confidence: 70,
-                    });
-                }
+        self.imports.retain(|edge| edge.from != path);
+        let parsed = TreeSitterParser.parse(language, content);
+        self.parse_statuses.insert(path.to_string(), parsed.status);
+        if matches!(
+            parsed.status,
+            ParseStatus::Unsupported | ParseStatus::Failed
+        ) {
+            return;
+        }
+        for node in parsed.nodes {
+            if node.role == "import" {
+                self.imports.push(ImportEdge {
+                    from: path.to_string(),
+                    to: normalize_import_target(language, &node.text),
+                    line: node.range.start_line,
+                });
+            } else if let Some(name) = node.name {
+                self.symbols.push(SymbolOccurrence {
+                    file_path: path.to_string(),
+                    name,
+                    kind: node.role,
+                    line: node.range.start_line,
+                    confidence: if parsed.status == ParseStatus::Parsed {
+                        95
+                    } else {
+                        80
+                    },
+                });
             }
         }
     }
 
+    #[allow(dead_code)]
     fn extract_imports(&mut self, path: &str, content: &str) {
         self.imports.retain(|edge| edge.from != path);
         for (index, line) in content.lines().enumerate() {
@@ -848,7 +1651,7 @@ impl CodeIntelligenceService {
                 kind: SemanticEdgeKind::Definition,
                 from: location.clone(),
                 to: location,
-                provenance: self.provenance(scope, "lsp-normalized+tree-sitter", 90),
+                provenance: self.provenance(scope, "TreeSitter", 95),
             });
         }
     }
@@ -906,7 +1709,7 @@ impl CodeIntelligenceService {
                                     end_line: symbol.line,
                                 },
                             },
-                            provenance: self.provenance(scope, "lsp-normalized-reference", 75),
+                            provenance: self.provenance(scope, "TextFallbackReference", 55),
                         });
                     }
                 }
@@ -934,7 +1737,7 @@ impl CodeIntelligenceService {
                         },
                         severity: "warning".to_string(),
                         message: message.to_string(),
-                        provenance: self.provenance(scope, "lsp-diagnostics-normalized", 70),
+                        provenance: self.provenance(scope, "TextFallbackDiagnostic", 55),
                     });
                 }
             }
@@ -1259,13 +2062,42 @@ fn language_for(path: &str) -> &'static str {
     match path.rsplit('.').next().unwrap_or("") {
         "rs" => "rust",
         "py" => "python",
-        "ts" | "tsx" | "js" | "jsx" => "javascript",
+        "js" | "jsx" => "javascript",
+        "ts" => "typescript",
+        "tsx" => "tsx",
         "go" => "go",
         "md" => "markdown",
         "toml" => "toml",
         "json" => "json",
         "yaml" | "yml" => "yaml",
         _ => "text",
+    }
+}
+
+fn normalize_import_target(language: &str, text: &str) -> String {
+    let trimmed = text.trim().trim_end_matches(';');
+    match SourceLanguage::from_name(language) {
+        SourceLanguage::Rust => trimmed
+            .strip_prefix("use ")
+            .or_else(|| trimmed.strip_prefix("pub use "))
+            .or_else(|| trimmed.strip_prefix("mod "))
+            .unwrap_or(trimmed)
+            .trim()
+            .trim_end_matches(';')
+            .to_string(),
+        SourceLanguage::Python => trimmed
+            .strip_prefix("from ")
+            .or_else(|| trimmed.strip_prefix("import "))
+            .unwrap_or(trimmed)
+            .trim()
+            .to_string(),
+        SourceLanguage::JavaScript | SourceLanguage::TypeScript | SourceLanguage::Tsx => trimmed
+            .split(['"', '\'', '`'])
+            .nth(1)
+            .unwrap_or(trimmed)
+            .to_string(),
+        SourceLanguage::Go => trimmed.split('"').nth(1).unwrap_or(trimmed).to_string(),
+        SourceLanguage::Unknown => trimmed.to_string(),
     }
 }
 fn hash_text(value: &str) -> String {
@@ -1460,6 +2292,159 @@ mod tests {
             .edges
             .iter()
             .any(|edge| edge.provenance.confidence < 90));
+    }
+
+    #[test]
+    fn tree_sitter_extracts_symbols_and_imports_for_supported_languages() {
+        let mut service = CodeIntelligenceService::new();
+        let scope = RepositoryScope {
+            repository_id: StableId::new("repo"),
+            worktree_id: StableId::new("wt"),
+            root: "/repo".to_string(),
+            commit: "abc".to_string(),
+            trust_profile: "trusted".to_string(),
+        };
+        service
+            .index_repository(
+                scope,
+                vec![
+                    source_file(
+                        "src/lib.rs",
+                        "rust",
+                        false,
+                        "use crate::api;\npub struct User;\nimpl User { pub fn name(&self) {} }\npub fn run() {}\n",
+                    ),
+                    source_file(
+                        "main.py",
+                        "python",
+                        false,
+                        "import os\nclass Worker:\n    pass\ndef handle():\n    pass\n",
+                    ),
+                    source_file(
+                        "web.ts",
+                        "typescript",
+                        false,
+                        "import { x } from './x';\ninterface User { id: string }\nclass View {}\nfunction render() {}\n",
+                    ),
+                    source_file(
+                        "server.go",
+                        "go",
+                        false,
+                        "package main\nimport \"fmt\"\ntype User struct{}\nfunc Serve() {}\n",
+                    ),
+                ],
+            )
+            .unwrap();
+
+        for path in ["src/lib.rs", "main.py", "web.ts", "server.go"] {
+            assert_eq!(service.parse_status(path), Some(ParseStatus::Parsed));
+        }
+        assert!(!service.query_symbols("run").is_empty());
+        assert!(!service.query_symbols("Worker").is_empty());
+        assert!(!service.query_symbols("render").is_empty());
+        assert!(!service.query_symbols("Serve").is_empty());
+        assert!(service
+            .imports_for("web.ts")
+            .iter()
+            .any(|edge| edge.to == "./x"));
+    }
+
+    #[test]
+    fn structural_search_and_rewrite_are_ast_scoped() {
+        let source = "fn target() -> u32 { 1 }\nfn untouched() -> u32 { target() }\n";
+        let matches = PatternMatcher
+            .search("rust", "function:target", source)
+            .unwrap();
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].name.as_deref(), Some("target"));
+        assert_eq!(matches[0].provenance, "TreeSitter");
+
+        let rewritten = structural_rewrite(
+            "rust",
+            source,
+            "function:target",
+            "fn target() -> usize { 1 }",
+        )
+        .unwrap();
+        assert!(rewritten.contains("fn target() -> usize"));
+        assert!(rewritten.contains("fn untouched() -> u32 { target() }"));
+        assert_eq!(
+            structural_rewrite("rust", source, "function:missing", "fn missing() {}")
+                .unwrap_err()
+                .code(),
+            "CODEINTEL-STRUCTURAL_MATCH_NOT_FOUND"
+        );
+    }
+
+    #[test]
+    fn lsp_discovery_reports_real_installed_status() {
+        let mut service = CodeIntelligenceService::new();
+        let session = service
+            .ensure_lsp_session(LspServerKind::Rust, "/tmp")
+            .unwrap();
+        if discover_lsp_executable(LspServerKind::Rust).is_some() {
+            assert_eq!(session.state, LspSessionState::Available);
+        } else {
+            assert_eq!(session.state, LspSessionState::Unavailable);
+        }
+    }
+
+    #[test]
+    fn lsp_workspace_edit_normalizes_changes_payload() {
+        let payload = json!({
+            "changes": {
+                "file:///tmp/demo.rs": [
+                    {
+                        "range": {
+                            "start": { "line": 0, "character": 7 },
+                            "end": { "line": 0, "character": 10 }
+                        },
+                        "newText": "new_name"
+                    }
+                ]
+            }
+        });
+        let edit = workspace_edit_from_lsp(LspServerKind::Rust, &payload).unwrap();
+        assert_eq!(edit.edits.len(), 1);
+        assert_eq!(edit.edits[0].file_path, "/tmp/demo.rs");
+        assert_eq!(edit.edits[0].range.start_line, 1);
+        assert_eq!(edit.edits[0].provenance, "Lsp:rust");
+    }
+
+    #[test]
+    fn rust_analyzer_lsp_lifecycle_runs_when_installed() {
+        let root = std::env::temp_dir().join(format!("agentcode-lsp-{}", StableId::new("tmp")));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(
+            root.join("Cargo.toml"),
+            "[package]\nname = \"agentcode_lsp_fixture\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[lib]\npath = \"src/lib.rs\"\n",
+        )
+        .unwrap();
+        let lib = root.join("src/lib.rs");
+        std::fs::write(&lib, "pub fn answer() -> u32 { 42 }\n").unwrap();
+
+        if discover_lsp_executable(LspServerKind::Rust).is_none() {
+            let err = match LspClient::start(LspServerKind::Rust, root.display().to_string()) {
+                Ok(client) => {
+                    let _ = client.shutdown();
+                    panic!(
+                        "rust-analyzer unexpectedly started after discovery returned unavailable"
+                    )
+                }
+                Err(error) => error,
+            };
+            assert_eq!(err.code(), "CODEINTEL-LANGUAGE_SERVER_UNAVAILABLE");
+            let _ = std::fs::remove_dir_all(root);
+            return;
+        }
+
+        let mut client = LspClient::start(LspServerKind::Rust, root.display().to_string()).unwrap();
+        let text = std::fs::read_to_string(&lib).unwrap();
+        let version = client.did_open(&lib, SourceLanguage::Rust, &text).unwrap();
+        assert_eq!(version, 1);
+        client.shutdown().unwrap();
+        let _ = std::fs::remove_dir_all(root);
     }
 
     fn source_file(

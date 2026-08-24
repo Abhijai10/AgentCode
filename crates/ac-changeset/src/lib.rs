@@ -231,6 +231,9 @@ pub enum EditStrategy {
         symbol: String,
         new_name: String,
     },
+    LspWorkspaceEdit {
+        edits: Vec<WorkspaceTextEdit>,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -241,6 +244,18 @@ pub enum EditStrategyKind {
     StructuredSymbol,
     AstGrep,
     LspRename,
+    LspWorkspaceEdit,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WorkspaceTextEdit {
+    pub path: String,
+    pub start_line: u32,
+    pub start_character: u32,
+    pub end_line: u32,
+    pub end_character: u32,
+    pub new_text: String,
+    pub provenance: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -353,7 +368,7 @@ impl EditEngine {
             }
             let current = repo.read(&request.path)?;
             validate_precondition(repo, &request, &current)?;
-            let after = apply_strategy(&current, &request.strategy)?;
+            let after = apply_strategy(&request.path, &current, &request.strategy)?;
             let before_hash = content_hash(&current);
             let after_hash = content_hash(&after);
             let (additions, removals) = line_delta(&current, &after);
@@ -661,7 +676,7 @@ fn validate_precondition<R: FileRepository>(
     Ok(())
 }
 
-fn apply_strategy(content: &str, strategy: &EditStrategy) -> AcResult<String> {
+fn apply_strategy(path: &str, content: &str, strategy: &EditStrategy) -> AcResult<String> {
     match strategy {
         EditStrategy::SearchReplace {
             search,
@@ -690,20 +705,17 @@ fn apply_strategy(content: &str, strategy: &EditStrategy) -> AcResult<String> {
             replacement,
         } => replace_symbol_line(content, symbol, replacement),
         EditStrategy::AstGrep { pattern, rewrite } => {
-            if pattern.trim().is_empty() {
-                return Err(AcError::validation(
-                    "EDIT-AST_GREP_PATTERN",
-                    "ast-grep pattern cannot be empty",
-                ));
-            }
-            let matches = content.matches(pattern).count();
-            if matches == 0 {
-                return Err(AcError::conflict(
-                    "EDIT-AST_GREP_NO_MATCH",
-                    "fallback ast-grep transform found no matches",
-                ));
-            }
-            Ok(content.replace(pattern, rewrite))
+            let language = language_for_path(path);
+            ac_code_intel::structural_rewrite(language, content, pattern, rewrite).map_err(
+                |error| {
+                    AcError::new(
+                        "EDIT-AST_GREP_ENGINE",
+                        error.to_string(),
+                        error.kind(),
+                        error.retryability(),
+                    )
+                },
+            )
         }
         EditStrategy::LspRename { symbol, new_name } => {
             if symbol.trim().is_empty() || new_name.trim().is_empty() {
@@ -712,7 +724,15 @@ fn apply_strategy(content: &str, strategy: &EditStrategy) -> AcResult<String> {
                     "LSP rename requires symbol and new name",
                 ));
             }
-            Ok(rename_identifier(content, symbol, new_name))
+            Err(AcError::new(
+                "EDIT-LANGUAGE_SERVER_UNAVAILABLE",
+                "LspRename requires a real LSP WorkspaceEdit; use LspWorkspaceEdit after textDocument/rename",
+                ac_common::ErrorKind::Unavailable,
+                ac_common::Retryability::NotRetryable,
+            ))
+        }
+        EditStrategy::LspWorkspaceEdit { edits } => {
+            apply_workspace_text_edits(path, content, edits)
         }
     }
 }
@@ -786,30 +806,6 @@ fn replace_symbol_line(content: &str, symbol: &str, replacement: &str) -> AcResu
     Ok(lines.join("\n") + trailing_newline(content))
 }
 
-fn rename_identifier(content: &str, symbol: &str, new_name: &str) -> String {
-    let mut output = String::with_capacity(content.len());
-    let mut token = String::new();
-    for ch in content.chars() {
-        if ch == '_' || ch.is_ascii_alphanumeric() {
-            token.push(ch);
-        } else {
-            if token == symbol {
-                output.push_str(new_name);
-            } else {
-                output.push_str(&token);
-            }
-            token.clear();
-            output.push(ch);
-        }
-    }
-    if token == symbol {
-        output.push_str(new_name);
-    } else {
-        output.push_str(&token);
-    }
-    output
-}
-
 fn trailing_newline(content: &str) -> &'static str {
     if content.ends_with('\n') {
         "\n"
@@ -826,6 +822,112 @@ fn strategy_kind(strategy: &EditStrategy) -> EditStrategyKind {
         EditStrategy::StructuredSymbol { .. } => EditStrategyKind::StructuredSymbol,
         EditStrategy::AstGrep { .. } => EditStrategyKind::AstGrep,
         EditStrategy::LspRename { .. } => EditStrategyKind::LspRename,
+        EditStrategy::LspWorkspaceEdit { .. } => EditStrategyKind::LspWorkspaceEdit,
+    }
+}
+
+fn apply_workspace_text_edits(
+    path: &str,
+    content: &str,
+    edits: &[WorkspaceTextEdit],
+) -> AcResult<String> {
+    for edit in edits {
+        validate_path(&edit.path)?;
+        if !edit.provenance.starts_with("Lsp:") {
+            return Err(AcError::validation(
+                "EDIT-LSP_WORKSPACE_EDIT_PROVENANCE",
+                "workspace edits must carry LSP provenance",
+            ));
+        }
+    }
+    let mut relevant = edits
+        .iter()
+        .filter(|edit| edit.path == path)
+        .cloned()
+        .collect::<Vec<_>>();
+    if relevant.is_empty() {
+        return Err(AcError::conflict(
+            "EDIT-LSP_WORKSPACE_EDIT_EMPTY",
+            "workspace edit contains no changes for request path",
+        ));
+    }
+    relevant.sort_by_key(|edit| {
+        std::cmp::Reverse((
+            edit.start_line,
+            edit.start_character,
+            edit.end_line,
+            edit.end_character,
+        ))
+    });
+    let line_starts = line_start_offsets(content);
+    let mut output = content.to_string();
+    let mut last_start = usize::MAX;
+    for edit in relevant {
+        let start =
+            position_to_offset(&line_starts, content, edit.start_line, edit.start_character)?;
+        let end = position_to_offset(&line_starts, content, edit.end_line, edit.end_character)?;
+        if start > end || end > output.len() {
+            return Err(AcError::validation(
+                "EDIT-LSP_WORKSPACE_EDIT_RANGE",
+                "workspace edit range is invalid",
+            ));
+        }
+        if end > last_start {
+            return Err(AcError::conflict(
+                "EDIT-LSP_WORKSPACE_EDIT_CONFLICT",
+                "workspace edit ranges overlap",
+            ));
+        }
+        output.replace_range(start..end, &edit.new_text);
+        last_start = start;
+    }
+    Ok(output)
+}
+
+fn line_start_offsets(content: &str) -> Vec<usize> {
+    let mut offsets = vec![0];
+    for (idx, byte) in content.bytes().enumerate() {
+        if byte == b'\n' {
+            offsets.push(idx + 1);
+        }
+    }
+    offsets
+}
+
+fn position_to_offset(
+    line_starts: &[usize],
+    content: &str,
+    one_based_line: u32,
+    character: u32,
+) -> AcResult<usize> {
+    let line = one_based_line.checked_sub(1).ok_or_else(|| {
+        AcError::validation(
+            "EDIT-LSP_WORKSPACE_EDIT_RANGE",
+            "line numbers are one-based",
+        )
+    })? as usize;
+    let line_start = *line_starts.get(line).ok_or_else(|| {
+        AcError::validation("EDIT-LSP_WORKSPACE_EDIT_RANGE", "line is outside document")
+    })?;
+    let offset = line_start + character as usize;
+    if !content.is_char_boundary(offset) {
+        return Err(AcError::validation(
+            "EDIT-LSP_WORKSPACE_EDIT_RANGE",
+            "edit offset is not a UTF-8 boundary",
+        ));
+    }
+    Ok(offset)
+}
+
+fn language_for_path(path: &str) -> &'static str {
+    match path.rsplit('.').next().unwrap_or("") {
+        "rs" => "rust",
+        "py" => "python",
+        "js" | "jsx" => "javascript",
+        "ts" => "typescript",
+        "tsx" => "tsx",
+        "go" => "go",
+        _ => "unknown",
     }
 }
 
@@ -1197,7 +1299,7 @@ mod tests {
             "pub fn old_name() -> u32 { 1 }\npub fn caller() -> u32 { old_name() }\n",
         );
         let engine = EditEngine;
-        let mut transaction = engine
+        let fake_rename = engine
             .prepare(
                 &repo,
                 vec![request(
@@ -1209,6 +1311,39 @@ mod tests {
                     },
                 )],
             )
+            .unwrap_err();
+        assert_eq!(fake_rename.code(), "EDIT-LANGUAGE_SERVER_UNAVAILABLE");
+
+        let mut transaction = engine
+            .prepare(
+                &repo,
+                vec![request(
+                    "src/lib.rs",
+                    &repo,
+                    EditStrategy::LspWorkspaceEdit {
+                        edits: vec![
+                            WorkspaceTextEdit {
+                                path: "src/lib.rs".to_string(),
+                                start_line: 1,
+                                start_character: 7,
+                                end_line: 1,
+                                end_character: 15,
+                                new_text: "new_name".to_string(),
+                                provenance: "Lsp:rust-analyzer".to_string(),
+                            },
+                            WorkspaceTextEdit {
+                                path: "src/lib.rs".to_string(),
+                                start_line: 2,
+                                start_character: 25,
+                                end_line: 2,
+                                end_character: 33,
+                                new_text: "new_name".to_string(),
+                                provenance: "Lsp:rust-analyzer".to_string(),
+                            },
+                        ],
+                    },
+                )],
+            )
             .unwrap();
         engine.apply(&mut repo, &mut transaction).unwrap();
         assert!(repo.read("src/lib.rs").unwrap().contains("new_name"));
@@ -1216,19 +1351,80 @@ mod tests {
             transaction.format_plan.formatter.as_deref(),
             Some("cargo fmt --all")
         );
-        assert_eq!(transaction.metrics.strategy, EditStrategyKind::LspRename);
+        assert_eq!(
+            transaction.metrics.strategy,
+            EditStrategyKind::LspWorkspaceEdit
+        );
 
         let ast_request = request(
             "src/lib.rs",
             &repo,
             EditStrategy::AstGrep {
-                pattern: "u32".to_string(),
-                rewrite: "usize".to_string(),
+                pattern: "function:caller".to_string(),
+                rewrite: "pub fn caller() -> usize { new_name() as usize }".to_string(),
             },
         );
         let ast = engine.prepare(&repo, vec![ast_request]).unwrap();
         assert_eq!(ast.edits[0].strategy, EditStrategyKind::AstGrep);
         assert!(ast.edits[0].after_content.contains("usize"));
+    }
+
+    #[test]
+    fn phase30_workspace_edit_rejects_escape_and_overlap_before_mutation() {
+        let mut repo = MemoryFileRepository::new("rev-a");
+        repo.put("src/lib.rs", "pub fn old_name() {}\n");
+        let engine = EditEngine;
+        let escaping = request(
+            "src/lib.rs",
+            &repo,
+            EditStrategy::LspWorkspaceEdit {
+                edits: vec![WorkspaceTextEdit {
+                    path: "../outside.rs".to_string(),
+                    start_line: 1,
+                    start_character: 7,
+                    end_line: 1,
+                    end_character: 15,
+                    new_text: "new_name".to_string(),
+                    provenance: "Lsp:rust-analyzer".to_string(),
+                }],
+            },
+        );
+        assert_eq!(
+            engine.prepare(&repo, vec![escaping]).unwrap_err().code(),
+            "EDIT-PATH_ESCAPE"
+        );
+
+        let overlapping = request(
+            "src/lib.rs",
+            &repo,
+            EditStrategy::LspWorkspaceEdit {
+                edits: vec![
+                    WorkspaceTextEdit {
+                        path: "src/lib.rs".to_string(),
+                        start_line: 1,
+                        start_character: 7,
+                        end_line: 1,
+                        end_character: 15,
+                        new_text: "new_name".to_string(),
+                        provenance: "Lsp:rust-analyzer".to_string(),
+                    },
+                    WorkspaceTextEdit {
+                        path: "src/lib.rs".to_string(),
+                        start_line: 1,
+                        start_character: 8,
+                        end_line: 1,
+                        end_character: 12,
+                        new_text: "bad".to_string(),
+                        provenance: "Lsp:rust-analyzer".to_string(),
+                    },
+                ],
+            },
+        );
+        assert_eq!(
+            engine.prepare(&repo, vec![overlapping]).unwrap_err().code(),
+            "EDIT-LSP_WORKSPACE_EDIT_CONFLICT"
+        );
+        assert_eq!(repo.read("src/lib.rs").unwrap(), "pub fn old_name() {}\n");
     }
 
     #[test]

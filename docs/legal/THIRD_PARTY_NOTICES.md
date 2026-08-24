@@ -8,6 +8,10 @@ Current release-preparation inventory is generated from workspace dependency aud
 records and persisted in schema v17. No copied donor repository code is recorded as
 shipped runtime material in this batch.
 
+Batch 3 admits Tree-sitter parser crates, LSP protocol types, and serde/serde_json
+for real code-intelligence parsing and LSP JSON-RPC payload handling. See
+`docs/policy/dependency-admissions/DEP-ADM-002-code-intel-real-engines.md`.
+
 Required fields per shipped component:
 
 - Name

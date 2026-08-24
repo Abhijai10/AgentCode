@@ -292,8 +292,72 @@
       "admission_record": null,
       "adopting_phase": "P02",
       "notes": "dev-time"
+    },
+    {
+      "id": "CAND-0019",
+      "name": "tree-sitter",
+      "status": "ACTUAL",
+      "resolved_version": "0.26.13",
+      "declared_license": "MIT",
+      "license_review": "INSPECTED",
+      "license_file": "~/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tree-sitter-0.26.13/LICENSE",
+      "classification": "DIRECT_RUNTIME_DEPENDENCY",
+      "source": "https://github.com/tree-sitter/tree-sitter",
+      "usage": "real syntax-tree parser runtime for code intelligence",
+      "attribution_required": true,
+      "admission_record": "docs/policy/dependency-admissions/DEP-ADM-002-code-intel-real-engines.md",
+      "adopting_phase": "Batch 3",
+      "notes": "pinned in Cargo.lock for ac-code-intel"
+    },
+    {
+      "id": "CAND-0020",
+      "name": "tree-sitter language grammars",
+      "status": "ACTUAL",
+      "resolved_version": "rust 0.24.2; python 0.25.0; javascript 0.25.0; typescript 0.23.2; go 0.25.0",
+      "declared_license": "MIT",
+      "license_review": "INSPECTED",
+      "license_file": "~/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tree-sitter-*/LICENSE",
+      "classification": "DIRECT_RUNTIME_DEPENDENCY",
+      "source": "https://github.com/tree-sitter",
+      "usage": "language grammars for Rust, Python, JavaScript, TypeScript/TSX, and Go",
+      "attribution_required": true,
+      "admission_record": "docs/policy/dependency-admissions/DEP-ADM-002-code-intel-real-engines.md",
+      "adopting_phase": "Batch 3",
+      "notes": "pinned in Cargo.lock for ac-code-intel"
+    },
+    {
+      "id": "CAND-0021",
+      "name": "lsp-types",
+      "status": "ACTUAL",
+      "resolved_version": "0.97.0",
+      "declared_license": "MIT",
+      "license_review": "INSPECTED",
+      "license_file": "~/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/lsp-types-0.97.0/LICENSE",
+      "classification": "DIRECT_RUNTIME_DEPENDENCY",
+      "source": "https://github.com/gluon-lang/lsp-types",
+      "usage": "Language Server Protocol type compatibility for code intelligence",
+      "attribution_required": true,
+      "admission_record": "docs/policy/dependency-admissions/DEP-ADM-002-code-intel-real-engines.md",
+      "adopting_phase": "Batch 3",
+      "notes": "pinned in Cargo.lock for ac-code-intel"
+    },
+    {
+      "id": "CAND-0022",
+      "name": "serde / serde_json",
+      "status": "ACTUAL",
+      "resolved_version": "serde 1.0.229; serde_json 1.0.151",
+      "declared_license": "MIT OR Apache-2.0",
+      "license_review": "INSPECTED",
+      "license_file": "~/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.229/LICENSE-*; ~/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde_json-1.0.151/LICENSE-*",
+      "classification": "DIRECT_RUNTIME_DEPENDENCY",
+      "source": "https://github.com/serde-rs",
+      "usage": "JSON-RPC framing and LSP payload handling",
+      "attribution_required": true,
+      "admission_record": "docs/policy/dependency-admissions/DEP-ADM-002-code-intel-real-engines.md",
+      "adopting_phase": "Batch 3",
+      "notes": "pinned in Cargo.lock for ac-code-intel"
     }
   ],
   "reference_research_entries": "see docs/reference/LICENSE_PROVENANCE_MATRIX.md (P01-WP02) — reference-library repos are research input only, never admitted as dependencies",
-  "last_updated": "2026-08-20"
+  "last_updated": "2026-08-25"
 }

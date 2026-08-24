@@ -6,6 +6,7 @@ license.workspace = true
 
 [dependencies]
 ac-common = { path = "../ac-common" }
+ac-code-intel = { path = "../ac-code-intel" }
 
 [lints]
 workspace = true
