@@ -5,7 +5,7 @@ Doc 10 gates for the phase pass and completion evidence exists).
 
 Phase names are the EXACT canonical names from Doc 09 HC-P00..HC-P29 (no aliases).
 
-Last updated: 2026-08-24 (Phase 11 context engine closure)
+Last updated: 2026-08-24 (Phase 12 autonomy kernel closure)
 
 | Phase | Name (Doc 09 HC-*) | Status | Notes |
 |-------|--------------------|--------|-------|
@@ -21,7 +21,7 @@ Last updated: 2026-08-24 (Phase 11 context engine closure)
 | P09 | Semantic Intelligence & Repository Graph | COMPLETE | P09-WP01..P09-WP14 ACCEPTED; LSP lifecycle contracts, language adapters, normalized definitions/references/diagnostics, optional SCIP/Zoekt decisions, unified semantic graph, workspace/test/API/schema edges and durable semantic persistence pass P9-G1..G10; evidence: docs/progress/phase-09-completion.md (+ .json) |
 | P10 | Persistent Memory & Knowledge Freshness | COMPLETE | P10-WP01..P10-WP10 ACCEPTED; typed evidence-linked facts, confidence/freshness, source invalidation, conflict sets, decision history, generated non-authoritative CONTEXT.md, snapshots, task memory and replacement handoff pass P10-G1..G11; evidence: docs/progress/phase-10-completion.md (+ .json) |
 | P11 | Context Engine & Token Efficiency | COMPLETE | P11-WP01..P11-WP13 ACCEPTED; typed fragments, deterministic relevance, hard includes, scoped rules, sensitivity filtering, profiles, token budgets, pack builder, dedupe, progressive retrieval, RTK-style compression, cache, metrics and benchmark receipts pass P11-G1..G11 plus benchmark gate; evidence: docs/progress/phase-11-completion.md (+ .json) |
-| P12 | Full Autonomy Kernel & Multi-Agent Runtime | NOT_STARTED | |
+| P12 | Full Autonomy Kernel & Multi-Agent Runtime | COMPLETE | P12-WP01..P12-WP24 ACCEPTED; mission contracts, requirement matrix, DAG validation, scheduler, worker registry, leases, heartbeats, progress/stall/loop detection, recovery/retry, Researcher, Verifier, mailbox, blackboard, concurrency, conflict prediction, resource governor, pause/resume/cancel, replanning, dynamic task discovery and escalation pass P12-G1..G20; evidence: docs/progress/phase-12-completion.md (+ .json) |
 | P13 | Advanced Edit Engine | NOT_STARTED | |
 | P14 | Verification & Evidence Engine | NOT_STARTED | |
 | P15 | Browser Runtime & Visual Verification | NOT_STARTED | |
