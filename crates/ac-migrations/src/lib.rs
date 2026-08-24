@@ -142,6 +142,12 @@ pub const SECURITY_RELEASE_V17: Migration = Migration {
     sql: include_str!("../../../migrations/0017_security_release.sql"),
 };
 
+pub const RELEASE_CANDIDATE_V1_V18: Migration = Migration {
+    id: "0018_release_candidate_v1",
+    description: "release candidates, validation runs, final decisions, manifests and bundles",
+    sql: include_str!("../../../migrations/0018_release_candidate_v1.sql"),
+};
+
 pub fn validate_migrations(migrations: &[Migration]) -> AcResult<()> {
     let mut seen = BTreeSet::new();
     for migration in migrations {

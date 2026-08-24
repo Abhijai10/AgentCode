@@ -509,4 +509,165 @@ mod tests {
             "RELEASE-APP_STATE_IN_REPOSITORY"
         );
     }
+
+    #[test]
+    fn phase28_release_candidate_gate_blocks_failed_validation_and_accepts_complete_evidence() {
+        let mut release = ReleaseEngineer::new();
+        let build = release
+            .capture_build("1.0.0-rc.1", "commit-rc", "release", "macos-arm64")
+            .unwrap();
+        let mut candidate = release
+            .create_candidate(
+                "1.0.0-rc.1",
+                "rc.1",
+                &build,
+                "macos-arm64",
+                vec!["release/rc/scope-freeze.md".to_string()],
+            )
+            .unwrap();
+        let migration = MigrationSafetyReport {
+            fresh_install: true,
+            upgrade: true,
+            schema_version: 18,
+            interrupted_recovery: true,
+            evidence_ref: "release/rc/migration-report.md".to_string(),
+        };
+        let failing = ReleaseChecklist {
+            security_checks: true,
+            tests: false,
+            artifact_verification: true,
+            migration_validation: true,
+        };
+        let failed_validation =
+            release.run_production_validation(&candidate, &migration, &failing, true, "rc/failed");
+        let blocked_gate = ReleaseCandidateGate {
+            tests_pass: false,
+            security_pass: true,
+            migrations_pass: true,
+            artifacts_valid: true,
+            evidence_refs: failed_validation.evidence_refs(),
+        };
+        assert_eq!(
+            release
+                .approve_candidate(&mut candidate, &failed_validation, &blocked_gate)
+                .unwrap_err()
+                .code(),
+            "RC-APPROVAL_BLOCKED"
+        );
+
+        let passing = ReleaseChecklist {
+            security_checks: true,
+            tests: true,
+            artifact_verification: true,
+            migration_validation: true,
+        };
+        let validation =
+            release.run_production_validation(&candidate, &migration, &passing, true, "rc/pass");
+        let gate = ReleaseCandidateGate {
+            tests_pass: true,
+            security_pass: true,
+            migrations_pass: true,
+            artifacts_valid: true,
+            evidence_refs: validation.evidence_refs(),
+        };
+        release
+            .approve_candidate(&mut candidate, &validation, &gate)
+            .unwrap();
+        assert_eq!(
+            candidate.validation_status,
+            ReleaseCandidateStatus::Accepted
+        );
+    }
+
+    #[test]
+    fn phase29_release_manifest_decision_bundle_and_status_require_evidence() {
+        let mut release = ReleaseEngineer::new();
+        let version = ReleaseVersion {
+            version: "1.0.0".to_string(),
+            source_commit: "commit-v1".to_string(),
+        };
+        let artifact = release
+            .create_artifact(&version, "macos-arm64", "app-bundle", b"agentcode-v1")
+            .unwrap();
+        let manifest = release
+            .final_manifest(
+                "1.0.0",
+                vec![
+                    "autonomous coding missions".to_string(),
+                    "Discuss Mode".to_string(),
+                    "Design Studio core".to_string(),
+                    "Security baseline".to_string(),
+                ],
+                vec!["0018_release_candidate_v1.sql".to_string()],
+                std::slice::from_ref(&artifact),
+                vec!["signed/notarized public artifact is prerequisite-bound".to_string()],
+            )
+            .unwrap();
+        assert!(manifest.manifest_hash.starts_with("fnv1a64:"));
+
+        let build = release
+            .capture_build("1.0.0", "commit-v1", "release", "macos-arm64")
+            .unwrap();
+        let candidate = release
+            .create_candidate(
+                "1.0.0",
+                "v1-final",
+                &build,
+                "macos-arm64",
+                vec!["release/manifest/v1.json".to_string()],
+            )
+            .unwrap();
+        let validation = release.run_production_validation(
+            &candidate,
+            &MigrationSafetyReport {
+                fresh_install: true,
+                upgrade: true,
+                schema_version: 18,
+                interrupted_recovery: true,
+                evidence_ref: "release/migration/final.md".to_string(),
+            },
+            &ReleaseChecklist {
+                security_checks: true,
+                tests: true,
+                artifact_verification: true,
+                migration_validation: true,
+            },
+            true,
+            "release/final",
+        );
+        let decision = release
+            .approve_release(&manifest, &validation, "security gate passed")
+            .unwrap();
+        assert_eq!(decision.approved_version, "1.0.0");
+        let bundle = release
+            .evidence_bundle(
+                "1.0.0",
+                "release/audit.md",
+                "release/security.md",
+                "release/validation.md",
+                "release/artifact.md",
+                "release/migration.md",
+            )
+            .unwrap();
+        assert!(bundle.complete());
+
+        let mut state = ReleaseStateMachine::new("1.0.0").unwrap();
+        assert_eq!(
+            state
+                .transition(ReleaseStatus::Released, "release/evidence")
+                .unwrap_err()
+                .code(),
+            "RELEASE-INVALID_TRANSITION"
+        );
+        state
+            .transition(ReleaseStatus::Candidate, "release/rc-accepted")
+            .unwrap();
+        state
+            .transition(ReleaseStatus::Approved, "release/decision")
+            .unwrap();
+        state
+            .transition(ReleaseStatus::Released, "release/published-hash")
+            .unwrap();
+        assert_eq!(state.status, ReleaseStatus::Released);
+    }
 }

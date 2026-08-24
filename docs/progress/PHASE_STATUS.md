@@ -5,7 +5,7 @@ Doc 10 gates for the phase pass and completion evidence exists).
 
 Phase names are the EXACT canonical names from Doc 09 HC-P00..HC-P29 (no aliases).
 
-Last updated: 2026-08-24 (Phase 26 security/licensing and Phase 27 release engineering closure)
+Last updated: 2026-08-24 (Phase 28 release candidate and Phase 29 V1 release closure)
 
 | Phase | Name (Doc 09 HC-*) | Status | Notes |
 |-------|--------------------|--------|-------|
@@ -37,8 +37,8 @@ Last updated: 2026-08-24 (Phase 26 security/licensing and Phase 27 release engin
 | P25 | AgentCode Dogfooding | COMPLETE | P25-WP01..P25-WP12 ACCEPTED; self-repository dogfood mission harness, findings, proposals, normal ChangeSet/verification flow, adversarial dogfood scenarios, metrics and durable feedback reports pass P25-G1..G14; evidence: docs/progress/phase-25-completion.md (+ .json) |
 | P26 | Security & Licensing Hardening | COMPLETE | P26-WP01..P26-WP12 ACCEPTED; threat model, boundary campaigns, prompt-injection/secret/privacy/MCP trust campaigns, dependency/license/SBOM/provenance closure, data retention review, signing prerequisites and self-red-team blocker report pass P26-G1..G8 and P26-L1..L6; evidence: docs/progress/phase-26-completion.md (+ .json) |
 | P27 | Packaging, Update & Release Engineering | COMPLETE | P27-WP01..P27-WP12 ACCEPTED; release artifact/build/update records, packaging layout, daemon lifecycle, app data paths, migration/upgrade records, managed-tool checksum validation, first-run checklist, diagnostics redaction, reset/rollback and signing pipeline prerequisites pass P27-G1..G11; evidence: docs/progress/phase-27-completion.md (+ .json) |
-| P28 | V1 Release Candidate | NOT_STARTED | |
-| P29 | V1 Release | NOT_STARTED | |
+| P28 | V1 Release Candidate | COMPLETE | P28-WP01..P28-WP14 ACCEPTED; RC model, validation sequence, production readiness audit, migration safety, regression path and approval gate pass RC-01..RC-20 with evidence; evidence: docs/progress/phase-28-completion.md (+ .json) |
+| P29 | V1 Release | COMPLETE | P29-WP01..P29-WP08 ACCEPTED; final manifest, immutable release decision, documentation, upgrade/rollback notes, evidence bundle and Draft→Candidate→Approved→Released state pass REL-G01..REL-G20; evidence: docs/progress/phase-29-completion.md (+ .json) |
 
 ## Work Package Records
 

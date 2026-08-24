@@ -25,6 +25,10 @@ path = "chaos_dogfood_flow.rs"
 name = "security_release_flow"
 path = "security_release_flow.rs"
 
+[[test]]
+name = "final_release_flow"
+path = "final_release_flow.rs"
+
 [dev-dependencies]
 ac-agent = { path = "../../crates/ac-agent" }
 ac-changeset = { path = "../../crates/ac-changeset" }

@@ -92,7 +92,7 @@ mod tests {
     fn sqlite_store_persists_kernel_state() {
         let mut db = ControlPlaneDb::open_memory().unwrap();
         db.migrate().unwrap();
-        assert_eq!(db.user_version().unwrap(), 17);
+        assert_eq!(db.user_version().unwrap(), 18);
 
         let mut kernel = Kernel::new(AllowAllPolicy);
         kernel.start().unwrap();
@@ -784,7 +784,7 @@ mod tests {
         {
             let mut db = ControlPlaneDb::open(&path).unwrap();
             db.migrate().unwrap();
-            assert_eq!(db.user_version().unwrap(), 17);
+            assert_eq!(db.user_version().unwrap(), 18);
             db.save_changeset_transaction(
                 &transaction,
                 Some("task-p13"),
@@ -863,7 +863,7 @@ mod tests {
         {
             let mut db = ControlPlaneDb::open(&path).unwrap();
             db.migrate().unwrap();
-            assert_eq!(db.user_version().unwrap(), 17);
+            assert_eq!(db.user_version().unwrap(), 18);
             db.save_verification_profile(&profile).unwrap();
             db.save_verification_manifest(
                 &manifest,
@@ -945,7 +945,7 @@ mod tests {
         {
             let mut db = ControlPlaneDb::open(&path).unwrap();
             db.migrate().unwrap();
-            assert_eq!(db.user_version().unwrap(), 17);
+            assert_eq!(db.user_version().unwrap(), 18);
             db.save_browser_process(&process).unwrap();
             db.save_browser_session(&session).unwrap();
             db.save_browser_dev_server(&dev_server).unwrap();
@@ -978,7 +978,7 @@ mod tests {
         {
             let mut db = ControlPlaneDb::open(&path).unwrap();
             db.migrate().unwrap();
-            assert_eq!(db.user_version().unwrap(), 17);
+            assert_eq!(db.user_version().unwrap(), 18);
             let skill = SkillManifest {
                 id: skill_id.clone(),
                 name: "Rust".to_string(),
@@ -1075,7 +1075,7 @@ mod tests {
         {
             let mut db = ControlPlaneDb::open(&path).unwrap();
             db.migrate().unwrap();
-            assert_eq!(db.user_version().unwrap(), 17);
+            assert_eq!(db.user_version().unwrap(), 18);
             let orchestrator = ac_security::BaselineSecurityOrchestrator::new(
                 ac_security::SecurityPolicy::baseline(),
             );
@@ -1126,7 +1126,7 @@ mod tests {
         {
             let mut db = ControlPlaneDb::open(&path).unwrap();
             db.migrate().unwrap();
-            assert_eq!(db.user_version().unwrap(), 17);
+            assert_eq!(db.user_version().unwrap(), 18);
             db.save_discuss_session(&DiscussSessionRow {
                 id: discuss_id.clone(),
                 repository_id: "repo-a".to_string(),
@@ -1254,7 +1254,7 @@ mod tests {
         {
             let mut db = ControlPlaneDb::open(&path).unwrap();
             db.migrate().unwrap();
-            assert_eq!(db.user_version().unwrap(), 17);
+            assert_eq!(db.user_version().unwrap(), 18);
             db.save_desktop_session(&DesktopSessionRow {
                 id: session_id.clone(),
                 active_project_id: Some(project_id.clone()),
@@ -1379,7 +1379,7 @@ mod tests {
         {
             let mut db = ControlPlaneDb::open(&path).unwrap();
             db.migrate().unwrap();
-            assert_eq!(db.user_version().unwrap(), 17);
+            assert_eq!(db.user_version().unwrap(), 18);
             db.save_chaos_experiment(&ChaosExperimentRow {
                 id: chaos_id.clone(),
                 gate_id: "P24-G5".to_string(),
@@ -1498,7 +1498,7 @@ mod tests {
         {
             let mut db = ControlPlaneDb::open(&path).unwrap();
             db.migrate().unwrap();
-            assert_eq!(db.user_version().unwrap(), 17);
+            assert_eq!(db.user_version().unwrap(), 18);
             db.save_dependency_audit(&DependencyAuditRow {
                 id: "dep-a".to_string(),
                 name: "rusqlite".to_string(),
@@ -1564,6 +1564,101 @@ mod tests {
             assert!(db.release_builds().unwrap()[0].reproducible);
             assert_eq!(db.release_artifacts().unwrap()[0].platform, "macos-arm64");
             assert!(db.update_records().unwrap()[0].verified);
+        }
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn phase28_29_release_candidate_and_v1_state_survive_reopen() {
+        let path = std::env::temp_dir().join(format!(
+            "agentcode-phase28-29-{}.sqlite",
+            StableId::new("db")
+        ));
+        {
+            let mut db = ControlPlaneDb::open(&path).unwrap();
+            db.migrate().unwrap();
+            assert_eq!(db.user_version().unwrap(), 18);
+            db.save_release_candidate(&ReleaseCandidateRow {
+                id: "rc-a".to_string(),
+                version: "1.0.0-rc.1".to_string(),
+                candidate_id: "rc.1".to_string(),
+                build_id: "build-a".to_string(),
+                commit_hash: "commit-a".to_string(),
+                platform_target: "macos-arm64".to_string(),
+                validation_status: "accepted".to_string(),
+                evidence_refs: "release/rc/manifest.md".to_string(),
+                created_at_ms: 1,
+            })
+            .unwrap();
+            db.save_release_validation_run(&ReleaseValidationRunRow {
+                id: "validation-a".to_string(),
+                candidate_id: "rc-a".to_string(),
+                security_status: "pass".to_string(),
+                tests_status: "pass".to_string(),
+                migration_status: "pass".to_string(),
+                artifact_status: "pass".to_string(),
+                performance_status: "pass".to_string(),
+                release_approval_status: "pass".to_string(),
+                evidence_refs: "security,tests,migration,artifact,performance,approval"
+                    .to_string(),
+                created_at_ms: 2,
+            })
+            .unwrap();
+            db.save_release_approval_decision(&ReleaseApprovalDecisionRow {
+                id: "decision-a".to_string(),
+                approved_version: "1.0.0".to_string(),
+                validation_evidence_refs: "release/validation/final.md".to_string(),
+                security_status: "pass".to_string(),
+                approval_timestamp_ms: 3,
+            })
+            .unwrap();
+            db.save_final_release_manifest(&FinalReleaseManifestRow {
+                id: "manifest-a".to_string(),
+                version: "1.0.0".to_string(),
+                features: "missions,discuss,design,security".to_string(),
+                migrations: "0001..0018".to_string(),
+                artifacts: "artifact-a".to_string(),
+                checksums: "fnv1a64:artifact".to_string(),
+                known_limitations: "notarization prerequisite-bound".to_string(),
+                manifest_hash: "fnv1a64:manifest".to_string(),
+                created_at_ms: 4,
+            })
+            .unwrap();
+            db.save_release_evidence_bundle(&ReleaseEvidenceBundleRow {
+                id: "bundle-a".to_string(),
+                version: "1.0.0".to_string(),
+                audit_report_ref: "release/audit.md".to_string(),
+                security_report_ref: "release/security.md".to_string(),
+                validation_report_ref: "release/validation.md".to_string(),
+                artifact_report_ref: "release/artifact.md".to_string(),
+                migration_report_ref: "release/migration.md".to_string(),
+                created_at_ms: 5,
+            })
+            .unwrap();
+        }
+        {
+            let mut db = ControlPlaneDb::open(&path).unwrap();
+            db.migrate().unwrap();
+            assert_eq!(
+                db.release_candidates().unwrap()[0].validation_status,
+                "accepted"
+            );
+            assert_eq!(
+                db.release_validation_runs().unwrap()[0].release_approval_status,
+                "pass"
+            );
+            assert_eq!(
+                db.release_approval_decisions().unwrap()[0].approved_version,
+                "1.0.0"
+            );
+            assert_eq!(
+                db.final_release_manifests().unwrap()[0].manifest_hash,
+                "fnv1a64:manifest"
+            );
+            assert_eq!(
+                db.release_evidence_bundles().unwrap()[0].migration_report_ref,
+                "release/migration.md"
+            );
         }
         let _ = fs::remove_file(path);
     }

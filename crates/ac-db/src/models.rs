@@ -872,3 +872,64 @@ pub struct UpdateRecordRow {
     pub recovery_action: String,
     pub created_at_ms: i64,
 }
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReleaseCandidateRow {
+    pub id: String,
+    pub version: String,
+    pub candidate_id: String,
+    pub build_id: String,
+    pub commit_hash: String,
+    pub platform_target: String,
+    pub validation_status: String,
+    pub evidence_refs: String,
+    pub created_at_ms: i64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReleaseValidationRunRow {
+    pub id: String,
+    pub candidate_id: String,
+    pub security_status: String,
+    pub tests_status: String,
+    pub migration_status: String,
+    pub artifact_status: String,
+    pub performance_status: String,
+    pub release_approval_status: String,
+    pub evidence_refs: String,
+    pub created_at_ms: i64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReleaseApprovalDecisionRow {
+    pub id: String,
+    pub approved_version: String,
+    pub validation_evidence_refs: String,
+    pub security_status: String,
+    pub approval_timestamp_ms: i64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FinalReleaseManifestRow {
+    pub id: String,
+    pub version: String,
+    pub features: String,
+    pub migrations: String,
+    pub artifacts: String,
+    pub checksums: String,
+    pub known_limitations: String,
+    pub manifest_hash: String,
+    pub created_at_ms: i64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReleaseEvidenceBundleRow {
+    pub id: String,
+    pub version: String,
+    pub audit_report_ref: String,
+    pub security_report_ref: String,
+    pub validation_report_ref: String,
+    pub artifact_report_ref: String,
+    pub migration_report_ref: String,
+    pub created_at_ms: i64,
+}
