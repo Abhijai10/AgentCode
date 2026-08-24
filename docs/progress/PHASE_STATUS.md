@@ -5,7 +5,7 @@ Doc 10 gates for the phase pass and completion evidence exists).
 
 Phase names are the EXACT canonical names from Doc 09 HC-P00..HC-P29 (no aliases).
 
-Last updated: 2026-08-24 (Phase 9 semantic intelligence closure)
+Last updated: 2026-08-24 (Phase 10 persistent memory closure)
 
 | Phase | Name (Doc 09 HC-*) | Status | Notes |
 |-------|--------------------|--------|-------|
@@ -19,7 +19,7 @@ Last updated: 2026-08-24 (Phase 9 semantic intelligence closure)
 | P07 | Git, Worktrees & Checkpointing | COMPLETE | P07-WP01..P07-WP09 ACCEPTED; durable lease fencing, dirty-base protection, task checkpoints, replacement recovery, safe cleanup/reconciliation, integration branches, and structured conflicts pass P7-G1..G9; evidence: docs/progress/phase-07-completion.md (+ .json) |
 | P08 | Code Intelligence Foundation | COMPLETE | P08-WP01..P08-WP13 ACCEPTED; deterministic parser/search fallbacks, durable structural index, import graph, incremental indexing, polling watcher and ContextBuilder retrieval evidence are implemented; evidence: docs/progress/phase-08-completion.md (+ .json) |
 | P09 | Semantic Intelligence & Repository Graph | COMPLETE | P09-WP01..P09-WP14 ACCEPTED; LSP lifecycle contracts, language adapters, normalized definitions/references/diagnostics, optional SCIP/Zoekt decisions, unified semantic graph, workspace/test/API/schema edges and durable semantic persistence pass P9-G1..G10; evidence: docs/progress/phase-09-completion.md (+ .json) |
-| P10 | Persistent Memory & Knowledge Freshness | NOT_STARTED | |
+| P10 | Persistent Memory & Knowledge Freshness | COMPLETE | P10-WP01..P10-WP10 ACCEPTED; typed evidence-linked facts, confidence/freshness, source invalidation, conflict sets, decision history, generated non-authoritative CONTEXT.md, snapshots, task memory and replacement handoff pass P10-G1..G11; evidence: docs/progress/phase-10-completion.md (+ .json) |
 | P11 | Context Engine & Token Efficiency | NOT_STARTED | |
 | P12 | Full Autonomy Kernel & Multi-Agent Runtime | NOT_STARTED | |
 | P13 | Advanced Edit Engine | NOT_STARTED | |
