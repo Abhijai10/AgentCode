@@ -88,6 +88,12 @@ pub const ADVANCED_EDIT_ENGINE_V8: Migration = Migration {
     sql: include_str!("../../../migrations/0008_advanced_edit_engine.sql"),
 };
 
+pub const VERIFICATION_EVIDENCE_ENGINE_V9: Migration = Migration {
+    id: "0009_verification_evidence_engine",
+    description: "verification profiles, runs, requirement links, findings, and final audits",
+    sql: include_str!("../../../migrations/0009_verification_evidence_engine.sql"),
+};
+
 pub fn validate_migrations(migrations: &[Migration]) -> AcResult<()> {
     let mut seen = BTreeSet::new();
     for migration in migrations {

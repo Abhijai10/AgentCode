@@ -23,7 +23,7 @@ use ac_provider::{
 use ac_runtime::{AgentSession, AgentSessionState};
 use ac_security::{Capability, CapabilityPolicy};
 use ac_tool::{ToolBroker, ToolRequest, ToolResult, ToolStatus};
-use ac_verification::{ValidationRunReport, VerificationEngine};
+use ac_verification::{FinalAuditInput, ValidationRunReport, VerificationEngine};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Goal {
@@ -946,6 +946,29 @@ impl<P: PolicyBoundary> AutonomousAgent<P> {
         )?;
         let mut accepted = evidence_refs.to_vec();
         accepted.push(completion_evidence);
+        let audit = self.verification.final_audit(
+            FinalAuditInput {
+                original_goal: goal.text.clone(),
+                requirements: vec![goal.stopping_condition.clone()],
+                verified_requirement_ids: vec![goal.id.clone()],
+                evidence_refs: accepted.clone(),
+                worker_completion_text: "worker requests completion with verification evidence"
+                    .to_string(),
+                unresolved_limitations: Vec::new(),
+            },
+            &mut self.evidence,
+        )?;
+        let gate = self.verification.completion_gate(
+            &audit,
+            "worker requests completion with verification evidence",
+        );
+        if !gate.allowed {
+            return Err(AcError::conflict(
+                "AGENT-COMPLETION_GATE_BLOCKED",
+                gate.reason,
+            ));
+        }
+        accepted.push(audit.evidence_ref);
         self.kernel
             .transition_mission(mission_id, MissionState::Completed, accepted)
     }

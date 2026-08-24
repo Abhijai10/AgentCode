@@ -11,6 +11,8 @@ ac-common = { path = "../ac-common" }
 ac-evidence = { path = "../ac-evidence" }
 ac-git = { path = "../ac-git" }
 ac-kernel = { path = "../ac-kernel" }
+ac-security = { path = "../ac-security" }
+ac-verification = { path = "../ac-verification" }
 rusqlite = { version = "0.32", features = ["bundled"] }
 
 [lints]

@@ -5,6 +5,9 @@ use ac_common::{AcError, AcResult, StableId, TimestampMillis};
 use ac_evidence::EvidenceRecord;
 use ac_git::{CheckpointRecord, WorktreeRecord};
 use ac_kernel::{KernelDecisionKind, KernelEvent, Mission, MissionState};
+use ac_verification::{
+    FinalAuditReport, RequirementEvidenceLink, VerificationEvidenceManifest, VerificationProfile,
+};
 use rusqlite::{params, Connection, OptionalExtension};
 
 pub struct ControlPlaneDb {
@@ -285,6 +288,48 @@ pub struct EditStrategyMetricRow {
     pub created_at_ms: i64,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VerificationRunRow {
+    pub id: String,
+    pub profile_id: Option<String>,
+    pub task_id: Option<String>,
+    pub commit_ref: String,
+    pub worktree_id: String,
+    pub environment: String,
+    pub command: String,
+    pub tool_version: String,
+    pub normalized_result: String,
+    pub raw_artifact: String,
+    pub evidence_ref: String,
+    pub freshness_dependencies: String,
+    pub created_at_ms: i64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RequirementVerificationRow {
+    pub id: String,
+    pub requirement_id: String,
+    pub verification_run_id: String,
+    pub evidence_ref: String,
+    pub evidence_kind: String,
+    pub verified: bool,
+    pub freshness_key: String,
+    pub created_at_ms: i64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FinalAuditRow {
+    pub id: String,
+    pub mission_id: String,
+    pub original_goal: String,
+    pub requirements: String,
+    pub evidence_refs: String,
+    pub passed: bool,
+    pub return_to_repair: bool,
+    pub completion_allowed: bool,
+    pub created_at_ms: i64,
+}
+
 impl ControlPlaneDb {
     pub fn open(path: impl AsRef<Path>) -> AcResult<Self> {
         let connection = Connection::open(path).map_err(db_error)?;
@@ -302,11 +347,11 @@ impl ControlPlaneDb {
 
     pub fn migrate(&mut self) -> AcResult<()> {
         let current_version = self.user_version()?;
-        if current_version > 8 {
+        if current_version > 9 {
             return Err(AcError::conflict(
                 "DB-FUTURE_VERSION",
                 format!(
-                    "database user_version {current_version} is newer than supported version 8"
+                    "database user_version {current_version} is newer than supported version 9"
                 ),
             ));
         }
@@ -353,7 +398,13 @@ impl ControlPlaneDb {
             ))
             .map_err(db_error)?;
         }
-        tx.pragma_update(None, "user_version", 8)
+        if current_version < 9 {
+            tx.execute_batch(include_str!(
+                "../../../migrations/0009_verification_evidence_engine.sql"
+            ))
+            .map_err(db_error)?;
+        }
+        tx.pragma_update(None, "user_version", 9)
             .map_err(db_error)?;
         tx.commit().map_err(db_error)?;
         Ok(())
@@ -1523,6 +1574,198 @@ impl ControlPlaneDb {
         rows.collect::<Result<Vec<_>, _>>().map_err(db_error)
     }
 
+    pub fn save_verification_profile(&self, profile: &VerificationProfile) -> AcResult<()> {
+        self.connection
+            .execute(
+                "INSERT INTO verification_profiles VALUES (?1, ?2, ?3, ?4, ?5)
+                 ON CONFLICT(id) DO UPDATE SET required_layers=excluded.required_layers",
+                params![
+                    profile.id.to_string(),
+                    profile.task_id.to_string(),
+                    format!("{:?}", profile.risk),
+                    profile
+                        .required_layers
+                        .iter()
+                        .map(|layer| format!("{:?}", layer))
+                        .collect::<Vec<_>>()
+                        .join(","),
+                    millis(profile.created_at)
+                ],
+            )
+            .map_err(db_error)?;
+        Ok(())
+    }
+
+    pub fn save_verification_manifest(
+        &self,
+        manifest: &VerificationEvidenceManifest,
+        profile_id: Option<&str>,
+        task_id: Option<&str>,
+    ) -> AcResult<()> {
+        self.connection
+            .execute(
+                "INSERT INTO verification_runs VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+                params![
+                    manifest.id.to_string(),
+                    profile_id,
+                    task_id,
+                    manifest.commit,
+                    manifest.worktree,
+                    manifest.environment,
+                    manifest.command,
+                    manifest.tool_version,
+                    format!("{:?}", manifest.normalized_result),
+                    manifest.raw_artifact,
+                    manifest.evidence_ref.to_string(),
+                    manifest.freshness_dependencies.join(","),
+                    millis(manifest.created_at)
+                ],
+            )
+            .map_err(db_error)?;
+        Ok(())
+    }
+
+    pub fn save_requirement_verification(
+        &self,
+        run_id: &str,
+        link: &RequirementEvidenceLink,
+    ) -> AcResult<()> {
+        self.connection
+            .execute(
+                "INSERT INTO requirement_verifications VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                params![
+                    StableId::new("reqver").to_string(),
+                    link.requirement_id.to_string(),
+                    run_id,
+                    link.evidence_ref.to_string(),
+                    link.evidence_kind,
+                    if link.verified { 1_i64 } else { 0_i64 },
+                    link.freshness_key,
+                    millis(TimestampMillis::now())
+                ],
+            )
+            .map_err(db_error)?;
+        Ok(())
+    }
+
+    pub fn save_final_audit(
+        &self,
+        mission_id: &str,
+        original_goal: &str,
+        requirements: &[String],
+        audit: &FinalAuditReport,
+        completion_allowed: bool,
+    ) -> AcResult<()> {
+        self.connection
+            .execute(
+                "INSERT INTO final_audits VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                params![
+                    audit.id.to_string(),
+                    mission_id,
+                    original_goal,
+                    requirements.join("\n"),
+                    audit
+                        .findings
+                        .iter()
+                        .map(|finding| finding.code.clone())
+                        .collect::<Vec<_>>()
+                        .join(","),
+                    if audit.passed { 1_i64 } else { 0_i64 },
+                    if audit.return_to_repair { 1_i64 } else { 0_i64 },
+                    if completion_allowed { 1_i64 } else { 0_i64 },
+                    millis(TimestampMillis::now())
+                ],
+            )
+            .map_err(db_error)?;
+        Ok(())
+    }
+
+    pub fn verification_run(&self, id: &str) -> AcResult<Option<VerificationRunRow>> {
+        self.connection
+            .query_row(
+                "SELECT id, profile_id, task_id, commit_ref, worktree_id, environment, command,
+                        tool_version, normalized_result, raw_artifact, evidence_ref,
+                        freshness_dependencies, created_at_ms
+                 FROM verification_runs WHERE id=?1",
+                params![id],
+                |row| {
+                    Ok(VerificationRunRow {
+                        id: row.get(0)?,
+                        profile_id: row.get(1)?,
+                        task_id: row.get(2)?,
+                        commit_ref: row.get(3)?,
+                        worktree_id: row.get(4)?,
+                        environment: row.get(5)?,
+                        command: row.get(6)?,
+                        tool_version: row.get(7)?,
+                        normalized_result: row.get(8)?,
+                        raw_artifact: row.get(9)?,
+                        evidence_ref: row.get(10)?,
+                        freshness_dependencies: row.get(11)?,
+                        created_at_ms: row.get(12)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(db_error)
+    }
+
+    pub fn requirement_verifications(
+        &self,
+        requirement_id: &str,
+    ) -> AcResult<Vec<RequirementVerificationRow>> {
+        let mut stmt = self
+            .connection
+            .prepare(
+                "SELECT id, requirement_id, verification_run_id, evidence_ref, evidence_kind,
+                        verified, freshness_key, created_at_ms
+                 FROM requirement_verifications WHERE requirement_id=?1 ORDER BY created_at_ms ASC",
+            )
+            .map_err(db_error)?;
+        let rows = stmt
+            .query_map(params![requirement_id], |row| {
+                Ok(RequirementVerificationRow {
+                    id: row.get(0)?,
+                    requirement_id: row.get(1)?,
+                    verification_run_id: row.get(2)?,
+                    evidence_ref: row.get(3)?,
+                    evidence_kind: row.get(4)?,
+                    verified: row.get::<_, i64>(5)? != 0,
+                    freshness_key: row.get(6)?,
+                    created_at_ms: row.get(7)?,
+                })
+            })
+            .map_err(db_error)?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(db_error)
+    }
+
+    pub fn final_audits(&self, mission_id: &str) -> AcResult<Vec<FinalAuditRow>> {
+        let mut stmt = self
+            .connection
+            .prepare(
+                "SELECT id, mission_id, original_goal, requirements, evidence_refs, passed,
+                        return_to_repair, completion_allowed, created_at_ms
+                 FROM final_audits WHERE mission_id=?1 ORDER BY created_at_ms ASC",
+            )
+            .map_err(db_error)?;
+        let rows = stmt
+            .query_map(params![mission_id], |row| {
+                Ok(FinalAuditRow {
+                    id: row.get(0)?,
+                    mission_id: row.get(1)?,
+                    original_goal: row.get(2)?,
+                    requirements: row.get(3)?,
+                    evidence_refs: row.get(4)?,
+                    passed: row.get::<_, i64>(5)? != 0,
+                    return_to_repair: row.get::<_, i64>(6)? != 0,
+                    completion_allowed: row.get::<_, i64>(7)? != 0,
+                    created_at_ms: row.get(8)?,
+                })
+            })
+            .map_err(db_error)?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(db_error)
+    }
+
     fn configure(&self) -> AcResult<()> {
         self.connection
             .pragma_update(None, "foreign_keys", "ON")
@@ -2439,7 +2682,7 @@ mod tests {
     fn sqlite_store_persists_kernel_state() {
         let mut db = ControlPlaneDb::open_memory().unwrap();
         db.migrate().unwrap();
-        assert_eq!(db.user_version().unwrap(), 8);
+        assert_eq!(db.user_version().unwrap(), 9);
 
         let mut kernel = Kernel::new(AllowAllPolicy);
         kernel.start().unwrap();
@@ -3057,7 +3300,7 @@ mod tests {
         {
             let mut db = ControlPlaneDb::open(&path).unwrap();
             db.migrate().unwrap();
-            assert_eq!(db.user_version().unwrap(), 8);
+            assert_eq!(db.user_version().unwrap(), 9);
             db.save_changeset_transaction(
                 &transaction,
                 Some("task-p13"),
@@ -3086,6 +3329,90 @@ mod tests {
                     .strategy,
                 "SearchReplace"
             );
+        }
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn phase14_verification_state_survives_reopen() {
+        let path =
+            std::env::temp_dir().join(format!("agentcode-p14-{}.sqlite", StableId::new("db")));
+        let engine = ac_verification::VerificationEngine::new(ac_security::CapabilityPolicy::new());
+        let mut evidence = ac_evidence::EvidenceStore::new();
+        let profile = engine.derive_profile(
+            StableId::new("task"),
+            ac_verification::VerificationRisk::High,
+            &ac_verification::ProjectCapabilities {
+                cargo: true,
+                makefile: false,
+                package_json: false,
+                browser: false,
+                security: false,
+            },
+        );
+        let requirement_id = StableId::new("req");
+        let manifest = engine
+            .record_evidence_manifest(
+                "commit-p14",
+                "worktree-p14",
+                "cargo test --workspace",
+                ac_verification::GateStatus::Passed,
+                vec![requirement_id.clone()],
+                vec!["src/lib.rs".to_string()],
+                &mut evidence,
+            )
+            .unwrap();
+        let link = engine.link_requirement_evidence(requirement_id.clone(), &manifest);
+        let audit = engine
+            .final_audit(
+                ac_verification::FinalAuditInput {
+                    original_goal: "finish phase 14".to_string(),
+                    requirements: vec!["verification evidence exists".to_string()],
+                    verified_requirement_ids: vec![requirement_id.clone()],
+                    evidence_refs: vec![manifest.evidence_ref.clone()],
+                    worker_completion_text: "verified".to_string(),
+                    unresolved_limitations: Vec::new(),
+                },
+                &mut evidence,
+            )
+            .unwrap();
+        {
+            let mut db = ControlPlaneDb::open(&path).unwrap();
+            db.migrate().unwrap();
+            assert_eq!(db.user_version().unwrap(), 9);
+            db.save_verification_profile(&profile).unwrap();
+            db.save_verification_manifest(
+                &manifest,
+                Some(profile.id.as_str()),
+                Some(profile.task_id.as_str()),
+            )
+            .unwrap();
+            db.save_requirement_verification(manifest.id.as_str(), &link)
+                .unwrap();
+            db.save_final_audit(
+                "mission-p14",
+                "finish phase 14",
+                &["verification evidence exists".to_string()],
+                &audit,
+                true,
+            )
+            .unwrap();
+        }
+        {
+            let db = ControlPlaneDb::open(&path).unwrap();
+            assert_eq!(
+                db.verification_run(manifest.id.as_str())
+                    .unwrap()
+                    .unwrap()
+                    .normalized_result,
+                "Passed"
+            );
+            assert!(
+                db.requirement_verifications(requirement_id.as_str())
+                    .unwrap()[0]
+                    .verified
+            );
+            assert!(db.final_audits("mission-p14").unwrap()[0].completion_allowed);
         }
         let _ = fs::remove_file(path);
     }

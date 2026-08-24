@@ -73,6 +73,8 @@ dependencies = [
  "ac-evidence",
  "ac-git",
  "ac-kernel",
+ "ac-security",
+ "ac-verification",
  "rusqlite",
 ]
 
