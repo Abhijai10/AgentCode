@@ -61,3 +61,7 @@
 ## Acceptance Decision
 
 ACCEPTED for Phase 3: the worker loop plans, retrieves context, executes through tools, verifies, generates repairs, creates final ChangeSets, requires Kernel approval for merge, and passes the autonomous coding benchmark.
+
+## Phase 6 Closure Evidence
+
+Worker identity, lifecycle, task decomposition, attempt accounting, retry state, and restart persistence are now provided by `ac-runtime` and `ac-db`. `AgentSession` remains ephemeral; the autonomous worker emits an evidence-backed completion request and Kernel remains the sole mission transition authority.

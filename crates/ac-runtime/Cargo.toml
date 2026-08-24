@@ -6,6 +6,7 @@ license.workspace = true
 
 [dependencies]
 ac-common = { path = "../ac-common" }
+ac-db = { path = "../ac-db" }
 ac-context = { path = "../ac-context" }
 ac-git = { path = "../ac-git" }
 ac-provider = { path = "../ac-provider" }

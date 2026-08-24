@@ -133,6 +133,7 @@ version = "0.1.0"
 dependencies = [
  "ac-common",
  "ac-context",
+ "ac-db",
  "ac-evidence",
  "ac-git",
  "ac-provider",

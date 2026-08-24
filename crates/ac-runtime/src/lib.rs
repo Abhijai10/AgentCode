@@ -1,9 +1,10 @@
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use ac_common::{AcError, AcResult, StableId, TimestampMillis};
 use ac_context::{ContextNode, ContextPack};
+use ac_db::{ControlPlaneDb, TaskAttemptRecord, TaskRecord, WorkerRecord};
 use ac_git::CheckpointRecord;
 use ac_provider::{NormalizedInferenceRequest, ProviderStreamEvent};
 use ac_tool::{ToolRequest, ToolResult};
@@ -69,6 +70,19 @@ impl Default for CancellationToken {
 pub struct Worker {
     pub id: StableId,
     pub workspace_ref: Option<StableId>,
+    pub mission_id: Option<StableId>,
+    pub state: WorkerState,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum WorkerState {
+    Created,
+    Assigned,
+    Running,
+    Checkpointed,
+    Cancelled,
+    Completed,
+    Failed,
 }
 
 impl Worker {
@@ -76,6 +90,8 @@ impl Worker {
         Self {
             id: StableId::new("worker"),
             workspace_ref: None,
+            mission_id: None,
+            state: WorkerState::Created,
         }
     }
 
@@ -83,6 +99,286 @@ impl Worker {
         Self {
             id: StableId::new("worker"),
             workspace_ref: Some(workspace_ref),
+            mission_id: None,
+            state: WorkerState::Created,
+        }
+    }
+}
+
+impl Worker {
+    pub fn assign(&mut self, mission_id: StableId) -> AcResult<()> {
+        if self.state != WorkerState::Created {
+            return Err(AcError::conflict(
+                "RUNTIME-WORKER_ALREADY_ASSIGNED",
+                "worker may only be assigned once",
+            ));
+        }
+        self.mission_id = Some(mission_id);
+        self.state = WorkerState::Assigned;
+        Ok(())
+    }
+
+    pub fn transition(&mut self, next: WorkerState) -> AcResult<()> {
+        let valid = matches!(
+            (self.state, next),
+            (WorkerState::Assigned, WorkerState::Running)
+                | (WorkerState::Running, WorkerState::Checkpointed)
+                | (WorkerState::Checkpointed, WorkerState::Running)
+                | (WorkerState::Running, WorkerState::Cancelled)
+                | (WorkerState::Running, WorkerState::Completed)
+                | (WorkerState::Running, WorkerState::Failed)
+        );
+        if !valid {
+            return Err(AcError::conflict(
+                "RUNTIME-WORKER_INVALID_STATE",
+                "invalid worker lifecycle transition",
+            ));
+        }
+        self.state = next;
+        Ok(())
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TaskState {
+    Pending,
+    Ready,
+    Running,
+    Retryable,
+    Completed,
+    Failed,
+    Cancelled,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WorkerTask {
+    pub id: StableId,
+    pub mission_id: StableId,
+    pub title: String,
+    pub dependencies: Vec<StableId>,
+    pub state: TaskState,
+    pub assigned_worker: Option<StableId>,
+    pub retry_count: u32,
+    pub max_retries: u32,
+    pub evidence_refs: Vec<StableId>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TaskAttempt {
+    pub id: StableId,
+    pub task_id: StableId,
+    pub worker_id: StableId,
+    pub outcome: TaskAttemptOutcome,
+    pub evidence_refs: Vec<StableId>,
+    pub failure_class: Option<String>,
+    pub created_at: TimestampMillis,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TaskAttemptOutcome {
+    Succeeded,
+    Failed,
+    Cancelled,
+}
+
+#[derive(Default)]
+pub struct TaskGraph {
+    tasks: BTreeMap<StableId, WorkerTask>,
+    attempts: Vec<TaskAttempt>,
+}
+
+impl TaskGraph {
+    pub fn decompose(mission_id: StableId, goal: &str) -> AcResult<Self> {
+        if goal.trim().is_empty() {
+            return Err(AcError::validation(
+                "RUNTIME-TASK_EMPTY_GOAL",
+                "task decomposition requires a goal",
+            ));
+        }
+        let mut graph = Self::default();
+        let analyze = graph.add_task(mission_id.clone(), "analyze repository", Vec::new(), 1);
+        let identify = graph.add_task(mission_id.clone(), "identify failure", vec![analyze], 1);
+        let modify = graph.add_task(mission_id.clone(), "modify code", vec![identify], 2);
+        let test = graph.add_task(mission_id.clone(), "run verification", vec![modify], 2);
+        graph.add_task(mission_id, "request completion", vec![test], 0);
+        graph.refresh_ready();
+        Ok(graph)
+    }
+
+    pub fn tasks(&self) -> impl Iterator<Item = &WorkerTask> {
+        self.tasks.values()
+    }
+    pub fn attempts(&self) -> &[TaskAttempt] {
+        &self.attempts
+    }
+
+    pub fn next_ready(&self) -> Option<&WorkerTask> {
+        self.tasks
+            .values()
+            .find(|task| task.state == TaskState::Ready)
+    }
+
+    pub fn start(&mut self, task_id: &StableId, worker: &Worker) -> AcResult<()> {
+        let task = self
+            .tasks
+            .get_mut(task_id)
+            .ok_or_else(|| AcError::validation("RUNTIME-TASK_UNKNOWN", "task is not in graph"))?;
+        if task.state != TaskState::Ready {
+            return Err(AcError::conflict(
+                "RUNTIME-TASK_NOT_READY",
+                "task dependencies are not complete",
+            ));
+        }
+        if worker.state != WorkerState::Running {
+            return Err(AcError::conflict(
+                "RUNTIME-WORKER_NOT_RUNNING",
+                "task requires a running worker",
+            ));
+        }
+        task.state = TaskState::Running;
+        task.assigned_worker = Some(worker.id.clone());
+        Ok(())
+    }
+
+    pub fn finish(
+        &mut self,
+        task_id: &StableId,
+        worker: &Worker,
+        outcome: TaskAttemptOutcome,
+        evidence_refs: Vec<StableId>,
+        failure_class: Option<String>,
+    ) -> AcResult<()> {
+        let task = self
+            .tasks
+            .get_mut(task_id)
+            .ok_or_else(|| AcError::validation("RUNTIME-TASK_UNKNOWN", "task is not in graph"))?;
+        if task.state != TaskState::Running || task.assigned_worker.as_ref() != Some(&worker.id) {
+            return Err(AcError::conflict(
+                "RUNTIME-TASK_OWNERSHIP",
+                "only assigned worker may finish task",
+            ));
+        }
+        task.evidence_refs.extend(evidence_refs.iter().cloned());
+        let attempt = TaskAttempt {
+            id: StableId::new("attempt"),
+            task_id: task.id.clone(),
+            worker_id: worker.id.clone(),
+            outcome,
+            evidence_refs,
+            failure_class,
+            created_at: TimestampMillis::now(),
+        };
+        match outcome {
+            TaskAttemptOutcome::Succeeded => task.state = TaskState::Completed,
+            TaskAttemptOutcome::Cancelled => task.state = TaskState::Cancelled,
+            TaskAttemptOutcome::Failed if task.retry_count < task.max_retries => {
+                task.retry_count += 1;
+                task.state = TaskState::Retryable;
+            }
+            TaskAttemptOutcome::Failed => task.state = TaskState::Failed,
+        }
+        self.attempts.push(attempt);
+        self.refresh_ready();
+        Ok(())
+    }
+
+    pub fn persist(
+        &self,
+        db: &ControlPlaneDb,
+        worker: &Worker,
+        session_id: &StableId,
+    ) -> AcResult<()> {
+        let mission = worker.mission_id.as_ref().ok_or_else(|| {
+            AcError::validation(
+                "RUNTIME-WORKER_NO_MISSION",
+                "worker is not assigned to a mission",
+            )
+        })?;
+        db.save_worker(&WorkerRecord {
+            id: worker.id.to_string(),
+            mission_id: mission.to_string(),
+            session_id: session_id.to_string(),
+            state: format!("{:?}", worker.state).to_lowercase(),
+            workspace_ref: worker.workspace_ref.as_ref().map(ToString::to_string),
+            updated_at_ms: TimestampMillis::now().as_millis() as i64,
+        })?;
+        for task in self.tasks.values() {
+            db.save_task(&TaskRecord {
+                id: task.id.to_string(),
+                mission_id: task.mission_id.to_string(),
+                title: task.title.clone(),
+                state: format!("{:?}", task.state).to_lowercase(),
+                dependencies_json: task
+                    .dependencies
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join(","),
+                assigned_worker_id: task.assigned_worker.as_ref().map(ToString::to_string),
+                retry_count: task.retry_count,
+                max_retries: task.max_retries,
+                updated_at_ms: TimestampMillis::now().as_millis() as i64,
+            })?;
+        }
+        for attempt in &self.attempts {
+            db.save_task_attempt(&TaskAttemptRecord {
+                id: attempt.id.to_string(),
+                task_id: attempt.task_id.to_string(),
+                worker_id: attempt.worker_id.to_string(),
+                outcome: format!("{:?}", attempt.outcome).to_lowercase(),
+                evidence_refs: attempt
+                    .evidence_refs
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join(","),
+                failure_class: attempt.failure_class.clone(),
+                created_at_ms: attempt.created_at.as_millis() as i64,
+            })?;
+        }
+        Ok(())
+    }
+
+    fn add_task(
+        &mut self,
+        mission_id: StableId,
+        title: &str,
+        dependencies: Vec<StableId>,
+        max_retries: u32,
+    ) -> StableId {
+        let id = StableId::new("task");
+        self.tasks.insert(
+            id.clone(),
+            WorkerTask {
+                id: id.clone(),
+                mission_id,
+                title: title.to_string(),
+                dependencies,
+                state: TaskState::Pending,
+                assigned_worker: None,
+                retry_count: 0,
+                max_retries,
+                evidence_refs: Vec::new(),
+            },
+        );
+        id
+    }
+
+    fn refresh_ready(&mut self) {
+        let completed = self
+            .tasks
+            .iter()
+            .filter_map(|(id, task)| (task.state == TaskState::Completed).then_some(id.clone()))
+            .collect::<Vec<_>>();
+        for task in self.tasks.values_mut() {
+            if matches!(task.state, TaskState::Pending | TaskState::Retryable)
+                && task
+                    .dependencies
+                    .iter()
+                    .all(|dependency| completed.contains(dependency))
+            {
+                task.state = TaskState::Ready;
+            }
         }
     }
 }
@@ -395,5 +691,57 @@ mod tests {
             .iter()
             .any(|event| matches!(event.kind, RuntimeEventKind::ModelEvent(_))));
         assert_eq!(session.checkpoints().len(), 1);
+    }
+
+    #[test]
+    fn durable_task_graph_orders_retries_and_recovers_after_reopen() {
+        let mission = StableId::new("mission");
+        let mut graph = TaskGraph::decompose(mission.clone(), "fix a three-file fixture").unwrap();
+        let mut worker = Worker::new();
+        worker.assign(mission.clone()).unwrap();
+        worker.transition(WorkerState::Running).unwrap();
+        let first = graph.next_ready().unwrap().id.clone();
+        graph.start(&first, &worker).unwrap();
+        graph
+            .finish(
+                &first,
+                &worker,
+                TaskAttemptOutcome::Succeeded,
+                vec![StableId::new("ev")],
+                None,
+            )
+            .unwrap();
+        let second = graph.next_ready().unwrap().id.clone();
+        graph.start(&second, &worker).unwrap();
+        graph
+            .finish(
+                &second,
+                &worker,
+                TaskAttemptOutcome::Failed,
+                vec![StableId::new("ev")],
+                Some("tool_failed".to_string()),
+            )
+            .unwrap();
+        assert_eq!(
+            graph.tasks().find(|task| task.id == second).unwrap().state,
+            TaskState::Ready
+        );
+        let path =
+            std::env::temp_dir().join(format!("agentcode-runtime-{}.sqlite", StableId::new("db")));
+        {
+            let mut db = ControlPlaneDb::open(&path).unwrap();
+            db.migrate().unwrap();
+            graph
+                .persist(&db, &worker, &StableId::new("session"))
+                .unwrap();
+        }
+        let db = ControlPlaneDb::open(&path).unwrap();
+        assert_eq!(db.tasks_for_mission(mission.as_str()).unwrap().len(), 5);
+        assert_eq!(db.task_attempts(second.as_str()).unwrap().len(), 1);
+        assert_eq!(
+            db.worker(worker.id.as_str()).unwrap().unwrap().state,
+            "running"
+        );
+        let _ = std::fs::remove_file(path);
     }
 }

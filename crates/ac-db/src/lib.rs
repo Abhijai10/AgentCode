@@ -229,6 +229,40 @@ pub struct ToolExecutionRecord {
     pub created_at_ms: u128,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WorkerRecord {
+    pub id: String,
+    pub mission_id: String,
+    pub session_id: String,
+    pub state: String,
+    pub workspace_ref: Option<String>,
+    pub updated_at_ms: i64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TaskRecord {
+    pub id: String,
+    pub mission_id: String,
+    pub title: String,
+    pub state: String,
+    pub dependencies_json: String,
+    pub assigned_worker_id: Option<String>,
+    pub retry_count: u32,
+    pub max_retries: u32,
+    pub updated_at_ms: i64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TaskAttemptRecord {
+    pub id: String,
+    pub task_id: String,
+    pub worker_id: String,
+    pub outcome: String,
+    pub evidence_refs: String,
+    pub failure_class: Option<String>,
+    pub created_at_ms: i64,
+}
+
 impl ControlPlaneDb {
     pub fn save_session(
         &self,
@@ -590,6 +624,79 @@ impl ControlPlaneDb {
                 id: row.get(0)?, tool_call_id: row.get(1)?, tool_id: row.get(2)?, status: row.get(3)?, manifest_json: row.get(4)?, raw_output: row.get(5)?, evidence_ref: row.get(6)?, created_at_ms: row.get::<_, i64>(7)? as u128,
             }),
         ).optional().map_err(db_error)
+    }
+
+    pub fn save_worker(&self, record: &WorkerRecord) -> AcResult<()> {
+        self.connection.execute(
+            "INSERT INTO workers (id, mission_id, session_id, state, workspace_ref, updated_at_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+             ON CONFLICT(id) DO UPDATE SET state = excluded.state, workspace_ref = excluded.workspace_ref, updated_at_ms = excluded.updated_at_ms",
+            params![record.id, record.mission_id, record.session_id, record.state, record.workspace_ref, record.updated_at_ms],
+        ).map_err(db_error)?;
+        Ok(())
+    }
+
+    pub fn worker(&self, id: &str) -> AcResult<Option<WorkerRecord>> {
+        self.connection.query_row(
+            "SELECT id, mission_id, session_id, state, workspace_ref, updated_at_ms FROM workers WHERE id = ?1", [id],
+            |row| Ok(WorkerRecord { id: row.get(0)?, mission_id: row.get(1)?, session_id: row.get(2)?, state: row.get(3)?, workspace_ref: row.get(4)?, updated_at_ms: row.get(5)? }),
+        ).optional().map_err(db_error)
+    }
+
+    pub fn save_task(&self, record: &TaskRecord) -> AcResult<()> {
+        self.connection.execute(
+            "INSERT INTO tasks (id, mission_id, title, state, dependencies_json, assigned_worker_id, retry_count, max_retries, updated_at_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+             ON CONFLICT(id) DO UPDATE SET state = excluded.state, assigned_worker_id = excluded.assigned_worker_id, retry_count = excluded.retry_count, updated_at_ms = excluded.updated_at_ms",
+            params![record.id, record.mission_id, record.title, record.state, record.dependencies_json, record.assigned_worker_id, record.retry_count, record.max_retries, record.updated_at_ms],
+        ).map_err(db_error)?;
+        Ok(())
+    }
+
+    pub fn tasks_for_mission(&self, mission_id: &str) -> AcResult<Vec<TaskRecord>> {
+        let mut stmt = self.connection.prepare("SELECT id, mission_id, title, state, dependencies_json, assigned_worker_id, retry_count, max_retries, updated_at_ms FROM tasks WHERE mission_id = ?1 ORDER BY id").map_err(db_error)?;
+        let rows = stmt
+            .query_map([mission_id], |row| {
+                Ok(TaskRecord {
+                    id: row.get(0)?,
+                    mission_id: row.get(1)?,
+                    title: row.get(2)?,
+                    state: row.get(3)?,
+                    dependencies_json: row.get(4)?,
+                    assigned_worker_id: row.get(5)?,
+                    retry_count: row.get(6)?,
+                    max_retries: row.get(7)?,
+                    updated_at_ms: row.get(8)?,
+                })
+            })
+            .map_err(db_error)?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(db_error)
+    }
+
+    pub fn save_task_attempt(&self, record: &TaskAttemptRecord) -> AcResult<()> {
+        self.connection.execute(
+            "INSERT INTO task_attempts (id, task_id, worker_id, outcome, evidence_refs, failure_class, created_at_ms) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![record.id, record.task_id, record.worker_id, record.outcome, record.evidence_refs, record.failure_class, record.created_at_ms],
+        ).map_err(db_error)?;
+        Ok(())
+    }
+
+    pub fn task_attempts(&self, task_id: &str) -> AcResult<Vec<TaskAttemptRecord>> {
+        let mut stmt = self.connection.prepare("SELECT id, task_id, worker_id, outcome, evidence_refs, failure_class, created_at_ms FROM task_attempts WHERE task_id = ?1 ORDER BY created_at_ms").map_err(db_error)?;
+        let rows = stmt
+            .query_map([task_id], |row| {
+                Ok(TaskAttemptRecord {
+                    id: row.get(0)?,
+                    task_id: row.get(1)?,
+                    worker_id: row.get(2)?,
+                    outcome: row.get(3)?,
+                    evidence_refs: row.get(4)?,
+                    failure_class: row.get(5)?,
+                    created_at_ms: row.get(6)?,
+                })
+            })
+            .map_err(db_error)?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(db_error)
     }
 }
 

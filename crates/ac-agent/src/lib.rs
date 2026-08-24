@@ -431,6 +431,17 @@ pub struct AgentRunReport {
     pub evidence_refs: Vec<StableId>,
     pub validation: Option<ValidationRunReport>,
     pub merge_review: Option<ac_git::MergeReview>,
+    pub completion_request: Option<CompletionRequest>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CompletionRequest {
+    pub id: StableId,
+    pub task_id: StableId,
+    pub summary: String,
+    pub evidence_refs: Vec<StableId>,
+    pub verification_passed: bool,
+    pub created_at: TimestampMillis,
 }
 
 pub struct AutonomousAgent<P: PolicyBoundary> {
@@ -614,11 +625,7 @@ impl<P: PolicyBoundary> AutonomousAgent<P> {
                 metadata.verification_passed = validation.as_ref().map(|report| report.passed);
             }
         }
-        self.kernel.transition_mission(
-            &mission_id,
-            MissionState::Completed,
-            evidence_refs.clone(),
-        )?;
+        self.request_completion(&mission_id, &goal, &evidence_refs, validation.as_ref())?;
         Ok(self.report(goal.id, changeset, evidence_refs, validation))
     }
 
@@ -860,6 +867,15 @@ impl<P: PolicyBoundary> AutonomousAgent<P> {
         evidence_refs: Vec<StableId>,
         validation: Option<ValidationRunReport>,
     ) -> AgentRunReport {
+        let completion_request =
+            (self.state == AutonomousState::Completed).then(|| CompletionRequest {
+                id: StableId::new("completion"),
+                task_id: goal_id.clone(),
+                summary: "worker requests completion with verification evidence".to_string(),
+                evidence_refs: evidence_refs.clone(),
+                verification_passed: validation.as_ref().is_some_and(|report| report.passed),
+                created_at: TimestampMillis::now(),
+            });
         AgentRunReport {
             goal_id,
             state: self.state.clone(),
@@ -867,7 +883,33 @@ impl<P: PolicyBoundary> AutonomousAgent<P> {
             evidence_refs,
             validation,
             merge_review: None,
+            completion_request,
         }
+    }
+
+    fn request_completion(
+        &mut self,
+        mission_id: &StableId,
+        goal: &Goal,
+        evidence_refs: &[StableId],
+        validation: Option<&ValidationRunReport>,
+    ) -> AcResult<()> {
+        if evidence_refs.is_empty() || !validation.is_some_and(|report| report.passed) {
+            return Err(AcError::conflict(
+                "AGENT-COMPLETION_UNSUPPORTED",
+                "completion requires passing verification and evidence",
+            ));
+        }
+        let completion_evidence = self.evidence.append(
+            EvidenceKind::DerivedContext,
+            provenance("agent.completion-request"),
+            format!("mem://agent/{}/completion", goal.id),
+            format!("evidence:{};verified:true", evidence_refs.len()),
+        )?;
+        let mut accepted = evidence_refs.to_vec();
+        accepted.push(completion_evidence);
+        self.kernel
+            .transition_mission(mission_id, MissionState::Completed, accepted)
     }
 }
 
@@ -1497,6 +1539,19 @@ mod tests {
             .run_goal(Goal::new("Create README.md").unwrap())
             .unwrap();
         assert_eq!(report.state, AutonomousState::Completed);
+        assert!(
+            report
+                .completion_request
+                .as_ref()
+                .unwrap()
+                .verification_passed
+        );
+        assert!(!report
+            .completion_request
+            .as_ref()
+            .unwrap()
+            .evidence_refs
+            .is_empty());
         assert_eq!(
             report.changeset.as_ref().unwrap().state,
             ac_changeset::ChangeSetState::Approved

@@ -92,3 +92,34 @@ CREATE TABLE IF NOT EXISTS tool_execution_records (
     evidence_ref TEXT NOT NULL,
     created_at_ms INTEGER NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS workers (
+    id TEXT PRIMARY KEY,
+    mission_id TEXT NOT NULL,
+    session_id TEXT NOT NULL,
+    state TEXT NOT NULL,
+    workspace_ref TEXT,
+    updated_at_ms INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS tasks (
+    id TEXT PRIMARY KEY,
+    mission_id TEXT NOT NULL,
+    title TEXT NOT NULL,
+    state TEXT NOT NULL,
+    dependencies_json TEXT NOT NULL,
+    assigned_worker_id TEXT,
+    retry_count INTEGER NOT NULL,
+    max_retries INTEGER NOT NULL,
+    updated_at_ms INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS task_attempts (
+    id TEXT PRIMARY KEY,
+    task_id TEXT NOT NULL,
+    worker_id TEXT NOT NULL,
+    outcome TEXT NOT NULL,
+    evidence_refs TEXT NOT NULL,
+    failure_class TEXT,
+    created_at_ms INTEGER NOT NULL
+);
