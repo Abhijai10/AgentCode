@@ -63,6 +63,12 @@ pub const SEMANTIC_REPOSITORY_GRAPH_V4: Migration = Migration {
     sql: include_str!("../../../migrations/0004_semantic_repository_graph.sql"),
 };
 
+pub const PERSISTENT_MEMORY_V5: Migration = Migration {
+    id: "0005_persistent_memory",
+    description: "persistent knowledge facts, decisions, task memory, and context snapshots",
+    sql: include_str!("../../../migrations/0005_persistent_memory.sql"),
+};
+
 pub fn validate_migrations(migrations: &[Migration]) -> AcResult<()> {
     let mut seen = BTreeSet::new();
     for migration in migrations {

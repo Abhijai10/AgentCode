@@ -17,6 +17,73 @@ pub type SemanticDiagnosticRow = (String, u32, String, String, u8);
 pub type WorkspaceBoundaryRow = (String, String, Option<String>, String);
 pub type OptionalIndexDecisionRow = (String, bool, String, usize, usize);
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MemoryFactRow {
+    pub id: String,
+    pub repository_id: String,
+    pub mission_id: Option<String>,
+    pub task_id: Option<String>,
+    pub branch: Option<String>,
+    pub statement: String,
+    pub fact_type: String,
+    pub source: String,
+    pub confidence: u8,
+    pub freshness: String,
+    pub memory_class: String,
+    pub observed_commit: String,
+    pub conflict_set_id: Option<String>,
+    pub valid_from_ms: i64,
+    pub valid_until_ms: Option<i64>,
+    pub superseded_by: Option<String>,
+    pub last_validation_ms: i64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MemoryEvidenceRow {
+    pub fact_id: String,
+    pub evidence_ref: String,
+    pub file_path: Option<String>,
+    pub symbol: Option<String>,
+    pub content_hash: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MemoryDecisionRow {
+    pub id: String,
+    pub repository_id: String,
+    pub mission_id: Option<String>,
+    pub task_id: Option<String>,
+    pub branch: Option<String>,
+    pub decision: String,
+    pub rationale: String,
+    pub authority_refs: String,
+    pub supersedes: Option<String>,
+    pub created_at_ms: i64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TaskMemoryRow {
+    pub id: String,
+    pub task_id: String,
+    pub summary: String,
+    pub evidence_refs: String,
+    pub created_at_ms: i64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ContextSnapshotRow {
+    pub id: String,
+    pub repository_id: String,
+    pub mission_id: Option<String>,
+    pub task_id: Option<String>,
+    pub branch: Option<String>,
+    pub reason: String,
+    pub content: String,
+    pub source_fact_ids: String,
+    pub decision_refs: String,
+    pub created_at_ms: i64,
+}
+
 impl ControlPlaneDb {
     pub fn open(path: impl AsRef<Path>) -> AcResult<Self> {
         let connection = Connection::open(path).map_err(db_error)?;
@@ -34,11 +101,11 @@ impl ControlPlaneDb {
 
     pub fn migrate(&mut self) -> AcResult<()> {
         let current_version = self.user_version()?;
-        if current_version > 4 {
+        if current_version > 5 {
             return Err(AcError::conflict(
                 "DB-FUTURE_VERSION",
                 format!(
-                    "database user_version {current_version} is newer than supported version 4"
+                    "database user_version {current_version} is newer than supported version 5"
                 ),
             ));
         }
@@ -63,7 +130,13 @@ impl ControlPlaneDb {
             ))
             .map_err(db_error)?;
         }
-        tx.pragma_update(None, "user_version", 4)
+        if current_version < 5 {
+            tx.execute_batch(include_str!(
+                "../../../migrations/0005_persistent_memory.sql"
+            ))
+            .map_err(db_error)?;
+        }
+        tx.pragma_update(None, "user_version", 5)
             .map_err(db_error)?;
         tx.commit().map_err(db_error)?;
         Ok(())
@@ -293,6 +366,254 @@ impl ControlPlaneDb {
             )
             .optional()
             .map(|value| value.map(|enabled| enabled != 0))
+            .map_err(db_error)
+    }
+
+    pub fn save_memory_fact(
+        &self,
+        fact: &MemoryFactRow,
+        evidence: &[MemoryEvidenceRow],
+    ) -> AcResult<()> {
+        if fact.statement.trim().is_empty() || evidence.is_empty() {
+            return Err(AcError::validation(
+                "DB-MEMORY_FACT_INVALID",
+                "memory facts require statement and evidence",
+            ));
+        }
+        self.connection
+            .execute(
+                "INSERT INTO memory_facts (
+                    id, repository_id, mission_id, task_id, branch, statement, fact_type, source,
+                    confidence, freshness, memory_class, observed_commit, conflict_set_id,
+                    valid_from_ms, valid_until_ms, superseded_by, last_validation_ms
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)
+                 ON CONFLICT(id) DO UPDATE SET
+                    statement=excluded.statement,
+                    confidence=excluded.confidence,
+                    freshness=excluded.freshness,
+                    conflict_set_id=excluded.conflict_set_id,
+                    valid_until_ms=excluded.valid_until_ms,
+                    superseded_by=excluded.superseded_by,
+                    last_validation_ms=excluded.last_validation_ms",
+                params![
+                    fact.id,
+                    fact.repository_id,
+                    fact.mission_id,
+                    fact.task_id,
+                    fact.branch,
+                    fact.statement,
+                    fact.fact_type,
+                    fact.source,
+                    fact.confidence,
+                    fact.freshness,
+                    fact.memory_class,
+                    fact.observed_commit,
+                    fact.conflict_set_id,
+                    fact.valid_from_ms,
+                    fact.valid_until_ms,
+                    fact.superseded_by,
+                    fact.last_validation_ms
+                ],
+            )
+            .map_err(db_error)?;
+        self.connection
+            .execute(
+                "DELETE FROM memory_fact_evidence WHERE fact_id=?1",
+                params![fact.id],
+            )
+            .map_err(db_error)?;
+        for row in evidence {
+            self.connection
+                .execute(
+                    "INSERT INTO memory_fact_evidence VALUES (?1, ?2, ?3, ?4, ?5)",
+                    params![
+                        row.fact_id,
+                        row.evidence_ref,
+                        row.file_path,
+                        row.symbol,
+                        row.content_hash
+                    ],
+                )
+                .map_err(db_error)?;
+        }
+        Ok(())
+    }
+
+    pub fn memory_fact(&self, id: &str) -> AcResult<Option<MemoryFactRow>> {
+        self.connection
+            .query_row(
+                "SELECT id, repository_id, mission_id, task_id, branch, statement, fact_type,
+                        source, confidence, freshness, memory_class, observed_commit,
+                        conflict_set_id, valid_from_ms, valid_until_ms, superseded_by,
+                        last_validation_ms
+                 FROM memory_facts WHERE id=?1",
+                params![id],
+                memory_fact_from_row,
+            )
+            .optional()
+            .map_err(db_error)
+    }
+
+    pub fn memory_fact_evidence(&self, fact_id: &str) -> AcResult<Vec<MemoryEvidenceRow>> {
+        let mut stmt = self
+            .connection
+            .prepare(
+                "SELECT fact_id, evidence_ref, file_path, symbol, content_hash
+                 FROM memory_fact_evidence WHERE fact_id=?1 ORDER BY evidence_ref ASC",
+            )
+            .map_err(db_error)?;
+        let rows = stmt
+            .query_map(params![fact_id], |row| {
+                Ok(MemoryEvidenceRow {
+                    fact_id: row.get(0)?,
+                    evidence_ref: row.get(1)?,
+                    file_path: row.get(2)?,
+                    symbol: row.get(3)?,
+                    content_hash: row.get(4)?,
+                })
+            })
+            .map_err(db_error)?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(db_error)
+    }
+
+    pub fn mark_memory_for_source_change(
+        &self,
+        file_path: &str,
+        symbol: Option<&str>,
+        deleted: bool,
+    ) -> AcResult<u64> {
+        let freshness = if deleted { "INVALID" } else { "POSSIBLY_STALE" };
+        let changed = if let Some(symbol) = symbol {
+            self.connection.execute(
+                "UPDATE memory_facts
+                 SET freshness=?3, last_validation_ms=?4
+                 WHERE id IN (
+                    SELECT fact_id FROM memory_fact_evidence
+                    WHERE file_path=?1 AND (symbol IS NULL OR symbol=?2)
+                 )",
+                params![file_path, symbol, freshness, millis(TimestampMillis::now())],
+            )
+        } else {
+            self.connection.execute(
+                "UPDATE memory_facts
+                 SET freshness=?2, last_validation_ms=?3
+                 WHERE id IN (
+                    SELECT fact_id FROM memory_fact_evidence WHERE file_path=?1
+                 )",
+                params![file_path, freshness, millis(TimestampMillis::now())],
+            )
+        }
+        .map_err(db_error)?;
+        Ok(changed as u64)
+    }
+
+    pub fn save_memory_decision(&self, decision: &MemoryDecisionRow) -> AcResult<()> {
+        if decision.decision.trim().is_empty() || decision.authority_refs.trim().is_empty() {
+            return Err(AcError::validation(
+                "DB-MEMORY_DECISION_INVALID",
+                "decisions require text and authority refs",
+            ));
+        }
+        self.connection
+            .execute(
+                "INSERT INTO memory_decisions VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                params![
+                    decision.id,
+                    decision.repository_id,
+                    decision.mission_id,
+                    decision.task_id,
+                    decision.branch,
+                    decision.decision,
+                    decision.rationale,
+                    decision.authority_refs,
+                    decision.supersedes,
+                    decision.created_at_ms
+                ],
+            )
+            .map_err(db_error)?;
+        Ok(())
+    }
+
+    pub fn memory_decision_count(&self, repository_id: &str) -> AcResult<u64> {
+        self.connection
+            .query_row(
+                "SELECT COUNT(*) FROM memory_decisions WHERE repository_id=?1",
+                params![repository_id],
+                |row| row.get(0),
+            )
+            .map_err(db_error)
+    }
+
+    pub fn save_task_memory(&self, memory: &TaskMemoryRow) -> AcResult<()> {
+        self.connection
+            .execute(
+                "INSERT INTO task_memory VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![
+                    memory.id,
+                    memory.task_id,
+                    memory.summary,
+                    memory.evidence_refs,
+                    memory.created_at_ms
+                ],
+            )
+            .map_err(db_error)?;
+        Ok(())
+    }
+
+    pub fn task_memory_count(&self, task_id: &str) -> AcResult<u64> {
+        self.connection
+            .query_row(
+                "SELECT COUNT(*) FROM task_memory WHERE task_id=?1",
+                params![task_id],
+                |row| row.get(0),
+            )
+            .map_err(db_error)
+    }
+
+    pub fn save_context_snapshot(&self, snapshot: &ContextSnapshotRow) -> AcResult<()> {
+        self.connection
+            .execute(
+                "INSERT INTO context_snapshots VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                params![
+                    snapshot.id,
+                    snapshot.repository_id,
+                    snapshot.mission_id,
+                    snapshot.task_id,
+                    snapshot.branch,
+                    snapshot.reason,
+                    snapshot.content,
+                    snapshot.source_fact_ids,
+                    snapshot.decision_refs,
+                    snapshot.created_at_ms
+                ],
+            )
+            .map_err(db_error)?;
+        Ok(())
+    }
+
+    pub fn context_snapshot(&self, id: &str) -> AcResult<Option<ContextSnapshotRow>> {
+        self.connection
+            .query_row(
+                "SELECT id, repository_id, mission_id, task_id, branch, reason, content,
+                        source_fact_ids, decision_refs, created_at_ms
+                 FROM context_snapshots WHERE id=?1",
+                params![id],
+                |row| {
+                    Ok(ContextSnapshotRow {
+                        id: row.get(0)?,
+                        repository_id: row.get(1)?,
+                        mission_id: row.get(2)?,
+                        task_id: row.get(3)?,
+                        branch: row.get(4)?,
+                        reason: row.get(5)?,
+                        content: row.get(6)?,
+                        source_fact_ids: row.get(7)?,
+                        decision_refs: row.get(8)?,
+                        created_at_ms: row.get(9)?,
+                    })
+                },
+            )
+            .optional()
             .map_err(db_error)
     }
 
@@ -962,6 +1283,28 @@ impl ControlPlaneDb {
     }
 }
 
+fn memory_fact_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<MemoryFactRow> {
+    Ok(MemoryFactRow {
+        id: row.get(0)?,
+        repository_id: row.get(1)?,
+        mission_id: row.get(2)?,
+        task_id: row.get(3)?,
+        branch: row.get(4)?,
+        statement: row.get(5)?,
+        fact_type: row.get(6)?,
+        source: row.get(7)?,
+        confidence: row.get(8)?,
+        freshness: row.get(9)?,
+        memory_class: row.get(10)?,
+        observed_commit: row.get(11)?,
+        conflict_set_id: row.get(12)?,
+        valid_from_ms: row.get(13)?,
+        valid_until_ms: row.get(14)?,
+        superseded_by: row.get(15)?,
+        last_validation_ms: row.get(16)?,
+    })
+}
+
 fn millis(ts: TimestampMillis) -> i64 {
     ts.as_millis().min(i64::MAX as u128) as i64
 }
@@ -1021,7 +1364,7 @@ mod tests {
     fn sqlite_store_persists_kernel_state() {
         let mut db = ControlPlaneDb::open_memory().unwrap();
         db.migrate().unwrap();
-        assert_eq!(db.user_version().unwrap(), 4);
+        assert_eq!(db.user_version().unwrap(), 5);
 
         let mut kernel = Kernel::new(AllowAllPolicy);
         kernel.start().unwrap();
@@ -1292,6 +1635,97 @@ mod tests {
                 db.optional_index_enabled("repo-1", "scip").unwrap(),
                 Some(false)
             );
+        }
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn persistent_memory_survives_reopen_and_source_changes_stale_facts() {
+        let path =
+            std::env::temp_dir().join(format!("agentcode-memory-{}.sqlite", StableId::new("db")));
+        let fact = MemoryFactRow {
+            id: StableId::new("mem").to_string(),
+            repository_id: "repo-1".to_string(),
+            mission_id: Some("mission-1".to_string()),
+            task_id: Some("task-1".to_string()),
+            branch: Some("main".to_string()),
+            statement: "A calls B".to_string(),
+            fact_type: "MODULE_RELATIONSHIP".to_string(),
+            source: "LSP".to_string(),
+            confidence: 90,
+            freshness: "FRESH".to_string(),
+            memory_class: "LONG_LIVED_REPO".to_string(),
+            observed_commit: "abc".to_string(),
+            conflict_set_id: None,
+            valid_from_ms: millis(TimestampMillis::now()),
+            valid_until_ms: None,
+            superseded_by: None,
+            last_validation_ms: millis(TimestampMillis::now()),
+        };
+        let evidence = MemoryEvidenceRow {
+            fact_id: fact.id.clone(),
+            evidence_ref: "ev-1".to_string(),
+            file_path: Some("src/a.rs".to_string()),
+            symbol: Some("A".to_string()),
+            content_hash: Some("h1".to_string()),
+        };
+        let decision = MemoryDecisionRow {
+            id: StableId::new("decision").to_string(),
+            repository_id: "repo-1".to_string(),
+            mission_id: Some("mission-1".to_string()),
+            task_id: None,
+            branch: Some("main".to_string()),
+            decision: "Keep CONTEXT.md derived".to_string(),
+            rationale: "Summaries are not authority".to_string(),
+            authority_refs: "ev-1".to_string(),
+            supersedes: None,
+            created_at_ms: millis(TimestampMillis::now()),
+        };
+        let task_memory = TaskMemoryRow {
+            id: StableId::new("taskmem").to_string(),
+            task_id: "task-1".to_string(),
+            summary: "Investigated freshness fixture".to_string(),
+            evidence_refs: "ev-1".to_string(),
+            created_at_ms: millis(TimestampMillis::now()),
+        };
+        let snapshot = ContextSnapshotRow {
+            id: StableId::new("snapshot").to_string(),
+            repository_id: "repo-1".to_string(),
+            mission_id: Some("mission-1".to_string()),
+            task_id: Some("task-1".to_string()),
+            branch: Some("main".to_string()),
+            reason: "replacement-agent".to_string(),
+            content: "# CONTEXT.md\nnot authority over current repository".to_string(),
+            source_fact_ids: fact.id.clone(),
+            decision_refs: decision.id.clone(),
+            created_at_ms: millis(TimestampMillis::now()),
+        };
+        {
+            let mut db = ControlPlaneDb::open(&path).unwrap();
+            db.migrate().unwrap();
+            db.save_memory_fact(&fact, &[evidence]).unwrap();
+            db.save_memory_decision(&decision).unwrap();
+            db.save_task_memory(&task_memory).unwrap();
+            db.save_context_snapshot(&snapshot).unwrap();
+            assert_eq!(
+                db.mark_memory_for_source_change("src/a.rs", Some("A"), false)
+                    .unwrap(),
+                1
+            );
+        }
+        {
+            let db = ControlPlaneDb::open(&path).unwrap();
+            let loaded = db.memory_fact(&fact.id).unwrap().unwrap();
+            assert_eq!(loaded.freshness, "POSSIBLY_STALE");
+            assert_eq!(db.memory_fact_evidence(&fact.id).unwrap().len(), 1);
+            assert_eq!(db.memory_decision_count("repo-1").unwrap(), 1);
+            assert_eq!(db.task_memory_count("task-1").unwrap(), 1);
+            assert!(db
+                .context_snapshot(&snapshot.id)
+                .unwrap()
+                .unwrap()
+                .content
+                .contains("not authority"));
         }
         let _ = fs::remove_file(path);
     }
