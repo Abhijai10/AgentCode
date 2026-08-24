@@ -11,6 +11,12 @@ pub struct ControlPlaneDb {
     connection: Connection,
 }
 
+pub type LspSessionRow = (String, String, String, Option<u32>, String, u8);
+pub type SemanticEdgeRow = (String, String, String, String, String, String, u8);
+pub type SemanticDiagnosticRow = (String, u32, String, String, u8);
+pub type WorkspaceBoundaryRow = (String, String, Option<String>, String);
+pub type OptionalIndexDecisionRow = (String, bool, String, usize, usize);
+
 impl ControlPlaneDb {
     pub fn open(path: impl AsRef<Path>) -> AcResult<Self> {
         let connection = Connection::open(path).map_err(db_error)?;
@@ -28,11 +34,11 @@ impl ControlPlaneDb {
 
     pub fn migrate(&mut self) -> AcResult<()> {
         let current_version = self.user_version()?;
-        if current_version > 3 {
+        if current_version > 4 {
             return Err(AcError::conflict(
                 "DB-FUTURE_VERSION",
                 format!(
-                    "database user_version {current_version} is newer than supported version 3"
+                    "database user_version {current_version} is newer than supported version 4"
                 ),
             ));
         }
@@ -51,7 +57,13 @@ impl ControlPlaneDb {
             ))
             .map_err(db_error)?;
         }
-        tx.pragma_update(None, "user_version", 3)
+        if current_version < 4 {
+            tx.execute_batch(include_str!(
+                "../../../migrations/0004_semantic_repository_graph.sql"
+            ))
+            .map_err(db_error)?;
+        }
+        tx.pragma_update(None, "user_version", 4)
             .map_err(db_error)?;
         tx.commit().map_err(db_error)?;
         Ok(())
@@ -125,6 +137,162 @@ impl ControlPlaneDb {
                 params![repository_id],
                 |row| row.get(0),
             )
+            .map_err(db_error)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn save_semantic_index(
+        &self,
+        repository_id: &str,
+        commit: &str,
+        worktree_id: &str,
+        lsp_sessions: &[LspSessionRow],
+        edges: &[SemanticEdgeRow],
+        diagnostics: &[SemanticDiagnosticRow],
+        workspace_boundaries: &[WorkspaceBoundaryRow],
+        optional_indexes: &[OptionalIndexDecisionRow],
+    ) -> AcResult<()> {
+        for table in [
+            "lsp_server_sessions",
+            "semantic_edges",
+            "semantic_diagnostics",
+            "workspace_boundaries",
+            "optional_index_decisions",
+        ] {
+            self.connection
+                .execute(
+                    &format!("DELETE FROM {table} WHERE repository_id=?1"),
+                    params![repository_id],
+                )
+                .map_err(db_error)?;
+        }
+        let now = millis(TimestampMillis::now());
+        for (id, server, root, pid, state, restart_count) in lsp_sessions {
+            self.connection
+                .execute(
+                    "INSERT INTO lsp_server_sessions (
+                        id, repository_id, server_type, workspace_root, pid, state,
+                        restart_count, last_activity_ms, degraded_reason
+                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, NULL)",
+                    params![
+                        id,
+                        repository_id,
+                        server,
+                        root,
+                        pid,
+                        state,
+                        restart_count,
+                        now
+                    ],
+                )
+                .map_err(db_error)?;
+        }
+        for (kind, from_path, from_symbol, to_path, to_symbol, source, confidence) in edges {
+            self.connection
+                .execute(
+                    "INSERT INTO semantic_edges (
+                        id, repository_id, edge_kind, from_path, from_symbol, to_path, to_symbol,
+                        provenance_source, confidence, freshness, commit_ref, worktree_id, created_at_ms
+                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 'fresh', ?10, ?11, ?12)",
+                    params![
+                        StableId::new("edge").to_string(),
+                        repository_id,
+                        kind,
+                        from_path,
+                        from_symbol,
+                        to_path,
+                        to_symbol,
+                        source,
+                        confidence,
+                        commit,
+                        worktree_id,
+                        now
+                    ],
+                )
+                .map_err(db_error)?;
+        }
+        for (path, line, severity, message, confidence) in diagnostics {
+            self.connection
+                .execute(
+                    "INSERT INTO semantic_diagnostics (
+                        id, repository_id, path, line, severity, message, provenance_source,
+                        confidence, freshness, commit_ref, worktree_id, created_at_ms
+                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'lsp-diagnostics-normalized', ?7, 'fresh', ?8, ?9, ?10)",
+                    params![
+                        StableId::new("diag").to_string(),
+                        repository_id,
+                        path,
+                        line,
+                        severity,
+                        message,
+                        confidence,
+                        commit,
+                        worktree_id,
+                        now
+                    ],
+                )
+                .map_err(db_error)?;
+        }
+        for (kind, root_path, package_name, evidence_path) in workspace_boundaries {
+            self.connection
+                .execute(
+                    "INSERT INTO workspace_boundaries VALUES (?1, ?2, ?3, ?4, ?5)",
+                    params![repository_id, kind, root_path, package_name, evidence_path],
+                )
+                .map_err(db_error)?;
+        }
+        for (engine, enabled, reason, measured_files, measured_edges) in optional_indexes {
+            self.connection
+                .execute(
+                    "INSERT INTO optional_index_decisions VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                    params![
+                        repository_id,
+                        engine,
+                        if *enabled { 1_i64 } else { 0_i64 },
+                        reason,
+                        *measured_files as i64,
+                        *measured_edges as i64,
+                        now
+                    ],
+                )
+                .map_err(db_error)?;
+        }
+        Ok(())
+    }
+
+    pub fn semantic_edge_count(&self, repository_id: &str) -> AcResult<u64> {
+        self.connection
+            .query_row(
+                "SELECT COUNT(*) FROM semantic_edges WHERE repository_id=?1",
+                params![repository_id],
+                |row| row.get(0),
+            )
+            .map_err(db_error)
+    }
+
+    pub fn workspace_boundary_count(&self, repository_id: &str) -> AcResult<u64> {
+        self.connection
+            .query_row(
+                "SELECT COUNT(*) FROM workspace_boundaries WHERE repository_id=?1",
+                params![repository_id],
+                |row| row.get(0),
+            )
+            .map_err(db_error)
+    }
+
+    pub fn optional_index_enabled(
+        &self,
+        repository_id: &str,
+        engine: &str,
+    ) -> AcResult<Option<bool>> {
+        self.connection
+            .query_row(
+                "SELECT enabled FROM optional_index_decisions WHERE repository_id=?1 AND engine=?2",
+                params![repository_id, engine],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()
+            .map(|value| value.map(|enabled| enabled != 0))
             .map_err(db_error)
     }
 
@@ -853,7 +1021,7 @@ mod tests {
     fn sqlite_store_persists_kernel_state() {
         let mut db = ControlPlaneDb::open_memory().unwrap();
         db.migrate().unwrap();
-        assert_eq!(db.user_version().unwrap(), 3);
+        assert_eq!(db.user_version().unwrap(), 4);
 
         let mut kernel = Kernel::new(AllowAllPolicy);
         kernel.start().unwrap();
@@ -1062,6 +1230,69 @@ mod tests {
         let loaded = db.tool_execution(&record.id).unwrap().unwrap();
         assert_eq!(loaded.raw_output, record.raw_output);
         assert_eq!(loaded.evidence_ref, record.evidence_ref);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn semantic_graph_evidence_survives_reopen() {
+        let path =
+            std::env::temp_dir().join(format!("agentcode-semantic-{}.sqlite", StableId::new("db")));
+        {
+            let mut db = ControlPlaneDb::open(&path).unwrap();
+            db.migrate().unwrap();
+            db.save_semantic_index(
+                "repo-1",
+                "abc",
+                "wt-1",
+                &[(
+                    "lsp-1".to_string(),
+                    "typescript".to_string(),
+                    "/repo".to_string(),
+                    None,
+                    "running".to_string(),
+                    0,
+                )],
+                &[(
+                    "api_route".to_string(),
+                    "app/api/users/route.ts".to_string(),
+                    "/api/users".to_string(),
+                    "db/schema.sql".to_string(),
+                    "users".to_string(),
+                    "api-route-adapter".to_string(),
+                    70,
+                )],
+                &[(
+                    "app/api/users/route.ts".to_string(),
+                    1,
+                    "warning".to_string(),
+                    "sample diagnostic".to_string(),
+                    70,
+                )],
+                &[(
+                    "npm-package".to_string(),
+                    "apps/web".to_string(),
+                    Some("web".to_string()),
+                    "apps/web/package.json".to_string(),
+                )],
+                &[(
+                    "scip".to_string(),
+                    false,
+                    "optional until benchmark threshold".to_string(),
+                    3,
+                    1,
+                )],
+            )
+            .unwrap();
+        }
+        {
+            let db = ControlPlaneDb::open(&path).unwrap();
+            assert_eq!(db.semantic_edge_count("repo-1").unwrap(), 1);
+            assert_eq!(db.workspace_boundary_count("repo-1").unwrap(), 1);
+            assert_eq!(
+                db.optional_index_enabled("repo-1", "scip").unwrap(),
+                Some(false)
+            );
+        }
         let _ = fs::remove_file(path);
     }
 

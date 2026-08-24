@@ -56,6 +56,13 @@ pub const KERNEL_SCHEMA_V1: Migration = Migration {
     sql: include_str!("../../../migrations/0001_kernel_schema.sql"),
 };
 
+pub const SEMANTIC_REPOSITORY_GRAPH_V4: Migration = Migration {
+    id: "0004_semantic_repository_graph",
+    description:
+        "semantic repository graph, LSP lifecycle, workspace, and optional index decisions",
+    sql: include_str!("../../../migrations/0004_semantic_repository_graph.sql"),
+};
+
 pub fn validate_migrations(migrations: &[Migration]) -> AcResult<()> {
     let mut seen = BTreeSet::new();
     for migration in migrations {
