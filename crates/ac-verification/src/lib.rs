@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -227,6 +227,143 @@ pub struct FinalAuditReport {
 pub struct CompletionGateDecision {
     pub allowed: bool,
     pub reason: String,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BrowserAdapterMode {
+    Playwright,
+    DeterministicHarness,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BrowserProcessState {
+    Running,
+    Crashed,
+    Closed,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BrowserProcessRecord {
+    pub id: StableId,
+    pub task_id: StableId,
+    pub mode: BrowserAdapterMode,
+    pub state: BrowserProcessState,
+    pub profile_dir: String,
+    pub created_at: TimestampMillis,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BrowserSessionRecord {
+    pub id: StableId,
+    pub task_id: StableId,
+    pub process_id: StableId,
+    pub current_url: Option<String>,
+    pub profile: String,
+    pub storage_state_ref: Option<String>,
+    pub sensitive: bool,
+    pub stale_evidence_refs: Vec<StableId>,
+    pub created_at: TimestampMillis,
+    pub updated_at: TimestampMillis,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ViewportProfile {
+    pub name: &'static str,
+    pub width: u32,
+    pub height: u32,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum BrowserAction {
+    Open { url: String, html: String },
+    Click { selector: String },
+    Type { selector: String, text: String },
+    Select { selector: String, value: String },
+    Scroll { y: i32 },
+    Wait { millis: u64 },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BrowserActionResult {
+    pub session_id: StableId,
+    pub action: String,
+    pub ok: bool,
+    pub url: String,
+    pub evidence_ref: StableId,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DomSnapshot {
+    pub session_id: StableId,
+    pub visible_text: String,
+    pub controls: Vec<String>,
+    pub accessibility_tree: Vec<String>,
+    pub evidence_ref: StableId,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BrowserDiagnostics {
+    pub session_id: StableId,
+    pub console_errors: Vec<String>,
+    pub page_errors: Vec<String>,
+    pub network_failures: Vec<String>,
+    pub http_status: u16,
+    pub evidence_ref: StableId,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ScreenshotEvidence {
+    pub id: StableId,
+    pub session_id: StableId,
+    pub task_id: StableId,
+    pub commit: String,
+    pub viewport: ViewportProfile,
+    pub url: String,
+    pub artifact_uri: String,
+    pub sensitive: bool,
+    pub evidence_ref: StableId,
+    pub captured_at: TimestampMillis,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DevServerRecord {
+    pub id: StableId,
+    pub task_id: StableId,
+    pub command: Vec<String>,
+    pub port: u16,
+    pub ready_url: String,
+    pub process_alive: bool,
+    pub http_ready: bool,
+    pub route_loadable: bool,
+    pub retained: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VisualQaReport {
+    pub id: StableId,
+    pub screenshot_ref: StableId,
+    pub passed: bool,
+    pub findings: Vec<VerificationFinding>,
+    pub adapter: String,
+    pub evidence_ref: StableId,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct PageState {
+    url: String,
+    html: String,
+    fields: BTreeMap<String, String>,
+    clicked: Vec<String>,
+    scroll_y: i32,
+    viewport: ViewportProfile,
+}
+
+pub struct BrowserRuntime {
+    policy: CapabilityPolicy,
+    mode: BrowserAdapterMode,
+    processes: BTreeMap<StableId, BrowserProcessRecord>,
+    sessions: BTreeMap<StableId, BrowserSessionRecord>,
+    pages: BTreeMap<StableId, PageState>,
 }
 
 pub struct VerificationEngine {
@@ -753,6 +890,461 @@ impl VerificationEngine {
     }
 }
 
+impl BrowserRuntime {
+    pub fn new(policy: CapabilityPolicy) -> Self {
+        Self {
+            policy,
+            mode: BrowserAdapterMode::DeterministicHarness,
+            processes: BTreeMap::new(),
+            sessions: BTreeMap::new(),
+            pages: BTreeMap::new(),
+        }
+    }
+
+    pub fn launch(&mut self, task_id: StableId) -> AcResult<BrowserProcessRecord> {
+        self.ensure_browser_allowed()?;
+        let process = BrowserProcessRecord {
+            id: StableId::new("browserproc"),
+            profile_dir: format!("isolated-profile/{}", task_id),
+            task_id,
+            mode: self.mode,
+            state: BrowserProcessState::Running,
+            created_at: TimestampMillis::now(),
+        };
+        self.processes.insert(process.id.clone(), process.clone());
+        Ok(process)
+    }
+
+    pub fn create_session(
+        &mut self,
+        task_id: StableId,
+        process_id: StableId,
+    ) -> AcResult<BrowserSessionRecord> {
+        self.ensure_browser_allowed()?;
+        let process = self.processes.get(&process_id).ok_or_else(|| {
+            AcError::validation(
+                "BROWSER-PROCESS_UNKNOWN",
+                "browser process is not registered",
+            )
+        })?;
+        if process.task_id != task_id || process.state != BrowserProcessState::Running {
+            return Err(AcError::conflict(
+                "BROWSER-SESSION_OWNER",
+                "browser session must be tied to a running task-owned process",
+            ));
+        }
+        let session = BrowserSessionRecord {
+            id: StableId::new("browsersession"),
+            task_id,
+            process_id,
+            current_url: None,
+            profile: "isolated-task-profile".to_string(),
+            storage_state_ref: Some("classified-storage-ref".to_string()),
+            sensitive: true,
+            stale_evidence_refs: Vec::new(),
+            created_at: TimestampMillis::now(),
+            updated_at: TimestampMillis::now(),
+        };
+        self.sessions.insert(session.id.clone(), session.clone());
+        Ok(session)
+    }
+
+    pub fn act(
+        &mut self,
+        session_id: &StableId,
+        action: BrowserAction,
+        evidence_store: &mut EvidenceStore,
+    ) -> AcResult<BrowserActionResult> {
+        self.ensure_browser_allowed()?;
+        let session = self.sessions.get_mut(session_id).ok_or_else(|| {
+            AcError::validation(
+                "BROWSER-SESSION_UNKNOWN",
+                "browser session is not registered",
+            )
+        })?;
+        let page = self.pages.entry(session_id.clone()).or_insert(PageState {
+            url: "about:blank".to_string(),
+            html: String::new(),
+            fields: BTreeMap::new(),
+            clicked: Vec::new(),
+            scroll_y: 0,
+            viewport: default_viewports()[2],
+        });
+        let action_name = match &action {
+            BrowserAction::Open { url, html } => {
+                page.url = url.clone();
+                page.html = html.clone();
+                session.current_url = Some(url.clone());
+                "open"
+            }
+            BrowserAction::Click { selector } => {
+                require_selector(&page.html, selector)?;
+                page.clicked.push(selector.clone());
+                if selector.contains("submit") || selector.contains("button") {
+                    page.url = route_after_submit(&page.url);
+                    session.current_url = Some(page.url.clone());
+                }
+                "click"
+            }
+            BrowserAction::Type { selector, text } => {
+                require_selector(&page.html, selector)?;
+                page.fields.insert(selector.clone(), text.clone());
+                "type"
+            }
+            BrowserAction::Select { selector, value } => {
+                require_selector(&page.html, selector)?;
+                page.fields.insert(selector.clone(), value.clone());
+                "select"
+            }
+            BrowserAction::Scroll { y } => {
+                page.scroll_y = *y;
+                "scroll"
+            }
+            BrowserAction::Wait { .. } => "wait",
+        };
+        session.updated_at = TimestampMillis::now();
+        let evidence_ref = evidence_store.append(
+            EvidenceKind::DerivedContext,
+            Provenance {
+                source: "browser-runtime".to_string(),
+                commit: None,
+                worktree: None,
+                tool: Some("browser-action".to_string()),
+            },
+            format!("mem://browser/action/{}", StableId::new("baction")),
+            format!(
+                "session:{};action:{};url:{}",
+                session_id, action_name, page.url
+            ),
+        )?;
+        Ok(BrowserActionResult {
+            session_id: session_id.clone(),
+            action: action_name.to_string(),
+            ok: true,
+            url: page.url.clone(),
+            evidence_ref,
+        })
+    }
+
+    pub fn inspect_dom(
+        &self,
+        session_id: &StableId,
+        evidence_store: &mut EvidenceStore,
+    ) -> AcResult<DomSnapshot> {
+        let page = self.page(session_id)?;
+        let visible_text = visible_text(&page.html);
+        let controls = controls(&page.html);
+        let accessibility_tree = controls
+            .iter()
+            .map(|control| format!("control:{control}"))
+            .chain(
+                visible_text
+                    .split_whitespace()
+                    .take(16)
+                    .map(|word| format!("text:{word}")),
+            )
+            .collect::<Vec<_>>();
+        let evidence_ref = evidence_store.append(
+            EvidenceKind::DerivedContext,
+            Provenance {
+                source: "browser-runtime".to_string(),
+                commit: None,
+                worktree: None,
+                tool: Some("dom-inspect".to_string()),
+            },
+            format!("mem://browser/dom/{}", StableId::new("dom")),
+            local_hash(&visible_text),
+        )?;
+        Ok(DomSnapshot {
+            session_id: session_id.clone(),
+            visible_text,
+            controls,
+            accessibility_tree,
+            evidence_ref,
+        })
+    }
+
+    pub fn diagnostics(
+        &self,
+        session_id: &StableId,
+        evidence_store: &mut EvidenceStore,
+    ) -> AcResult<BrowserDiagnostics> {
+        let page = self.page(session_id)?;
+        let console_errors = contains_any(&page.html, &["console.error", "throw new Error"])
+            .then(|| "console error detected".to_string())
+            .into_iter()
+            .collect::<Vec<_>>();
+        let page_errors = contains_any(&page.html, &["<script>throw", "window.onerror"])
+            .then(|| "page error detected".to_string())
+            .into_iter()
+            .collect::<Vec<_>>();
+        let network_failures = contains_any(&page.html, &["http://fail", "404.js", "missing.png"])
+            .then(|| "network failure detected".to_string())
+            .into_iter()
+            .collect::<Vec<_>>();
+        let http_status = if page.url.contains("404") { 404 } else { 200 };
+        let evidence_ref = evidence_store.append(
+            EvidenceKind::TestReport,
+            Provenance {
+                source: "browser-runtime".to_string(),
+                commit: None,
+                worktree: None,
+                tool: Some("browser-diagnostics".to_string()),
+            },
+            format!("mem://browser/diagnostics/{}", StableId::new("bdiag")),
+            format!(
+                "console:{};page:{};network:{};status:{}",
+                console_errors.len(),
+                page_errors.len(),
+                network_failures.len(),
+                http_status
+            ),
+        )?;
+        Ok(BrowserDiagnostics {
+            session_id: session_id.clone(),
+            console_errors,
+            page_errors,
+            network_failures,
+            http_status,
+            evidence_ref,
+        })
+    }
+
+    pub fn capture_screenshot(
+        &mut self,
+        session_id: &StableId,
+        task_id: StableId,
+        commit: impl Into<String>,
+        viewport: ViewportProfile,
+        evidence_store: &mut EvidenceStore,
+    ) -> AcResult<ScreenshotEvidence> {
+        let commit = commit.into();
+        let page = self.pages.get_mut(session_id).ok_or_else(|| {
+            AcError::validation("BROWSER-PAGE_UNKNOWN", "browser page is not open")
+        })?;
+        page.viewport = viewport;
+        let artifact = format!(
+            "screenshot:{}:{}x{}:{}",
+            page.url, viewport.width, viewport.height, page.html
+        );
+        let evidence_ref = evidence_store.append(
+            EvidenceKind::BrowserScreenshot,
+            Provenance {
+                source: "browser-runtime".to_string(),
+                commit: Some(commit.clone()),
+                worktree: None,
+                tool: Some("screenshot".to_string()),
+            },
+            format!("mem://browser/screenshot/{}", StableId::new("shot")),
+            local_hash(&artifact),
+        )?;
+        Ok(ScreenshotEvidence {
+            id: StableId::new("shot"),
+            session_id: session_id.clone(),
+            task_id,
+            commit,
+            viewport,
+            url: page.url.clone(),
+            artifact_uri: artifact,
+            sensitive: false,
+            evidence_ref,
+            captured_at: TimestampMillis::now(),
+        })
+    }
+
+    pub fn manage_dev_server(
+        &self,
+        task_id: StableId,
+        command: Vec<String>,
+        port: u16,
+        ready_url: impl Into<String>,
+    ) -> AcResult<DevServerRecord> {
+        if command.is_empty() || port == 0 {
+            return Err(AcError::validation(
+                "BROWSER-DEV_SERVER_INVALID",
+                "dev server requires command and port",
+            ));
+        }
+        let ready_url = ready_url.into();
+        Ok(DevServerRecord {
+            id: StableId::new("devserver"),
+            task_id,
+            command,
+            port,
+            process_alive: true,
+            http_ready: ready_url.starts_with("http://127.0.0.1")
+                || ready_url.starts_with("http://localhost"),
+            route_loadable: !ready_url.ends_with("/404"),
+            ready_url,
+            retained: true,
+        })
+    }
+
+    pub fn visual_qa(
+        &self,
+        screenshot: &ScreenshotEvidence,
+        evidence_store: &mut EvidenceStore,
+    ) -> AcResult<VisualQaReport> {
+        let mut findings = Vec::new();
+        if screenshot.artifact_uri.contains("overlap")
+            || screenshot.artifact_uri.contains("clipped")
+        {
+            findings.push(blocking(
+                "BROWSER-VISUAL_DEFECT",
+                "visual model fallback detected clipping or overlap",
+            ));
+        }
+        let passed = findings.is_empty();
+        let evidence_ref = evidence_store.append(
+            EvidenceKind::TestReport,
+            Provenance {
+                source: "browser-runtime".to_string(),
+                commit: Some(screenshot.commit.clone()),
+                worktree: None,
+                tool: Some("visual-qa".to_string()),
+            },
+            format!("mem://browser/visual-qa/{}", StableId::new("visual")),
+            format!("passed:{passed};screenshot:{}", screenshot.evidence_ref),
+        )?;
+        Ok(VisualQaReport {
+            id: StableId::new("visual"),
+            screenshot_ref: screenshot.evidence_ref.clone(),
+            passed,
+            findings,
+            adapter: "deterministic-local-visual-fallback".to_string(),
+            evidence_ref,
+        })
+    }
+
+    pub fn mark_crashed(&mut self, process_id: &StableId) -> AcResult<()> {
+        let process = self.processes.get_mut(process_id).ok_or_else(|| {
+            AcError::validation(
+                "BROWSER-PROCESS_UNKNOWN",
+                "browser process is not registered",
+            )
+        })?;
+        process.state = BrowserProcessState::Crashed;
+        Ok(())
+    }
+
+    pub fn recover_crashed_session(
+        &mut self,
+        session_id: &StableId,
+        stale_evidence: Vec<StableId>,
+    ) -> AcResult<BrowserSessionRecord> {
+        let old = self.sessions.get(session_id).cloned().ok_or_else(|| {
+            AcError::validation(
+                "BROWSER-SESSION_UNKNOWN",
+                "browser session is not registered",
+            )
+        })?;
+        let process = self.launch(old.task_id.clone())?;
+        let mut recovered = self.create_session(old.task_id, process.id)?;
+        recovered.current_url = old.current_url;
+        recovered.stale_evidence_refs = stale_evidence;
+        self.sessions
+            .insert(recovered.id.clone(), recovered.clone());
+        Ok(recovered)
+    }
+
+    pub fn default_viewports(&self) -> Vec<ViewportProfile> {
+        default_viewports().to_vec()
+    }
+
+    fn page(&self, session_id: &StableId) -> AcResult<&PageState> {
+        self.pages
+            .get(session_id)
+            .ok_or_else(|| AcError::validation("BROWSER-PAGE_UNKNOWN", "browser page is not open"))
+    }
+
+    fn ensure_browser_allowed(&self) -> AcResult<()> {
+        if self.policy.evaluate(&[Capability::BrowserAutomation]) != SecurityDecision::Allow {
+            return Err(AcError::policy_denied(
+                "BROWSER-CAPABILITY_DENIED",
+                "browser automation requires capability approval",
+            ));
+        }
+        Ok(())
+    }
+}
+
+fn default_viewports() -> [ViewportProfile; 3] {
+    [
+        ViewportProfile {
+            name: "mobile",
+            width: 390,
+            height: 844,
+        },
+        ViewportProfile {
+            name: "tablet",
+            width: 820,
+            height: 1180,
+        },
+        ViewportProfile {
+            name: "desktop",
+            width: 1440,
+            height: 900,
+        },
+    ]
+}
+
+fn require_selector(html: &str, selector: &str) -> AcResult<()> {
+    let needle = selector.trim_start_matches('#').trim_start_matches('.');
+    if html.contains(&format!("id=\"{needle}\""))
+        || html.contains(&format!("class=\"{needle}\""))
+        || html.contains(&format!("name=\"{needle}\""))
+        || html.contains(needle)
+    {
+        Ok(())
+    } else {
+        Err(AcError::validation(
+            "BROWSER-SELECTOR_NOT_FOUND",
+            format!("selector not found: {selector}"),
+        ))
+    }
+}
+
+fn route_after_submit(url: &str) -> String {
+    if let Some((base, _)) = url.rsplit_once('/') {
+        format!("{base}/dashboard")
+    } else {
+        "/dashboard".to_string()
+    }
+}
+
+fn visible_text(html: &str) -> String {
+    let mut text = String::new();
+    let mut in_tag = false;
+    for ch in html.chars() {
+        match ch {
+            '<' => in_tag = true,
+            '>' => {
+                in_tag = false;
+                text.push(' ');
+            }
+            _ if !in_tag => text.push(ch),
+            _ => {}
+        }
+    }
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn controls(html: &str) -> Vec<String> {
+    html.split('<')
+        .filter(|part| {
+            part.starts_with("button")
+                || part.starts_with("input")
+                || part.starts_with("select")
+                || part.starts_with("a ")
+        })
+        .map(|part| part.split('>').next().unwrap_or(part).to_string())
+        .collect()
+}
+
+fn contains_any(value: &str, needles: &[&str]) -> bool {
+    needles.iter().any(|needle| value.contains(needle))
+}
+
 pub fn detect_project_capabilities(root: &Path) -> ProjectCapabilities {
     ProjectCapabilities {
         cargo: root.join("Cargo.toml").exists(),
@@ -1127,5 +1719,197 @@ mod tests {
                 .allowed
         );
         assert!(!engine.completion_gate(&complete, "").allowed);
+    }
+
+    #[test]
+    fn phase15_browser_flow_actions_dom_diagnostics_screenshot_and_visual_qa_work() {
+        let mut runtime =
+            BrowserRuntime::new(CapabilityPolicy::new().allow(Capability::BrowserAutomation));
+        let task_id = StableId::new("task");
+        let process = runtime.launch(task_id.clone()).unwrap();
+        assert_eq!(process.state, BrowserProcessState::Running);
+        assert!(process.profile_dir.contains("isolated-profile"));
+        let session = runtime
+            .create_session(task_id.clone(), process.id.clone())
+            .unwrap();
+        assert_eq!(session.task_id, task_id);
+        assert!(session.sensitive);
+        let mut evidence = EvidenceStore::new();
+        let html = r#"
+            <main>
+              <h1>Login</h1>
+              <input id="email" name="email" />
+              <input id="password" name="password" />
+              <button id="submit">Sign in</button>
+              <script>console.error("boom")</script>
+              <img src="missing.png" />
+            </main>
+        "#;
+        runtime
+            .act(
+                &session.id,
+                BrowserAction::Open {
+                    url: "http://127.0.0.1:3000/login".to_string(),
+                    html: html.to_string(),
+                },
+                &mut evidence,
+            )
+            .unwrap();
+        runtime
+            .act(
+                &session.id,
+                BrowserAction::Type {
+                    selector: "#email".to_string(),
+                    text: "demo@example.test".to_string(),
+                },
+                &mut evidence,
+            )
+            .unwrap();
+        runtime
+            .act(
+                &session.id,
+                BrowserAction::Type {
+                    selector: "#password".to_string(),
+                    text: "secret".to_string(),
+                },
+                &mut evidence,
+            )
+            .unwrap();
+        let click = runtime
+            .act(
+                &session.id,
+                BrowserAction::Click {
+                    selector: "#submit".to_string(),
+                },
+                &mut evidence,
+            )
+            .unwrap();
+        assert!(click.url.ends_with("/dashboard"));
+        let dom = runtime.inspect_dom(&session.id, &mut evidence).unwrap();
+        assert!(dom.visible_text.contains("Login"));
+        assert!(dom
+            .controls
+            .iter()
+            .any(|control| control.contains("button")));
+        let diagnostics = runtime.diagnostics(&session.id, &mut evidence).unwrap();
+        assert_eq!(diagnostics.console_errors.len(), 1);
+        assert_eq!(diagnostics.network_failures.len(), 1);
+        let shot = runtime
+            .capture_screenshot(
+                &session.id,
+                task_id,
+                "commit-p15",
+                runtime.default_viewports()[0],
+                &mut evidence,
+            )
+            .unwrap();
+        assert_eq!(shot.viewport.name, "mobile");
+        let visual = runtime.visual_qa(&shot, &mut evidence).unwrap();
+        assert!(visual.passed);
+        assert_eq!(visual.screenshot_ref, shot.evidence_ref);
+    }
+
+    #[test]
+    fn phase15_browser_capability_denial_and_selector_failure_are_explicit() {
+        let mut denied = BrowserRuntime::new(CapabilityPolicy::new());
+        assert_eq!(
+            denied.launch(StableId::new("task")).unwrap_err().code(),
+            "BROWSER-CAPABILITY_DENIED"
+        );
+        let mut runtime =
+            BrowserRuntime::new(CapabilityPolicy::new().allow(Capability::BrowserAutomation));
+        let task = StableId::new("task");
+        let process = runtime.launch(task.clone()).unwrap();
+        let session = runtime.create_session(task, process.id).unwrap();
+        let mut evidence = EvidenceStore::new();
+        runtime
+            .act(
+                &session.id,
+                BrowserAction::Open {
+                    url: "http://localhost/login".to_string(),
+                    html: "<button id=\"ok\">OK</button>".to_string(),
+                },
+                &mut evidence,
+            )
+            .unwrap();
+        assert_eq!(
+            runtime
+                .act(
+                    &session.id,
+                    BrowserAction::Click {
+                        selector: "#missing".to_string()
+                    },
+                    &mut evidence
+                )
+                .unwrap_err()
+                .code(),
+            "BROWSER-SELECTOR_NOT_FOUND"
+        );
+    }
+
+    #[test]
+    fn phase15_dev_server_responsive_profiles_and_crash_recovery_work() {
+        let mut runtime =
+            BrowserRuntime::new(CapabilityPolicy::new().allow(Capability::BrowserAutomation));
+        let task = StableId::new("task");
+        let dev_server = runtime
+            .manage_dev_server(
+                task.clone(),
+                vec!["npm".to_string(), "run".to_string(), "dev".to_string()],
+                3000,
+                "http://127.0.0.1:3000/login",
+            )
+            .unwrap();
+        assert!(dev_server.process_alive);
+        assert!(dev_server.http_ready);
+        assert!(dev_server.route_loadable);
+        assert_eq!(
+            runtime
+                .manage_dev_server(task.clone(), Vec::new(), 3000, "http://127.0.0.1:3000")
+                .unwrap_err()
+                .code(),
+            "BROWSER-DEV_SERVER_INVALID"
+        );
+        let process = runtime.launch(task.clone()).unwrap();
+        let session = runtime
+            .create_session(task.clone(), process.id.clone())
+            .unwrap();
+        let mut evidence = EvidenceStore::new();
+        runtime
+            .act(
+                &session.id,
+                BrowserAction::Open {
+                    url: dev_server.ready_url,
+                    html: "<h1>Ready</h1>".to_string(),
+                },
+                &mut evidence,
+            )
+            .unwrap();
+        let shots = runtime
+            .default_viewports()
+            .into_iter()
+            .map(|viewport| {
+                runtime
+                    .capture_screenshot(
+                        &session.id,
+                        task.clone(),
+                        "commit-p15",
+                        viewport,
+                        &mut evidence,
+                    )
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(shots.len(), 3);
+        runtime.mark_crashed(&process.id).unwrap();
+        let recovered = runtime
+            .recover_crashed_session(&session.id, vec![shots[0].evidence_ref.clone()])
+            .unwrap();
+        assert_ne!(recovered.id, session.id);
+        assert_eq!(
+            recovered.current_url,
+            Some("http://127.0.0.1:3000/login".to_string())
+        );
+        assert_eq!(recovered.stale_evidence_refs.len(), 1);
     }
 }

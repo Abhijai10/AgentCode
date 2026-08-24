@@ -6,7 +6,9 @@ use ac_evidence::EvidenceRecord;
 use ac_git::{CheckpointRecord, WorktreeRecord};
 use ac_kernel::{KernelDecisionKind, KernelEvent, Mission, MissionState};
 use ac_verification::{
-    FinalAuditReport, RequirementEvidenceLink, VerificationEvidenceManifest, VerificationProfile,
+    BrowserProcessRecord, BrowserSessionRecord, DevServerRecord, FinalAuditReport,
+    RequirementEvidenceLink, ScreenshotEvidence, VerificationEvidenceManifest, VerificationProfile,
+    VisualQaReport,
 };
 use rusqlite::{params, Connection, OptionalExtension};
 
@@ -330,6 +332,34 @@ pub struct FinalAuditRow {
     pub created_at_ms: i64,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BrowserSessionRow {
+    pub id: String,
+    pub task_id: String,
+    pub process_id: String,
+    pub current_url: Option<String>,
+    pub profile: String,
+    pub storage_state_ref: Option<String>,
+    pub sensitive: bool,
+    pub stale_evidence_refs: String,
+    pub created_at_ms: i64,
+    pub updated_at_ms: i64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BrowserScreenshotRow {
+    pub id: String,
+    pub session_id: String,
+    pub task_id: String,
+    pub commit_ref: String,
+    pub viewport: String,
+    pub url: String,
+    pub artifact_uri: String,
+    pub sensitive: bool,
+    pub evidence_ref: String,
+    pub captured_at_ms: i64,
+}
+
 impl ControlPlaneDb {
     pub fn open(path: impl AsRef<Path>) -> AcResult<Self> {
         let connection = Connection::open(path).map_err(db_error)?;
@@ -347,11 +377,11 @@ impl ControlPlaneDb {
 
     pub fn migrate(&mut self) -> AcResult<()> {
         let current_version = self.user_version()?;
-        if current_version > 9 {
+        if current_version > 10 {
             return Err(AcError::conflict(
                 "DB-FUTURE_VERSION",
                 format!(
-                    "database user_version {current_version} is newer than supported version 9"
+                    "database user_version {current_version} is newer than supported version 10"
                 ),
             ));
         }
@@ -404,7 +434,11 @@ impl ControlPlaneDb {
             ))
             .map_err(db_error)?;
         }
-        tx.pragma_update(None, "user_version", 9)
+        if current_version < 10 {
+            tx.execute_batch(include_str!("../../../migrations/0010_browser_runtime.sql"))
+                .map_err(db_error)?;
+        }
+        tx.pragma_update(None, "user_version", 10)
             .map_err(db_error)?;
         tx.commit().map_err(db_error)?;
         Ok(())
@@ -1766,6 +1800,171 @@ impl ControlPlaneDb {
         rows.collect::<Result<Vec<_>, _>>().map_err(db_error)
     }
 
+    pub fn save_browser_process(&self, process: &BrowserProcessRecord) -> AcResult<()> {
+        self.connection
+            .execute(
+                "INSERT INTO browser_processes VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                 ON CONFLICT(id) DO UPDATE SET state=excluded.state",
+                params![
+                    process.id.to_string(),
+                    process.task_id.to_string(),
+                    format!("{:?}", process.mode),
+                    format!("{:?}", process.state),
+                    process.profile_dir,
+                    millis(process.created_at)
+                ],
+            )
+            .map_err(db_error)?;
+        Ok(())
+    }
+
+    pub fn save_browser_session(&self, session: &BrowserSessionRecord) -> AcResult<()> {
+        self.connection
+            .execute(
+                "INSERT INTO browser_sessions VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+                 ON CONFLICT(id) DO UPDATE SET
+                    current_url=excluded.current_url,
+                    stale_evidence_refs=excluded.stale_evidence_refs,
+                    updated_at_ms=excluded.updated_at_ms",
+                params![
+                    session.id.to_string(),
+                    session.task_id.to_string(),
+                    session.process_id.to_string(),
+                    session.current_url,
+                    session.profile,
+                    session.storage_state_ref,
+                    if session.sensitive { 1_i64 } else { 0_i64 },
+                    session
+                        .stale_evidence_refs
+                        .iter()
+                        .map(StableId::to_string)
+                        .collect::<Vec<_>>()
+                        .join(","),
+                    millis(session.created_at),
+                    millis(session.updated_at)
+                ],
+            )
+            .map_err(db_error)?;
+        Ok(())
+    }
+
+    pub fn save_browser_dev_server(&self, server: &DevServerRecord) -> AcResult<()> {
+        self.connection
+            .execute(
+                "INSERT INTO browser_dev_servers VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                params![
+                    server.id.to_string(),
+                    server.task_id.to_string(),
+                    server.command.join("\n"),
+                    server.port,
+                    server.ready_url,
+                    if server.process_alive { 1_i64 } else { 0_i64 },
+                    if server.http_ready { 1_i64 } else { 0_i64 },
+                    if server.route_loadable { 1_i64 } else { 0_i64 },
+                    if server.retained { 1_i64 } else { 0_i64 }
+                ],
+            )
+            .map_err(db_error)?;
+        Ok(())
+    }
+
+    pub fn save_browser_screenshot(&self, screenshot: &ScreenshotEvidence) -> AcResult<()> {
+        self.connection
+            .execute(
+                "INSERT INTO browser_screenshots VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                params![
+                    screenshot.id.to_string(),
+                    screenshot.session_id.to_string(),
+                    screenshot.task_id.to_string(),
+                    screenshot.commit,
+                    screenshot.viewport.name,
+                    screenshot.url,
+                    screenshot.artifact_uri,
+                    if screenshot.sensitive { 1_i64 } else { 0_i64 },
+                    screenshot.evidence_ref.to_string(),
+                    millis(screenshot.captured_at)
+                ],
+            )
+            .map_err(db_error)?;
+        Ok(())
+    }
+
+    pub fn save_browser_visual_qa(&self, report: &VisualQaReport) -> AcResult<()> {
+        self.connection
+            .execute(
+                "INSERT INTO browser_visual_qa VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![
+                    report.id.to_string(),
+                    report.screenshot_ref.to_string(),
+                    if report.passed { 1_i64 } else { 0_i64 },
+                    report
+                        .findings
+                        .iter()
+                        .map(|finding| finding.code.clone())
+                        .collect::<Vec<_>>()
+                        .join(","),
+                    report.adapter,
+                    report.evidence_ref.to_string()
+                ],
+            )
+            .map_err(db_error)?;
+        Ok(())
+    }
+
+    pub fn browser_session(&self, id: &str) -> AcResult<Option<BrowserSessionRow>> {
+        self.connection
+            .query_row(
+                "SELECT id, task_id, process_id, current_url, profile, storage_state_ref,
+                        sensitive, stale_evidence_refs, created_at_ms, updated_at_ms
+                 FROM browser_sessions WHERE id=?1",
+                params![id],
+                |row| {
+                    Ok(BrowserSessionRow {
+                        id: row.get(0)?,
+                        task_id: row.get(1)?,
+                        process_id: row.get(2)?,
+                        current_url: row.get(3)?,
+                        profile: row.get(4)?,
+                        storage_state_ref: row.get(5)?,
+                        sensitive: row.get::<_, i64>(6)? != 0,
+                        stale_evidence_refs: row.get(7)?,
+                        created_at_ms: row.get(8)?,
+                        updated_at_ms: row.get(9)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(db_error)
+    }
+
+    pub fn browser_screenshots(&self, session_id: &str) -> AcResult<Vec<BrowserScreenshotRow>> {
+        let mut stmt = self
+            .connection
+            .prepare(
+                "SELECT id, session_id, task_id, commit_ref, viewport, url, artifact_uri,
+                        sensitive, evidence_ref, captured_at_ms
+                 FROM browser_screenshots WHERE session_id=?1 ORDER BY captured_at_ms ASC",
+            )
+            .map_err(db_error)?;
+        let rows = stmt
+            .query_map(params![session_id], |row| {
+                Ok(BrowserScreenshotRow {
+                    id: row.get(0)?,
+                    session_id: row.get(1)?,
+                    task_id: row.get(2)?,
+                    commit_ref: row.get(3)?,
+                    viewport: row.get(4)?,
+                    url: row.get(5)?,
+                    artifact_uri: row.get(6)?,
+                    sensitive: row.get::<_, i64>(7)? != 0,
+                    evidence_ref: row.get(8)?,
+                    captured_at_ms: row.get(9)?,
+                })
+            })
+            .map_err(db_error)?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(db_error)
+    }
+
     fn configure(&self) -> AcResult<()> {
         self.connection
             .pragma_update(None, "foreign_keys", "ON")
@@ -2682,7 +2881,7 @@ mod tests {
     fn sqlite_store_persists_kernel_state() {
         let mut db = ControlPlaneDb::open_memory().unwrap();
         db.migrate().unwrap();
-        assert_eq!(db.user_version().unwrap(), 9);
+        assert_eq!(db.user_version().unwrap(), 10);
 
         let mut kernel = Kernel::new(AllowAllPolicy);
         kernel.start().unwrap();
@@ -3300,7 +3499,7 @@ mod tests {
         {
             let mut db = ControlPlaneDb::open(&path).unwrap();
             db.migrate().unwrap();
-            assert_eq!(db.user_version().unwrap(), 9);
+            assert_eq!(db.user_version().unwrap(), 10);
             db.save_changeset_transaction(
                 &transaction,
                 Some("task-p13"),
@@ -3379,7 +3578,7 @@ mod tests {
         {
             let mut db = ControlPlaneDb::open(&path).unwrap();
             db.migrate().unwrap();
-            assert_eq!(db.user_version().unwrap(), 9);
+            assert_eq!(db.user_version().unwrap(), 10);
             db.save_verification_profile(&profile).unwrap();
             db.save_verification_manifest(
                 &manifest,
@@ -3413,6 +3612,72 @@ mod tests {
                     .verified
             );
             assert!(db.final_audits("mission-p14").unwrap()[0].completion_allowed);
+        }
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn phase15_browser_runtime_state_survives_reopen() {
+        let path =
+            std::env::temp_dir().join(format!("agentcode-p15-{}.sqlite", StableId::new("db")));
+        let mut runtime = ac_verification::BrowserRuntime::new(
+            ac_security::CapabilityPolicy::new().allow(ac_security::Capability::BrowserAutomation),
+        );
+        let mut evidence = ac_evidence::EvidenceStore::new();
+        let task = StableId::new("task");
+        let process = runtime.launch(task.clone()).unwrap();
+        let session = runtime
+            .create_session(task.clone(), process.id.clone())
+            .unwrap();
+        let dev_server = runtime
+            .manage_dev_server(
+                task.clone(),
+                vec!["npm".to_string(), "run".to_string(), "dev".to_string()],
+                3000,
+                "http://127.0.0.1:3000/login",
+            )
+            .unwrap();
+        runtime
+            .act(
+                &session.id,
+                ac_verification::BrowserAction::Open {
+                    url: dev_server.ready_url.clone(),
+                    html: "<h1>Login</h1><button id=\"submit\">Submit</button>".to_string(),
+                },
+                &mut evidence,
+            )
+            .unwrap();
+        let screenshot = runtime
+            .capture_screenshot(
+                &session.id,
+                task.clone(),
+                "commit-p15",
+                runtime.default_viewports()[2],
+                &mut evidence,
+            )
+            .unwrap();
+        let visual = runtime.visual_qa(&screenshot, &mut evidence).unwrap();
+        {
+            let mut db = ControlPlaneDb::open(&path).unwrap();
+            db.migrate().unwrap();
+            assert_eq!(db.user_version().unwrap(), 10);
+            db.save_browser_process(&process).unwrap();
+            db.save_browser_session(&session).unwrap();
+            db.save_browser_dev_server(&dev_server).unwrap();
+            db.save_browser_screenshot(&screenshot).unwrap();
+            db.save_browser_visual_qa(&visual).unwrap();
+        }
+        {
+            let db = ControlPlaneDb::open(&path).unwrap();
+            let loaded = db.browser_session(session.id.as_str()).unwrap().unwrap();
+            assert_eq!(loaded.task_id, task.to_string());
+            assert!(loaded.sensitive);
+            let screenshots = db.browser_screenshots(session.id.as_str()).unwrap();
+            assert_eq!(screenshots[0].viewport, "desktop");
+            assert_eq!(
+                screenshots[0].evidence_ref,
+                screenshot.evidence_ref.to_string()
+            );
         }
         let _ = fs::remove_file(path);
     }

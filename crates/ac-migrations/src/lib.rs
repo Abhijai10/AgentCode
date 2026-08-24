@@ -94,6 +94,12 @@ pub const VERIFICATION_EVIDENCE_ENGINE_V9: Migration = Migration {
     sql: include_str!("../../../migrations/0009_verification_evidence_engine.sql"),
 };
 
+pub const BROWSER_RUNTIME_V10: Migration = Migration {
+    id: "0010_browser_runtime",
+    description: "browser runtime processes, sessions, dev servers, screenshots, and visual QA",
+    sql: include_str!("../../../migrations/0010_browser_runtime.sql"),
+};
+
 pub fn validate_migrations(migrations: &[Migration]) -> AcResult<()> {
     let mut seen = BTreeSet::new();
     for migration in migrations {

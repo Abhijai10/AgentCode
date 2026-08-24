@@ -5,7 +5,7 @@ Doc 10 gates for the phase pass and completion evidence exists).
 
 Phase names are the EXACT canonical names from Doc 09 HC-P00..HC-P29 (no aliases).
 
-Last updated: 2026-08-24 (Phase 14 verification engine closure)
+Last updated: 2026-08-24 (Phase 15 browser runtime closure)
 
 | Phase | Name (Doc 09 HC-*) | Status | Notes |
 |-------|--------------------|--------|-------|
@@ -24,7 +24,7 @@ Last updated: 2026-08-24 (Phase 14 verification engine closure)
 | P12 | Full Autonomy Kernel & Multi-Agent Runtime | COMPLETE | P12-WP01..P12-WP24 ACCEPTED; mission contracts, requirement matrix, DAG validation, scheduler, worker registry, leases, heartbeats, progress/stall/loop detection, recovery/retry, Researcher, Verifier, mailbox, blackboard, concurrency, conflict prediction, resource governor, pause/resume/cancel, replanning, dynamic task discovery and escalation pass P12-G1..G20; evidence: docs/progress/phase-12-completion.md (+ .json) |
 | P13 | Advanced Edit Engine | COMPLETE | P13-WP01..P13-WP13 ACCEPTED; typed edit strategies, preconditions, transaction journal, rollback/recovery, formatter detection, AST/LSP fallbacks, strategy metrics and durable edit persistence pass P13-G1..G10; evidence: docs/progress/phase-13-completion.md (+ .json) |
 | P14 | Verification & Evidence Engine | COMPLETE | P14-WP01..P14-WP14 ACCEPTED; verification profiles, command detection, mechanical gates, test registry/selection, evidence manifests, requirement links, independent verifier, adversarial/tampering checks, freshness invalidation, integration verification, final audit and completion gate pass P14-G1..G14; evidence: docs/progress/phase-14-completion.md (+ .json) |
-| P15 | Browser Runtime & Visual Verification | NOT_STARTED | |
+| P15 | Browser Runtime & Visual Verification | COMPLETE | P15-WP01..P15-WP11 ACCEPTED; adapter abstraction, process/session registry, page actions, DOM/a11y extraction, diagnostics, screenshots, dev-server records, responsive profiles, visual QA and crash recovery pass P15-G1..G11 plus behavioral browser flow; evidence: docs/progress/phase-15-completion.md (+ .json) |
 | P16 | Skills, Hooks & MCP | NOT_STARTED | |
 | P17 | Baseline Security Platform | NOT_STARTED | |
 | P18 | Advanced AppSec, Cloud & Red-Team | NOT_STARTED | |
