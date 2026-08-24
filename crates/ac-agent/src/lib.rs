@@ -17,8 +17,10 @@ use ac_evidence::{EvidenceKind, EvidenceStore, Provenance};
 use ac_git::GitCoordinator;
 use ac_kernel::{MissionState, PolicyBoundary};
 use ac_provider::{
-    PrivacyClass, ProviderCapability, ProviderFailureClass, ProviderRegistry, ProviderStreamEvent,
-    RoutingProfile, ScriptedProvider, TaskProfile,
+    AnthropicProviderAdapter, GeminiProviderAdapter, LMStudioProviderAdapter,
+    OllamaProviderAdapter, OpenAIProviderAdapter, PrivacyClass, ProviderCapability,
+    ProviderFailureClass, ProviderRegistry, ProviderStreamEvent, RoutingProfile, ScriptedProvider,
+    TaskProfile,
 };
 use ac_runtime::{AgentSession, AgentSessionState};
 use ac_security::{
@@ -985,7 +987,368 @@ impl<P: PolicyBoundary> AutonomousAgent<P> {
 }
 
 pub fn default_provider_registry() -> AcResult<ProviderRegistry> {
+    provider_registry_from_config(ProviderRegistryConfig::default_provider_config()?)
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProviderRegistryConfig {
+    pub mock_mode: bool,
+    pub entries: Vec<ProviderConfigEntry>,
+}
+
+impl ProviderRegistryConfig {
+    pub fn default_provider_config() -> AcResult<Self> {
+        let mut config = Self::from_environment();
+        if let Ok(path) = std::env::var("AGENTCODE_PROVIDER_CONFIG") {
+            config
+                .entries
+                .extend(Self::entries_from_config_file(Path::new(&path))?);
+        }
+        Ok(config)
+    }
+
+    pub fn from_environment() -> Self {
+        let mut config = Self {
+            mock_mode: std::env::var("AGENTCODE_PROVIDER_MODE").ok().as_deref() == Some("mock"),
+            entries: Vec::new(),
+        };
+        if std::env::var("OPENAI_API_KEY").is_ok() {
+            config.entries.push(ProviderConfigEntry {
+                kind: ProviderConfigKind::OpenAi,
+                name: "openai".to_string(),
+                endpoint: std::env::var("OPENAI_BASE_URL")
+                    .unwrap_or_else(|_| "https://api.openai.com/v1/chat/completions".to_string()),
+                model: std::env::var("OPENAI_MODEL").unwrap_or_else(|_| "gpt-4o-mini".to_string()),
+            });
+        }
+        if std::env::var("ANTHROPIC_API_KEY").is_ok() {
+            config.entries.push(ProviderConfigEntry {
+                kind: ProviderConfigKind::Anthropic,
+                name: "anthropic".to_string(),
+                endpoint: std::env::var("ANTHROPIC_BASE_URL")
+                    .unwrap_or_else(|_| "https://api.anthropic.com/v1/messages".to_string()),
+                model: std::env::var("ANTHROPIC_MODEL")
+                    .unwrap_or_else(|_| "claude-3-5-haiku-latest".to_string()),
+            });
+        }
+        if std::env::var("GEMINI_API_KEY").is_ok() {
+            let model =
+                std::env::var("GEMINI_MODEL").unwrap_or_else(|_| "gemini-1.5-flash".to_string());
+            config.entries.push(ProviderConfigEntry {
+                kind: ProviderConfigKind::Gemini,
+                name: "gemini".to_string(),
+                endpoint: std::env::var("GEMINI_BASE_URL").unwrap_or_else(|_| {
+                    format!(
+                        "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+                    )
+                }),
+                model,
+            });
+        }
+        if std::env::var("OLLAMA_BASE_URL").is_ok()
+            || std::env::var("AGENTCODE_ENABLE_OLLAMA").ok().as_deref() == Some("1")
+        {
+            config.entries.push(ProviderConfigEntry {
+                kind: ProviderConfigKind::Ollama,
+                name: "ollama".to_string(),
+                endpoint: std::env::var("OLLAMA_BASE_URL")
+                    .unwrap_or_else(|_| "http://127.0.0.1:11434/api/chat".to_string()),
+                model: std::env::var("OLLAMA_MODEL").unwrap_or_else(|_| "llama3.1".to_string()),
+            });
+        }
+        if let Ok(endpoint) = std::env::var("LMSTUDIO_BASE_URL") {
+            config.entries.push(ProviderConfigEntry {
+                kind: ProviderConfigKind::LmStudio,
+                name: "lm-studio".to_string(),
+                endpoint,
+                model: std::env::var("LMSTUDIO_MODEL")
+                    .unwrap_or_else(|_| "local-model".to_string()),
+            });
+        }
+        config
+    }
+
+    fn entries_from_config_file(path: &Path) -> AcResult<Vec<ProviderConfigEntry>> {
+        let raw = fs::read_to_string(path).map_err(|error| {
+            AcError::validation("AGENT-PROVIDER_CONFIG_READ_FAILED", error.to_string())
+        })?;
+        let mut entries = Vec::new();
+        let mut current = Vec::new();
+        for line in raw.lines() {
+            let line = line.trim();
+            if line.is_empty() {
+                if !current.is_empty() {
+                    entries.push(ProviderConfigEntry::from_key_value_lines(&current)?);
+                    current.clear();
+                }
+                continue;
+            }
+            if line.starts_with('#') {
+                continue;
+            }
+            current.push(line.to_string());
+        }
+        if !current.is_empty() {
+            entries.push(ProviderConfigEntry::from_key_value_lines(&current)?);
+        }
+        Ok(entries)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ProviderConfigKind {
+    OpenAi,
+    Anthropic,
+    Gemini,
+    Ollama,
+    LmStudio,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProviderConfigEntry {
+    pub kind: ProviderConfigKind,
+    pub name: String,
+    pub endpoint: String,
+    pub model: String,
+}
+
+impl ProviderConfigEntry {
+    fn from_key_value_lines(lines: &[String]) -> AcResult<Self> {
+        let mut kind = None;
+        let mut name = None;
+        let mut endpoint = None;
+        let mut model = None;
+        for line in lines {
+            let (key, value) = line.split_once('=').ok_or_else(|| {
+                AcError::validation(
+                    "AGENT-PROVIDER_CONFIG_INVALID",
+                    "provider config lines must be key=value",
+                )
+            })?;
+            let value = value.trim().to_string();
+            match key.trim() {
+                "kind" | "provider" => kind = Some(parse_provider_kind(&value)?),
+                "name" => name = Some(value),
+                "endpoint" => endpoint = Some(value),
+                "model" => model = Some(value),
+                _ => {
+                    return Err(AcError::validation(
+                        "AGENT-PROVIDER_CONFIG_INVALID",
+                        format!("unknown provider config key: {}", key.trim()),
+                    ));
+                }
+            }
+        }
+        let kind = kind.ok_or_else(|| {
+            AcError::validation("AGENT-PROVIDER_CONFIG_INVALID", "provider kind is required")
+        })?;
+        let default_name = provider_kind_name(kind).to_string();
+        Ok(Self {
+            kind,
+            name: name.unwrap_or(default_name),
+            endpoint: endpoint.ok_or_else(|| {
+                AcError::validation(
+                    "AGENT-PROVIDER_CONFIG_INVALID",
+                    "provider endpoint is required",
+                )
+            })?,
+            model: model.ok_or_else(|| {
+                AcError::validation(
+                    "AGENT-PROVIDER_CONFIG_INVALID",
+                    "provider model is required",
+                )
+            })?,
+        })
+    }
+}
+
+fn parse_provider_kind(value: &str) -> AcResult<ProviderConfigKind> {
+    match value {
+        "openai" => Ok(ProviderConfigKind::OpenAi),
+        "anthropic" => Ok(ProviderConfigKind::Anthropic),
+        "gemini" => Ok(ProviderConfigKind::Gemini),
+        "ollama" => Ok(ProviderConfigKind::Ollama),
+        "lm-studio" | "lmstudio" => Ok(ProviderConfigKind::LmStudio),
+        _ => Err(AcError::validation(
+            "AGENT-PROVIDER_CONFIG_INVALID",
+            format!("unsupported provider kind: {value}"),
+        )),
+    }
+}
+
+fn provider_kind_name(kind: ProviderConfigKind) -> &'static str {
+    match kind {
+        ProviderConfigKind::OpenAi => "openai",
+        ProviderConfigKind::Anthropic => "anthropic",
+        ProviderConfigKind::Gemini => "gemini",
+        ProviderConfigKind::Ollama => "ollama",
+        ProviderConfigKind::LmStudio => "lm-studio",
+    }
+}
+
+pub fn provider_registry_from_config(config: ProviderRegistryConfig) -> AcResult<ProviderRegistry> {
     let mut providers = ProviderRegistry::new();
+    if config.mock_mode {
+        register_scripted_mock_provider(&mut providers)?;
+        return Ok(providers);
+    }
+    for entry in config.entries {
+        register_configured_provider(&mut providers, entry)?;
+    }
+    Ok(providers)
+}
+
+fn register_configured_provider(
+    providers: &mut ProviderRegistry,
+    entry: ProviderConfigEntry,
+) -> AcResult<()> {
+    if entry.name.trim().is_empty()
+        || entry.endpoint.trim().is_empty()
+        || entry.model.trim().is_empty()
+    {
+        return Err(AcError::validation(
+            "AGENT-PROVIDER_CONFIG_INVALID",
+            "provider name, endpoint, and model are required",
+        ));
+    }
+    match entry.kind {
+        ProviderConfigKind::OpenAi => register_real_provider(
+            providers,
+            &entry.name,
+            Some("env:OPENAI_API_KEY".to_string()),
+            Box::new(OpenAIProviderAdapter::new(
+                entry.endpoint,
+                entry.model.clone(),
+            )?),
+            entry.model,
+            "config:openai.endpoint",
+            false,
+            true,
+            PrivacyClass::ExternalAllowed,
+            10,
+            40,
+        ),
+        ProviderConfigKind::Anthropic => register_real_provider(
+            providers,
+            &entry.name,
+            Some("env:ANTHROPIC_API_KEY".to_string()),
+            Box::new(AnthropicProviderAdapter::new(
+                entry.endpoint,
+                entry.model.clone(),
+            )?),
+            entry.model,
+            "config:anthropic.endpoint",
+            false,
+            true,
+            PrivacyClass::ExternalAllowed,
+            8,
+            40,
+        ),
+        ProviderConfigKind::Gemini => register_real_provider(
+            providers,
+            &entry.name,
+            Some("env:GEMINI_API_KEY".to_string()),
+            Box::new(GeminiProviderAdapter::new(
+                entry.endpoint,
+                entry.model.clone(),
+            )?),
+            entry.model,
+            "config:gemini.endpoint",
+            false,
+            true,
+            PrivacyClass::ExternalAllowed,
+            3,
+            12,
+        ),
+        ProviderConfigKind::Ollama => register_real_provider(
+            providers,
+            &entry.name,
+            None,
+            Box::new(OllamaProviderAdapter::new(
+                entry.endpoint,
+                entry.model.clone(),
+            )?),
+            entry.model,
+            "config:ollama.endpoint",
+            true,
+            false,
+            PrivacyClass::LocalOnly,
+            0,
+            0,
+        ),
+        ProviderConfigKind::LmStudio => register_real_provider(
+            providers,
+            &entry.name,
+            None,
+            Box::new(LMStudioProviderAdapter::new(
+                entry.endpoint,
+                entry.model.clone(),
+            )?),
+            entry.model,
+            "config:lm-studio.endpoint",
+            true,
+            false,
+            PrivacyClass::LocalOnly,
+            0,
+            0,
+        ),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn register_real_provider(
+    providers: &mut ProviderRegistry,
+    name: &str,
+    credential_ref: Option<String>,
+    adapter: Box<dyn ac_provider::ProviderAdapter>,
+    model_name: String,
+    endpoint_ref: &str,
+    local: bool,
+    paid: bool,
+    privacy: PrivacyClass,
+    input_cost_micros: u32,
+    output_cost_micros: u32,
+) -> AcResult<()> {
+    let provider_id = providers.register_provider(
+        name,
+        credential_ref,
+        vec![ProviderCapability::Chat, ProviderCapability::Streaming],
+        name,
+    )?;
+    providers.register_adapter(&provider_id, adapter)?;
+    let model_id = providers.register_model(
+        &provider_id,
+        model_name.clone(),
+        vec![ProviderCapability::Chat, ProviderCapability::Streaming],
+        if local { 8192 } else { 128_000 },
+    )?;
+    let connection_id = providers.register_connection(
+        &provider_id,
+        format!("{name}-account"),
+        None,
+        name,
+        endpoint_ref,
+        true,
+        paid,
+        local,
+    )?;
+    let identity_id = providers.register_model_identity(
+        model_name,
+        if local { 8192 } else { 128_000 },
+        80,
+        80,
+        false,
+        false,
+        true,
+        input_cost_micros,
+        output_cost_micros,
+        privacy,
+    )?;
+    providers.register_model_route(&identity_id, &model_id, &connection_id)?;
+    Ok(())
+}
+
+fn register_scripted_mock_provider(providers: &mut ProviderRegistry) -> AcResult<()> {
     let provider_id = providers.register_provider(
         "local-scripted",
         None,
@@ -1038,7 +1401,7 @@ pub fn default_provider_registry() -> AcResult<ProviderRegistry> {
             providers.register_model_route(&identity_id, &model_id, &connection_id)?;
             Ok(model_id)
         })?;
-    Ok(providers)
+    Ok(())
 }
 
 pub fn default_tool_broker(policy: CapabilityPolicy) -> ToolBroker {
@@ -1424,6 +1787,27 @@ mod tests {
     use ac_kernel::AllowAllPolicy;
     use ac_runtime::Worker;
     use ac_tool::{ToolDefinition, ToolExecutor};
+    use std::sync::Mutex;
+
+    static PROVIDER_ENV_LOCK: Mutex<()> = Mutex::new(());
+    const PROVIDER_ENV_KEYS: &[&str] = &[
+        "AGENTCODE_PROVIDER_MODE",
+        "OPENAI_API_KEY",
+        "OPENAI_BASE_URL",
+        "OPENAI_MODEL",
+        "ANTHROPIC_API_KEY",
+        "ANTHROPIC_BASE_URL",
+        "ANTHROPIC_MODEL",
+        "GEMINI_API_KEY",
+        "GEMINI_BASE_URL",
+        "GEMINI_MODEL",
+        "OLLAMA_BASE_URL",
+        "AGENTCODE_ENABLE_OLLAMA",
+        "OLLAMA_MODEL",
+        "LMSTUDIO_BASE_URL",
+        "LMSTUDIO_MODEL",
+        "AGENTCODE_PROVIDER_CONFIG",
+    ];
 
     struct FlakyTool {
         failures: std::sync::Mutex<usize>,
@@ -1454,6 +1838,105 @@ mod tests {
             }
             Ok(request.payload.clone())
         }
+    }
+
+    fn with_clean_provider_env<T>(f: impl FnOnce() -> T) -> T {
+        let _guard = PROVIDER_ENV_LOCK.lock().unwrap();
+        let saved = PROVIDER_ENV_KEYS
+            .iter()
+            .map(|key| (*key, std::env::var(key).ok()))
+            .collect::<Vec<_>>();
+        for key in PROVIDER_ENV_KEYS {
+            std::env::remove_var(key);
+        }
+        let result = f();
+        for (key, value) in saved {
+            if let Some(value) = value {
+                std::env::set_var(key, value);
+            } else {
+                std::env::remove_var(key);
+            }
+        }
+        result
+    }
+
+    #[test]
+    fn default_provider_registry_does_not_register_scripted_provider_by_default() {
+        with_clean_provider_env(|| {
+            let registry = default_provider_registry().unwrap();
+            assert_eq!(registry.provider_count(), 0);
+            assert!(!registry.provider_names().contains(&"local-scripted"));
+        });
+    }
+
+    #[test]
+    fn default_provider_registry_registers_real_providers_from_configuration() {
+        with_clean_provider_env(|| {
+            std::env::set_var("OPENAI_API_KEY", "test-key");
+            std::env::set_var("OPENAI_MODEL", "gpt-test");
+            std::env::set_var("AGENTCODE_ENABLE_OLLAMA", "1");
+            std::env::set_var("OLLAMA_MODEL", "llama-test");
+            let registry = default_provider_registry().unwrap();
+            let names = registry.provider_names();
+            assert!(names.contains(&"openai"));
+            assert!(names.contains(&"ollama"));
+            assert!(!names.contains(&"local-scripted"));
+        });
+    }
+
+    #[test]
+    fn provider_registry_accepts_runtime_configuration() {
+        let registry = provider_registry_from_config(ProviderRegistryConfig {
+            mock_mode: false,
+            entries: vec![
+                ProviderConfigEntry {
+                    kind: ProviderConfigKind::Ollama,
+                    name: "local-ollama".to_string(),
+                    endpoint: "http://127.0.0.1:11434/api/chat".to_string(),
+                    model: "llama-test".to_string(),
+                },
+                ProviderConfigEntry {
+                    kind: ProviderConfigKind::LmStudio,
+                    name: "studio".to_string(),
+                    endpoint: "http://127.0.0.1:1234/v1/chat/completions".to_string(),
+                    model: "local-model".to_string(),
+                },
+            ],
+        })
+        .unwrap();
+        let names = registry.provider_names();
+        assert!(names.contains(&"local-ollama"));
+        assert!(names.contains(&"studio"));
+    }
+
+    #[test]
+    fn default_provider_registry_reads_provider_config_file() {
+        with_clean_provider_env(|| {
+            let path = std::env::temp_dir().join(format!(
+                "agentcode-provider-config-{}.txt",
+                StableId::new("test")
+            ));
+            fs::write(
+                &path,
+                "provider=ollama\nname=config-ollama\nendpoint=http://127.0.0.1:11434/api/chat\nmodel=llama-file\n\nprovider=lm-studio\nname=config-studio\nendpoint=http://127.0.0.1:1234/v1/chat/completions\nmodel=studio-file\n",
+            )
+            .unwrap();
+            std::env::set_var("AGENTCODE_PROVIDER_CONFIG", path.as_os_str());
+            let registry = default_provider_registry().unwrap();
+            let names = registry.provider_names();
+            assert!(names.contains(&"config-ollama"));
+            assert!(names.contains(&"config-studio"));
+            let _ = fs::remove_file(path);
+        });
+    }
+
+    #[test]
+    fn scripted_provider_requires_explicit_mock_mode() {
+        with_clean_provider_env(|| {
+            std::env::set_var("AGENTCODE_PROVIDER_MODE", "mock");
+            let registry = default_provider_registry().unwrap();
+            assert_eq!(registry.provider_names(), vec!["local-scripted"]);
+        });
     }
 
     fn run_git<const N: usize>(cwd: &Path, args: [&str; N]) {
@@ -1503,7 +1986,11 @@ mod tests {
         AutonomousAgent::new(
             ac_kernel::Kernel::new(AllowAllPolicy),
             AgentSession::new(Worker::new()),
-            default_provider_registry().unwrap(),
+            {
+                let mut providers = ProviderRegistry::new();
+                register_scripted_mock_provider(&mut providers).unwrap();
+                providers
+            },
             tools,
             EvidenceStore::new(),
             MemoryService::new(),
@@ -2025,6 +2512,11 @@ mod tests {
                 "initial",
             ],
         );
+        let _provider_env_guard = PROVIDER_ENV_LOCK.lock().unwrap();
+        for key in PROVIDER_ENV_KEYS {
+            std::env::remove_var(key);
+        }
+        std::env::set_var("AGENTCODE_PROVIDER_MODE", "mock");
         let mut agent = isolated_workspace_agent(
             source.clone(),
             worktree.clone(),

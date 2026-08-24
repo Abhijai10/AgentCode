@@ -67,6 +67,7 @@ fn autonomous_flow_reaches_completion_only_after_verification_evidence() {
         ],
     );
 
+    std::env::set_var("AGENTCODE_PROVIDER_MODE", "mock");
     let mut agent = isolated_workspace_agent(
         source.clone(),
         worktree.clone(),

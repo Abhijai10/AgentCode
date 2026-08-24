@@ -1,9 +1,10 @@
 use std::collections::{BTreeMap, VecDeque};
-use std::io::{Read, Write};
-use std::net::{TcpStream, ToSocketAddrs};
 use std::time::Duration;
 
 use ac_common::{AcError, AcResult, StableId, TimestampMillis};
+use reqwest::blocking::{Client, Response};
+use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION, CONTENT_TYPE};
+use serde_json::{json, Value};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ProviderCapability {
@@ -506,7 +507,7 @@ impl ProviderAdapter for ConfiguredProviderAdapter {
                 self.endpoint_ref, self.model_name
             )),
             ProviderStreamEvent::Usage {
-                input_tokens: request.prompt.split_whitespace().count() as u32,
+                input_tokens: estimate_token_count(&request.prompt),
                 output_tokens: 3,
             },
             ProviderStreamEvent::Finished,
@@ -520,6 +521,103 @@ pub struct HttpProviderAdapter {
     pub credential_env: Option<String>,
     pub model_name: String,
     pub timeout_ms: u64,
+    provider_kind: HttpProviderKind,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum HttpProviderKind {
+    OpenAiCompatible,
+    OpenAiChatCompletions,
+    AnthropicMessages,
+    GeminiGenerateContent,
+    OllamaChat,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OpenAIProviderAdapter {
+    inner: HttpProviderAdapter,
+}
+
+impl OpenAIProviderAdapter {
+    pub fn new(endpoint: impl Into<String>, model_name: impl Into<String>) -> AcResult<Self> {
+        Ok(Self {
+            inner: HttpProviderAdapter::new_kind(
+                endpoint,
+                Some("OPENAI_API_KEY".to_string()),
+                model_name,
+                60_000,
+                HttpProviderKind::OpenAiChatCompletions,
+            )?,
+        })
+    }
+}
+
+impl ProviderAdapter for OpenAIProviderAdapter {
+    fn stream(
+        &self,
+        request: &NormalizedInferenceRequest,
+        cancel: &dyn Fn() -> bool,
+    ) -> Result<Vec<ProviderStreamEvent>, ProviderFailureClass> {
+        self.inner.stream(request, cancel)
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AnthropicProviderAdapter {
+    inner: HttpProviderAdapter,
+}
+
+impl AnthropicProviderAdapter {
+    pub fn new(endpoint: impl Into<String>, model_name: impl Into<String>) -> AcResult<Self> {
+        Ok(Self {
+            inner: HttpProviderAdapter::new_kind(
+                endpoint,
+                Some("ANTHROPIC_API_KEY".to_string()),
+                model_name,
+                60_000,
+                HttpProviderKind::AnthropicMessages,
+            )?,
+        })
+    }
+}
+
+impl ProviderAdapter for AnthropicProviderAdapter {
+    fn stream(
+        &self,
+        request: &NormalizedInferenceRequest,
+        cancel: &dyn Fn() -> bool,
+    ) -> Result<Vec<ProviderStreamEvent>, ProviderFailureClass> {
+        self.inner.stream(request, cancel)
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GeminiProviderAdapter {
+    inner: HttpProviderAdapter,
+}
+
+impl GeminiProviderAdapter {
+    pub fn new(endpoint: impl Into<String>, model_name: impl Into<String>) -> AcResult<Self> {
+        Ok(Self {
+            inner: HttpProviderAdapter::new_kind(
+                endpoint,
+                Some("GEMINI_API_KEY".to_string()),
+                model_name,
+                60_000,
+                HttpProviderKind::GeminiGenerateContent,
+            )?,
+        })
+    }
+}
+
+impl ProviderAdapter for GeminiProviderAdapter {
+    fn stream(
+        &self,
+        request: &NormalizedInferenceRequest,
+        cancel: &dyn Fn() -> bool,
+    ) -> Result<Vec<ProviderStreamEvent>, ProviderFailureClass> {
+        self.inner.stream(request, cancel)
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -530,12 +628,47 @@ pub struct OllamaProviderAdapter {
 impl OllamaProviderAdapter {
     pub fn new(endpoint: impl Into<String>, model_name: impl Into<String>) -> AcResult<Self> {
         Ok(Self {
-            inner: HttpProviderAdapter::new(endpoint, None, model_name, 30_000)?,
+            inner: HttpProviderAdapter::new_kind(
+                endpoint,
+                None,
+                model_name,
+                60_000,
+                HttpProviderKind::OllamaChat,
+            )?,
         })
     }
 }
 
 impl ProviderAdapter for OllamaProviderAdapter {
+    fn stream(
+        &self,
+        request: &NormalizedInferenceRequest,
+        cancel: &dyn Fn() -> bool,
+    ) -> Result<Vec<ProviderStreamEvent>, ProviderFailureClass> {
+        self.inner.stream(request, cancel)
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LMStudioProviderAdapter {
+    inner: HttpProviderAdapter,
+}
+
+impl LMStudioProviderAdapter {
+    pub fn new(endpoint: impl Into<String>, model_name: impl Into<String>) -> AcResult<Self> {
+        Ok(Self {
+            inner: HttpProviderAdapter::new_kind(
+                endpoint,
+                None,
+                model_name,
+                60_000,
+                HttpProviderKind::OpenAiCompatible,
+            )?,
+        })
+    }
+}
+
+impl ProviderAdapter for LMStudioProviderAdapter {
     fn stream(
         &self,
         request: &NormalizedInferenceRequest,
@@ -552,12 +685,31 @@ impl HttpProviderAdapter {
         model_name: impl Into<String>,
         timeout_ms: u64,
     ) -> AcResult<Self> {
+        Self::new_kind(
+            endpoint,
+            credential_env,
+            model_name,
+            timeout_ms,
+            HttpProviderKind::OpenAiCompatible,
+        )
+    }
+
+    fn new_kind(
+        endpoint: impl Into<String>,
+        credential_env: Option<String>,
+        model_name: impl Into<String>,
+        timeout_ms: u64,
+        provider_kind: HttpProviderKind,
+    ) -> AcResult<Self> {
         let endpoint = endpoint.into();
         let model_name = model_name.into();
-        if !endpoint.starts_with("http://") || model_name.trim().is_empty() || timeout_ms == 0 {
+        if !(endpoint.starts_with("http://") || endpoint.starts_with("https://"))
+            || model_name.trim().is_empty()
+            || timeout_ms == 0
+        {
             return Err(AcError::validation(
                 "PROVIDER-INVALID_HTTP_CONFIG",
-                "http endpoint, model name, and timeout are required",
+                "http(s) endpoint, model name, and timeout are required",
             ));
         }
         Ok(Self {
@@ -565,7 +717,65 @@ impl HttpProviderAdapter {
             credential_env,
             model_name,
             timeout_ms,
+            provider_kind,
         })
+    }
+
+    pub fn request_json(&self, request: &NormalizedInferenceRequest) -> Value {
+        match self.provider_kind {
+            HttpProviderKind::OpenAiCompatible | HttpProviderKind::OpenAiChatCompletions => json!({
+                "model": self.model_name,
+                "messages": [{"role": "user", "content": request.prompt}],
+                "max_tokens": request.max_output_tokens,
+                "stream": true
+            }),
+            HttpProviderKind::AnthropicMessages => json!({
+                "model": self.model_name,
+                "messages": [{"role": "user", "content": request.prompt}],
+                "max_tokens": request.max_output_tokens,
+                "stream": true
+            }),
+            HttpProviderKind::GeminiGenerateContent => json!({
+                "contents": [{"role": "user", "parts": [{"text": request.prompt}]}],
+                "generationConfig": {"maxOutputTokens": request.max_output_tokens}
+            }),
+            HttpProviderKind::OllamaChat => json!({
+                "model": self.model_name,
+                "messages": [{"role": "user", "content": request.prompt}],
+                "stream": true
+            }),
+        }
+    }
+
+    pub fn auth_headers(&self) -> Result<HeaderMap, ProviderFailureClass> {
+        let mut headers = HeaderMap::new();
+        headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+        if let Some(env_name) = &self.credential_env {
+            let key = std::env::var(env_name).map_err(|_| ProviderFailureClass::Auth)?;
+            match self.provider_kind {
+                HttpProviderKind::AnthropicMessages => {
+                    headers.insert(
+                        "x-api-key",
+                        HeaderValue::from_str(&key).map_err(|_| ProviderFailureClass::Auth)?,
+                    );
+                    headers.insert("anthropic-version", HeaderValue::from_static("2023-06-01"));
+                }
+                HttpProviderKind::GeminiGenerateContent => {
+                    headers.insert(
+                        "x-goog-api-key",
+                        HeaderValue::from_str(&key).map_err(|_| ProviderFailureClass::Auth)?,
+                    );
+                }
+                _ => {
+                    let value = format!("Bearer {key}");
+                    headers.insert(
+                        AUTHORIZATION,
+                        HeaderValue::from_str(&value).map_err(|_| ProviderFailureClass::Auth)?,
+                    );
+                }
+            }
+        }
+        Ok(headers)
     }
 }
 
@@ -578,67 +788,21 @@ impl ProviderAdapter for HttpProviderAdapter {
         if cancel() {
             return Err(ProviderFailureClass::Cancelled);
         }
-        let endpoint = parse_http_endpoint(&self.endpoint)?;
-        let timeout = Duration::from_millis(self.timeout_ms);
-        let address = endpoint
-            .address
-            .to_socket_addrs()
-            .map_err(|_| ProviderFailureClass::ServerError)?
-            .next()
-            .ok_or(ProviderFailureClass::ServerError)?;
-        let mut stream = TcpStream::connect_timeout(&address, timeout)
-            .map_err(|_| ProviderFailureClass::Timeout)?;
-        stream
-            .set_read_timeout(Some(timeout))
+        let client = Client::builder()
+            .timeout(Duration::from_millis(self.timeout_ms))
+            .build()
             .map_err(|_| ProviderFailureClass::ServerError)?;
-        stream
-            .set_write_timeout(Some(timeout))
-            .map_err(|_| ProviderFailureClass::ServerError)?;
+        let response = client
+            .post(&self.endpoint)
+            .headers(self.auth_headers()?)
+            .json(&self.request_json(request))
+            .send()
+            .map_err(map_reqwest_error)?;
         if cancel() {
             return Err(ProviderFailureClass::Cancelled);
         }
-        let credential = self
-            .credential_env
-            .as_ref()
-            .and_then(|name| std::env::var(name).ok());
-        let body = format!(
-            "{{\"model\":\"{}\",\"prompt\":\"{}\",\"max_output_tokens\":{}}}",
-            escape_json(&self.model_name),
-            escape_json(&request.prompt),
-            request.max_output_tokens
-        );
-        let auth = credential
-            .as_ref()
-            .map(|value| format!("Authorization: Bearer {}\r\n", value))
-            .unwrap_or_default();
-        let wire = format!(
-            "POST {} HTTP/1.1\r\nHost: {}\r\n{}Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-            endpoint.path,
-            endpoint.host_header,
-            auth,
-            body.len(),
-            body
-        );
-        stream
-            .write_all(wire.as_bytes())
-            .map_err(|_| ProviderFailureClass::Timeout)?;
-        let mut response = String::new();
-        stream
-            .read_to_string(&mut response)
-            .map_err(|_| ProviderFailureClass::Timeout)?;
-        if cancel() {
-            return Err(ProviderFailureClass::Cancelled);
-        }
-        let (headers, body) = response
-            .split_once("\r\n\r\n")
-            .ok_or(ProviderFailureClass::MalformedResponse)?;
-        let status = headers
-            .lines()
-            .next()
-            .and_then(|line| line.split_whitespace().nth(1))
-            .and_then(|code| code.parse::<u16>().ok())
-            .ok_or(ProviderFailureClass::MalformedResponse)?;
-        events_from_http_parts(status, body, request)
+        let events = events_from_response(response, self.provider_kind)?;
+        Ok(ensure_usage_event(events, &request.prompt))
     }
 }
 
@@ -1050,6 +1214,17 @@ impl ProviderRegistry {
 
     pub fn attempts(&self) -> &[RouteAttempt] {
         &self.attempts
+    }
+
+    pub fn provider_count(&self) -> usize {
+        self.providers.len()
+    }
+
+    pub fn provider_names(&self) -> Vec<&str> {
+        self.providers
+            .values()
+            .map(|provider| provider.name.as_str())
+            .collect()
     }
 
     pub fn ranked_candidates(&self, profile: &TaskProfile) -> Vec<RouteCandidate> {
@@ -1493,37 +1668,44 @@ fn token_usage(events: &[ProviderStreamEvent]) -> (u32, u32) {
         .unwrap_or((0, 0))
 }
 
-struct ParsedHttpEndpoint {
-    address: String,
-    host_header: String,
-    path: String,
-}
-
-fn parse_http_endpoint(endpoint: &str) -> Result<ParsedHttpEndpoint, ProviderFailureClass> {
-    let rest = endpoint
-        .strip_prefix("http://")
-        .ok_or(ProviderFailureClass::MalformedResponse)?;
-    let (authority, path) = rest.split_once('/').unwrap_or((rest, ""));
-    if authority.trim().is_empty() {
-        return Err(ProviderFailureClass::MalformedResponse);
+fn ensure_usage_event(
+    mut events: Vec<ProviderStreamEvent>,
+    prompt: &str,
+) -> Vec<ProviderStreamEvent> {
+    if events
+        .iter()
+        .any(|event| matches!(event, ProviderStreamEvent::Usage { .. }))
+    {
+        return events;
     }
-    let address = if authority.contains(':') {
-        authority.to_string()
-    } else {
-        format!("{}:80", authority)
-    };
-    Ok(ParsedHttpEndpoint {
-        address,
-        host_header: authority.to_string(),
-        path: format!("/{}", path),
-    })
+    let output = events
+        .iter()
+        .filter_map(|event| {
+            if let ProviderStreamEvent::Delta(text) = event {
+                Some(text.as_str())
+            } else {
+                None
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("");
+    let insert_at = events
+        .iter()
+        .position(|event| matches!(event, ProviderStreamEvent::Finished))
+        .unwrap_or(events.len());
+    events.insert(
+        insert_at,
+        ProviderStreamEvent::Usage {
+            input_tokens: estimate_token_count(prompt),
+            output_tokens: estimate_token_count(&output),
+        },
+    );
+    events
 }
 
-fn escape_json(value: &str) -> String {
-    value
-        .replace('\\', "\\\\")
-        .replace('"', "\\\"")
-        .replace('\n', "\\n")
+fn estimate_token_count(text: &str) -> u32 {
+    let chars = text.chars().count();
+    u32::try_from(chars.div_ceil(4)).unwrap_or(u32::MAX).max(1)
 }
 
 fn extract_string_array(raw: &str, key: &str) -> AcResult<Vec<String>> {
@@ -1579,38 +1761,38 @@ fn extract_string_array(raw: &str, key: &str) -> AcResult<Vec<String>> {
         .collect())
 }
 
-fn extract_delta(body: &str) -> Option<String> {
-    let trimmed = body.trim();
-    if trimmed.is_empty() {
-        return None;
+fn map_reqwest_error(error: reqwest::Error) -> ProviderFailureClass {
+    if error.is_timeout() {
+        ProviderFailureClass::Timeout
+    } else if error.is_builder() {
+        ProviderFailureClass::MalformedResponse
+    } else {
+        ProviderFailureClass::ServerError
     }
-    if let Some(start) = trimmed.find("\"delta\"") {
-        let after_key = &trimmed[start + "\"delta\"".len()..];
-        let after_colon = after_key.split_once(':')?.1.trim_start();
-        let value = after_colon.strip_prefix('"')?;
-        let end = value.find('"')?;
-        return Some(value[..end].replace("\\n", "\n").replace("\\\"", "\""));
-    }
-    Some(trimmed.to_string())
 }
 
-fn events_from_http_parts(
+fn events_from_response(
+    response: Response,
+    provider_kind: HttpProviderKind,
+) -> Result<Vec<ProviderStreamEvent>, ProviderFailureClass> {
+    let status = response.status().as_u16();
+    let body = response.text().map_err(|error| {
+        if error.is_timeout() {
+            ProviderFailureClass::Timeout
+        } else {
+            ProviderFailureClass::MalformedResponse
+        }
+    })?;
+    events_from_status_and_body(status, &body, provider_kind)
+}
+
+fn events_from_status_and_body(
     status: u16,
     body: &str,
-    request: &NormalizedInferenceRequest,
+    provider_kind: HttpProviderKind,
 ) -> Result<Vec<ProviderStreamEvent>, ProviderFailureClass> {
     match status {
-        200..=299 => {
-            let delta = extract_delta(body).ok_or(ProviderFailureClass::MalformedResponse)?;
-            Ok(vec![
-                ProviderStreamEvent::Delta(delta),
-                ProviderStreamEvent::Usage {
-                    input_tokens: request.prompt.split_whitespace().count() as u32,
-                    output_tokens: body.split_whitespace().count() as u32,
-                },
-                ProviderStreamEvent::Finished,
-            ])
-        }
+        200..=299 => parse_provider_body(body, provider_kind),
         401 | 403 => Err(ProviderFailureClass::Auth),
         408 | 504 => Err(ProviderFailureClass::Timeout),
         429 => Err(ProviderFailureClass::RateLimited),
@@ -1619,10 +1801,181 @@ fn events_from_http_parts(
     }
 }
 
+fn parse_provider_body(
+    body: &str,
+    provider_kind: HttpProviderKind,
+) -> Result<Vec<ProviderStreamEvent>, ProviderFailureClass> {
+    let trimmed = body.trim();
+    if trimmed.is_empty() {
+        return Err(ProviderFailureClass::MalformedResponse);
+    }
+    if trimmed.contains("\ndata:") || trimmed.starts_with("data:") {
+        return parse_sse_body(trimmed, provider_kind);
+    }
+    if trimmed.lines().count() > 1 && trimmed.lines().all(|line| line.trim().starts_with('{')) {
+        return parse_json_lines(trimmed, provider_kind);
+    }
+    let value: Value =
+        serde_json::from_str(trimmed).map_err(|_| ProviderFailureClass::MalformedResponse)?;
+    events_from_json_value(&value, provider_kind)
+}
+
+fn parse_sse_body(
+    body: &str,
+    provider_kind: HttpProviderKind,
+) -> Result<Vec<ProviderStreamEvent>, ProviderFailureClass> {
+    let mut events = Vec::new();
+    for line in body.lines().map(str::trim) {
+        let Some(payload) = line.strip_prefix("data:") else {
+            continue;
+        };
+        let payload = payload.trim();
+        if payload == "[DONE]" {
+            events.push(ProviderStreamEvent::Finished);
+            continue;
+        }
+        let value: Value =
+            serde_json::from_str(payload).map_err(|_| ProviderFailureClass::MalformedResponse)?;
+        append_json_events(&mut events, &value, provider_kind)?;
+    }
+    finish_events(events)
+}
+
+fn parse_json_lines(
+    body: &str,
+    provider_kind: HttpProviderKind,
+) -> Result<Vec<ProviderStreamEvent>, ProviderFailureClass> {
+    let mut events = Vec::new();
+    for line in body.lines().map(str::trim).filter(|line| !line.is_empty()) {
+        let value: Value =
+            serde_json::from_str(line).map_err(|_| ProviderFailureClass::MalformedResponse)?;
+        append_json_events(&mut events, &value, provider_kind)?;
+    }
+    finish_events(events)
+}
+
+fn events_from_json_value(
+    value: &Value,
+    provider_kind: HttpProviderKind,
+) -> Result<Vec<ProviderStreamEvent>, ProviderFailureClass> {
+    let mut events = Vec::new();
+    append_json_events(&mut events, value, provider_kind)?;
+    finish_events(events)
+}
+
+fn append_json_events(
+    events: &mut Vec<ProviderStreamEvent>,
+    value: &Value,
+    provider_kind: HttpProviderKind,
+) -> Result<(), ProviderFailureClass> {
+    if let Some(text) = extract_provider_text(value, provider_kind) {
+        if !text.is_empty() {
+            events.push(ProviderStreamEvent::Delta(text));
+        }
+    }
+    if let Some((input_tokens, output_tokens)) = extract_usage(value, provider_kind) {
+        events.push(ProviderStreamEvent::Usage {
+            input_tokens,
+            output_tokens,
+        });
+    }
+    if provider_finished(value, provider_kind) {
+        events.push(ProviderStreamEvent::Finished);
+    }
+    Ok(())
+}
+
+fn finish_events(
+    mut events: Vec<ProviderStreamEvent>,
+) -> Result<Vec<ProviderStreamEvent>, ProviderFailureClass> {
+    if !events
+        .iter()
+        .any(|event| matches!(event, ProviderStreamEvent::Delta(_)))
+    {
+        return Err(ProviderFailureClass::MalformedResponse);
+    }
+    if !matches!(events.last(), Some(ProviderStreamEvent::Finished)) {
+        events.push(ProviderStreamEvent::Finished);
+    }
+    Ok(events)
+}
+
+fn extract_provider_text(value: &Value, provider_kind: HttpProviderKind) -> Option<String> {
+    match provider_kind {
+        HttpProviderKind::OpenAiCompatible | HttpProviderKind::OpenAiChatCompletions => value
+            .pointer("/choices/0/delta/content")
+            .or_else(|| value.pointer("/choices/0/message/content"))
+            .or_else(|| value.pointer("/delta"))
+            .and_then(Value::as_str)
+            .map(ToString::to_string),
+        HttpProviderKind::AnthropicMessages => value
+            .pointer("/delta/text")
+            .or_else(|| value.pointer("/content/0/text"))
+            .and_then(Value::as_str)
+            .map(ToString::to_string),
+        HttpProviderKind::GeminiGenerateContent => value
+            .pointer("/candidates/0/content/parts/0/text")
+            .and_then(Value::as_str)
+            .map(ToString::to_string),
+        HttpProviderKind::OllamaChat => value
+            .pointer("/message/content")
+            .or_else(|| value.pointer("/response"))
+            .and_then(Value::as_str)
+            .map(ToString::to_string),
+    }
+}
+
+fn extract_usage(value: &Value, provider_kind: HttpProviderKind) -> Option<(u32, u32)> {
+    let as_u32 = |pointer: &str| {
+        value
+            .pointer(pointer)
+            .and_then(Value::as_u64)
+            .and_then(|value| u32::try_from(value).ok())
+    };
+    match provider_kind {
+        HttpProviderKind::OpenAiCompatible | HttpProviderKind::OpenAiChatCompletions => Some((
+            as_u32("/usage/prompt_tokens")?,
+            as_u32("/usage/completion_tokens")?,
+        )),
+        HttpProviderKind::AnthropicMessages => Some((
+            as_u32("/usage/input_tokens")?,
+            as_u32("/usage/output_tokens")?,
+        )),
+        HttpProviderKind::GeminiGenerateContent => Some((
+            as_u32("/usageMetadata/promptTokenCount")?,
+            as_u32("/usageMetadata/candidatesTokenCount")?,
+        )),
+        HttpProviderKind::OllamaChat => {
+            Some((as_u32("/prompt_eval_count")?, as_u32("/eval_count")?))
+        }
+    }
+}
+
+fn provider_finished(value: &Value, provider_kind: HttpProviderKind) -> bool {
+    match provider_kind {
+        HttpProviderKind::OpenAiCompatible | HttpProviderKind::OpenAiChatCompletions => value
+            .pointer("/choices/0/finish_reason")
+            .is_some_and(|reason| !reason.is_null()),
+        HttpProviderKind::AnthropicMessages => value
+            .get("type")
+            .and_then(Value::as_str)
+            .is_some_and(|event_type| event_type == "message_stop"),
+        HttpProviderKind::GeminiGenerateContent => {
+            value.pointer("/candidates/0/finishReason").is_some()
+        }
+        HttpProviderKind::OllamaChat => value.get("done").and_then(Value::as_bool).unwrap_or(false),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::sync::mpsc;
     use std::sync::Mutex;
+    use std::thread;
+    use std::time::Duration as StdDuration;
 
     struct RetryProvider {
         responses: Mutex<VecDeque<Result<Vec<ProviderStreamEvent>, ProviderFailureClass>>>,
@@ -1661,6 +2014,42 @@ mod tests {
             },
             ProviderStreamEvent::Finished,
         ]
+    }
+
+    fn request() -> NormalizedInferenceRequest {
+        NormalizedInferenceRequest {
+            model_id: StableId::new("model"),
+            prompt: "plan".to_string(),
+            required: vec![ProviderCapability::Chat],
+            max_output_tokens: 32,
+        }
+    }
+
+    fn mock_server(
+        status: u16,
+        body: &'static str,
+        delay: Option<StdDuration>,
+    ) -> (String, mpsc::Receiver<String>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = format!("http://{}/v1/chat", listener.local_addr().unwrap());
+        let (tx, rx) = mpsc::channel();
+        thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0_u8; 4096];
+            let read = stream.read(&mut request).unwrap_or(0);
+            tx.send(String::from_utf8_lossy(&request[..read]).to_string())
+                .unwrap();
+            if let Some(delay) = delay {
+                thread::sleep(delay);
+            }
+            let reason = if status == 200 { "OK" } else { "ERR" };
+            let response = format!(
+                "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = stream.write_all(response.as_bytes());
+        });
+        (endpoint, rx)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1941,32 +2330,123 @@ mod tests {
     }
 
     #[test]
-    fn http_provider_adapter_normalizes_mocked_response() {
+    fn http_provider_adapter_uses_reqwest_auth_headers_and_parses_openai_stream() {
+        std::env::set_var("AGENTCODE_TEST_PROVIDER_KEY", "test-key");
+        let body = "data: {\"choices\":[{\"delta\":{\"content\":\"goal=fix\\n\"}}]}\n\
+data: {\"choices\":[{\"delta\":{\"content\":\"verify=status:0\"},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":4,\"completion_tokens\":6}}\n\
+data: [DONE]\n";
+        let (endpoint, received) = mock_server(200, body, None);
         let adapter = HttpProviderAdapter::new(
-            "http://provider.example/v1/chat",
+            endpoint,
             Some("AGENTCODE_TEST_PROVIDER_KEY".to_string()),
             "fixture-model",
             1000,
         )
         .unwrap();
-        let request = NormalizedInferenceRequest {
-            model_id: StableId::new("model"),
-            prompt: "plan".to_string(),
-            required: vec![ProviderCapability::Chat],
-            max_output_tokens: 32,
-        };
-        let endpoint = parse_http_endpoint(&adapter.endpoint).unwrap();
-        assert_eq!(endpoint.path, "/v1/chat");
-        let events =
-            events_from_http_parts(200, "{\"delta\":\"goal=fix\\nverify=status:0\"}", &request)
-                .unwrap();
+        let request = request();
+        let events = adapter.stream(&request, &|| false).unwrap();
+        let wire_request = received.recv_timeout(StdDuration::from_secs(1)).unwrap();
+        assert!(wire_request.contains("authorization: Bearer test-key"));
+        assert!(wire_request.contains("\"messages\""));
         assert!(matches!(events.last(), Some(ProviderStreamEvent::Finished)));
         assert!(
             matches!(&events[0], ProviderStreamEvent::Delta(text) if text.contains("goal=fix"))
         );
+        assert_eq!(token_usage(&events), (4, 6));
+    }
+
+    #[test]
+    fn provider_request_formatting_and_auth_headers_are_provider_specific() {
+        std::env::set_var("ANTHROPIC_API_KEY", "anthropic-key");
+        std::env::set_var("GEMINI_API_KEY", "gemini-key");
+        let request = request();
+        let anthropic = AnthropicProviderAdapter::new("http://127.0.0.1:1/v1/messages", "claude")
+            .unwrap()
+            .inner;
+        let anthropic_headers = anthropic.auth_headers().unwrap();
+        assert!(anthropic.request_json(&request).get("messages").is_some());
         assert_eq!(
-            events_from_http_parts(429, "rate limited", &request).unwrap_err(),
+            anthropic_headers
+                .get("x-api-key")
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            "anthropic-key"
+        );
+        assert!(anthropic_headers.get("anthropic-version").is_some());
+
+        let gemini = GeminiProviderAdapter::new(
+            "http://127.0.0.1:1/v1beta/models/gemini:generateContent",
+            "gemini",
+        )
+        .unwrap()
+        .inner;
+        assert!(gemini.request_json(&request).get("contents").is_some());
+        assert_eq!(
+            gemini
+                .auth_headers()
+                .unwrap()
+                .get("x-goog-api-key")
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            "gemini-key"
+        );
+    }
+
+    #[test]
+    fn provider_response_parsing_handles_provider_shapes_and_failures() {
+        let openai = events_from_status_and_body(
+            200,
+            "{\"choices\":[{\"message\":{\"content\":\"plan=ok\"},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":2,\"completion_tokens\":3}}",
+            HttpProviderKind::OpenAiChatCompletions,
+        )
+        .unwrap();
+        assert_eq!(token_usage(&openai), (2, 3));
+        let anthropic = events_from_status_and_body(
+            200,
+            "{\"content\":[{\"text\":\"plan=anthropic\"}],\"usage\":{\"input_tokens\":5,\"output_tokens\":7},\"type\":\"message_stop\"}",
+            HttpProviderKind::AnthropicMessages,
+        )
+        .unwrap();
+        assert_eq!(token_usage(&anthropic), (5, 7));
+        let gemini = events_from_status_and_body(
+            200,
+            "{\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"plan=gemini\"}]},\"finishReason\":\"STOP\"}],\"usageMetadata\":{\"promptTokenCount\":11,\"candidatesTokenCount\":13}}",
+            HttpProviderKind::GeminiGenerateContent,
+        )
+        .unwrap();
+        assert_eq!(token_usage(&gemini), (11, 13));
+        let ollama = events_from_status_and_body(
+            200,
+            "{\"message\":{\"content\":\"plan=ollama\"},\"done\":true,\"prompt_eval_count\":17,\"eval_count\":19}",
+            HttpProviderKind::OllamaChat,
+        )
+        .unwrap();
+        assert_eq!(token_usage(&ollama), (17, 19));
+        assert_eq!(
+            events_from_status_and_body(429, "rate limited", HttpProviderKind::OpenAiCompatible)
+                .unwrap_err(),
             ProviderFailureClass::RateLimited
+        );
+        assert_eq!(
+            events_from_status_and_body(200, "not json", HttpProviderKind::OpenAiCompatible)
+                .unwrap_err(),
+            ProviderFailureClass::MalformedResponse
+        );
+    }
+
+    #[test]
+    fn http_provider_adapter_reports_timeout() {
+        let (endpoint, _received) = mock_server(
+            200,
+            "{\"choices\":[{\"message\":{\"content\":\"late\"}}]}",
+            Some(StdDuration::from_millis(150)),
+        );
+        let adapter = HttpProviderAdapter::new(endpoint, None, "fixture-model", 25).unwrap();
+        assert_eq!(
+            adapter.stream(&request(), &|| false).unwrap_err(),
+            ProviderFailureClass::Timeout
         );
     }
 
