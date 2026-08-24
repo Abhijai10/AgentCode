@@ -811,3 +811,64 @@ pub struct DogfoodReportRow {
     pub recommendations: String,
     pub created_at_ms: i64,
 }
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DependencyAuditRow {
+    pub id: String,
+    pub name: String,
+    pub version: String,
+    pub license: String,
+    pub source: String,
+    pub checksum: String,
+    pub security_status: String,
+    pub vulnerability_refs: String,
+    pub release_blocking: bool,
+    pub created_at_ms: i64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HardeningReportRow {
+    pub id: String,
+    pub report_type: String,
+    pub findings: String,
+    pub mitigations: String,
+    pub unresolved_risks: String,
+    pub accepted_limitations: String,
+    pub release_blocked: bool,
+    pub created_at_ms: i64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReleaseArtifactRow {
+    pub id: String,
+    pub version: String,
+    pub platform: String,
+    pub artifact_kind: String,
+    pub build_hash: String,
+    pub integrity_hash: String,
+    pub source_commit: String,
+    pub created_at_ms: i64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReleaseBuildRow {
+    pub id: String,
+    pub version: String,
+    pub commit_ref: String,
+    pub build_profile: String,
+    pub environment: String,
+    pub reproducible: bool,
+    pub created_at_ms: i64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct UpdateRecordRow {
+    pub id: String,
+    pub current_version: String,
+    pub available_version: String,
+    pub decision: String,
+    pub verified: bool,
+    pub rollback_ref: Option<String>,
+    pub recovery_action: String,
+    pub created_at_ms: i64,
+}

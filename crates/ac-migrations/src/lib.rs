@@ -136,6 +136,12 @@ pub const CHAOS_DOGFOOD_V16: Migration = Migration {
     sql: include_str!("../../../migrations/0016_chaos_dogfood.sql"),
 };
 
+pub const SECURITY_RELEASE_V17: Migration = Migration {
+    id: "0017_security_release",
+    description: "security hardening, dependency audit, release artifacts, builds and updates",
+    sql: include_str!("../../../migrations/0017_security_release.sql"),
+};
+
 pub fn validate_migrations(migrations: &[Migration]) -> AcResult<()> {
     let mut seen = BTreeSet::new();
     for migration in migrations {

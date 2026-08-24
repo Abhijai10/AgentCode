@@ -1,0 +1,56 @@
+{
+  "phase": "P26",
+  "name": "Security & Licensing Hardening",
+  "status": "COMPLETE",
+  "starting_commit": "1f37b15b27e28840215a614d412ee9eeca45b72a",
+  "schema_version": 17,
+  "migration": "migrations/0017_security_release.sql",
+  "workpackages": [
+    "P26-WP01",
+    "P26-WP02",
+    "P26-WP03",
+    "P26-WP04",
+    "P26-WP05",
+    "P26-WP06",
+    "P26-WP07",
+    "P26-WP08",
+    "P26-WP09",
+    "P26-WP10",
+    "P26-WP11",
+    "P26-WP12"
+  ],
+  "gates": [
+    "P26-G1",
+    "P26-G2",
+    "P26-G3",
+    "P26-G4",
+    "P26-G5",
+    "P26-G6",
+    "P26-G7",
+    "P26-G8",
+    "P26-L1",
+    "P26-L2",
+    "P26-L3",
+    "P26-L4",
+    "P26-L5",
+    "P26-L6"
+  ],
+  "evidence": [
+    "crates/ac-security/src/hardening.rs",
+    "docs/security/SECURITY.md",
+    "docs/legal/THIRD_PARTY_NOTICES.md",
+    "release/SBOM.md",
+    "crates/ac-db/src/security_release.rs"
+  ],
+  "validation": [
+    "cargo fmt --all",
+    "cargo check --workspace --all-targets",
+    "cargo test --workspace",
+    "cargo clippy --workspace --all-targets -- -D warnings",
+    "JSON validation",
+    "git diff --check"
+  ],
+  "limitations": [
+    "External scanner execution is represented by deterministic records; future adapters must surface unavailable tools explicitly."
+  ]
+}

@@ -92,7 +92,7 @@ mod tests {
     fn sqlite_store_persists_kernel_state() {
         let mut db = ControlPlaneDb::open_memory().unwrap();
         db.migrate().unwrap();
-        assert_eq!(db.user_version().unwrap(), 16);
+        assert_eq!(db.user_version().unwrap(), 17);
 
         let mut kernel = Kernel::new(AllowAllPolicy);
         kernel.start().unwrap();
@@ -784,7 +784,7 @@ mod tests {
         {
             let mut db = ControlPlaneDb::open(&path).unwrap();
             db.migrate().unwrap();
-            assert_eq!(db.user_version().unwrap(), 16);
+            assert_eq!(db.user_version().unwrap(), 17);
             db.save_changeset_transaction(
                 &transaction,
                 Some("task-p13"),
@@ -863,7 +863,7 @@ mod tests {
         {
             let mut db = ControlPlaneDb::open(&path).unwrap();
             db.migrate().unwrap();
-            assert_eq!(db.user_version().unwrap(), 16);
+            assert_eq!(db.user_version().unwrap(), 17);
             db.save_verification_profile(&profile).unwrap();
             db.save_verification_manifest(
                 &manifest,
@@ -945,7 +945,7 @@ mod tests {
         {
             let mut db = ControlPlaneDb::open(&path).unwrap();
             db.migrate().unwrap();
-            assert_eq!(db.user_version().unwrap(), 16);
+            assert_eq!(db.user_version().unwrap(), 17);
             db.save_browser_process(&process).unwrap();
             db.save_browser_session(&session).unwrap();
             db.save_browser_dev_server(&dev_server).unwrap();
@@ -978,7 +978,7 @@ mod tests {
         {
             let mut db = ControlPlaneDb::open(&path).unwrap();
             db.migrate().unwrap();
-            assert_eq!(db.user_version().unwrap(), 16);
+            assert_eq!(db.user_version().unwrap(), 17);
             let skill = SkillManifest {
                 id: skill_id.clone(),
                 name: "Rust".to_string(),
@@ -1075,7 +1075,7 @@ mod tests {
         {
             let mut db = ControlPlaneDb::open(&path).unwrap();
             db.migrate().unwrap();
-            assert_eq!(db.user_version().unwrap(), 16);
+            assert_eq!(db.user_version().unwrap(), 17);
             let orchestrator = ac_security::BaselineSecurityOrchestrator::new(
                 ac_security::SecurityPolicy::baseline(),
             );
@@ -1126,7 +1126,7 @@ mod tests {
         {
             let mut db = ControlPlaneDb::open(&path).unwrap();
             db.migrate().unwrap();
-            assert_eq!(db.user_version().unwrap(), 16);
+            assert_eq!(db.user_version().unwrap(), 17);
             db.save_discuss_session(&DiscussSessionRow {
                 id: discuss_id.clone(),
                 repository_id: "repo-a".to_string(),
@@ -1254,7 +1254,7 @@ mod tests {
         {
             let mut db = ControlPlaneDb::open(&path).unwrap();
             db.migrate().unwrap();
-            assert_eq!(db.user_version().unwrap(), 16);
+            assert_eq!(db.user_version().unwrap(), 17);
             db.save_desktop_session(&DesktopSessionRow {
                 id: session_id.clone(),
                 active_project_id: Some(project_id.clone()),
@@ -1379,7 +1379,7 @@ mod tests {
         {
             let mut db = ControlPlaneDb::open(&path).unwrap();
             db.migrate().unwrap();
-            assert_eq!(db.user_version().unwrap(), 16);
+            assert_eq!(db.user_version().unwrap(), 17);
             db.save_chaos_experiment(&ChaosExperimentRow {
                 id: chaos_id.clone(),
                 gate_id: "P24-G5".to_string(),
@@ -1485,6 +1485,85 @@ mod tests {
             assert_eq!(db.dogfood_findings(&dogfood_id).unwrap()[0].severity, "medium");
             assert_eq!(db.dogfood_proposals(&dogfood_id).unwrap()[0].decision, "accepted");
             assert_eq!(db.dogfood_reports().unwrap()[0].accepted_improvements, 1);
+        }
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn phase26_27_security_and_release_state_survive_reopen() {
+        let path = std::env::temp_dir().join(format!(
+            "agentcode-phase26-27-{}.sqlite",
+            StableId::new("db")
+        ));
+        {
+            let mut db = ControlPlaneDb::open(&path).unwrap();
+            db.migrate().unwrap();
+            assert_eq!(db.user_version().unwrap(), 17);
+            db.save_dependency_audit(&DependencyAuditRow {
+                id: "dep-a".to_string(),
+                name: "rusqlite".to_string(),
+                version: "0.31.0".to_string(),
+                license: "MIT".to_string(),
+                source: "crates.io".to_string(),
+                checksum: "sha256:abc".to_string(),
+                security_status: "reviewed".to_string(),
+                vulnerability_refs: String::new(),
+                release_blocking: false,
+                created_at_ms: 1,
+            })
+            .unwrap();
+            db.save_hardening_report(&HardeningReportRow {
+                id: "hardening-a".to_string(),
+                report_type: "production-security".to_string(),
+                findings: "none critical".to_string(),
+                mitigations: "redaction verified".to_string(),
+                unresolved_risks: String::new(),
+                accepted_limitations: "manual notarization credentials unavailable".to_string(),
+                release_blocked: false,
+                created_at_ms: 2,
+            })
+            .unwrap();
+            db.save_release_build(&ReleaseBuildRow {
+                id: "build-a".to_string(),
+                version: "1.0.0".to_string(),
+                commit_ref: "commit-a".to_string(),
+                build_profile: "release".to_string(),
+                environment: "macos-arm64".to_string(),
+                reproducible: true,
+                created_at_ms: 3,
+            })
+            .unwrap();
+            db.save_release_artifact(&ReleaseArtifactRow {
+                id: "artifact-a".to_string(),
+                version: "1.0.0".to_string(),
+                platform: "macos-arm64".to_string(),
+                artifact_kind: "app-bundle".to_string(),
+                build_hash: "fnv1a64:build".to_string(),
+                integrity_hash: "fnv1a64:artifact".to_string(),
+                source_commit: "commit-a".to_string(),
+                created_at_ms: 4,
+            })
+            .unwrap();
+            db.save_update_record(&UpdateRecordRow {
+                id: "update-a".to_string(),
+                current_version: "1.0.0".to_string(),
+                available_version: "1.0.1".to_string(),
+                decision: "install".to_string(),
+                verified: true,
+                rollback_ref: Some("rollback:commit-a".to_string()),
+                recovery_action: "restore previous artifact".to_string(),
+                created_at_ms: 5,
+            })
+            .unwrap();
+        }
+        {
+            let mut db = ControlPlaneDb::open(&path).unwrap();
+            db.migrate().unwrap();
+            assert_eq!(db.dependency_audits().unwrap()[0].license, "MIT");
+            assert!(!db.hardening_reports().unwrap()[0].release_blocked);
+            assert!(db.release_builds().unwrap()[0].reproducible);
+            assert_eq!(db.release_artifacts().unwrap()[0].platform, "macos-arm64");
+            assert!(db.update_records().unwrap()[0].verified);
         }
         let _ = fs::remove_file(path);
     }

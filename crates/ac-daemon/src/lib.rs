@@ -6,6 +6,8 @@ use ac_db::{ControlPlaneDb, PersistedSession};
 use ac_kernel::{AllowAllPolicy, Kernel, MissionState};
 use ac_runtime::{AgentSession, AgentSessionState, Worker};
 
+include!("release.rs");
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum DaemonLifecycle {
     Created,
@@ -444,5 +446,67 @@ mod tests {
         DaemonLifecycleRuntime::shutdown(&mut daemon).unwrap();
         assert_eq!(daemon.health().lifecycle, DaemonLifecycle::Stopped);
         let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn phase27_release_engineering_verifies_artifact_update_rollback_and_diagnostics() {
+        let mut release = ReleaseEngineer::new();
+        let build = release
+            .capture_build("1.0.0", "commit-a", "release", "macos-arm64")
+            .unwrap();
+        assert!(build.reproducible);
+        let version = ReleaseVersion {
+            version: "1.0.1".to_string(),
+            source_commit: "commit-b".to_string(),
+        };
+        let bytes = b"agentcode-app-bundle";
+        let artifact = release
+            .create_artifact(&version, "macos-arm64", "app-bundle", bytes)
+            .unwrap();
+        assert!(release.verify_artifact(&artifact, bytes));
+        assert!(!release.verify_artifact(&artifact, b"tampered"));
+        let update = release.plan_update("1.0.0", &artifact, bytes);
+        assert_eq!(update.decision, UpdateDecision::Install);
+        assert!(update.verified);
+        let blocked = release.plan_update("1.0.0", &artifact, b"tampered");
+        assert_eq!(blocked.decision, UpdateDecision::Blocked);
+        let rollback = release.rollback_after_failed_update("1.0.0", "1.0.1", "rollback:commit-a");
+        assert_eq!(rollback.decision, UpdateDecision::Rollback);
+        let diagnostics =
+            release.diagnostics_report("AC_SECRET_CANARY", "daemon ok AC_SECRET_CANARY");
+        assert!(!diagnostics.contains("AC_SECRET_CANARY"));
+        assert!(diagnostics.contains("[REDACTED]"));
+    }
+
+    #[test]
+    fn phase27_packaging_layout_keeps_state_outside_user_repository_and_reset_is_safe() {
+        let repository = PathBuf::from("/Volumes/T7 Shield/My Repo");
+        let layout = PackagingLayout {
+            app_bundle_id: "com.agentcode.desktop".to_string(),
+            config_dir: PathBuf::from("/Users/me/Library/Application Support/AgentCode/config"),
+            data_dir: PathBuf::from("/Users/me/Library/Application Support/AgentCode/data"),
+            cache_dir: PathBuf::from("/Users/me/Library/Caches/AgentCode"),
+            log_dir: PathBuf::from("/Users/me/Library/Logs/AgentCode"),
+            managed_tools_dir: PathBuf::from(
+                "/Users/me/Library/Application Support/AgentCode/tools",
+            ),
+            browser_profiles_dir: PathBuf::from(
+                "/Users/me/Library/Application Support/AgentCode/browser",
+            ),
+        };
+        layout.validate(&repository).unwrap();
+        let release = ReleaseEngineer::new();
+        assert!(release
+            .reset_plan_preserves_repository(&repository)
+            .iter()
+            .all(|path| !path.starts_with(&repository)));
+        let unsafe_layout = PackagingLayout {
+            data_dir: repository.join(".agentcode"),
+            ..layout
+        };
+        assert_eq!(
+            unsafe_layout.validate(&repository).unwrap_err().code(),
+            "RELEASE-APP_STATE_IN_REPOSITORY"
+        );
     }
 }

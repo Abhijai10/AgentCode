@@ -676,18 +676,64 @@
       ],
       "notes": "P25-WP01..P25-WP12 accepted; self-repository dogfood mission harness, findings, proposals, normal ChangeSet/verification flow, adversarial scenarios, metrics and durable feedback reports pass P25-G1..G14"
     },
-    {
-      "id": "P26",
-      "name": "Security & Licensing Hardening",
-      "status": "NOT_STARTED",
-      "evidence": []
-    },
-    {
-      "id": "P27",
-      "name": "Packaging, Update & Release Engineering",
-      "status": "NOT_STARTED",
-      "evidence": []
-    },
+        {
+            "id": "P26",
+            "name": "Security & Licensing Hardening",
+            "status": "COMPLETE",
+            "evidence": [
+                "crates/ac-security/src/hardening.rs",
+                "crates/ac-db/src/security_release.rs",
+                "migrations/0017_security_release.sql",
+                "docs/security/SECURITY.md",
+                "docs/legal/THIRD_PARTY_NOTICES.md",
+                "release/SBOM.md",
+                "tests/integration/security_release_flow.rs",
+                "docs/progress/workpackages/WP-P26-WP01.md",
+                "docs/progress/workpackages/WP-P26-WP02.md",
+                "docs/progress/workpackages/WP-P26-WP03.md",
+                "docs/progress/workpackages/WP-P26-WP04.md",
+                "docs/progress/workpackages/WP-P26-WP05.md",
+                "docs/progress/workpackages/WP-P26-WP06.md",
+                "docs/progress/workpackages/WP-P26-WP07.md",
+                "docs/progress/workpackages/WP-P26-WP08.md",
+                "docs/progress/workpackages/WP-P26-WP09.md",
+                "docs/progress/workpackages/WP-P26-WP10.md",
+                "docs/progress/workpackages/WP-P26-WP11.md",
+                "docs/progress/workpackages/WP-P26-WP12.md",
+                "docs/progress/phase-26-completion.md",
+                "docs/progress/phase-26-completion.json"
+            ],
+            "notes": "P26-WP01..P26-WP12 accepted; threat model, boundary campaigns, prompt-injection/secret/privacy/MCP trust campaigns, dependency/license/SBOM/provenance closure, data retention review, signing prerequisites and self-red-team blocker report pass P26-G1..G8 and P26-L1..L6"
+        },
+        {
+            "id": "P27",
+            "name": "Packaging, Update & Release Engineering",
+            "status": "COMPLETE",
+            "evidence": [
+                "crates/ac-daemon/src/release.rs",
+                "crates/ac-db/src/security_release.rs",
+                "migrations/0017_security_release.sql",
+                "release/packaging/manifest.md",
+                "release/update/update-policy.md",
+                "release/diagnostics/redaction-policy.md",
+                "tests/integration/security_release_flow.rs",
+                "docs/progress/workpackages/WP-P27-WP01.md",
+                "docs/progress/workpackages/WP-P27-WP02.md",
+                "docs/progress/workpackages/WP-P27-WP03.md",
+                "docs/progress/workpackages/WP-P27-WP04.md",
+                "docs/progress/workpackages/WP-P27-WP05.md",
+                "docs/progress/workpackages/WP-P27-WP06.md",
+                "docs/progress/workpackages/WP-P27-WP07.md",
+                "docs/progress/workpackages/WP-P27-WP08.md",
+                "docs/progress/workpackages/WP-P27-WP09.md",
+                "docs/progress/workpackages/WP-P27-WP10.md",
+                "docs/progress/workpackages/WP-P27-WP11.md",
+                "docs/progress/workpackages/WP-P27-WP12.md",
+                "docs/progress/phase-27-completion.md",
+                "docs/progress/phase-27-completion.json"
+            ],
+            "notes": "P27-WP01..P27-WP12 accepted; release artifact/build/update records, packaging layout, daemon lifecycle, app data paths, migration/upgrade records, managed-tool checksum validation, first-run checklist, diagnostics redaction, reset/rollback and signing pipeline prerequisites pass P27-G1..G11"
+        },
     {
       "id": "P28",
       "name": "V1 Release Candidate",

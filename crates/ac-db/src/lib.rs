@@ -27,5 +27,6 @@ include!("agent.rs");
 include!("discuss_design.rs");
 include!("desktop_optimization.rs");
 include!("chaos_dogfood.rs");
+include!("security_release.rs");
 include!("git.rs");
 include!("tests.rs");

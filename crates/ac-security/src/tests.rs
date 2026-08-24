@@ -501,4 +501,59 @@ mod tests {
         assert!(bundle.markdown.contains("AI Security Report"));
         assert!(bundle.sarif.contains("AgentCode AI Security"));
     }
+
+    #[test]
+    fn phase26_security_hardening_tracks_dependencies_redacts_secrets_and_blocks_boundaries() {
+        let mut review = SecurityHardeningReview::new();
+        let dep = review
+            .record_dependency(
+                "rusqlite",
+                "0.31.0",
+                "MIT",
+                "crates.io",
+                "sha256:abc123",
+            )
+            .unwrap();
+        assert_eq!(dep.security_status, "reviewed");
+        review
+            .record_supply_chain("ac-daemon", "workspace", "0.1.0", "sha256:def456")
+            .unwrap();
+        review
+            .validate_secret_review(SecretReviewInput {
+                canary_secret: "AC_SECRET_CANARY".to_string(),
+                evidence: "tool output [REDACTED]".to_string(),
+                report: "security report [REDACTED]".to_string(),
+                logs: "logs [REDACTED]".to_string(),
+            })
+            .unwrap();
+        review
+            .run_boundary_campaign(true, true, true, true, true)
+            .unwrap();
+        let sbom = review.generate_sbom().unwrap();
+        assert!(sbom.contains("rusqlite,0.31.0,MIT"));
+        let report = review.report();
+        assert!(!report.release_blocked);
+        assert!(report
+            .mitigations
+            .iter()
+            .any(|item| item.contains("secret canary redaction")));
+    }
+
+    #[test]
+    fn phase26_secret_leak_or_unknown_license_blocks_release() {
+        let mut review = SecurityHardeningReview::new();
+        review
+            .record_dependency("mystery", "1.0.0", "UNKNOWN", "vendor", "sha256:bad")
+            .unwrap();
+        let error = review
+            .validate_secret_review(SecretReviewInput {
+                canary_secret: "AC_SECRET_CANARY".to_string(),
+                evidence: "evidence AC_SECRET_CANARY".to_string(),
+                report: "report [REDACTED]".to_string(),
+                logs: "logs [REDACTED]".to_string(),
+            })
+            .unwrap_err();
+        assert_eq!(error.code(), "SECURITY-SECRET_LEAK");
+        assert!(review.report().release_blocked);
+    }
 }
