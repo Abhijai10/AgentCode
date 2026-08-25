@@ -1,4 +1,14 @@
 impl TaskGraph {
+    pub fn from_runtime_plan(plan: &RuntimePlan) -> AcResult<Self> {
+        validate_plan_dag(plan)?;
+        let mut graph = Self::default();
+        for task in &plan.tasks {
+            graph.tasks.insert(task.id.clone(), task.clone());
+        }
+        graph.refresh_ready();
+        Ok(graph)
+    }
+
     pub fn decompose(mission_id: StableId, goal: &str) -> AcResult<Self> {
         if goal.trim().is_empty() {
             return Err(AcError::validation(

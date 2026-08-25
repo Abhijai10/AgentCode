@@ -66,6 +66,16 @@ impl AgentSession {
         &self.worker
     }
 
+    pub fn start_worker_for_mission(&mut self, mission_id: StableId) -> AcResult<()> {
+        if self.worker.mission_id.is_none() {
+            self.worker.assign(mission_id)?;
+        }
+        if self.worker.state == WorkerState::Assigned {
+            self.worker.transition(WorkerState::Running)?;
+        }
+        Ok(())
+    }
+
     pub fn state(&self) -> AgentSessionState {
         self.state
     }
@@ -209,4 +219,3 @@ impl AgentSession {
         });
     }
 }
-

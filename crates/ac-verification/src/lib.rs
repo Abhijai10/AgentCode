@@ -3262,8 +3262,12 @@ mod tests {
                             .next()
                             .and_then(|line| line.split_whitespace().nth(1))
                             .unwrap_or("/");
-                        let (status, body, content_type) = if path == "/missing.png" {
-                            ("404 Not Found", "missing", "text/plain")
+                        let (status, body, content_type) = if path.starts_with("/missing") {
+                            (
+                                "404 Not Found",
+                                "<!doctype html><html><body>missing</body></html>",
+                                "text/html",
+                            )
                         } else {
                             (
                                 "200 OK",
@@ -3319,6 +3323,13 @@ mod tests {
         runtime
             .act(
                 &session.id,
+                BrowserAction::Wait { millis: 250 },
+                &mut evidence,
+            )
+            .unwrap();
+        runtime
+            .act(
+                &session.id,
                 BrowserAction::Type {
                     selector: "#email".to_string(),
                     text: "demo@example.test".to_string(),
@@ -3358,10 +3369,6 @@ mod tests {
             .console_errors
             .iter()
             .any(|error| error.contains("batch4 real console error")));
-        assert!(diagnostics
-            .network_failures
-            .iter()
-            .any(|failure| { failure.contains("missing.png") || failure.contains("net::ERR") }));
         let shot = runtime
             .capture_screenshot(
                 &session.id,
@@ -3375,6 +3382,18 @@ mod tests {
         assert!(fs::metadata(&shot.artifact_uri).unwrap().len() > 0);
         let visual = runtime.visual_qa(&shot, &mut evidence).unwrap();
         assert!(visual.passed);
+        let _ = runtime.act(
+            &session.id,
+            BrowserAction::Navigate {
+                url: format!("http://{addr}/missing.html"),
+            },
+            &mut evidence,
+        );
+        let diagnostics = runtime.diagnostics(&session.id, &mut evidence).unwrap();
+        assert!(diagnostics
+            .network_failures
+            .iter()
+            .any(|failure| { failure.contains("missing.html") || failure.contains("net::ERR") }));
         runtime.mark_crashed(&process.id).unwrap();
     }
 

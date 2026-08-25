@@ -143,6 +143,75 @@ mod tests {
     }
 
     #[test]
+    fn provider_runtime_plan_builds_ready_graph_and_persists() {
+        let mission = StableId::new("mission");
+        let inspect = WorkerTask {
+            id: StableId::from_existing("inspect-dynamic").unwrap(),
+            mission_id: mission.clone(),
+            title: "Inspect dynamic target".to_string(),
+            dependencies: Vec::new(),
+            state: TaskState::Pending,
+            assigned_worker: None,
+            retry_count: 0,
+            max_retries: 2,
+            evidence_refs: Vec::new(),
+        };
+        let modify = WorkerTask {
+            id: StableId::from_existing("modify-dynamic").unwrap(),
+            mission_id: mission.clone(),
+            title: "Modify dynamic target".to_string(),
+            dependencies: vec![inspect.id.clone()],
+            state: TaskState::Pending,
+            assigned_worker: None,
+            retry_count: 0,
+            max_retries: 2,
+            evidence_refs: Vec::new(),
+        };
+        let plan = RuntimePlan {
+            id: StableId::new("plan"),
+            mission_id: mission.clone(),
+            revision: 7,
+            tasks: vec![inspect.clone(), modify.clone()],
+            proposals: Vec::new(),
+            supersedes: None,
+        };
+        let mut graph = TaskGraph::from_runtime_plan(&plan).unwrap();
+        assert_eq!(graph.next_ready().unwrap().id, inspect.id);
+        let mut worker = Worker::new();
+        worker.assign(mission.clone()).unwrap();
+        worker.transition(WorkerState::Running).unwrap();
+        graph.start(&inspect.id, &worker).unwrap();
+        graph
+            .finish(
+                &inspect.id,
+                &worker,
+                TaskAttemptOutcome::Succeeded,
+                vec![StableId::new("ev")],
+                None,
+            )
+            .unwrap();
+        assert_eq!(graph.next_ready().unwrap().id, modify.id);
+        let path = std::env::temp_dir().join(format!(
+            "agentcode-runtime-dynamic-{}.sqlite",
+            StableId::new("db")
+        ));
+        {
+            let mut db = ControlPlaneDb::open(&path).unwrap();
+            db.migrate().unwrap();
+            graph
+                .persist(&db, &worker, &StableId::new("session"))
+                .unwrap();
+        }
+        let db = ControlPlaneDb::open(&path).unwrap();
+        let recovered = db.tasks_for_mission(mission.as_str()).unwrap();
+        assert_eq!(recovered.len(), 2);
+        assert!(recovered
+            .iter()
+            .any(|task| task.title == "Modify dynamic target" && task.state == "ready"));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
     fn phase12_contract_planner_dag_scheduler_and_controls_work() {
         let mission_id = StableId::from_existing("mission-p12").unwrap();
         let mut autonomy = AutonomyKernel::from_goal(

@@ -18,6 +18,7 @@ dependencies = [
  "ac-security",
  "ac-tool",
  "ac-verification",
+ "serde_json",
 ]
 
 [[package]]
