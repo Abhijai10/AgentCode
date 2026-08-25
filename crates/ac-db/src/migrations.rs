@@ -1,3 +1,5 @@
+pub const CURRENT_SCHEMA_VERSION: u32 = 19;
+
 impl ControlPlaneDb {
     pub fn open(path: impl AsRef<Path>) -> AcResult<Self> {
         let connection = Connection::open(path).map_err(db_error)?;
@@ -15,11 +17,11 @@ impl ControlPlaneDb {
 
     pub fn migrate(&mut self) -> AcResult<()> {
         let current_version = self.user_version()?;
-        if current_version > 18 {
+        if current_version > CURRENT_SCHEMA_VERSION {
             return Err(AcError::conflict(
                 "DB-FUTURE_VERSION",
                 format!(
-                    "database user_version {current_version} is newer than supported version 18"
+                    "database user_version {current_version} is newer than supported version {CURRENT_SCHEMA_VERSION}"
                 ),
             ));
         }
@@ -124,7 +126,11 @@ impl ControlPlaneDb {
             ))
             .map_err(db_error)?;
         }
-        tx.pragma_update(None, "user_version", 18)
+        if current_version < CURRENT_SCHEMA_VERSION {
+            tx.execute_batch(include_str!("../../../migrations/0019_daemon_semantic_memory.sql"))
+                .map_err(db_error)?;
+        }
+        tx.pragma_update(None, "user_version", CURRENT_SCHEMA_VERSION)
             .map_err(db_error)?;
         tx.commit().map_err(db_error)?;
         Ok(())

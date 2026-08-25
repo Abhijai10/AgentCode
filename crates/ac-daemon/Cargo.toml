@@ -11,6 +11,8 @@ ac-db = { path = "../ac-db" }
 ac-kernel = { path = "../ac-kernel" }
 ac-logging = { path = "../ac-logging" }
 ac-runtime = { path = "../ac-runtime" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1.0.151"
 
 [lints]
 workspace = true

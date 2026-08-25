@@ -390,6 +390,22 @@
       "notes": "pinned in Cargo.lock for ac-verification"
     },
     {
+      "id": "CAND-0026",
+      "name": "fastembed",
+      "status": "ACTUAL",
+      "resolved_version": "6.0.1",
+      "declared_license": "Apache-2.0",
+      "license_review": "INSPECTED",
+      "license_file": "~/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/fastembed-6.0.1/LICENSE",
+      "classification": "DIRECT_RUNTIME_DEPENDENCY",
+      "source": "https://github.com/Anush008/fastembed-rs",
+      "usage": "Explicit local dense embeddings for semantic memory retrieval",
+      "attribution_required": true,
+      "admission_record": "docs/policy/dependency-admissions/DEP-ADM-004-fastembed.md",
+      "adopting_phase": "Batch 7",
+      "notes": "Model download is explicit and cached locally; source is not sent to a remote embedding API."
+    },
+    {
       "id": "CAND-0025",
       "name": "tempfile",
       "status": "ACTUAL",

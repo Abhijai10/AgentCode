@@ -1,12 +1,14 @@
 use std::fs::{self, File, OpenOptions};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use ac_common::{AcError, AcResult, StableId, TimestampMillis};
 use ac_db::{ControlPlaneDb, PersistedSession};
 use ac_kernel::{AllowAllPolicy, Kernel, MissionState};
-use ac_runtime::{AgentSession, AgentSessionState, Worker};
+use ac_runtime::{AgentSession, AgentSessionState, HydratedSession, RuntimeHydrator, Worker};
 
 include!("release.rs");
+include!("ipc.rs");
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum DaemonLifecycle {
@@ -96,7 +98,9 @@ pub struct DaemonService {
     kernel: Kernel<AllowAllPolicy>,
     lock_path: PathBuf,
     lock_file: Option<File>,
+    instance_id: StableId,
     recovered: Vec<PersistedSession>,
+    hydrated: Vec<HydratedSession>,
 }
 
 impl DaemonService {
@@ -109,7 +113,9 @@ impl DaemonService {
             kernel: Kernel::new(AllowAllPolicy),
             lock_path: lock_path.into(),
             lock_file: None,
+            instance_id: StableId::new("daemon"),
             recovered: Vec::new(),
+            hydrated: Vec::new(),
         })
     }
 
@@ -122,7 +128,12 @@ impl DaemonService {
         }
         self.acquire_singleton()?;
         self.kernel.start()?;
-        self.recovered = self.db.interrupted_sessions()?;
+        self.hydrated = RuntimeHydrator::hydrate_interrupted(&self.db)?;
+        self.recovered = self
+            .hydrated
+            .iter()
+            .map(|hydrated| hydrated.session.clone())
+            .collect();
         self.lifecycle = DaemonLifecycle::Running;
         Ok(())
     }
@@ -187,6 +198,29 @@ impl DaemonService {
         &self.recovered
     }
 
+    pub fn active_missions(&self) -> AcResult<Vec<(String, String, usize)>> {
+        self.db
+            .active_sessions()?
+            .into_iter()
+            .map(|session| {
+                Ok((
+                    session.mission_id.clone(),
+                    session.state,
+                    self.db.tasks_for_mission(&session.mission_id)?.len(),
+                ))
+            })
+            .collect()
+    }
+
+    pub fn task_states(&self, mission_id: &str) -> AcResult<Vec<(String, String)>> {
+        self.db.tasks_for_mission(mission_id).map(|tasks| {
+            tasks
+                .into_iter()
+                .map(|task| (task.id, task.state))
+                .collect()
+        })
+    }
+
     pub fn handle(&mut self, command: DaemonCommand) -> AcResult<DaemonResponse> {
         match command {
             DaemonCommand::Health => Ok(DaemonResponse::Health(self.health())),
@@ -245,7 +279,18 @@ impl DaemonService {
     }
 
     fn acquire_singleton(&mut self) -> AcResult<()> {
-        let file = OpenOptions::new()
+        if self.lock_path.exists() {
+            let stale = fs::read_to_string(&self.lock_path)
+                .ok()
+                .and_then(|metadata| lock_pid(&metadata))
+                .is_none_or(|pid| !process_is_alive(pid));
+            if stale {
+                fs::remove_file(&self.lock_path).map_err(|error| {
+                    AcError::conflict("DAEMON-STALE_LOCK_REMOVE", error.to_string())
+                })?;
+            }
+        }
+        let mut file = OpenOptions::new()
             .write(true)
             .create_new(true)
             .open(&self.lock_path)
@@ -255,9 +300,31 @@ impl DaemonService {
                     format!("daemon singleton lock unavailable: {}", err),
                 )
             })?;
+        writeln!(
+            file,
+            "pid={}\nstarted_at_ms={}\ninstance_id={}",
+            std::process::id(),
+            TimestampMillis::now().as_millis(),
+            self.instance_id
+        )
+        .map_err(|error| AcError::validation("DAEMON-SINGLETON_WRITE", error.to_string()))?;
         self.lock_file = Some(file);
         Ok(())
     }
+}
+
+fn lock_pid(metadata: &str) -> Option<u32> {
+    metadata
+        .lines()
+        .find_map(|line| line.strip_prefix("pid="))
+        .and_then(|pid| pid.parse().ok())
+}
+
+fn process_is_alive(pid: u32) -> bool {
+    std::process::Command::new("kill")
+        .args(["-0", &pid.to_string()])
+        .status()
+        .is_ok_and(|status| status.success())
 }
 
 impl DaemonLifecycleRuntime for DaemonService {
@@ -310,6 +377,10 @@ pub fn default_paths(base: impl AsRef<Path>) -> (PathBuf, PathBuf) {
         base.join("agentcode.sqlite"),
         base.join("agentcode-daemon.lock"),
     )
+}
+
+pub fn default_socket_path(base: impl AsRef<Path>) -> PathBuf {
+    base.as_ref().join("agentcode.sock")
 }
 
 #[allow(dead_code)]
@@ -397,6 +468,45 @@ mod tests {
         let err = second.start().unwrap_err();
         assert_eq!(err.code(), "DAEMON-SINGLETON_LOCKED");
         first.stop().unwrap();
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn stale_singleton_lock_is_reclaimed_but_live_owner_is_not() {
+        let (dir, db, lock) = temp_paths();
+        fs::write(&lock, "pid=999999\nstarted_at_ms=1\ninstance_id=old").unwrap();
+        let mut daemon = DaemonService::open(&db, &lock).unwrap();
+        daemon.start().unwrap();
+        assert!(fs::read_to_string(&lock).unwrap().contains("pid="));
+        daemon.stop().unwrap();
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn unix_ipc_is_framed_and_disconnect_does_not_stop_daemon() {
+        let (dir, db, lock) = temp_paths();
+        let socket = default_socket_path(&dir);
+        let mut daemon = DaemonService::open(&db, &lock).unwrap();
+        daemon.start().unwrap();
+        let (server, listener) = UnixIpcServer::bind(&socket).unwrap();
+        let client = UnixIpcClient::new(&socket);
+        let join = std::thread::spawn(move || {
+            client
+                .request(
+                    serde_json::json!({"id":"one","command":"SubmitMission","goal":"keep going"}),
+                )
+                .unwrap()
+        });
+        while !server.serve_once(&listener, &mut daemon).unwrap() {
+            if join.is_finished() {
+                break;
+            }
+        }
+        let response = join.join().unwrap();
+        assert_eq!(response["ok"], true, "unexpected IPC response: {response}");
+        assert_eq!(daemon.health().lifecycle, DaemonLifecycle::Running);
+        server.cleanup();
+        daemon.stop().unwrap();
         let _ = fs::remove_dir_all(dir);
     }
 

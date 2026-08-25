@@ -16,6 +16,9 @@ Batch 4 admits tungstenite, base64 and tempfile for the real Chrome DevTools
 Protocol browser backend. See
 `docs/policy/dependency-admissions/DEP-ADM-003-browser-cdp-backend.md`.
 
+Batch 7 admits fastembed 6.0.1 (Apache-2.0) for explicit local ONNX embedding
+inference. See `docs/policy/dependency-admissions/DEP-ADM-004-fastembed.md`.
+
 Required fields per shipped component:
 
 - Name

@@ -92,7 +92,7 @@ mod tests {
     fn sqlite_store_persists_kernel_state() {
         let mut db = ControlPlaneDb::open_memory().unwrap();
         db.migrate().unwrap();
-        assert_eq!(db.user_version().unwrap(), 18);
+        assert_eq!(db.user_version().unwrap(), CURRENT_SCHEMA_VERSION);
 
         let mut kernel = Kernel::new(AllowAllPolicy);
         kernel.start().unwrap();
@@ -784,7 +784,7 @@ mod tests {
         {
             let mut db = ControlPlaneDb::open(&path).unwrap();
             db.migrate().unwrap();
-            assert_eq!(db.user_version().unwrap(), 18);
+            assert_eq!(db.user_version().unwrap(), CURRENT_SCHEMA_VERSION);
             db.save_changeset_transaction(
                 &transaction,
                 Some("task-p13"),
@@ -863,7 +863,7 @@ mod tests {
         {
             let mut db = ControlPlaneDb::open(&path).unwrap();
             db.migrate().unwrap();
-            assert_eq!(db.user_version().unwrap(), 18);
+            assert_eq!(db.user_version().unwrap(), CURRENT_SCHEMA_VERSION);
             db.save_verification_profile(&profile).unwrap();
             db.save_verification_manifest(
                 &manifest,
@@ -945,7 +945,7 @@ mod tests {
         {
             let mut db = ControlPlaneDb::open(&path).unwrap();
             db.migrate().unwrap();
-            assert_eq!(db.user_version().unwrap(), 18);
+            assert_eq!(db.user_version().unwrap(), CURRENT_SCHEMA_VERSION);
             db.save_browser_process(&process).unwrap();
             db.save_browser_session(&session).unwrap();
             db.save_browser_dev_server(&dev_server).unwrap();
@@ -978,7 +978,7 @@ mod tests {
         {
             let mut db = ControlPlaneDb::open(&path).unwrap();
             db.migrate().unwrap();
-            assert_eq!(db.user_version().unwrap(), 18);
+            assert_eq!(db.user_version().unwrap(), CURRENT_SCHEMA_VERSION);
             let skill = SkillManifest {
                 id: skill_id.clone(),
                 name: "Rust".to_string(),
@@ -1075,7 +1075,7 @@ mod tests {
         {
             let mut db = ControlPlaneDb::open(&path).unwrap();
             db.migrate().unwrap();
-            assert_eq!(db.user_version().unwrap(), 18);
+            assert_eq!(db.user_version().unwrap(), CURRENT_SCHEMA_VERSION);
             let orchestrator = ac_security::BaselineSecurityOrchestrator::new(
                 ac_security::SecurityPolicy::baseline(),
             );
@@ -1126,7 +1126,7 @@ mod tests {
         {
             let mut db = ControlPlaneDb::open(&path).unwrap();
             db.migrate().unwrap();
-            assert_eq!(db.user_version().unwrap(), 18);
+            assert_eq!(db.user_version().unwrap(), CURRENT_SCHEMA_VERSION);
             db.save_discuss_session(&DiscussSessionRow {
                 id: discuss_id.clone(),
                 repository_id: "repo-a".to_string(),
@@ -1254,7 +1254,7 @@ mod tests {
         {
             let mut db = ControlPlaneDb::open(&path).unwrap();
             db.migrate().unwrap();
-            assert_eq!(db.user_version().unwrap(), 18);
+            assert_eq!(db.user_version().unwrap(), CURRENT_SCHEMA_VERSION);
             db.save_desktop_session(&DesktopSessionRow {
                 id: session_id.clone(),
                 active_project_id: Some(project_id.clone()),
@@ -1379,7 +1379,7 @@ mod tests {
         {
             let mut db = ControlPlaneDb::open(&path).unwrap();
             db.migrate().unwrap();
-            assert_eq!(db.user_version().unwrap(), 18);
+            assert_eq!(db.user_version().unwrap(), CURRENT_SCHEMA_VERSION);
             db.save_chaos_experiment(&ChaosExperimentRow {
                 id: chaos_id.clone(),
                 gate_id: "P24-G5".to_string(),
@@ -1498,7 +1498,7 @@ mod tests {
         {
             let mut db = ControlPlaneDb::open(&path).unwrap();
             db.migrate().unwrap();
-            assert_eq!(db.user_version().unwrap(), 18);
+            assert_eq!(db.user_version().unwrap(), CURRENT_SCHEMA_VERSION);
             db.save_dependency_audit(&DependencyAuditRow {
                 id: "dep-a".to_string(),
                 name: "rusqlite".to_string(),
@@ -1577,7 +1577,7 @@ mod tests {
         {
             let mut db = ControlPlaneDb::open(&path).unwrap();
             db.migrate().unwrap();
-            assert_eq!(db.user_version().unwrap(), 18);
+            assert_eq!(db.user_version().unwrap(), CURRENT_SCHEMA_VERSION);
             db.save_release_candidate(&ReleaseCandidateRow {
                 id: "rc-a".to_string(),
                 version: "1.0.0-rc.1".to_string(),
@@ -1660,6 +1660,21 @@ mod tests {
                 "release/migration.md"
             );
         }
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn semantic_vectors_survive_reopen_and_drop_corrupt_rows() {
+        let path = std::env::temp_dir().join(format!("agentcode-semantic-{}.sqlite", StableId::new("db")));
+        let fact = MemoryFactRow { id: "memory-1".to_string(), repository_id: "repo-1".to_string(), mission_id: None, task_id: None, branch: None, statement: "scheduler is authoritative".to_string(), fact_type: "ARCHITECTURE_FACT".to_string(), source: "TEST".to_string(), confidence: 100, freshness: "FRESH".to_string(), memory_class: "DECISION".to_string(), observed_commit: "abc".to_string(), conflict_set_id: None, valid_from_ms: 1, valid_until_ms: None, superseded_by: None, last_validation_ms: 1 };
+        {
+            let mut db = ControlPlaneDb::open(&path).unwrap();
+            db.migrate().unwrap();
+            db.save_memory_fact(&fact, &[MemoryEvidenceRow { fact_id: fact.id.clone(), evidence_ref: "evidence-1".to_string(), file_path: None, symbol: None, content_hash: None }]).unwrap();
+            db.save_semantic_chunk(&SemanticChunkRow { id: "chunk-1".to_string(), repository_id: "repo-1".to_string(), fact_id: fact.id.clone(), content: fact.statement.clone(), content_hash: "hash-1".to_string(), model_id: "fastembed/all-MiniLM-L6-v2".to_string(), dimension: 3, vector: vec![0.1, 0.2, 0.3], freshness: "FRESH".to_string(), created_at_ms: 1 }).unwrap();
+        }
+        let db = ControlPlaneDb::open(&path).unwrap();
+        assert_eq!(db.semantic_chunks("repo-1", "fastembed/all-MiniLM-L6-v2").unwrap()[0].vector, vec![0.1, 0.2, 0.3]);
         let _ = fs::remove_file(path);
     }
 

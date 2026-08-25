@@ -3,6 +3,11 @@ use std::hash::{Hash, Hasher};
 
 use ac_common::{AcError, AcResult, StableId, TimestampMillis};
 
+mod semantic;
+pub use semantic::{
+    EmbeddingAvailability, EmbeddingProvider, SemanticChunk, SemanticMatch, SemanticMemoryIndex,
+};
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AuthorityClass {
     KernelState,
@@ -550,6 +555,7 @@ pub struct MemoryService {
     decisions: BTreeMap<StableId, MemoryDecision>,
     task_memories: BTreeMap<StableId, TaskMemory>,
     snapshots: BTreeMap<StableId, ContextSnapshot>,
+    semantic: SemanticMemoryIndex,
 }
 
 impl MemoryService {
@@ -647,6 +653,36 @@ impl MemoryService {
             })
             .cloned()
             .collect()
+    }
+
+    pub fn embedding_availability(&self) -> EmbeddingAvailability {
+        self.semantic.availability()
+    }
+
+    /// Explicitly loads the local model; this is the only operation that may download it.
+    pub fn load_local_embeddings(
+        &mut self,
+        cache_dir: impl Into<std::path::PathBuf>,
+    ) -> AcResult<()> {
+        self.semantic.load_local(cache_dir)?;
+        for fact in self.facts.values() {
+            if fact.valid_until.is_none() && fact.freshness != FreshnessState::Invalid {
+                self.semantic.index_fact(fact)?;
+            }
+        }
+        Ok(())
+    }
+
+    pub fn semantic_search(&mut self, query: &str, limit: usize) -> AcResult<Vec<SemanticMatch>> {
+        self.semantic.search(query, limit)
+    }
+
+    pub fn semantic_chunks(&self) -> Vec<SemanticChunk> {
+        self.semantic.chunks()
+    }
+
+    pub fn restore_semantic_chunks(&mut self, chunks: Vec<SemanticChunk>) {
+        self.semantic.restore(chunks);
     }
 
     pub fn fact(&self, fact_id: &StableId) -> Option<MemoryFact> {
@@ -1613,6 +1649,52 @@ fn stable_hash(input: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn semantic_memory_is_unavailable_until_the_explicit_model_load() {
+        let mut memory = MemoryService::new();
+        let fact = memory
+            .record_fact(
+                "The task scheduler owns durable task lifecycle.",
+                vec![StableId::new("evidence")],
+                100,
+            )
+            .unwrap();
+        assert!(matches!(
+            memory.embedding_availability(),
+            EmbeddingAvailability::NeedsModel
+        ));
+        assert_eq!(memory.semantic_chunks().len(), 0);
+        assert_eq!(
+            memory.fact(&fact).unwrap().statement,
+            "The task scheduler owns durable task lifecycle."
+        );
+    }
+
+    #[test]
+    #[ignore = "requires the user-explicit local model download"]
+    fn real_minilm_retrieves_paraphrased_durable_memory() {
+        let mut memory = MemoryService::new();
+        memory
+            .record_fact(
+                "The scheduler owns durable task lifecycle while models are replaceable workers.",
+                vec![StableId::new("evidence")],
+                100,
+            )
+            .unwrap();
+        let cache =
+            std::env::temp_dir().join(format!("agentcode-fastembed-{}", StableId::new("test")));
+        memory.load_local_embeddings(&cache).unwrap();
+        let matches = memory
+            .semantic_search(
+                "Who decides task lifecycle instead of the language model?",
+                1,
+            )
+            .unwrap();
+        assert_eq!(matches[0].chunk.dimension, 384);
+        assert!(matches[0].chunk.content.contains("scheduler"));
+        let _ = std::fs::remove_dir_all(cache);
+    }
 
     #[test]
     fn memory_requires_evidence_and_supersedes_without_overwrite() {

@@ -358,6 +358,38 @@ impl ControlPlaneDb {
         Ok(changed as u64)
     }
 
+    pub fn save_semantic_chunk(&self, chunk: &SemanticChunkRow) -> AcResult<()> {
+        if chunk.dimension == 0 || chunk.vector.len() != chunk.dimension as usize {
+            return Err(AcError::validation("DB-SEMANTIC_VECTOR_INVALID", "semantic vector dimension does not match its payload"));
+        }
+        let vector = serde_json::to_string(&chunk.vector)
+            .map_err(|error| AcError::validation("DB-SEMANTIC_VECTOR_SERIALIZE", error.to_string()))?;
+        self.connection.execute(
+            "INSERT INTO semantic_chunks (id, repository_id, fact_id, content, content_hash, model_id, dimension, vector_json, freshness, created_at_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+             ON CONFLICT(repository_id, fact_id, content_hash, model_id) DO UPDATE SET vector_json=excluded.vector_json, dimension=excluded.dimension, freshness=excluded.freshness, created_at_ms=excluded.created_at_ms",
+            params![chunk.id, chunk.repository_id, chunk.fact_id, chunk.content, chunk.content_hash, chunk.model_id, chunk.dimension, vector, chunk.freshness, chunk.created_at_ms],
+        ).map_err(db_error)?;
+        Ok(())
+    }
+
+    pub fn semantic_chunks(&self, repository_id: &str, model_id: &str) -> AcResult<Vec<SemanticChunkRow>> {
+        let mut statement = self.connection.prepare(
+            "SELECT id, repository_id, fact_id, content, content_hash, model_id, dimension, vector_json, freshness, created_at_ms
+             FROM semantic_chunks WHERE repository_id=?1 AND model_id=?2 ORDER BY created_at_ms ASC",
+        ).map_err(db_error)?;
+        let rows = statement.query_map(params![repository_id, model_id], |row| {
+            let vector_json: String = row.get(7)?;
+            let vector = serde_json::from_str::<Vec<f32>>(&vector_json).map_err(|error| rusqlite::Error::FromSqlConversionFailure(7, rusqlite::types::Type::Text, Box::new(error)))?;
+            Ok(SemanticChunkRow { id: row.get(0)?, repository_id: row.get(1)?, fact_id: row.get(2)?, content: row.get(3)?, content_hash: row.get(4)?, model_id: row.get(5)?, dimension: row.get::<_, u32>(6)?, vector, freshness: row.get(8)?, created_at_ms: row.get(9)? })
+        }).map_err(db_error)?;
+        let mut chunks = Vec::new();
+        for chunk in rows.flatten() {
+            if chunk.vector.len() == chunk.dimension as usize { chunks.push(chunk); }
+        }
+        Ok(chunks)
+    }
+
     pub fn save_memory_decision(&self, decision: &MemoryDecisionRow) -> AcResult<()> {
         if decision.decision.trim().is_empty() || decision.authority_refs.trim().is_empty() {
             return Err(AcError::validation(

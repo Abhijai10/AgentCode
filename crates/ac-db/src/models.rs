@@ -38,6 +38,20 @@ pub struct MemoryEvidenceRow {
     pub content_hash: Option<String>,
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub struct SemanticChunkRow {
+    pub id: String,
+    pub repository_id: String,
+    pub fact_id: String,
+    pub content: String,
+    pub content_hash: String,
+    pub model_id: String,
+    pub dimension: u32,
+    pub vector: Vec<f32>,
+    pub freshness: String,
+    pub created_at_ms: i64,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MemoryDecisionRow {
     pub id: String,

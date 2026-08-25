@@ -554,6 +554,12 @@ impl ControlPlaneDb {
             .pragma_update(None, "foreign_keys", "ON")
             .map_err(db_error)?;
         self.connection
+            .pragma_update(None, "journal_mode", "WAL")
+            .map_err(db_error)?;
+        self.connection
+            .pragma_update(None, "synchronous", "NORMAL")
+            .map_err(db_error)?;
+        self.connection
             .busy_timeout(std::time::Duration::from_millis(5000))
             .map_err(db_error)?;
         Ok(())

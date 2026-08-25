@@ -85,6 +85,14 @@ impl ControlPlaneDb {
         rows.collect::<Result<Vec<_>, _>>().map_err(db_error)
     }
 
+    pub fn active_sessions(&self) -> AcResult<Vec<PersistedSession>> {
+        let mut stmt = self.connection.prepare(
+            "SELECT id, mission_id, state, updated_at_ms FROM agent_sessions WHERE state NOT IN ('completed', 'cancelled', 'failed') ORDER BY updated_at_ms DESC",
+        ).map_err(db_error)?;
+        let rows = stmt.query_map([], |row| Ok(PersistedSession { id: row.get(0)?, mission_id: row.get(1)?, state: row.get(2)?, updated_at_ms: row.get(3)? })).map_err(db_error)?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(db_error)
+    }
+
     pub fn get_session(&self, session_id: &StableId) -> AcResult<Option<PersistedSession>> {
         let mut stmt = self
             .connection

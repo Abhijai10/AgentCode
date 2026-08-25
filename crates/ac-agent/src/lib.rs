@@ -524,7 +524,7 @@ impl ContextBuilder {
         &self,
         goal: &Goal,
         prior_evidence: &[StableId],
-        memory: &MemoryService,
+        memory: &mut MemoryService,
         code_intel: &mut CodeIntelligenceService,
         repository: Option<RepositoryContext>,
         candidates: Vec<ContextCandidate>,
@@ -560,6 +560,21 @@ impl ContextBuilder {
                 protected: false,
                 degraded: false,
             });
+        }
+        // Dense retrieval is an additional signal. If the user has not explicitly
+        // activated the local model, lexical/structural retrieval still builds a pack.
+        if let Ok(matches) = memory.semantic_search(&goal.text, 5) {
+            for matched in matches {
+                nodes.push(ContextNode {
+                    id: StableId::new("ctxnode"),
+                    source_ref: matched.chunk.fact_id,
+                    authority: AuthorityClass::AcceptedMemory,
+                    content: matched.chunk.content,
+                    token_estimate: 8,
+                    protected: false,
+                    degraded: false,
+                });
+            }
         }
         let mut ranked_candidates = candidates;
         if let Some(repository) = repository {
@@ -975,7 +990,7 @@ impl<P: PolicyBoundary> AutonomousAgent<P> {
         self.context_builder.build(
             goal,
             evidence_refs,
-            &self.memory,
+            &mut self.memory,
             &mut self.code_intel,
             repository,
             Vec::new(),
@@ -4191,7 +4206,7 @@ mod tests {
             .build(
                 &goal,
                 &[],
-                &MemoryService::new(),
+                &mut MemoryService::new(),
                 &mut code_intel,
                 Some(RepositoryContext {
                     root: root.clone(),
