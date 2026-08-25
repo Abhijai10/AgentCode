@@ -8,7 +8,12 @@ repository.workspace = true
 [dependencies]
 ac-common = { path = "../ac-common" }
 ac-evidence = { path = "../ac-evidence" }
+ac-sandbox = { path = "../ac-sandbox" }
 ac-security = { path = "../ac-security" }
+base64 = "0.23.1"
+serde_json = "1.0.151"
+tempfile = "3.27.0"
+tungstenite = "0.30.0"
 
 [lints]
 workspace = true

@@ -905,7 +905,7 @@ mod tests {
     fn phase15_browser_runtime_state_survives_reopen() {
         let path =
             std::env::temp_dir().join(format!("agentcode-p15-{}.sqlite", StableId::new("db")));
-        let mut runtime = ac_verification::BrowserRuntime::new(
+        let mut runtime = ac_verification::BrowserRuntime::deterministic_harness_for_tests(
             ac_security::CapabilityPolicy::new().allow(ac_security::Capability::BrowserAutomation),
         );
         let mut evidence = ac_evidence::EvidenceStore::new();
@@ -925,7 +925,7 @@ mod tests {
         runtime
             .act(
                 &session.id,
-                ac_verification::BrowserAction::Open {
+                ac_verification::BrowserAction::OpenHtmlForTest {
                     url: dev_server.ready_url.clone(),
                     html: "<h1>Login</h1><button id=\"submit\">Submit</button>".to_string(),
                 },

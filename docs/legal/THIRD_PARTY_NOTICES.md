@@ -12,6 +12,10 @@ Batch 3 admits Tree-sitter parser crates, LSP protocol types, and serde/serde_js
 for real code-intelligence parsing and LSP JSON-RPC payload handling. See
 `docs/policy/dependency-admissions/DEP-ADM-002-code-intel-real-engines.md`.
 
+Batch 4 admits tungstenite, base64 and tempfile for the real Chrome DevTools
+Protocol browser backend. See
+`docs/policy/dependency-admissions/DEP-ADM-003-browser-cdp-backend.md`.
+
 Required fields per shipped component:
 
 - Name

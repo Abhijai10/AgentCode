@@ -1,12 +1,25 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
+use std::io::{Read, Write};
+use std::net::TcpStream;
 use std::path::{Path, PathBuf};
+use std::process::{Child, Command, Stdio};
+use std::thread;
+use std::time::{Duration, Instant};
 
 use ac_common::{AcError, AcResult, StableId, TimestampMillis};
 use ac_evidence::{EvidenceKind, EvidenceStore, Provenance};
+use ac_sandbox::{
+    ExecRequest, IsolationLevel, ProcessRestrictedBackend, SandboxManager, SandboxPolicy,
+};
 use ac_security::{
     ActiveSecurityReport, AiSecurityReport, Capability, CapabilityPolicy, SecurityDecision,
 };
+use base64::Engine;
+use serde_json::{json, Value};
+use tempfile::TempDir;
+use tungstenite::stream::MaybeTlsStream;
+use tungstenite::{connect, Message, WebSocket};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct BrowserObservation {
@@ -234,13 +247,19 @@ pub struct CompletionGateDecision {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum BrowserAdapterMode {
     Playwright,
+    ChromiumCdp,
     DeterministicHarness,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum BrowserProcessState {
+    Launching,
     Running,
+    Ready,
     Crashed,
+    LaunchFailed,
+    Unavailable,
+    Closing,
     Closed,
 }
 
@@ -277,7 +296,8 @@ pub struct ViewportProfile {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum BrowserAction {
-    Open { url: String, html: String },
+    Navigate { url: String },
+    OpenHtmlForTest { url: String, html: String },
     Click { selector: String },
     Type { selector: String, text: String },
     Select { selector: String, value: String },
@@ -402,6 +422,29 @@ pub struct BrowserRuntime {
     processes: BTreeMap<StableId, BrowserProcessRecord>,
     sessions: BTreeMap<StableId, BrowserSessionRecord>,
     pages: BTreeMap<StableId, PageState>,
+    real_processes: BTreeMap<StableId, RealBrowserProcess>,
+    real_pages: BTreeMap<StableId, RealBrowserPage>,
+}
+
+struct RealBrowserProcess {
+    child: Child,
+    _profile_dir: TempDir,
+    port: u16,
+}
+
+struct RealBrowserPage {
+    client: CdpClient,
+    url: String,
+    viewport: ViewportProfile,
+}
+
+struct CdpClient {
+    socket: WebSocket<MaybeTlsStream<TcpStream>>,
+    next_id: u64,
+    console_errors: Vec<String>,
+    page_errors: Vec<String>,
+    network_failures: Vec<String>,
+    http_status: u16,
 }
 
 pub struct VerificationEngine {
@@ -1154,15 +1197,32 @@ impl BrowserRuntime {
     pub fn new(policy: CapabilityPolicy) -> Self {
         Self {
             policy,
+            mode: BrowserAdapterMode::ChromiumCdp,
+            processes: BTreeMap::new(),
+            sessions: BTreeMap::new(),
+            pages: BTreeMap::new(),
+            real_processes: BTreeMap::new(),
+            real_pages: BTreeMap::new(),
+        }
+    }
+
+    pub fn deterministic_harness_for_tests(policy: CapabilityPolicy) -> Self {
+        Self {
+            policy,
             mode: BrowserAdapterMode::DeterministicHarness,
             processes: BTreeMap::new(),
             sessions: BTreeMap::new(),
             pages: BTreeMap::new(),
+            real_processes: BTreeMap::new(),
+            real_pages: BTreeMap::new(),
         }
     }
 
     pub fn launch(&mut self, task_id: StableId) -> AcResult<BrowserProcessRecord> {
         self.ensure_browser_allowed()?;
+        if self.mode == BrowserAdapterMode::ChromiumCdp {
+            return self.launch_chromium_cdp(task_id);
+        }
         let process = BrowserProcessRecord {
             id: StableId::new("browserproc"),
             profile_dir: format!("isolated-profile/{}", task_id),
@@ -1193,6 +1253,16 @@ impl BrowserRuntime {
                 "browser session must be tied to a running task-owned process",
             ));
         }
+        if self.mode == BrowserAdapterMode::ChromiumCdp {
+            let real_process = self.real_processes.get(&process_id).ok_or_else(|| {
+                AcError::validation(
+                    "BROWSER-PROCESS_UNKNOWN",
+                    "real browser process is not registered",
+                )
+            })?;
+            let page = RealBrowserPage::create(real_process.port)?;
+            self.real_pages.insert(process_id.clone(), page);
+        }
         let session = BrowserSessionRecord {
             id: StableId::new("browsersession"),
             task_id,
@@ -1216,12 +1286,15 @@ impl BrowserRuntime {
         evidence_store: &mut EvidenceStore,
     ) -> AcResult<BrowserActionResult> {
         self.ensure_browser_allowed()?;
-        let session = self.sessions.get_mut(session_id).ok_or_else(|| {
-            AcError::validation(
+        if self.mode == BrowserAdapterMode::ChromiumCdp {
+            return self.act_chromium_cdp(session_id, action, evidence_store);
+        }
+        if !self.sessions.contains_key(session_id) {
+            return Err(AcError::validation(
                 "BROWSER-SESSION_UNKNOWN",
                 "browser session is not registered",
-            )
-        })?;
+            ));
+        }
         let page = self.pages.entry(session_id.clone()).or_insert(PageState {
             url: "about:blank".to_string(),
             html: String::new(),
@@ -1231,18 +1304,20 @@ impl BrowserRuntime {
             viewport: default_viewports()[2],
         });
         let action_name = match &action {
-            BrowserAction::Open { url, html } => {
+            BrowserAction::Navigate { url } => {
+                page.url = url.clone();
+                "navigate"
+            }
+            BrowserAction::OpenHtmlForTest { url, html } => {
                 page.url = url.clone();
                 page.html = html.clone();
-                session.current_url = Some(url.clone());
-                "open"
+                "open-html-for-test"
             }
             BrowserAction::Click { selector } => {
                 require_selector(&page.html, selector)?;
                 page.clicked.push(selector.clone());
                 if selector.contains("submit") || selector.contains("button") {
                     page.url = route_after_submit(&page.url);
-                    session.current_url = Some(page.url.clone());
                 }
                 "click"
             }
@@ -1262,7 +1337,12 @@ impl BrowserRuntime {
             }
             BrowserAction::Wait { .. } => "wait",
         };
-        session.updated_at = TimestampMillis::now();
+        let url = page.url.clone();
+        {
+            let session = self.session_mut(session_id)?;
+            session.current_url = Some(url.clone());
+            session.updated_at = TimestampMillis::now();
+        }
         let evidence_ref = evidence_store.append(
             EvidenceKind::DerivedContext,
             Provenance {
@@ -1272,25 +1352,25 @@ impl BrowserRuntime {
                 tool: Some("browser-action".to_string()),
             },
             format!("mem://browser/action/{}", StableId::new("baction")),
-            format!(
-                "session:{};action:{};url:{}",
-                session_id, action_name, page.url
-            ),
+            format!("session:{};action:{};url:{}", session_id, action_name, url),
         )?;
         Ok(BrowserActionResult {
             session_id: session_id.clone(),
             action: action_name.to_string(),
             ok: true,
-            url: page.url.clone(),
+            url,
             evidence_ref,
         })
     }
 
     pub fn inspect_dom(
-        &self,
+        &mut self,
         session_id: &StableId,
         evidence_store: &mut EvidenceStore,
     ) -> AcResult<DomSnapshot> {
+        if self.mode == BrowserAdapterMode::ChromiumCdp {
+            return self.inspect_dom_chromium_cdp(session_id, evidence_store);
+        }
         let page = self.page(session_id)?;
         let visible_text = visible_text(&page.html);
         let controls = controls(&page.html);
@@ -1325,10 +1405,13 @@ impl BrowserRuntime {
     }
 
     pub fn diagnostics(
-        &self,
+        &mut self,
         session_id: &StableId,
         evidence_store: &mut EvidenceStore,
     ) -> AcResult<BrowserDiagnostics> {
+        if self.mode == BrowserAdapterMode::ChromiumCdp {
+            return self.diagnostics_chromium_cdp(session_id, evidence_store);
+        }
         let page = self.page(session_id)?;
         let console_errors = contains_any(&page.html, &["console.error", "throw new Error"])
             .then(|| "console error detected".to_string())
@@ -1379,6 +1462,15 @@ impl BrowserRuntime {
         evidence_store: &mut EvidenceStore,
     ) -> AcResult<ScreenshotEvidence> {
         let commit = commit.into();
+        if self.mode == BrowserAdapterMode::ChromiumCdp {
+            return self.capture_screenshot_chromium_cdp(
+                session_id,
+                task_id,
+                commit,
+                viewport,
+                evidence_store,
+            );
+        }
         let page = self.pages.get_mut(session_id).ok_or_else(|| {
             AcError::validation("BROWSER-PAGE_UNKNOWN", "browser page is not open")
         })?;
@@ -1446,12 +1538,18 @@ impl BrowserRuntime {
         evidence_store: &mut EvidenceStore,
     ) -> AcResult<VisualQaReport> {
         let mut findings = Vec::new();
-        if screenshot.artifact_uri.contains("overlap")
-            || screenshot.artifact_uri.contains("clipped")
+        if screenshot.artifact_uri.starts_with("screenshot:") {
+            findings.push(blocking(
+                "BROWSER-VISUAL_FAKE_ARTIFACT",
+                "visual QA requires a real screenshot artifact",
+            ));
+        } else if fs::metadata(&screenshot.artifact_uri)
+            .map(|metadata| metadata.len() == 0)
+            .unwrap_or(true)
         {
             findings.push(blocking(
-                "BROWSER-VISUAL_DEFECT",
-                "visual model fallback detected clipping or overlap",
+                "BROWSER-VISUAL_ARTIFACT_MISSING",
+                "screenshot artifact is missing or empty",
             ));
         }
         let passed = findings.is_empty();
@@ -1471,7 +1569,7 @@ impl BrowserRuntime {
             screenshot_ref: screenshot.evidence_ref.clone(),
             passed,
             findings,
-            adapter: "deterministic-local-visual-fallback".to_string(),
+            adapter: "browser-screenshot-file-check".to_string(),
             evidence_ref,
         })
     }
@@ -1484,6 +1582,10 @@ impl BrowserRuntime {
             )
         })?;
         process.state = BrowserProcessState::Crashed;
+        if let Some(mut real_process) = self.real_processes.remove(process_id) {
+            let _ = real_process.child.kill();
+            let _ = real_process.child.wait();
+        }
         Ok(())
     }
 
@@ -1517,6 +1619,284 @@ impl BrowserRuntime {
             .ok_or_else(|| AcError::validation("BROWSER-PAGE_UNKNOWN", "browser page is not open"))
     }
 
+    fn session_mut(&mut self, session_id: &StableId) -> AcResult<&mut BrowserSessionRecord> {
+        self.sessions.get_mut(session_id).ok_or_else(|| {
+            AcError::validation(
+                "BROWSER-SESSION_UNKNOWN",
+                "browser session is not registered",
+            )
+        })
+    }
+
+    fn launch_chromium_cdp(&mut self, task_id: StableId) -> AcResult<BrowserProcessRecord> {
+        let executable = discover_chromium_executable().ok_or_else(|| {
+            AcError::new(
+                "BROWSER-UNAVAILABLE",
+                "no Chrome/Chromium executable is configured or available",
+                ac_common::ErrorKind::Unavailable,
+                ac_common::Retryability::NotRetryable,
+            )
+        })?;
+        let profile_dir = tempfile::Builder::new()
+            .prefix("agentcode-browser-profile-")
+            .tempdir()
+            .map_err(|err| {
+                AcError::new(
+                    "BROWSER-PROFILE_CREATE",
+                    err.to_string(),
+                    ac_common::ErrorKind::Unavailable,
+                    ac_common::Retryability::NotRetryable,
+                )
+            })?;
+        let browser_args = vec![
+            "--headless=new".to_string(),
+            "--remote-debugging-port=0".to_string(),
+            format!("--user-data-dir={}", profile_dir.path().display()),
+            "--no-first-run".to_string(),
+            "--no-default-browser-check".to_string(),
+            "--disable-background-networking".to_string(),
+            "--disable-sync".to_string(),
+            "--disable-extensions".to_string(),
+            "--disable-popup-blocking".to_string(),
+            "about:blank".to_string(),
+        ];
+        let plan = prepare_browser_spawn(&executable, &browser_args, profile_dir.path())?;
+        let mut child = Command::new(plan.backend_argv.first().ok_or_else(|| {
+            AcError::validation("BROWSER-SANDBOX_PLAN", "sandbox plan has no executable")
+        })?)
+        .args(plan.backend_argv.iter().skip(1))
+        .current_dir(plan.cwd)
+        .env_clear()
+        .envs(plan.allowed_env)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|err| {
+            AcError::new(
+                "BROWSER-LAUNCH_FAILED",
+                err.to_string(),
+                ac_common::ErrorKind::Unavailable,
+                ac_common::Retryability::NotRetryable,
+            )
+        })?;
+        let port = match wait_for_devtools_port(profile_dir.path(), &mut child) {
+            Ok(port) => port,
+            Err(err) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(err);
+            }
+        };
+        let process = BrowserProcessRecord {
+            id: StableId::new("browserproc"),
+            profile_dir: profile_dir.path().display().to_string(),
+            task_id,
+            mode: BrowserAdapterMode::ChromiumCdp,
+            state: BrowserProcessState::Running,
+            created_at: TimestampMillis::now(),
+        };
+        self.real_processes.insert(
+            process.id.clone(),
+            RealBrowserProcess {
+                child,
+                _profile_dir: profile_dir,
+                port,
+            },
+        );
+        self.processes.insert(process.id.clone(), process.clone());
+        Ok(process)
+    }
+
+    fn real_page_mut(&mut self, session_id: &StableId) -> AcResult<&mut RealBrowserPage> {
+        let process_id = self
+            .sessions
+            .get(session_id)
+            .ok_or_else(|| {
+                AcError::validation(
+                    "BROWSER-SESSION_UNKNOWN",
+                    "browser session is not registered",
+                )
+            })?
+            .process_id
+            .clone();
+        self.real_pages.get_mut(&process_id).ok_or_else(|| {
+            AcError::validation("BROWSER-PAGE_UNKNOWN", "real browser page is not open")
+        })
+    }
+
+    fn act_chromium_cdp(
+        &mut self,
+        session_id: &StableId,
+        action: BrowserAction,
+        evidence_store: &mut EvidenceStore,
+    ) -> AcResult<BrowserActionResult> {
+        let action_name = {
+            let page = self.real_page_mut(session_id)?;
+            match &action {
+                BrowserAction::Navigate { url } => {
+                    page.navigate(url)?;
+                    "navigate"
+                }
+                BrowserAction::OpenHtmlForTest { .. } => {
+                    return Err(AcError::policy_denied(
+                        "BROWSER-HTML_HARNESS_DISABLED",
+                        "caller-provided HTML is not accepted by the production browser backend",
+                    ));
+                }
+                BrowserAction::Click { selector } => {
+                    page.click(selector)?;
+                    "click"
+                }
+                BrowserAction::Type { selector, text } => {
+                    page.type_text(selector, text)?;
+                    "type"
+                }
+                BrowserAction::Select { selector, value } => {
+                    page.select(selector, value)?;
+                    "select"
+                }
+                BrowserAction::Scroll { y } => {
+                    page.scroll(*y)?;
+                    "scroll"
+                }
+                BrowserAction::Wait { millis } => {
+                    page.wait(*millis)?;
+                    "wait"
+                }
+            }
+        };
+        let url = self.real_page_mut(session_id)?.url.clone();
+        {
+            let session = self.session_mut(session_id)?;
+            session.current_url = Some(url.clone());
+            session.updated_at = TimestampMillis::now();
+        }
+        let evidence_ref = evidence_store.append(
+            EvidenceKind::DerivedContext,
+            Provenance {
+                source: "browser-runtime".to_string(),
+                commit: None,
+                worktree: None,
+                tool: Some("browser-action-cdp".to_string()),
+            },
+            format!("mem://browser/action/{}", StableId::new("baction")),
+            format!("session:{};action:{};url:{}", session_id, action_name, url),
+        )?;
+        Ok(BrowserActionResult {
+            session_id: session_id.clone(),
+            action: action_name.to_string(),
+            ok: true,
+            url,
+            evidence_ref,
+        })
+    }
+
+    fn inspect_dom_chromium_cdp(
+        &mut self,
+        session_id: &StableId,
+        evidence_store: &mut EvidenceStore,
+    ) -> AcResult<DomSnapshot> {
+        let page = self.real_page_mut(session_id)?;
+        let visible_text = page.visible_text()?;
+        let controls = page.controls()?;
+        let accessibility_tree = page.accessibility_tree()?;
+        let evidence_ref = evidence_store.append(
+            EvidenceKind::DerivedContext,
+            Provenance {
+                source: "browser-runtime".to_string(),
+                commit: None,
+                worktree: None,
+                tool: Some("dom-inspect-cdp".to_string()),
+            },
+            format!("mem://browser/dom/{}", StableId::new("dom")),
+            local_hash(&visible_text),
+        )?;
+        Ok(DomSnapshot {
+            session_id: session_id.clone(),
+            visible_text,
+            controls,
+            accessibility_tree,
+            evidence_ref,
+        })
+    }
+
+    fn diagnostics_chromium_cdp(
+        &mut self,
+        session_id: &StableId,
+        evidence_store: &mut EvidenceStore,
+    ) -> AcResult<BrowserDiagnostics> {
+        let page = self.real_page_mut(session_id)?;
+        page.client.drain_events(Duration::from_millis(150))?;
+        let console_errors = page.client.console_errors.clone();
+        let page_errors = page.client.page_errors.clone();
+        let network_failures = page.client.network_failures.clone();
+        let http_status = page.client.http_status;
+        let evidence_ref = evidence_store.append(
+            EvidenceKind::TestReport,
+            Provenance {
+                source: "browser-runtime".to_string(),
+                commit: None,
+                worktree: None,
+                tool: Some("browser-diagnostics-cdp".to_string()),
+            },
+            format!("mem://browser/diagnostics/{}", StableId::new("bdiag")),
+            format!(
+                "console:{};page:{};network:{};status:{}",
+                console_errors.len(),
+                page_errors.len(),
+                network_failures.len(),
+                http_status
+            ),
+        )?;
+        Ok(BrowserDiagnostics {
+            session_id: session_id.clone(),
+            console_errors,
+            page_errors,
+            network_failures,
+            http_status,
+            evidence_ref,
+        })
+    }
+
+    fn capture_screenshot_chromium_cdp(
+        &mut self,
+        session_id: &StableId,
+        task_id: StableId,
+        commit: String,
+        viewport: ViewportProfile,
+        evidence_store: &mut EvidenceStore,
+    ) -> AcResult<ScreenshotEvidence> {
+        let page = self.real_page_mut(session_id)?;
+        let artifact_uri = page.capture_screenshot(viewport)?;
+        let url = page.url.clone();
+        let screenshot_bytes = fs::read(&artifact_uri)
+            .map_err(|err| AcError::validation("BROWSER-SCREENSHOT_READ", err.to_string()))?;
+        let evidence_ref = evidence_store.append(
+            EvidenceKind::BrowserScreenshot,
+            Provenance {
+                source: "browser-runtime".to_string(),
+                commit: Some(commit.clone()),
+                worktree: None,
+                tool: Some("screenshot-cdp".to_string()),
+            },
+            artifact_uri.clone(),
+            local_hash(&base64::engine::general_purpose::STANDARD.encode(&screenshot_bytes)),
+        )?;
+        Ok(ScreenshotEvidence {
+            id: StableId::new("shot"),
+            session_id: session_id.clone(),
+            task_id,
+            commit,
+            viewport,
+            url,
+            artifact_uri,
+            sensitive: false,
+            evidence_ref,
+            captured_at: TimestampMillis::now(),
+        })
+    }
+
     fn ensure_browser_allowed(&self) -> AcResult<()> {
         if self.policy.evaluate(&[Capability::BrowserAutomation]) != SecurityDecision::Allow {
             return Err(AcError::policy_denied(
@@ -1526,6 +1906,673 @@ impl BrowserRuntime {
         }
         Ok(())
     }
+}
+
+impl Drop for BrowserRuntime {
+    fn drop(&mut self) {
+        for process in self.processes.values_mut() {
+            if matches!(
+                process.state,
+                BrowserProcessState::Running | BrowserProcessState::Ready
+            ) {
+                process.state = BrowserProcessState::Closing;
+            }
+        }
+        for (_, mut process) in std::mem::take(&mut self.real_processes) {
+            let _ = process.child.kill();
+            let _ = process.child.wait();
+        }
+        for process in self.processes.values_mut() {
+            if process.state == BrowserProcessState::Closing {
+                process.state = BrowserProcessState::Closed;
+            }
+        }
+    }
+}
+
+impl RealBrowserPage {
+    fn create(port: u16) -> AcResult<Self> {
+        let target = http_request_json("PUT", port, "/json/new?about:blank")
+            .or_else(|_| http_request_json("GET", port, "/json/new?about:blank"))?;
+        let ws_url = target
+            .get("webSocketDebuggerUrl")
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                AcError::validation(
+                    "BROWSER-CDP_TARGET",
+                    "Chrome did not return a page websocket URL",
+                )
+            })?;
+        let mut client = CdpClient::connect(ws_url)?;
+        client.call("Page.enable", json!({}))?;
+        client.call("Runtime.enable", json!({}))?;
+        client.call("DOM.enable", json!({}))?;
+        client.call("Network.enable", json!({}))?;
+        client.call("Accessibility.enable", json!({}))?;
+        Ok(Self {
+            client,
+            url: "about:blank".to_string(),
+            viewport: default_viewports()[2],
+        })
+    }
+
+    fn navigate(&mut self, url: &str) -> AcResult<()> {
+        self.client
+            .call("Page.navigate", json!({ "url": url.to_string() }))?;
+        self.client.wait_for_load(Some(url))?;
+        self.url = self.current_url()?;
+        Ok(())
+    }
+
+    fn click(&mut self, selector: &str) -> AcResult<()> {
+        let selector = serde_json::to_string(selector)
+            .map_err(|err| AcError::validation("BROWSER-SELECTOR_ENCODE", err.to_string()))?;
+        let clicked = self.client.evaluate_bool(&format!(
+            r#"(() => {{
+                const el = document.querySelector({selector});
+                if (!el) return false;
+                el.scrollIntoView({{ block: "center", inline: "center" }});
+                el.click();
+                return true;
+            }})()"#
+        ))?;
+        if !clicked {
+            return Err(AcError::validation(
+                "BROWSER-SELECTOR_NOT_FOUND",
+                "selector not found in real browser DOM",
+            ));
+        }
+        self.client.drain_events(Duration::from_millis(250))?;
+        self.url = self.current_url()?;
+        Ok(())
+    }
+
+    fn type_text(&mut self, selector: &str, text: &str) -> AcResult<()> {
+        let selector = serde_json::to_string(selector)
+            .map_err(|err| AcError::validation("BROWSER-SELECTOR_ENCODE", err.to_string()))?;
+        let text = serde_json::to_string(text)
+            .map_err(|err| AcError::validation("BROWSER-TEXT_ENCODE", err.to_string()))?;
+        let typed = self.client.evaluate_bool(&format!(
+            r#"(() => {{
+                const el = document.querySelector({selector});
+                if (!el) return false;
+                el.focus();
+                el.value = {text};
+                el.dispatchEvent(new Event("input", {{ bubbles: true }}));
+                el.dispatchEvent(new Event("change", {{ bubbles: true }}));
+                return true;
+            }})()"#
+        ))?;
+        if !typed {
+            return Err(AcError::validation(
+                "BROWSER-SELECTOR_NOT_FOUND",
+                "selector not found in real browser DOM",
+            ));
+        }
+        Ok(())
+    }
+
+    fn select(&mut self, selector: &str, value: &str) -> AcResult<()> {
+        let selector = serde_json::to_string(selector)
+            .map_err(|err| AcError::validation("BROWSER-SELECTOR_ENCODE", err.to_string()))?;
+        let value = serde_json::to_string(value)
+            .map_err(|err| AcError::validation("BROWSER-VALUE_ENCODE", err.to_string()))?;
+        let selected = self.client.evaluate_bool(&format!(
+            r#"(() => {{
+                const el = document.querySelector({selector});
+                if (!el) return false;
+                el.value = {value};
+                el.dispatchEvent(new Event("input", {{ bubbles: true }}));
+                el.dispatchEvent(new Event("change", {{ bubbles: true }}));
+                return true;
+            }})()"#
+        ))?;
+        if !selected {
+            return Err(AcError::validation(
+                "BROWSER-SELECTOR_NOT_FOUND",
+                "selector not found in real browser DOM",
+            ));
+        }
+        Ok(())
+    }
+
+    fn scroll(&mut self, y: i32) -> AcResult<()> {
+        self.client.evaluate_bool(&format!(
+            "(() => {{ window.scrollTo(0, {y}); return true; }})()"
+        ))?;
+        Ok(())
+    }
+
+    fn wait(&mut self, millis: u64) -> AcResult<()> {
+        let bounded = millis.min(10_000);
+        self.client.drain_events(Duration::from_millis(bounded))?;
+        self.url = self.current_url()?;
+        Ok(())
+    }
+
+    fn visible_text(&mut self) -> AcResult<String> {
+        self.client.evaluate_string(
+            r#"(() => document.body ? document.body.innerText.replace(/\s+/g, " ").trim() : "")()"#,
+        )
+    }
+
+    fn controls(&mut self) -> AcResult<Vec<String>> {
+        self.client.evaluate_string_vec(
+            r#"(() => Array.from(document.querySelectorAll("button,input,select,textarea,a"))
+                .slice(0, 80)
+                .map((el) => {
+                    const role = el.getAttribute("role") || el.tagName.toLowerCase();
+                    const name = el.getAttribute("aria-label") || el.name || el.id || el.innerText || el.value || "";
+                    return `${role}:${String(name).replace(/\s+/g, " ").trim()}`;
+                }))()"#,
+        )
+    }
+
+    fn accessibility_tree(&mut self) -> AcResult<Vec<String>> {
+        let value = self
+            .client
+            .call("Accessibility.getFullAXTree", json!({ "depth": 4 }))?;
+        let nodes = value
+            .get("nodes")
+            .and_then(Value::as_array)
+            .map(|nodes| {
+                nodes
+                    .iter()
+                    .filter_map(|node| {
+                        let role = node
+                            .get("role")
+                            .and_then(|role| role.get("value"))
+                            .and_then(Value::as_str)?;
+                        let name = node
+                            .get("name")
+                            .and_then(|name| name.get("value"))
+                            .and_then(Value::as_str)
+                            .unwrap_or("");
+                        Some(format!("{role}:{}", name.trim()))
+                    })
+                    .take(80)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        Ok(nodes)
+    }
+
+    fn capture_screenshot(&mut self, viewport: ViewportProfile) -> AcResult<String> {
+        self.viewport = viewport;
+        self.client.call(
+            "Emulation.setDeviceMetricsOverride",
+            json!({
+                "width": viewport.width,
+                "height": viewport.height,
+                "deviceScaleFactor": 1,
+                "mobile": viewport.width < 600
+            }),
+        )?;
+        self.client.drain_events(Duration::from_millis(100))?;
+        let value = self.client.call(
+            "Page.captureScreenshot",
+            json!({ "format": "png", "fromSurface": true }),
+        )?;
+        let data = value.get("data").and_then(Value::as_str).ok_or_else(|| {
+            AcError::validation(
+                "BROWSER-SCREENSHOT_EMPTY",
+                "Chrome returned no screenshot data",
+            )
+        })?;
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(data)
+            .map_err(|err| AcError::validation("BROWSER-SCREENSHOT_DECODE", err.to_string()))?;
+        let dir = std::env::temp_dir().join("agentcode-browser-artifacts");
+        fs::create_dir_all(&dir)
+            .map_err(|err| AcError::validation("BROWSER-SCREENSHOT_DIR", err.to_string()))?;
+        let path = dir.join(format!("{}.png", StableId::new("browser-shot")));
+        fs::write(&path, bytes)
+            .map_err(|err| AcError::validation("BROWSER-SCREENSHOT_WRITE", err.to_string()))?;
+        Ok(path.display().to_string())
+    }
+
+    fn current_url(&mut self) -> AcResult<String> {
+        self.client.evaluate_string("(() => location.href)()")
+    }
+}
+
+impl CdpClient {
+    fn connect(ws_url: &str) -> AcResult<Self> {
+        let (mut socket, _) = connect(ws_url).map_err(|err| {
+            AcError::new(
+                "BROWSER-CDP_CONNECT",
+                err.to_string(),
+                ac_common::ErrorKind::Unavailable,
+                ac_common::Retryability::NotRetryable,
+            )
+        })?;
+        if let MaybeTlsStream::Plain(stream) = socket.get_mut() {
+            stream
+                .set_read_timeout(Some(Duration::from_millis(100)))
+                .map_err(|err| AcError::validation("BROWSER-CDP_TIMEOUT", err.to_string()))?;
+        }
+        Ok(Self {
+            socket,
+            next_id: 1,
+            console_errors: Vec::new(),
+            page_errors: Vec::new(),
+            network_failures: Vec::new(),
+            http_status: 0,
+        })
+    }
+
+    fn call(&mut self, method: &str, params: Value) -> AcResult<Value> {
+        let id = self.next_id;
+        self.next_id += 1;
+        let payload = json!({
+            "id": id,
+            "method": method,
+            "params": params,
+        });
+        self.socket
+            .send(Message::Text(payload.to_string().into()))
+            .map_err(|err| AcError::validation("BROWSER-CDP_SEND", err.to_string()))?;
+        let deadline = Instant::now() + Duration::from_secs(8);
+        while Instant::now() < deadline {
+            match self.socket.read() {
+                Ok(message) => {
+                    if let Some(response) = self.observe_message(message, id)? {
+                        if let Some(error) = response.get("error") {
+                            return Err(AcError::validation(
+                                "BROWSER-CDP_ERROR",
+                                error.to_string(),
+                            ));
+                        }
+                        return Ok(response.get("result").cloned().unwrap_or(Value::Null));
+                    }
+                }
+                Err(tungstenite::Error::Io(err))
+                    if matches!(
+                        err.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                    ) =>
+                {
+                    continue;
+                }
+                Err(err) => {
+                    return Err(AcError::validation("BROWSER-CDP_READ", err.to_string()));
+                }
+            }
+        }
+        Err(AcError::new(
+            "BROWSER-CDP_TIMEOUT",
+            format!("timed out waiting for {method}"),
+            ac_common::ErrorKind::Unavailable,
+            ac_common::Retryability::NotRetryable,
+        ))
+    }
+
+    fn drain_events(&mut self, duration: Duration) -> AcResult<()> {
+        let deadline = Instant::now() + duration;
+        while Instant::now() < deadline {
+            match self.socket.read() {
+                Ok(message) => {
+                    self.observe_message(message, u64::MAX)?;
+                }
+                Err(tungstenite::Error::Io(err))
+                    if matches!(
+                        err.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                    ) =>
+                {
+                    thread::sleep(Duration::from_millis(25));
+                }
+                Err(tungstenite::Error::ConnectionClosed) => break,
+                Err(err) => {
+                    return Err(AcError::validation("BROWSER-CDP_READ", err.to_string()));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn wait_for_load(&mut self, expected_url: Option<&str>) -> AcResult<()> {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < deadline {
+            self.drain_events(Duration::from_millis(100))?;
+            let ready = self.evaluate_string("(() => document.readyState)()")?;
+            let url_matches = if let Some(expected_url) = expected_url {
+                self.evaluate_string("(() => location.href)()")?
+                    .starts_with(expected_url)
+            } else {
+                true
+            };
+            if (ready == "complete" || ready == "interactive") && url_matches {
+                return Ok(());
+            }
+        }
+        Err(AcError::new(
+            "BROWSER-NAVIGATION_TIMEOUT",
+            "navigation did not reach an interactive document state",
+            ac_common::ErrorKind::Unavailable,
+            ac_common::Retryability::NotRetryable,
+        ))
+    }
+
+    fn evaluate_string(&mut self, expression: &str) -> AcResult<String> {
+        let value = self.evaluate_value(expression)?;
+        Ok(value.as_str().unwrap_or_default().to_string())
+    }
+
+    fn evaluate_bool(&mut self, expression: &str) -> AcResult<bool> {
+        let value = self.evaluate_value(expression)?;
+        Ok(value.as_bool().unwrap_or(false))
+    }
+
+    fn evaluate_string_vec(&mut self, expression: &str) -> AcResult<Vec<String>> {
+        let value = self.evaluate_value(expression)?;
+        Ok(value
+            .as_array()
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(ToOwned::to_owned)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default())
+    }
+
+    fn evaluate_value(&mut self, expression: &str) -> AcResult<Value> {
+        let result = self.call(
+            "Runtime.evaluate",
+            json!({
+                "expression": expression,
+                "returnByValue": true,
+                "awaitPromise": true
+            }),
+        )?;
+        Ok(result
+            .get("result")
+            .and_then(|result| result.get("value"))
+            .cloned()
+            .unwrap_or(Value::Null))
+    }
+
+    fn observe_message(&mut self, message: Message, expected_id: u64) -> AcResult<Option<Value>> {
+        let text = match message {
+            Message::Text(text) => text.to_string(),
+            Message::Binary(bytes) => String::from_utf8_lossy(&bytes).to_string(),
+            Message::Ping(payload) => {
+                let _ = self.socket.send(Message::Pong(payload));
+                return Ok(None);
+            }
+            Message::Close(_) => {
+                return Err(AcError::new(
+                    "BROWSER-CDP_DISCONNECTED",
+                    "Chrome DevTools websocket closed",
+                    ac_common::ErrorKind::Unavailable,
+                    ac_common::Retryability::NotRetryable,
+                ));
+            }
+            _ => return Ok(None),
+        };
+        let value: Value = serde_json::from_str(&text)
+            .map_err(|err| AcError::validation("BROWSER-CDP_JSON", err.to_string()))?;
+        if value.get("id").and_then(Value::as_u64) == Some(expected_id) {
+            return Ok(Some(value));
+        }
+        if let Some(method) = value.get("method").and_then(Value::as_str) {
+            self.observe_event(method, value.get("params").unwrap_or(&Value::Null));
+        }
+        Ok(None)
+    }
+
+    fn observe_event(&mut self, method: &str, params: &Value) {
+        match method {
+            "Runtime.consoleAPICalled" => {
+                if matches!(params.get("type").and_then(Value::as_str), Some("error")) {
+                    let text = params
+                        .get("args")
+                        .and_then(Value::as_array)
+                        .map(|args| {
+                            args.iter()
+                                .filter_map(|arg| {
+                                    arg.get("value")
+                                        .and_then(Value::as_str)
+                                        .or_else(|| arg.get("description").and_then(Value::as_str))
+                                })
+                                .collect::<Vec<_>>()
+                                .join(" ")
+                        })
+                        .unwrap_or_else(|| "console error".to_string());
+                    self.console_errors.push(redact_url(&text));
+                }
+            }
+            "Runtime.exceptionThrown" => {
+                let text = params
+                    .get("exceptionDetails")
+                    .and_then(|details| details.get("text"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("page exception");
+                self.page_errors.push(redact_url(text));
+            }
+            "Network.responseReceived" => {
+                if let Some(status) = params
+                    .get("response")
+                    .and_then(|response| response.get("status"))
+                    .and_then(Value::as_u64)
+                {
+                    self.http_status = status as u16;
+                    if status >= 400 {
+                        let url = params
+                            .get("response")
+                            .and_then(|response| response.get("url"))
+                            .and_then(Value::as_str)
+                            .unwrap_or("network response");
+                        self.network_failures
+                            .push(format!("http {status}: {}", redact_url(url)));
+                    }
+                }
+            }
+            "Network.loadingFailed" => {
+                let text = params
+                    .get("errorText")
+                    .and_then(Value::as_str)
+                    .unwrap_or("network loading failed");
+                self.network_failures.push(redact_url(text));
+            }
+            _ => {}
+        }
+    }
+}
+
+fn discover_chromium_executable() -> Option<PathBuf> {
+    if let Ok(value) = std::env::var("AGENTCODE_CHROME_EXECUTABLE") {
+        let path = PathBuf::from(value);
+        return path.is_file().then_some(path);
+    }
+    [
+        "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+        "/Applications/Chromium.app/Contents/MacOS/Chromium",
+        "/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge",
+        "/usr/bin/chromium",
+        "/usr/bin/chromium-browser",
+        "/usr/bin/google-chrome",
+        "/usr/bin/google-chrome-stable",
+    ]
+    .iter()
+    .map(PathBuf::from)
+    .find(|path| path.is_file())
+}
+
+fn prepare_browser_spawn(
+    executable: &Path,
+    args: &[String],
+    profile_dir: &Path,
+) -> AcResult<ac_sandbox::SandboxedExecutionPlan> {
+    let executable = executable.display().to_string();
+    let mut argv = vec![executable.clone()];
+    argv.extend(args.iter().cloned());
+    let mut capability_policy = CapabilityPolicy::new()
+        .allow(Capability::ProcessExec(executable))
+        .allow(Capability::Network("*".to_string()));
+    capability_policy = capability_policy.allow(Capability::BrowserAutomation);
+    let policy = SandboxPolicy {
+        workspace_roots: vec![profile_dir.to_path_buf()],
+        capability_policy,
+        network_default_allow: true,
+        max_timeout_ms: 60_000,
+        required_isolation: IsolationLevel::ProcessRestricted,
+        max_output_bytes: 1024 * 1024,
+    };
+    SandboxManager::with_backend(policy, Box::new(ProcessRestrictedBackend)).prepare_execution(
+        ExecRequest {
+            argv,
+            cwd: profile_dir.to_path_buf(),
+            env: BTreeMap::new(),
+            network: true,
+            timeout_ms: 60_000,
+        },
+    )
+}
+
+fn wait_for_devtools_port(profile_dir: &Path, child: &mut Child) -> AcResult<u16> {
+    let port_file = profile_dir.join("DevToolsActivePort");
+    let deadline = Instant::now() + Duration::from_secs(8);
+    while Instant::now() < deadline {
+        if let Some(status) = child.try_wait().map_err(|err| {
+            AcError::new(
+                "BROWSER-LAUNCH_STATUS",
+                err.to_string(),
+                ac_common::ErrorKind::Unavailable,
+                ac_common::Retryability::NotRetryable,
+            )
+        })? {
+            return Err(AcError::new(
+                "BROWSER-LAUNCH_FAILED",
+                format!("Chrome exited before DevTools became ready: {status}"),
+                ac_common::ErrorKind::Unavailable,
+                ac_common::Retryability::NotRetryable,
+            ));
+        }
+        if let Ok(contents) = fs::read_to_string(&port_file) {
+            if let Some(port) = contents.lines().next().and_then(|line| line.parse().ok()) {
+                return Ok(port);
+            }
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    Err(AcError::new(
+        "BROWSER-LAUNCH_TIMEOUT",
+        "Chrome did not publish DevToolsActivePort",
+        ac_common::ErrorKind::Unavailable,
+        ac_common::Retryability::NotRetryable,
+    ))
+}
+
+fn http_request_json(method: &str, port: u16, path: &str) -> AcResult<Value> {
+    let mut stream = TcpStream::connect(("127.0.0.1", port)).map_err(|err| {
+        AcError::new(
+            "BROWSER-CDP_HTTP_CONNECT",
+            err.to_string(),
+            ac_common::ErrorKind::Unavailable,
+            ac_common::Retryability::NotRetryable,
+        )
+    })?;
+    stream
+        .set_read_timeout(Some(Duration::from_secs(4)))
+        .map_err(|err| AcError::validation("BROWSER-CDP_HTTP_TIMEOUT", err.to_string()))?;
+    let request =
+        format!("{method} {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n");
+    stream
+        .write_all(request.as_bytes())
+        .map_err(|err| AcError::validation("BROWSER-CDP_HTTP_WRITE", err.to_string()))?;
+    let mut bytes = Vec::new();
+    let mut buffer = [0_u8; 4096];
+    loop {
+        match stream.read(&mut buffer) {
+            Ok(0) => break,
+            Ok(n) => {
+                bytes.extend_from_slice(&buffer[..n]);
+                if bytes.windows(5).any(|window| window == b"\r\n0\r\n") {
+                    break;
+                }
+            }
+            Err(err)
+                if matches!(
+                    err.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) && !bytes.is_empty() =>
+            {
+                break;
+            }
+            Err(err) => {
+                return Err(AcError::validation(
+                    "BROWSER-CDP_HTTP_READ",
+                    err.to_string(),
+                ));
+            }
+        }
+    }
+    let response = String::from_utf8_lossy(&bytes);
+    let (headers, body) = response.split_once("\r\n\r\n").ok_or_else(|| {
+        AcError::validation(
+            "BROWSER-CDP_HTTP_RESPONSE",
+            "invalid HTTP response from Chrome",
+        )
+    })?;
+    if !headers.starts_with("HTTP/1.1 200") {
+        return Err(AcError::validation(
+            "BROWSER-CDP_HTTP_STATUS",
+            headers.lines().next().unwrap_or("HTTP error").to_string(),
+        ));
+    }
+    let body = if headers.lines().any(|line| {
+        line.to_ascii_lowercase()
+            .starts_with("transfer-encoding: chunked")
+    }) {
+        decode_chunked_body(body)?
+    } else {
+        body.to_string()
+    };
+    serde_json::from_str(&body)
+        .map_err(|err| AcError::validation("BROWSER-CDP_HTTP_JSON", err.to_string()))
+}
+
+fn decode_chunked_body(body: &str) -> AcResult<String> {
+    let mut rest = body;
+    let mut decoded = String::new();
+    while let Some((size_line, after_size)) = rest.split_once("\r\n") {
+        let size = usize::from_str_radix(size_line.trim(), 16)
+            .map_err(|err| AcError::validation("BROWSER-CDP_HTTP_CHUNK", err.to_string()))?;
+        if size == 0 {
+            break;
+        }
+        if after_size.len() < size {
+            return Err(AcError::validation(
+                "BROWSER-CDP_HTTP_CHUNK",
+                "truncated chunked response from Chrome",
+            ));
+        }
+        decoded.push_str(&after_size[..size]);
+        rest = after_size.get(size + 2..).unwrap_or_default();
+    }
+    Ok(decoded)
+}
+
+fn redact_url(value: &str) -> String {
+    value
+        .split_whitespace()
+        .map(|part| {
+            if let Some((base, query)) = part.split_once('?') {
+                if query.contains("token")
+                    || query.contains("secret")
+                    || query.contains("key")
+                    || query.contains("auth")
+                {
+                    return format!("{base}?[REDACTED]");
+                }
+            }
+            part.to_string()
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 fn default_viewports() -> [ViewportProfile; 3] {
@@ -2099,8 +3146,9 @@ mod tests {
 
     #[test]
     fn phase15_browser_flow_actions_dom_diagnostics_screenshot_and_visual_qa_work() {
-        let mut runtime =
-            BrowserRuntime::new(CapabilityPolicy::new().allow(Capability::BrowserAutomation));
+        let mut runtime = BrowserRuntime::deterministic_harness_for_tests(
+            CapabilityPolicy::new().allow(Capability::BrowserAutomation),
+        );
         let task_id = StableId::new("task");
         let process = runtime.launch(task_id.clone()).unwrap();
         assert_eq!(process.state, BrowserProcessState::Running);
@@ -2124,7 +3172,7 @@ mod tests {
         runtime
             .act(
                 &session.id,
-                BrowserAction::Open {
+                BrowserAction::OpenHtmlForTest {
                     url: "http://127.0.0.1:3000/login".to_string(),
                     html: html.to_string(),
                 },
@@ -2181,8 +3229,153 @@ mod tests {
             .unwrap();
         assert_eq!(shot.viewport.name, "mobile");
         let visual = runtime.visual_qa(&shot, &mut evidence).unwrap();
-        assert!(visual.passed);
+        assert!(!visual.passed);
         assert_eq!(visual.screenshot_ref, shot.evidence_ref);
+    }
+
+    #[test]
+    fn batch4_browser_runtime_drives_real_chrome_dom_and_evidence() {
+        if discover_chromium_executable().is_none() {
+            let mut runtime =
+                BrowserRuntime::new(CapabilityPolicy::new().allow(Capability::BrowserAutomation));
+            assert_eq!(
+                runtime.launch(StableId::new("task")).unwrap_err().code(),
+                "BROWSER-UNAVAILABLE"
+            );
+            return;
+        }
+        let Ok(listener) = std::net::TcpListener::bind("127.0.0.1:0") else {
+            return;
+        };
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            listener.set_nonblocking(true).unwrap();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(6);
+            while std::time::Instant::now() < deadline {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        let mut buffer = [0_u8; 2048];
+                        let n = stream.read(&mut buffer).unwrap_or(0);
+                        let request = String::from_utf8_lossy(&buffer[..n]);
+                        let path = request
+                            .lines()
+                            .next()
+                            .and_then(|line| line.split_whitespace().nth(1))
+                            .unwrap_or("/");
+                        let (status, body, content_type) = if path == "/missing.png" {
+                            ("404 Not Found", "missing", "text/plain")
+                        } else {
+                            (
+                                "200 OK",
+                                r#"<!doctype html>
+                                <html>
+                                  <head><title>AgentCode Browser Test</title></head>
+                                  <body>
+                                    <main>
+                                      <h1 id="title">Login</h1>
+                                      <input id="email" name="email" aria-label="Email" />
+                                      <select id="role" aria-label="Role">
+                                        <option value="user">User</option>
+                                        <option value="admin">Admin</option>
+                                      </select>
+                                      <button id="submit" onclick="document.getElementById('title').innerText='Dashboard'; history.pushState({}, '', '/dashboard');">Sign in</button>
+                                      <script>console.error("batch4 real console error")</script>
+                                      <img src="/missing.png" />
+                                    </main>
+                                  </body>
+                                </html>"#,
+                                "text/html",
+                            )
+                        };
+                        let response = format!(
+                            "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                            body.len()
+                        );
+                        let _ = stream.write_all(response.as_bytes());
+                    }
+                    Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(std::time::Duration::from_millis(25));
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+
+        let mut runtime =
+            BrowserRuntime::new(CapabilityPolicy::new().allow(Capability::BrowserAutomation));
+        let mut evidence = EvidenceStore::new();
+        let task = StableId::new("task");
+        let process = runtime.launch(task.clone()).unwrap();
+        assert_eq!(process.mode, BrowserAdapterMode::ChromiumCdp);
+        assert_eq!(process.state, BrowserProcessState::Running);
+        assert!(process.profile_dir.contains("agentcode-browser-profile"));
+        let session = runtime
+            .create_session(task.clone(), process.id.clone())
+            .unwrap();
+        let url = format!("http://{addr}/login");
+        runtime
+            .act(&session.id, BrowserAction::Navigate { url }, &mut evidence)
+            .unwrap();
+        runtime
+            .act(
+                &session.id,
+                BrowserAction::Type {
+                    selector: "#email".to_string(),
+                    text: "demo@example.test".to_string(),
+                },
+                &mut evidence,
+            )
+            .unwrap();
+        runtime
+            .act(
+                &session.id,
+                BrowserAction::Select {
+                    selector: "#role".to_string(),
+                    value: "admin".to_string(),
+                },
+                &mut evidence,
+            )
+            .unwrap();
+        let click = runtime
+            .act(
+                &session.id,
+                BrowserAction::Click {
+                    selector: "#submit".to_string(),
+                },
+                &mut evidence,
+            )
+            .unwrap();
+        assert!(click.url.ends_with("/dashboard"));
+        let dom = runtime.inspect_dom(&session.id, &mut evidence).unwrap();
+        assert!(dom.visible_text.contains("Dashboard"));
+        assert!(dom.controls.iter().any(|control| control.contains("Email")));
+        assert!(dom
+            .accessibility_tree
+            .iter()
+            .any(|node| node.contains("Sign in") || node.contains("Email")));
+        let diagnostics = runtime.diagnostics(&session.id, &mut evidence).unwrap();
+        assert!(diagnostics
+            .console_errors
+            .iter()
+            .any(|error| error.contains("batch4 real console error")));
+        assert!(diagnostics
+            .network_failures
+            .iter()
+            .any(|failure| { failure.contains("missing.png") || failure.contains("net::ERR") }));
+        let shot = runtime
+            .capture_screenshot(
+                &session.id,
+                task,
+                "commit-batch4",
+                runtime.default_viewports()[0],
+                &mut evidence,
+            )
+            .unwrap();
+        assert_eq!(shot.viewport.name, "mobile");
+        assert!(fs::metadata(&shot.artifact_uri).unwrap().len() > 0);
+        let visual = runtime.visual_qa(&shot, &mut evidence).unwrap();
+        assert!(visual.passed);
+        runtime.mark_crashed(&process.id).unwrap();
     }
 
     #[test]
@@ -2192,8 +3385,9 @@ mod tests {
             denied.launch(StableId::new("task")).unwrap_err().code(),
             "BROWSER-CAPABILITY_DENIED"
         );
-        let mut runtime =
-            BrowserRuntime::new(CapabilityPolicy::new().allow(Capability::BrowserAutomation));
+        let mut runtime = BrowserRuntime::deterministic_harness_for_tests(
+            CapabilityPolicy::new().allow(Capability::BrowserAutomation),
+        );
         let task = StableId::new("task");
         let process = runtime.launch(task.clone()).unwrap();
         let session = runtime.create_session(task, process.id).unwrap();
@@ -2201,7 +3395,7 @@ mod tests {
         runtime
             .act(
                 &session.id,
-                BrowserAction::Open {
+                BrowserAction::OpenHtmlForTest {
                     url: "http://localhost/login".to_string(),
                     html: "<button id=\"ok\">OK</button>".to_string(),
                 },
@@ -2225,8 +3419,9 @@ mod tests {
 
     #[test]
     fn phase15_dev_server_responsive_profiles_and_crash_recovery_work() {
-        let mut runtime =
-            BrowserRuntime::new(CapabilityPolicy::new().allow(Capability::BrowserAutomation));
+        let mut runtime = BrowserRuntime::deterministic_harness_for_tests(
+            CapabilityPolicy::new().allow(Capability::BrowserAutomation),
+        );
         let task = StableId::new("task");
         let dev_server = runtime
             .manage_dev_server(
@@ -2254,7 +3449,7 @@ mod tests {
         runtime
             .act(
                 &session.id,
-                BrowserAction::Open {
+                BrowserAction::OpenHtmlForTest {
                     url: dev_server.ready_url,
                     html: "<h1>Ready</h1>".to_string(),
                 },
