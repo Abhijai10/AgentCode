@@ -20,6 +20,7 @@ members = [
     "crates/ac-runtime",
     "crates/ac-daemon",
     "apps/desktop-placeholder",
+    "apps/desktop/src-tauri",
     "tests/integration",
 ]
 resolver = "2"

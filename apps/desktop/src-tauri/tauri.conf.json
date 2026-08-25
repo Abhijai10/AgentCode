@@ -1,0 +1,8 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "AgentCode",
+  "version": "0.1.0",
+  "identifier": "dev.agentcode.desktop",
+  "build": { "beforeDevCommand": "npm run dev", "beforeBuildCommand": "npm run build", "devUrl": "http://localhost:5173", "frontendDist": "../dist" },
+  "app": { "windows": [{ "title": "AgentCode", "width": 1440, "height": 900, "minWidth": 1100, "minHeight": 700, "resizable": true }] }
+}
