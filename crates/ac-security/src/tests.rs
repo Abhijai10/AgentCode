@@ -2,6 +2,49 @@
 mod tests {
     use super::*;
 
+    struct UnavailableScanner;
+
+    impl SecurityScannerExecutor for UnavailableScanner {
+        fn execute(&self, _request: ScannerProcessRequest) -> Result<ScannerProcessResult, ScannerFailure> {
+            Err(ScannerFailure::Unavailable("scanner executable not found".to_string()))
+        }
+    }
+
+    #[test]
+    fn managed_scanner_unavailability_is_honest_and_required_scanners_fail_closed() {
+        let root = std::env::temp_dir();
+        let input = ManagedSecurityScanInput {
+            repository_id: StableId::new("repo"),
+            commit: "security-test".to_string(),
+            workspace_root: root,
+            configurations: vec![ScannerConfiguration::external(SecurityAdapter::Gitleaks)],
+            target_url: None,
+            target_authorized: false,
+        };
+        let mut evidence = EvidenceStore::new();
+        let orchestrator = BaselineSecurityOrchestrator::new(SecurityPolicy::baseline());
+        let report = orchestrator.run_managed(&input, &UnavailableScanner, &mut evidence).unwrap();
+        assert!(report.adapters_run.is_empty());
+        assert_eq!(report.executions[0].availability, ScannerAvailability::Unavailable);
+        assert!(report.instances.is_empty());
+
+        let mut required = input;
+        required.configurations[0].required = true;
+        assert_eq!(orchestrator.run_managed(&required, &UnavailableScanner, &mut evidence).unwrap_err().code(), "SECURITY-SCANNER_REQUIRED_UNAVAILABLE");
+    }
+
+    #[test]
+    fn external_parser_redacts_secret_bearing_output_and_preserves_external_provenance() {
+        let parsed = parse_external_output(
+            SecurityAdapter::Gitleaks,
+            r#"[{"RuleID":"aws-key","File":"src/a.rs","StartLine":7,"Description":"SECRET=not-for-storage"}]"#,
+            StableId::new("evidence"),
+        ).unwrap();
+        assert_eq!(parsed[0].adapter, SecurityAdapter::Gitleaks);
+        assert_eq!(parsed[0].proof_level, ProofLevel::ExternalTool);
+        assert!(!parsed[0].redacted_evidence.contains("not-for-storage"));
+    }
+
     #[test]
     fn denied_capability_overrides_allow() {
         let capability = Capability::Network("*".to_string());
@@ -262,7 +305,7 @@ mod tests {
         assert!(report
             .instances
             .iter()
-            .any(|item| item.adapter == SecurityAdapter::Gitleaks));
+            .any(|item| item.adapter == SecurityAdapter::BuiltInSecretHeuristic));
         assert!(report
             .instances
             .iter()
@@ -270,15 +313,15 @@ mod tests {
         assert!(report
             .instances
             .iter()
-            .any(|item| item.adapter == SecurityAdapter::Osv));
+            .all(|item| item.adapter != SecurityAdapter::Osv));
         assert!(report
             .instances
             .iter()
-            .any(|item| item.adapter == SecurityAdapter::Semgrep));
+            .any(|item| item.adapter == SecurityAdapter::BuiltInSuspiciousSqlHeuristic));
         assert!(report
             .instances
             .iter()
-            .any(|item| item.adapter == SecurityAdapter::Checkov));
+            .any(|item| item.adapter == SecurityAdapter::BuiltInIacHeuristic));
         assert!(report
             .findings
             .iter()
@@ -312,15 +355,15 @@ mod tests {
         let secret_group = report
             .findings
             .iter()
-            .find(|finding| finding.root_cause == "secret-exposure")
+            .find(|finding| finding.root_cause == "builtin-secret-pattern")
             .unwrap();
-        assert_eq!(secret_group.instance_ids.len(), 2);
-        let dismissed = report
+        assert_eq!(secret_group.instance_ids.len(), 1);
+        let suspicious = report
             .findings
             .iter()
-            .find(|finding| finding.root_cause == "injection-pattern")
+            .find(|finding| finding.root_cause == "builtin-suspicious-sink")
             .unwrap();
-        assert_eq!(dismissed.status, FindingStatus::FalsePositive);
+        assert_eq!(suspicious.status, FindingStatus::Confirmed);
         let repair = orchestrator.create_repair_task(secret_group).unwrap();
         assert_eq!(repair.finding_id, secret_group.id);
         let clean_rescan = orchestrator

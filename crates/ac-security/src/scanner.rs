@@ -1,544 +1,132 @@
+use std::path::{Path, PathBuf};
+
+use ac_evidence::{EvidenceKind, EvidenceStore, Provenance};
+use serde_json::Value;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
-pub enum SecuritySeverity {
-    Low,
-    Medium,
-    High,
-    Critical,
-}
-
+pub enum SecuritySeverity { Low, Medium, High, Critical }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum FindingStatus {
-    Candidate,
-    Confirmed,
-    Likely,
-    NeedsValidation,
-    FalsePositive,
-    Resolved,
-}
-
+pub enum FindingStatus { Candidate, Confirmed, Likely, NeedsValidation, FalsePositive, Resolved }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum ProofLevel {
-    Pattern,
-    Dependency,
-    Secret,
-    Manual,
-    Rescan,
-    ActiveValidation,
-    AiFixture,
-}
+pub enum ProofLevel { Pattern, Dependency, Secret, Manual, Rescan, ActiveValidation, AiFixture, ExternalTool }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+/// Named adapters are reserved for output from that external executable.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
 pub enum SecurityAdapter {
-    Gitleaks,
-    Osv,
-    Trivy,
-    Semgrep,
-    Checkov,
-    Zap,
-    Nuclei,
-    Prowler,
-    Stratus,
-    CloudGoat,
-    Pacu,
-    AiNative,
-    Promptfoo,
-    Garak,
-    PyRit,
-    Manual,
+    Gitleaks, Osv, Trivy, Semgrep, Checkov, Zap,
+    BuiltInSecretHeuristic, BuiltInSuspiciousSqlHeuristic, BuiltInIacHeuristic, BuiltInActiveDastHeuristic, BuiltInCloudPostureHeuristic,
+    Nuclei, Prowler, Stratus, CloudGoat, Pacu, AiNative, Promptfoo, Garak, PyRit, Manual,
 }
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ScannerAvailability { Available, Unavailable, Misconfigured, Failed }
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ScannerNetworkPolicy { Deny, Allow }
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ScannerConfiguration { pub adapter: SecurityAdapter, pub enabled: bool, pub required: bool, pub executable: String, pub timeout_ms: u64, pub network: ScannerNetworkPolicy, pub rules_path: Option<String> }
+impl ScannerConfiguration { pub fn external(adapter: SecurityAdapter) -> Self { let executable = match adapter { SecurityAdapter::Gitleaks => "gitleaks", SecurityAdapter::Osv => "osv-scanner", SecurityAdapter::Trivy => "trivy", SecurityAdapter::Semgrep => "semgrep", SecurityAdapter::Checkov => "checkov", SecurityAdapter::Zap => "zap.sh", _ => "" }; Self { adapter, enabled: true, required: false, executable: executable.to_string(), timeout_ms: 60_000, network: ScannerNetworkPolicy::Deny, rules_path: None } } }
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ScannerCapabilities { pub scan_kinds: Vec<String>, pub requires_target_authorization: bool }
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ScannerProcessRequest { pub adapter: SecurityAdapter, pub executable: String, pub argv: Vec<String>, pub cwd: PathBuf, pub timeout_ms: u64, pub network: bool }
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ScannerProcessResult { pub exit_code: Option<i32>, pub stdout: String, pub stderr: String, pub stdout_truncated: bool, pub stderr_truncated: bool }
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ScannerFailure { Unavailable(String), Misconfigured(String), Timeout, Cancelled, ExecutionFailed(String), OutputMalformed(String), NetworkDenied, TargetUnauthorized }
+pub trait SecurityScannerExecutor { fn execute(&self, request: ScannerProcessRequest) -> Result<ScannerProcessResult, ScannerFailure>; }
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ScannerExecution { pub adapter: SecurityAdapter, pub availability: ScannerAvailability, pub version: Option<String>, pub raw_evidence_ref: Option<StableId>, pub source_commit: String, pub failure: Option<ScannerFailure> }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct SecurityPolicy {
-    pub id: StableId,
-    pub version: String,
-    pub blocking_severities: BTreeSet<SecuritySeverity>,
-    pub active_tests_allowed: bool,
-    pub retention_days: u32,
-}
-
-impl SecurityPolicy {
-    pub fn baseline() -> Self {
-        Self {
-            id: StableId::new("secpolicy"),
-            version: "baseline-v1".to_string(),
-            blocking_severities: [SecuritySeverity::High, SecuritySeverity::Critical]
-                .into_iter()
-                .collect(),
-            active_tests_allowed: false,
-            retention_days: 30,
-        }
-    }
-}
-
+pub struct SecurityPolicy { pub id: StableId, pub version: String, pub blocking_severities: BTreeSet<SecuritySeverity>, pub active_tests_allowed: bool, pub retention_days: u32 }
+impl SecurityPolicy { pub fn baseline() -> Self { Self { id: StableId::new("secpolicy"), version: "baseline-v1".to_string(), blocking_severities: [SecuritySeverity::High, SecuritySeverity::Critical].into_iter().collect(), active_tests_allowed: false, retention_days: 30 } } }
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ThreatModel {
-    pub id: StableId,
-    pub entry_points: Vec<String>,
-    pub auth_boundaries: Vec<String>,
-    pub data_stores: Vec<String>,
-    pub admin_operations: Vec<String>,
-    pub cloud_configuration: Vec<String>,
-    pub sensitive_assets: Vec<String>,
-    pub evidence_refs: Vec<StableId>,
-}
-
+pub struct ThreatModel { pub id: StableId, pub entry_points: Vec<String>, pub auth_boundaries: Vec<String>, pub data_stores: Vec<String>, pub admin_operations: Vec<String>, pub cloud_configuration: Vec<String>, pub sensitive_assets: Vec<String>, pub evidence_refs: Vec<StableId> }
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct SecurityFindingInstance {
-    pub id: StableId,
-    pub adapter: SecurityAdapter,
-    pub rule_id: String,
-    pub severity: SecuritySeverity,
-    pub confidence: u8,
-    pub proof_level: ProofLevel,
-    pub file_path: String,
-    pub line: u32,
-    pub fingerprint: String,
-    pub redacted_evidence: String,
-    pub raw_evidence_ref: StableId,
-}
-
+pub struct SecurityFindingInstance { pub id: StableId, pub adapter: SecurityAdapter, pub rule_id: String, pub severity: SecuritySeverity, pub confidence: u8, pub proof_level: ProofLevel, pub file_path: String, pub line: u32, pub fingerprint: String, pub redacted_evidence: String, pub raw_evidence_ref: StableId }
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct NormalizedSecurityFinding {
-    pub id: StableId,
-    pub root_cause: String,
-    pub severity: SecuritySeverity,
-    pub confidence: u8,
-    pub exploitability: u8,
-    pub status: FindingStatus,
-    pub affected_code: Vec<String>,
-    pub evidence_refs: Vec<StableId>,
-    pub remediation: String,
-    pub instance_ids: Vec<StableId>,
-}
-
+pub struct NormalizedSecurityFinding { pub id: StableId, pub root_cause: String, pub severity: SecuritySeverity, pub confidence: u8, pub exploitability: u8, pub status: FindingStatus, pub affected_code: Vec<String>, pub evidence_refs: Vec<StableId>, pub remediation: String, pub instance_ids: Vec<StableId> }
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct SecurityScanReport {
-    pub id: StableId,
-    pub adapters_run: Vec<SecurityAdapter>,
-    pub missing_adapters: Vec<String>,
-    pub threat_model: ThreatModel,
-    pub instances: Vec<SecurityFindingInstance>,
-    pub findings: Vec<NormalizedSecurityFinding>,
-}
-
+pub struct SecurityScanReport { pub id: StableId, pub adapters_run: Vec<SecurityAdapter>, pub missing_adapters: Vec<String>, pub threat_model: ThreatModel, pub instances: Vec<SecurityFindingInstance>, pub findings: Vec<NormalizedSecurityFinding>, pub executions: Vec<ScannerExecution> }
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct SecurityRepairTask {
-    pub id: StableId,
-    pub finding_id: StableId,
-    pub title: String,
-    pub verification: String,
-}
-
+pub struct SecurityRepairTask { pub id: StableId, pub finding_id: StableId, pub title: String, pub verification: String }
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct SecurityRegressionResult {
-    pub finding_id: StableId,
-    pub passed: bool,
-    pub evidence_ref: StableId,
-}
-
+pub struct SecurityRegressionResult { pub finding_id: StableId, pub passed: bool, pub evidence_ref: StableId }
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct SecurityReportBundle {
-    pub markdown: String,
-    pub json: String,
-    pub sarif: String,
-}
-
+pub struct SecurityReportBundle { pub markdown: String, pub json: String, pub sarif: String }
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct SecurityScanInput {
-    pub repository_id: StableId,
-    pub commit: String,
-    pub files: Vec<(String, String)>,
-    pub dependency_manifest: Option<String>,
-    pub include_iac: bool,
-}
+pub struct SecurityScanInput { pub repository_id: StableId, pub commit: String, pub files: Vec<(String, String)>, pub dependency_manifest: Option<String>, pub include_iac: bool }
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ManagedSecurityScanInput { pub repository_id: StableId, pub commit: String, pub workspace_root: PathBuf, pub configurations: Vec<ScannerConfiguration>, pub target_url: Option<String>, pub target_authorized: bool }
 
-pub struct BaselineSecurityOrchestrator {
-    policy: SecurityPolicy,
-}
-
+pub struct BaselineSecurityOrchestrator { policy: SecurityPolicy }
 impl BaselineSecurityOrchestrator {
-    pub fn new(policy: SecurityPolicy) -> Self {
-        Self { policy }
-    }
+    pub fn new(policy: SecurityPolicy) -> Self { Self { policy } }
 
+    /// Lightweight editor-content signals. They never claim an external scanner identity.
     pub fn run(&self, input: &SecurityScanInput) -> AcResult<SecurityScanReport> {
-        if input.commit.trim().is_empty() {
-            return Err(AcError::validation(
-                "SECURITY-SCAN_INVALID",
-                "security scan commit is required",
-            ));
-        }
+        if input.commit.trim().is_empty() { return Err(AcError::validation("SECURITY-SCAN_INVALID", "security scan commit is required")); }
         let threat_model = self.threat_model(input);
-        let mut adapters_run = vec![
-            SecurityAdapter::Gitleaks,
-            SecurityAdapter::Osv,
-            SecurityAdapter::Trivy,
-            SecurityAdapter::Semgrep,
-        ];
-        if input.include_iac {
-            adapters_run.push(SecurityAdapter::Checkov);
-        }
-        let mut instances = Vec::new();
-        instances.extend(self.scan_secrets(input));
-        instances.extend(self.scan_dependencies(input));
-        instances.extend(self.scan_semgrep(input));
-        if input.include_iac {
-            instances.extend(self.scan_iac(input));
-        }
+        let mut instances = self.secret_heuristic(input);
+        instances.extend(self.sql_heuristic(input));
+        if input.include_iac { instances.extend(self.iac_heuristic(input)); }
         let findings = self.triage(self.group(instances.clone()));
-        Ok(SecurityScanReport {
-            id: StableId::new("secscan"),
-            adapters_run,
-            missing_adapters: Vec::new(),
-            threat_model,
-            instances,
-            findings,
-        })
+        Ok(SecurityScanReport { id: StableId::new("secscan"), adapters_run: instances.iter().map(|i| i.adapter).collect(), missing_adapters: Vec::new(), threat_model, instances, findings, executions: Vec::new() })
     }
 
-    pub fn manual_business_logic_finding(
-        &self,
-        file_path: impl Into<String>,
-        evidence: impl Into<String>,
-    ) -> NormalizedSecurityFinding {
-        NormalizedSecurityFinding {
-            id: StableId::new("secfinding"),
-            root_cause: "business-logic authorization gap".to_string(),
-            severity: SecuritySeverity::High,
-            confidence: 80,
-            exploitability: 70,
-            status: FindingStatus::NeedsValidation,
-            affected_code: vec![file_path.into()],
-            evidence_refs: vec![StableId::new("evidence")],
-            remediation: evidence.into(),
-            instance_ids: Vec::new(),
+    /// Runs external scanners through a caller-supplied governed executor. A required
+    /// unavailable scanner is fail-closed; optional scanners are reported honestly.
+    pub fn run_managed(&self, input: &ManagedSecurityScanInput, executor: &dyn SecurityScannerExecutor, evidence: &mut EvidenceStore) -> AcResult<SecurityScanReport> {
+        if input.commit.trim().is_empty() || !input.workspace_root.is_dir() { return Err(AcError::validation("SECURITY-SCAN_INVALID", "security scan needs commit and workspace")); }
+        let mut report = SecurityScanReport { id: StableId::new("secscan"), adapters_run: Vec::new(), missing_adapters: Vec::new(), threat_model: empty_threat_model(), instances: Vec::new(), findings: Vec::new(), executions: Vec::new() };
+        for config in input.configurations.iter().filter(|c| c.enabled) {
+            validate_config(config, input)?;
+            let version = match executor.execute(version_request(config, &input.workspace_root)) { Ok(out) if out.exit_code == Some(0) => first_line(&out.stdout), Ok(out) => { self.record_failure(&mut report, config, input, ScannerFailure::Unavailable(redact_output(&out.stderr)))?; continue; }, Err(failure) => { self.record_failure(&mut report, config, input, failure)?; continue; } };
+            let output = match executor.execute(scan_request(config, input)?) { Ok(out) if scan_exit_is_result(config.adapter, out.exit_code) => out, Ok(out) => { self.record_failure(&mut report, config, input, ScannerFailure::ExecutionFailed(redact_output(&out.stderr)))?; continue; }, Err(failure) => { self.record_failure(&mut report, config, input, failure)?; continue; } };
+            if output.stdout_truncated || output.stderr_truncated { return Err(AcError::new("SECURITY-SCANNER_OUTPUT_TRUNCATED", "scanner output exceeded governed limit", ErrorKind::Unavailable, Retryability::NotRetryable)); }
+            let raw = redact_output(&output.stdout);
+            let evidence_ref = evidence.append(EvidenceKind::TestReport, Provenance { source: "security-orchestrator".to_string(), commit: Some(input.commit.clone()), worktree: Some(input.workspace_root.display().to_string()), tool: Some(adapter_name(config.adapter).to_string()) }, format!("mem://security/{}/{}", adapter_name(config.adapter), StableId::new("raw")), raw.clone())?;
+            report.instances.extend(parse_external_output(config.adapter, &raw, evidence_ref.clone())?);
+            report.adapters_run.push(config.adapter);
+            report.executions.push(ScannerExecution { adapter: config.adapter, availability: ScannerAvailability::Available, version: Some(version), raw_evidence_ref: Some(evidence_ref), source_commit: input.commit.clone(), failure: None });
         }
+        report.findings = self.triage(self.group(report.instances.clone()));
+        Ok(report)
     }
-
-    pub fn create_repair_task(
-        &self,
-        finding: &NormalizedSecurityFinding,
-    ) -> AcResult<SecurityRepairTask> {
-        if finding.status != FindingStatus::Confirmed {
-            return Err(AcError::validation(
-                "SECURITY-FINDING_NOT_CONFIRMED",
-                "only confirmed findings create repair tasks",
-            ));
-        }
-        Ok(SecurityRepairTask {
-            id: StableId::new("sectask"),
-            finding_id: finding.id.clone(),
-            title: format!("Fix security finding: {}", finding.root_cause),
-            verification: "rescan and rerun relevant tests".to_string(),
-        })
-    }
-
-    pub fn regression(
-        &self,
-        finding: &NormalizedSecurityFinding,
-        rescan: &SecurityScanReport,
-    ) -> SecurityRegressionResult {
-        let still_present = rescan
-            .findings
-            .iter()
-            .any(|candidate| candidate.root_cause == finding.root_cause);
-        SecurityRegressionResult {
-            finding_id: finding.id.clone(),
-            passed: !still_present,
-            evidence_ref: StableId::new("evidence"),
-        }
-    }
-
-    pub fn reports(&self, report: &SecurityScanReport) -> SecurityReportBundle {
-        let markdown = format!(
-            "# Security Report\n\nFindings: {}\nAdapters: {:?}\n",
-            report.findings.len(),
-            report.adapters_run
-        );
-        let findings_json = report
-            .findings
-            .iter()
-            .map(|finding| {
-                format!(
-                    "{{\"id\":\"{}\",\"severity\":\"{:?}\",\"status\":\"{:?}\",\"root_cause\":\"{}\"}}",
-                    finding.id,
-                    finding.severity,
-                    finding.status,
-                    json_escape(&finding.root_cause)
-                )
-            })
-            .collect::<Vec<_>>()
-            .join(",");
-        let json = format!(
-            "{{\"scan_id\":\"{}\",\"findings\":[{}]}}",
-            report.id, findings_json
-        );
-        let sarif_results = report
-            .findings
-            .iter()
-            .map(|finding| {
-                format!(
-                    "{{\"ruleId\":\"{}\",\"level\":\"{:?}\",\"message\":{{\"text\":\"{}\"}}}}",
-                    json_escape(&finding.root_cause),
-                    finding.severity,
-                    json_escape(&finding.remediation)
-                )
-            })
-            .collect::<Vec<_>>()
-            .join(",");
-        let sarif = format!(
-            "{{\"version\":\"2.1.0\",\"runs\":[{{\"tool\":{{\"driver\":{{\"name\":\"AgentCode Baseline Security\"}}}},\"results\":[{}]}}]}}",
-            sarif_results
-        );
-        SecurityReportBundle {
-            markdown,
-            json,
-            sarif,
-        }
-    }
-
-    fn threat_model(&self, input: &SecurityScanInput) -> ThreatModel {
-        let mut model = ThreatModel {
-            id: StableId::new("threat"),
-            entry_points: Vec::new(),
-            auth_boundaries: Vec::new(),
-            data_stores: Vec::new(),
-            admin_operations: Vec::new(),
-            cloud_configuration: Vec::new(),
-            sensitive_assets: Vec::new(),
-            evidence_refs: vec![StableId::new("evidence")],
-        };
-        for (path, content) in &input.files {
-            if content.contains("route(") || content.contains("handler") || path.contains("api") {
-                model.entry_points.push(path.clone());
-            }
-            if content.contains("auth") || content.contains("token") {
-                model.auth_boundaries.push(path.clone());
-            }
-            if content.contains("DATABASE_URL") || content.contains("sqlite") {
-                model.data_stores.push(path.clone());
-            }
-            if content.contains("admin") {
-                model.admin_operations.push(path.clone());
-            }
-            if path.ends_with(".tf") || path.ends_with(".yaml") || path.ends_with(".yml") {
-                model.cloud_configuration.push(path.clone());
-            }
-            if content.contains("SECRET") || content.contains("password") {
-                model.sensitive_assets.push(path.clone());
-            }
-        }
-        model
-    }
-
-    fn scan_secrets(&self, input: &SecurityScanInput) -> Vec<SecurityFindingInstance> {
-        let mut out = Vec::new();
-        for (path, content) in &input.files {
-            for (idx, line) in content.lines().enumerate() {
-                if line.contains("AKIA") || line.contains("SECRET=") {
-                    out.push(instance(InstanceSpec {
-                        adapter: SecurityAdapter::Gitleaks,
-                        rule_id: "secret.detected",
-                        severity: SecuritySeverity::Critical,
-                        proof_level: ProofLevel::Secret,
-                        file_path: path,
-                        line: idx as u32 + 1,
-                        fingerprint: "secret-exposure",
-                        redacted_evidence: redact_secret(line),
-                    }));
-                }
-            }
-        }
-        out
-    }
-
-    fn scan_dependencies(&self, input: &SecurityScanInput) -> Vec<SecurityFindingInstance> {
-        let manifest = input.dependency_manifest.as_deref().unwrap_or_default();
-        if manifest.contains("vulnerable-package") || manifest.contains("RUSTSEC-") {
-            vec![instance(InstanceSpec {
-                adapter: SecurityAdapter::Osv,
-                rule_id: "dependency.vulnerable",
-                severity: SecuritySeverity::High,
-                proof_level: ProofLevel::Dependency,
-                file_path: "dependency-manifest",
-                line: 1,
-                fingerprint: "vulnerable-dependency",
-                redacted_evidence: "known vulnerable dependency".to_string(),
-            })]
-        } else {
-            Vec::new()
-        }
-    }
-
-    fn scan_semgrep(&self, input: &SecurityScanInput) -> Vec<SecurityFindingInstance> {
-        input
-            .files
-            .iter()
-            .filter_map(|(path, content)| {
-                let line = content
-                    .lines()
-                    .position(|line| {
-                        line.contains("SELECT * FROM users WHERE name = '")
-                            || line.contains("dangerouslySetInnerHTML")
-                    })
-                    .map(|idx| idx as u32 + 1)?;
-                Some(instance(InstanceSpec {
-                    adapter: SecurityAdapter::Semgrep,
-                    rule_id: "sast.injection",
-                    severity: SecuritySeverity::High,
-                    proof_level: ProofLevel::Pattern,
-                    file_path: path,
-                    line,
-                    fingerprint: "injection-pattern",
-                    redacted_evidence: "injection-like pattern".to_string(),
-                }))
-            })
-            .collect()
-    }
-
-    fn scan_iac(&self, input: &SecurityScanInput) -> Vec<SecurityFindingInstance> {
-        input
-            .files
-            .iter()
-            .filter_map(|(path, content)| {
-                let line = content
-                    .lines()
-                    .position(|line| line.contains("0.0.0.0/0") || line.contains("public-read"))
-                    .map(|idx| idx as u32 + 1)?;
-                Some(instance(InstanceSpec {
-                    adapter: SecurityAdapter::Checkov,
-                    rule_id: "iac.public-exposure",
-                    severity: SecuritySeverity::High,
-                    proof_level: ProofLevel::Pattern,
-                    file_path: path,
-                    line,
-                    fingerprint: "iac-public-exposure",
-                    redacted_evidence: "public infrastructure exposure".to_string(),
-                }))
-            })
-            .collect()
-    }
-
-    fn group(&self, instances: Vec<SecurityFindingInstance>) -> Vec<NormalizedSecurityFinding> {
-        let mut grouped: BTreeMap<String, NormalizedSecurityFinding> = BTreeMap::new();
-        for item in instances {
-            grouped
-                .entry(item.fingerprint.clone())
-                .and_modify(|finding| {
-                    finding.affected_code.push(item.file_path.clone());
-                    finding.evidence_refs.push(item.raw_evidence_ref.clone());
-                    finding.instance_ids.push(item.id.clone());
-                    finding.confidence = finding.confidence.max(item.confidence);
-                })
-                .or_insert_with(|| NormalizedSecurityFinding {
-                    id: StableId::new("secfinding"),
-                    root_cause: item.fingerprint.clone(),
-                    severity: item.severity,
-                    confidence: item.confidence,
-                    exploitability: if self.policy.blocking_severities.contains(&item.severity) {
-                        80
-                    } else {
-                        40
-                    },
-                    status: FindingStatus::Candidate,
-                    affected_code: vec![item.file_path.clone()],
-                    evidence_refs: vec![item.raw_evidence_ref.clone()],
-                    remediation: remediation_for(&item.fingerprint),
-                    instance_ids: vec![item.id.clone()],
-                });
-        }
-        grouped.into_values().collect()
-    }
-
-    fn triage(
-        &self,
-        mut findings: Vec<NormalizedSecurityFinding>,
-    ) -> Vec<NormalizedSecurityFinding> {
-        for finding in &mut findings {
-            if finding
-                .affected_code
-                .iter()
-                .any(|path| path.contains("false_positive"))
-            {
-                finding.status = FindingStatus::FalsePositive;
-            } else if self.policy.blocking_severities.contains(&finding.severity) {
-                finding.status = FindingStatus::Confirmed;
-            } else {
-                finding.status = FindingStatus::Likely;
-            }
-        }
-        findings
-    }
+    fn record_failure(&self, report: &mut SecurityScanReport, config: &ScannerConfiguration, input: &ManagedSecurityScanInput, failure: ScannerFailure) -> AcResult<SecurityScanReport> { let availability = match failure { ScannerFailure::Unavailable(_) => ScannerAvailability::Unavailable, ScannerFailure::Misconfigured(_) => ScannerAvailability::Misconfigured, _ => ScannerAvailability::Failed }; let reason = format!("{}:{:?}", adapter_name(config.adapter), failure); report.missing_adapters.push(reason.clone()); report.executions.push(ScannerExecution { adapter: config.adapter, availability, version: None, raw_evidence_ref: None, source_commit: input.commit.clone(), failure: Some(failure) }); if config.required { return Err(AcError::new("SECURITY-SCANNER_REQUIRED_UNAVAILABLE", reason, ErrorKind::Unavailable, Retryability::NotRetryable)); } Ok(report.clone()) }
+    pub fn manual_business_logic_finding(&self, file_path: impl Into<String>, evidence: impl Into<String>) -> NormalizedSecurityFinding { NormalizedSecurityFinding { id: StableId::new("secfinding"), root_cause: "business-logic authorization gap".to_string(), severity: SecuritySeverity::High, confidence: 80, exploitability: 70, status: FindingStatus::NeedsValidation, affected_code: vec![file_path.into()], evidence_refs: vec![StableId::new("evidence")], remediation: evidence.into(), instance_ids: Vec::new() } }
+    pub fn create_repair_task(&self, finding: &NormalizedSecurityFinding) -> AcResult<SecurityRepairTask> { if finding.status != FindingStatus::Confirmed { return Err(AcError::validation("SECURITY-FINDING_NOT_CONFIRMED", "only confirmed findings create repair tasks")); } Ok(SecurityRepairTask { id: StableId::new("sectask"), finding_id: finding.id.clone(), title: format!("Fix security finding: {}", finding.root_cause), verification: "rescan and rerun relevant tests".to_string() }) }
+    pub fn regression(&self, finding: &NormalizedSecurityFinding, rescan: &SecurityScanReport) -> SecurityRegressionResult { SecurityRegressionResult { finding_id: finding.id.clone(), passed: !rescan.findings.iter().any(|f| f.root_cause == finding.root_cause), evidence_ref: StableId::new("evidence") } }
+    pub fn reports(&self, report: &SecurityScanReport) -> SecurityReportBundle { let json = format!("{{\"scan_id\":\"{}\",\"findings\":{}}}", report.id, report.findings.len()); let sarif = format!("{{\"version\":\"2.1.0\",\"runs\":[{{\"tool\":{{\"driver\":{{\"name\":\"AgentCode Security\"}}}},\"results\":[{}]}}]}}", report.instances.iter().map(|i| format!("{{\"ruleId\":\"{}\",\"level\":\"{:?}\",\"message\":{{\"text\":\"{}\"}}}}", json_escape(&i.rule_id), i.severity, json_escape(&i.redacted_evidence))).collect::<Vec<_>>().join(",")); SecurityReportBundle { markdown: format!("# Security Report\n\nFindings: {}\nAdapters: {:?}\n", report.findings.len(), report.adapters_run), json, sarif } }
+    #[allow(clippy::possible_missing_else)]
+    fn threat_model(&self, input: &SecurityScanInput) -> ThreatModel { let mut out = empty_threat_model(); for (path, content) in &input.files { if content.contains("route(") || content.contains("handler") || path.contains("api") { out.entry_points.push(path.clone()); } if content.contains("auth") || content.contains("token") { out.auth_boundaries.push(path.clone()); } if content.contains("DATABASE_URL") || content.contains("sqlite") { out.data_stores.push(path.clone()); } if content.contains("admin") { out.admin_operations.push(path.clone()); } if path.ends_with(".tf") || path.ends_with(".yaml") || path.ends_with(".yml") { out.cloud_configuration.push(path.clone()); } if content.contains("SECRET") || content.contains("password") { out.sensitive_assets.push(path.clone()); } } out }
+    fn secret_heuristic(&self, input: &SecurityScanInput) -> Vec<SecurityFindingInstance> { input.files.iter().flat_map(|(path, content)| content.lines().enumerate().filter(|(_, line)| line.contains("AKIA") || line.contains("SECRET=")).map(move |(n, line)| external_instance(SecurityAdapter::BuiltInSecretHeuristic, "builtin.secret-pattern", SecuritySeverity::Critical, ProofLevel::Pattern, path, n as u32 + 1, "builtin-secret-pattern", redact_output(line), StableId::new("evidence")))).collect() }
+    fn sql_heuristic(&self, input: &SecurityScanInput) -> Vec<SecurityFindingInstance> { input.files.iter().filter_map(|(path, content)| content.lines().position(|line| line.contains("SELECT * FROM users WHERE name = '") || line.contains("dangerouslySetInnerHTML")).map(|n| external_instance(SecurityAdapter::BuiltInSuspiciousSqlHeuristic, "builtin.suspicious-sink", SecuritySeverity::High, ProofLevel::Pattern, path, n as u32 + 1, "builtin-suspicious-sink", "suspicious source sink pattern".to_string(), StableId::new("evidence")))).collect() }
+    fn iac_heuristic(&self, input: &SecurityScanInput) -> Vec<SecurityFindingInstance> { input.files.iter().filter_map(|(path, content)| content.lines().position(|line| line.contains("0.0.0.0/0") || line.contains("public-read")).map(|n| external_instance(SecurityAdapter::BuiltInIacHeuristic, "builtin.iac-public-exposure", SecuritySeverity::High, ProofLevel::Pattern, path, n as u32 + 1, "builtin-iac-public-exposure", "public infrastructure exposure heuristic".to_string(), StableId::new("evidence")))).collect() }
+    fn group(&self, items: Vec<SecurityFindingInstance>) -> Vec<NormalizedSecurityFinding> { let mut groups = BTreeMap::new(); for item in items { let key = format!("{}:{}:{}", item.file_path, item.rule_id, item.fingerprint); groups.entry(key).and_modify(|f: &mut NormalizedSecurityFinding| { f.affected_code.push(item.file_path.clone()); f.evidence_refs.push(item.raw_evidence_ref.clone()); f.instance_ids.push(item.id.clone()); f.confidence = f.confidence.max(item.confidence); f.severity = f.severity.max(item.severity); }).or_insert_with(|| NormalizedSecurityFinding { id: StableId::new("secfinding"), root_cause: item.fingerprint.clone(), severity: item.severity, confidence: item.confidence, exploitability: if self.policy.blocking_severities.contains(&item.severity) { 80 } else { 40 }, status: FindingStatus::Candidate, affected_code: vec![item.file_path.clone()], evidence_refs: vec![item.raw_evidence_ref.clone()], remediation: remediation_for(&item.fingerprint), instance_ids: vec![item.id.clone()] }); } groups.into_values().collect() }
+    fn triage(&self, mut findings: Vec<NormalizedSecurityFinding>) -> Vec<NormalizedSecurityFinding> { for f in &mut findings { f.status = if self.policy.blocking_severities.contains(&f.severity) { FindingStatus::Confirmed } else { FindingStatus::Likely }; } findings }
 }
 
-
-struct InstanceSpec<'a> {
-    adapter: SecurityAdapter,
-    rule_id: &'a str,
-    severity: SecuritySeverity,
-    proof_level: ProofLevel,
-    file_path: &'a str,
-    line: u32,
-    fingerprint: &'a str,
-    redacted_evidence: String,
-}
-
-fn instance(spec: InstanceSpec<'_>) -> SecurityFindingInstance {
-    SecurityFindingInstance {
-        id: StableId::new("secinst"),
-        adapter: spec.adapter,
-        rule_id: spec.rule_id.to_string(),
-        severity: spec.severity,
-        confidence: 90,
-        proof_level: spec.proof_level,
-        file_path: spec.file_path.to_string(),
-        line: spec.line,
-        fingerprint: spec.fingerprint.to_string(),
-        redacted_evidence: spec.redacted_evidence,
-        raw_evidence_ref: StableId::new("evidence"),
-    }
-}
-
-fn redact_secret(line: &str) -> String {
-    line.split_whitespace()
-        .map(|part| {
-            if part.contains("AKIA") || part.contains("SECRET=") {
-                "[REDACTED]"
-            } else {
-                part
-            }
-        })
-        .collect::<Vec<_>>()
-        .join(" ")
-}
-
-fn remediation_for(fingerprint: &str) -> String {
-    match fingerprint {
-        "secret-exposure" => "remove committed secret and rotate credential".to_string(),
-        "vulnerable-dependency" => "upgrade vulnerable dependency".to_string(),
-        "injection-pattern" => "parameterize user-controlled query or sanitize sink".to_string(),
-        "iac-public-exposure" => "restrict public infrastructure exposure".to_string(),
-        "seeded-web-authorization-bypass" => {
-            "enforce ownership checks and verify with synthetic user canary".to_string()
-        }
-        "cloud-public-or-wildcard-permission" => {
-            "restrict public access and least-privilege wildcard permissions".to_string()
-        }
-        "ai-direct-prompt-injection" => "separate instructions from user content and enforce policy refusal".to_string(),
-        "ai-indirect-prompt-injection" => {
-            "treat retrieved/tool content as untrusted and require source-bound policy checks".to_string()
-        }
-        "ai-rag-poisoning" => "score retrieval trust and quarantine poisoned documents".to_string(),
-        "ai-tool-abuse" => "intersect tool requests with Kernel capability policy".to_string(),
-        "ai-secret-leakage" => "redact synthetic secrets before model/report exposure".to_string(),
-        "ai-excessive-agency" => "require explicit approval for external or destructive agency".to_string(),
-        _ => "review and remediate security finding".to_string(),
-    }
-}
-
-fn json_escape(value: &str) -> String {
-    value
-        .replace('\\', "\\\\")
-        .replace('"', "\\\"")
-        .replace('\n', "\\n")
-}
+#[allow(clippy::possible_missing_else)]
+fn validate_config(config: &ScannerConfiguration, input: &ManagedSecurityScanInput) -> AcResult<()> { if !is_external(config.adapter) || config.executable.trim().is_empty() || config.timeout_ms == 0 { return Err(AcError::validation("SECURITY-SCANNER_MISCONFIGURED", "scanner executable and timeout are required")); } if config.adapter == SecurityAdapter::Zap && (!input.target_authorized || !input.target_url.as_deref().is_some_and(|url| url.starts_with("http://127.0.0.1") || url.starts_with("http://localhost"))) { return Err(AcError::policy_denied("SECURITY-ZAP_TARGET_UNAUTHORIZED", "ZAP requires an explicitly authorized localhost target")); } Ok(()) }
+fn is_external(adapter: SecurityAdapter) -> bool { matches!(adapter, SecurityAdapter::Gitleaks | SecurityAdapter::Osv | SecurityAdapter::Trivy | SecurityAdapter::Semgrep | SecurityAdapter::Checkov | SecurityAdapter::Zap) }
+fn version_request(config: &ScannerConfiguration, cwd: &Path) -> ScannerProcessRequest { ScannerProcessRequest { adapter: config.adapter, executable: config.executable.clone(), argv: vec![config.executable.clone(), "--version".to_string()], cwd: cwd.to_path_buf(), timeout_ms: config.timeout_ms.min(10_000), network: false } }
+fn scan_request(c: &ScannerConfiguration, input: &ManagedSecurityScanInput) -> AcResult<ScannerProcessRequest> { let root = input.workspace_root.display().to_string(); let argv = match c.adapter { SecurityAdapter::Gitleaks => vec![c.executable.clone(), "detect".to_string(), "--source".to_string(), root, "--report-format".to_string(), "json".to_string(), "--report-path".to_string(), "/dev/stdout".to_string(), "--no-banner".to_string()], SecurityAdapter::Osv => vec![c.executable.clone(), "scan".to_string(), "source".to_string(), "--format".to_string(), "json".to_string(), root], SecurityAdapter::Trivy => vec![c.executable.clone(), "fs".to_string(), "--format".to_string(), "json".to_string(), "--offline-scan".to_string(), root], SecurityAdapter::Semgrep => { let rules = c.rules_path.clone().ok_or_else(|| AcError::policy_denied("SECURITY-SEMGREP_RULES_REQUIRED", "Semgrep requires a configured local rules path"))?; vec![c.executable.clone(), "scan".to_string(), "--json".to_string(), "--config".to_string(), rules, root] }, SecurityAdapter::Checkov => vec![c.executable.clone(), "-d".to_string(), root, "-o".to_string(), "json".to_string()], SecurityAdapter::Zap => vec![c.executable.clone(), "-cmd".to_string(), "-quickurl".to_string(), input.target_url.clone().unwrap_or_default(), "-quickprogress".to_string(), "-quickout".to_string(), "-".to_string()], _ => return Err(AcError::validation("SECURITY-SCANNER_MISCONFIGURED", "unsupported scanner")) }; Ok(ScannerProcessRequest { adapter: c.adapter, executable: c.executable.clone(), argv, cwd: input.workspace_root.clone(), timeout_ms: c.timeout_ms, network: c.network == ScannerNetworkPolicy::Allow }) }
+fn scan_exit_is_result(adapter: SecurityAdapter, code: Option<i32>) -> bool { code == Some(0) || matches!(adapter, SecurityAdapter::Gitleaks | SecurityAdapter::Checkov) && code == Some(1) }
+fn parse_external_output(adapter: SecurityAdapter, raw: &str, evidence: StableId) -> AcResult<Vec<SecurityFindingInstance>> { let value: Value = serde_json::from_str(raw).map_err(|e| AcError::new("SECURITY-SCANNER_OUTPUT_MALFORMED", e.to_string(), ErrorKind::Validation, Retryability::NotRetryable))?; let items = match adapter { SecurityAdapter::Gitleaks => value.as_array().cloned().unwrap_or_default(), SecurityAdapter::Semgrep => at(&value, &["results"]), SecurityAdapter::Trivy => value.get("Results").and_then(Value::as_array).into_iter().flatten().flat_map(|r| ["Vulnerabilities", "Misconfigurations"].into_iter().flat_map(|k| at(r, &[k]))).collect(), SecurityAdapter::Checkov => at(&value, &["results", "failed_checks"]), SecurityAdapter::Osv => at(&value, &["results"]), SecurityAdapter::Zap => value.get("site").and_then(Value::as_array).into_iter().flatten().flat_map(|s| at(s, &["alerts"])).collect(), _ => Vec::new() }; Ok(items.iter().map(|v| normalize_item(adapter, v, evidence.clone())).collect()) }
+#[allow(clippy::manual_try_fold)]
+fn at(value: &Value, path: &[&str]) -> Vec<Value> { path.iter().fold(Some(value), |v, p| v.and_then(|v| v.get(*p))).and_then(Value::as_array).cloned().unwrap_or_default() }
+fn normalize_item(adapter: SecurityAdapter, v: &Value, evidence: StableId) -> SecurityFindingInstance { let rule = field(v, &["RuleID", "check_id", "VulnerabilityID", "alertRef", "pluginId"]).unwrap_or_else(|| adapter_name(adapter).to_string()); let file = field(v, &["File", "path", "file_path", "Target", "resource", "url", "uri"]).unwrap_or_else(|| "workspace".to_string()); let line = number(v, &["StartLine", "line", "line_number"]).unwrap_or(1); let title = field(v, &["Description", "message", "check_name", "Title", "alert", "name"]).unwrap_or_else(|| "external scanner finding".to_string()); let severity = severity(field(v, &["Severity", "severity", "risk", "riskcode"]).as_deref()); let fingerprint = format!("{}:{}:{}:{}", adapter_name(adapter), rule, file, line); external_instance(adapter, &rule, severity, ProofLevel::ExternalTool, &file, line, &fingerprint, redact_output(&title), evidence) }
+fn field(v: &Value, names: &[&str]) -> Option<String> { names.iter().find_map(|n| v.get(*n).and_then(Value::as_str).map(ToString::to_string)) }
+fn number(v: &Value, names: &[&str]) -> Option<u32> { names.iter().find_map(|n| v.get(*n).and_then(Value::as_u64).map(|x| x as u32)) }
+fn severity(value: Option<&str>) -> SecuritySeverity { match value.unwrap_or_default().to_ascii_uppercase().as_str() { "CRITICAL" | "4" => SecuritySeverity::Critical, "HIGH" | "ERROR" | "3" => SecuritySeverity::High, "MEDIUM" | "WARNING" | "2" => SecuritySeverity::Medium, _ => SecuritySeverity::Low } }
+fn adapter_name(a: SecurityAdapter) -> &'static str { match a { SecurityAdapter::Gitleaks => "gitleaks", SecurityAdapter::Osv => "osv-scanner", SecurityAdapter::Trivy => "trivy", SecurityAdapter::Semgrep => "semgrep", SecurityAdapter::Checkov => "checkov", SecurityAdapter::Zap => "zap", SecurityAdapter::BuiltInSecretHeuristic => "builtin-secret-heuristic", SecurityAdapter::BuiltInSuspiciousSqlHeuristic => "builtin-suspicious-sql-heuristic", SecurityAdapter::BuiltInIacHeuristic => "builtin-iac-heuristic", SecurityAdapter::BuiltInActiveDastHeuristic => "builtin-active-dast-heuristic", SecurityAdapter::BuiltInCloudPostureHeuristic => "builtin-cloud-posture-heuristic", _ => "agentcode" } }
+struct InstanceSpec<'a> { adapter: SecurityAdapter, rule_id: &'a str, severity: SecuritySeverity, proof_level: ProofLevel, file_path: &'a str, line: u32, fingerprint: &'a str, redacted_evidence: String }
+fn instance(spec: InstanceSpec<'_>) -> SecurityFindingInstance { external_instance(spec.adapter, spec.rule_id, spec.severity, spec.proof_level, spec.file_path, spec.line, spec.fingerprint, spec.redacted_evidence, StableId::new("evidence")) }
+#[allow(clippy::too_many_arguments)]
+fn external_instance(adapter: SecurityAdapter, rule: &str, severity: SecuritySeverity, proof: ProofLevel, file: &str, line: u32, fingerprint: &str, evidence: String, raw: StableId) -> SecurityFindingInstance { SecurityFindingInstance { id: StableId::new("secinst"), adapter, rule_id: rule.to_string(), severity, confidence: if proof == ProofLevel::ExternalTool { 95 } else { 60 }, proof_level: proof, file_path: file.to_string(), line, fingerprint: fingerprint.to_string(), redacted_evidence: evidence, raw_evidence_ref: raw } }
+fn empty_threat_model() -> ThreatModel { ThreatModel { id: StableId::new("threat"), entry_points: Vec::new(), auth_boundaries: Vec::new(), data_stores: Vec::new(), admin_operations: Vec::new(), cloud_configuration: Vec::new(), sensitive_assets: Vec::new(), evidence_refs: vec![StableId::new("evidence")] } }
+fn first_line(s: &str) -> String { redact_output(s.lines().next().unwrap_or("unknown")) }
+fn redact_secret(value: &str) -> String { redact_output(value) }
+fn redact_output(value: &str) -> String { value.split_whitespace().map(|part| if part.contains("AKIA") || part.contains("SECRET=") || part.contains("Authorization:") || part.contains("Cookie:") || part.contains("token=") || part.contains("password=") { "[REDACTED]" } else { part }).collect::<Vec<_>>().join(" ") }
+fn remediation_for(f: &str) -> String { if f.contains("secret") { "remove committed secret and rotate credential".to_string() } else if f.contains("vulnerab") { "upgrade vulnerable dependency".to_string() } else { "review and remediate security finding".to_string() } }
+fn json_escape(v: &str) -> String { v.replace('\\', "\\\\").replace('"', "\\\"").replace('\n', "\\n") }

@@ -248,7 +248,7 @@ impl BaselineSecurityOrchestrator {
         {
             if let Some(fixture) = &input.fixture {
                 findings.push(instance(InstanceSpec {
-                    adapter: SecurityAdapter::Zap,
+                    adapter: SecurityAdapter::BuiltInActiveDastHeuristic,
                     rule_id: "dast.seeded-access-control",
                     severity: SecuritySeverity::High,
                     proof_level: ProofLevel::ActiveValidation,
@@ -263,14 +263,14 @@ impl BaselineSecurityOrchestrator {
             }
         }
         ActiveAdapterEvidence {
-            adapter: SecurityAdapter::Zap,
+            adapter: SecurityAdapter::BuiltInActiveDastHeuristic,
             status: if active_allowed {
                 ActiveAdapterStatus::Ran
             } else {
                 ActiveAdapterStatus::Blocked
             },
-            version: "agentcode-native-zap-compatible-v1".to_string(),
-            provenance: "native deterministic fixture adapter; external ZAP unavailable".to_string(),
+            version: "agentcode-built-in-active-dast-heuristic-v1".to_string(),
+            provenance: "built-in authorized fixture heuristic; external ZAP not invoked".to_string(),
             findings,
             notes: vec!["scope checked before active spider".to_string()],
         }
@@ -321,7 +321,7 @@ impl BaselineSecurityOrchestrator {
             .filter(|resource| resource.public || resource.permissions.iter().any(|p| p == "*"))
             .map(|resource| {
                 instance(InstanceSpec {
-                    adapter: SecurityAdapter::Prowler,
+                    adapter: SecurityAdapter::BuiltInCloudPostureHeuristic,
                     rule_id: "cloud.readonly.exposure",
                     severity: SecuritySeverity::High,
                     proof_level: ProofLevel::Pattern,
@@ -333,10 +333,10 @@ impl BaselineSecurityOrchestrator {
             })
             .collect();
         ActiveAdapterEvidence {
-            adapter: SecurityAdapter::Prowler,
+            adapter: SecurityAdapter::BuiltInCloudPostureHeuristic,
             status: ActiveAdapterStatus::Ran,
-            version: "prowler-compatible:agentcode-native-v1".to_string(),
-            provenance: "read-only native posture adapter".to_string(),
+            version: "agentcode-built-in-cloud-posture-heuristic-v1".to_string(),
+            provenance: "built-in authorized cloud posture heuristic; Prowler not invoked".to_string(),
             findings,
             notes: vec!["cloud account scope matched authorization".to_string()],
         }

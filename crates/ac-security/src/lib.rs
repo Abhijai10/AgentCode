@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 
-use ac_common::{AcError, AcResult, StableId, TimestampMillis};
+use ac_common::{AcError, AcResult, ErrorKind, Retryability, StableId, TimestampMillis};
 
 include!("capability.rs");
 include!("extensions.rs");

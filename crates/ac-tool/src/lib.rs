@@ -11,6 +11,9 @@ use ac_common::{AcError, AcResult, StableId, TimestampMillis};
 use ac_evidence::{EvidenceStore, Provenance};
 use ac_sandbox::{ExecRequest, SandboxEvidence, SandboxManager, SandboxPolicy, SecretBroker};
 use ac_security::{Capability, CapabilityPolicy, McpToolRecord, SecurityDecision};
+use ac_security::{
+    ScannerFailure, ScannerProcessRequest, ScannerProcessResult, SecurityScannerExecutor,
+};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ToolDescriptor {
@@ -88,6 +91,61 @@ pub struct SecretProcessRequest<'a> {
 pub struct ProcessManager {
     children: Arc<Mutex<BTreeMap<StableId, std::process::Child>>>,
     records: Arc<Mutex<BTreeMap<StableId, ProcessRecord>>>,
+}
+
+/// Bridge used by security adapters. It deliberately shares the ToolBroker's
+/// sandboxed process implementation instead of allowing ac-security to spawn.
+pub struct GovernedScannerExecutor {
+    sandbox: SandboxManager,
+    manager: ProcessManager,
+}
+
+impl GovernedScannerExecutor {
+    pub fn new(sandbox: SandboxManager) -> Self {
+        Self {
+            sandbox,
+            manager: ProcessManager::default(),
+        }
+    }
+}
+
+impl SecurityScannerExecutor for GovernedScannerExecutor {
+    fn execute(
+        &self,
+        request: ScannerProcessRequest,
+    ) -> Result<ScannerProcessResult, ScannerFailure> {
+        let plan = self
+            .sandbox
+            .prepare_execution(ExecRequest {
+                argv: request.argv,
+                cwd: request.cwd,
+                env: toolchain_env(),
+                network: request.network,
+                timeout_ms: request.timeout_ms,
+            })
+            .map_err(|error| match error.code() {
+                "SANDBOX-NETWORK_DENIED" => ScannerFailure::NetworkDenied,
+                "SANDBOX-INVALID_COMMAND" | "SANDBOX-CWD_OUTSIDE_WORKSPACE" => {
+                    ScannerFailure::Misconfigured(error.to_string())
+                }
+                _ => ScannerFailure::Misconfigured(error.to_string()),
+            })?;
+        self.manager
+            .run("security-scanner", plan)
+            .map(|result| ScannerProcessResult {
+                exit_code: result.exit_code,
+                stdout: result.stdout,
+                stderr: result.stderr,
+                stdout_truncated: result.stdout_truncated,
+                stderr_truncated: result.stderr_truncated,
+            })
+            .map_err(|error| match error.code() {
+                "TOOL-COMMAND_TIMEOUT" => ScannerFailure::Timeout,
+                "TOOL-COMMAND_CANCELLED" => ScannerFailure::Cancelled,
+                "TOOL-COMMAND_SPAWN_FAILED" => ScannerFailure::Unavailable(error.to_string()),
+                _ => ScannerFailure::ExecutionFailed(error.to_string()),
+            })
+    }
 }
 
 impl ProcessManager {
@@ -1347,6 +1405,26 @@ mod tests {
         assert_eq!(manager.inspect(&id).unwrap().state, ProcessState::Running);
         manager.cancel(&id).unwrap();
         assert_eq!(manager.inspect(&id).unwrap().state, ProcessState::Cancelled);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn governed_scanner_executor_uses_the_sandboxed_process_path() {
+        let root = std::env::temp_dir().join(format!("agentcode-scanner-{}", StableId::new("t")));
+        fs::create_dir_all(&root).unwrap();
+        let executor = GovernedScannerExecutor::new(permitted_sandbox(root.clone(), 1_000));
+        let result = executor
+            .execute(ScannerProcessRequest {
+                adapter: ac_security::SecurityAdapter::Gitleaks,
+                executable: "/bin/echo".to_string(),
+                argv: vec!["/bin/echo".to_string(), "scanner-version".to_string()],
+                cwd: root.clone(),
+                timeout_ms: 1_000,
+                network: false,
+            })
+            .unwrap();
+        assert_eq!(result.exit_code, Some(0));
+        assert_eq!(result.stdout.trim(), "scanner-version");
         let _ = fs::remove_dir_all(root);
     }
 

@@ -1103,10 +1103,10 @@ mod tests {
             let findings = db.security_findings(scan_id.as_str()).unwrap();
             assert!(findings
                 .iter()
-                .any(|finding| finding.root_cause == "secret-exposure"));
+                .any(|finding| finding.root_cause == "builtin-secret-pattern"));
             assert!(findings
                 .iter()
-                .any(|finding| finding.root_cause == "vulnerable-dependency"));
+                .all(|finding| finding.root_cause != "vulnerable-dependency"));
         }
         let _ = fs::remove_file(path);
     }

@@ -171,6 +171,8 @@ name = "ac-security"
 version = "0.1.0"
 dependencies = [
  "ac-common",
+ "ac-evidence",
+ "serde_json",
 ]
 
 [[package]]

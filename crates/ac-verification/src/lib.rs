@@ -551,6 +551,36 @@ impl VerificationEngine {
         })
     }
 
+    /// Converts a current, normalized security scan into verification evidence.
+    /// A policy that requires scanners cannot pass using an unavailable result.
+    pub fn record_managed_security_scan(
+        &self,
+        report: &ac_security::SecurityScanReport,
+        require_all_configured_scanners: bool,
+        evidence_store: &mut EvidenceStore,
+    ) -> AcResult<SecurityScanReport> {
+        if require_all_configured_scanners && !report.missing_adapters.is_empty() {
+            return Err(AcError::new(
+                "VERIFY-SECURITY_SCANNER_UNAVAILABLE",
+                format!(
+                    "required security scanner unavailable: {}",
+                    report.missing_adapters.join(", ")
+                ),
+                ac_common::ErrorKind::Unavailable,
+                ac_common::Retryability::NotRetryable,
+            ));
+        }
+        self.record_security_scan(
+            "managed-security",
+            report
+                .findings
+                .iter()
+                .filter(|finding| finding.status == ac_security::FindingStatus::Confirmed)
+                .count(),
+            evidence_store,
+        )
+    }
+
     pub fn record_active_security_report(
         &self,
         report: &ActiveSecurityReport,
