@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 
 use ac_common::{AcError, AcResult, StableId, TimestampMillis};
 use ac_db::{ControlPlaneDb, PersistedSession};
-use ac_kernel::{AllowAllPolicy, Kernel, MissionState};
+use ac_kernel::{Kernel, KernelDecisionKind, MissionState, PermissionDecision, PolicyBoundary};
 use ac_runtime::{AgentSession, AgentSessionState, HydratedSession, RuntimeHydrator, Worker};
 
 include!("release.rs");
@@ -95,12 +95,30 @@ impl IpcTransport for LocalIpc<'_> {
 pub struct DaemonService {
     lifecycle: DaemonLifecycle,
     db: ControlPlaneDb,
-    kernel: Kernel<AllowAllPolicy>,
+    kernel: Kernel<ProductionKernelPolicy>,
     lock_path: PathBuf,
     lock_file: Option<File>,
     instance_id: StableId,
     recovered: Vec<PersistedSession>,
     hydrated: Vec<HydratedSession>,
+}
+
+/// Production daemon policy. Tool capability checks remain owned by ToolBroker;
+/// this boundary retains authority over kernel state and refuses autonomous
+/// completion until the agent's verification gate supplies evidence.
+#[derive(Default)]
+struct ProductionKernelPolicy;
+
+impl PolicyBoundary for ProductionKernelPolicy {
+    fn evaluate(&self, decision: KernelDecisionKind) -> PermissionDecision {
+        match decision {
+            KernelDecisionKind::CreateMission
+            | KernelDecisionKind::ActivateMission
+            | KernelDecisionKind::CancelMission
+            | KernelDecisionKind::ApproveChangeSet => PermissionDecision::Allow,
+            KernelDecisionKind::CompleteMission => PermissionDecision::RequireApproval,
+        }
+    }
 }
 
 impl DaemonService {
@@ -110,7 +128,7 @@ impl DaemonService {
         Ok(Self {
             lifecycle: DaemonLifecycle::Created,
             db,
-            kernel: Kernel::new(AllowAllPolicy),
+            kernel: Kernel::new(ProductionKernelPolicy),
             lock_path: lock_path.into(),
             lock_file: None,
             instance_id: StableId::new("daemon"),

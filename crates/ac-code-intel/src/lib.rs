@@ -340,6 +340,13 @@ impl LspClient {
         let deadline = Instant::now() + timeout;
         while Instant::now() < deadline {
             let message = self.read_message()?;
+            if let (Some(method), Some(request_id)) = (
+                message.get("method").and_then(Value::as_str),
+                message.get("id"),
+            ) {
+                self.respond_to_server_request(method, request_id.clone())?;
+                continue;
+            }
             if message.get("id").and_then(Value::as_u64) != Some(id) {
                 continue;
             }
@@ -357,6 +364,10 @@ impl LspClient {
             ac_common::ErrorKind::Unavailable,
             ac_common::Retryability::Retryable,
         ))
+    }
+
+    fn respond_to_server_request(&mut self, method: &str, request_id: Value) -> AcResult<()> {
+        self.write_message(server_request_response(method, request_id))
     }
 
     fn read_message(&mut self) -> AcResult<Value> {
@@ -394,6 +405,18 @@ impl LspClient {
             .map_err(|error| AcError::validation("CODEINTEL-LSP_READ", error.to_string()))?;
         serde_json::from_slice(&body).map_err(|error| {
             AcError::validation("CODEINTEL-INVALID_LSP_RESPONSE", error.to_string())
+        })
+    }
+}
+
+fn server_request_response(method: &str, request_id: Value) -> Value {
+    if method == "workspace/configuration" {
+        json!({ "jsonrpc": "2.0", "id": request_id, "result": [] })
+    } else {
+        json!({
+            "jsonrpc": "2.0",
+            "id": request_id,
+            "error": { "code": -32601, "message": "client method not supported" }
         })
     }
 }
@@ -2445,6 +2468,17 @@ mod tests {
         assert_eq!(version, 1);
         client.shutdown().unwrap();
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn lsp_server_requests_receive_json_rpc_responses() {
+        let configuration = server_request_response("workspace/configuration", json!(7));
+        assert_eq!(configuration["id"], 7);
+        assert_eq!(configuration["result"], json!([]));
+
+        let unsupported = server_request_response("window/showMessageRequest", json!(8));
+        assert_eq!(unsupported["id"], 8);
+        assert_eq!(unsupported["error"]["code"], -32601);
     }
 
     fn source_file(

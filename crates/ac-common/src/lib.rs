@@ -1,16 +1,28 @@
 use std::fmt;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::io::Read;
 use std::time::{SystemTime, UNIX_EPOCH};
-
-static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct StableId(String);
 
 impl StableId {
     pub fn new(prefix: &str) -> Self {
-        let sequence = NEXT_ID.fetch_add(1, Ordering::Relaxed);
-        Self(format!("{}-{:016x}", prefix, sequence))
+        let mut random = [0_u8; 16];
+        if std::fs::File::open("/dev/urandom")
+            .and_then(|mut source| source.read_exact(&mut random))
+            .is_ok()
+        {
+            return Self(format!("{}-{:032x}", prefix, u128::from_be_bytes(random)));
+        }
+
+        // `/dev/urandom` is present on supported Unix targets. Retain a non-panicking
+        // fallback for constrained test environments, while keeping the normal path
+        // independent of process-local counters.
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_nanos())
+            .unwrap_or_default();
+        Self(format!("{}-{:032x}", prefix, nanos))
     }
 
     pub fn from_existing(value: impl Into<String>) -> Result<Self, AcError> {

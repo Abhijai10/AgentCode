@@ -1342,12 +1342,13 @@ impl<P: PolicyBoundary> AutonomousAgent<P> {
         evidence_refs: &mut Vec<StableId>,
         changeset: &mut Option<ChangeSet>,
     ) -> AcResult<ValidationRunReport> {
+        validate_verification_tool(tool_id)?;
         let tool_result = self.invoke_with_retry(tool_id, "", 1)?;
         evidence_refs.push(tool_result.evidence_ref.clone());
         let forced_failure = self.verification_failures_remaining > 0;
-        let passed = !forced_failure
-            && tool_result.status == ToolStatus::Succeeded
-            && tool_result.observation.contains("status:0");
+        // Test-only failure injection may force the initial repair path, but never
+        // turns a failed tool result into a passing verification result.
+        let passed = !forced_failure && tool_result.status == ToolStatus::Succeeded;
         let report = self.verification.record_validation(
             plan_name.to_string(),
             passed,
@@ -1412,8 +1413,8 @@ impl<P: PolicyBoundary> AutonomousAgent<P> {
             ));
         }
         let retry = self.invoke_with_retry(tool_id, "", 1)?;
-        evidence_refs.push(retry.evidence_ref);
-        let passed = self.verification_failures_remaining == 0;
+        evidence_refs.push(retry.evidence_ref.clone());
+        let passed = retry.status == ToolStatus::Succeeded;
         let repaired = self.verification.record_validation(
             format!("{plan_name}-repair"),
             passed,
@@ -2405,6 +2406,20 @@ fn validate_tool_action(tool_id: &str) -> AcResult<()> {
         Err(AcError::validation(
             "AGENT-ACTION_UNSUPPORTED_TOOL",
             format!("unsupported tool action: {tool_id}"),
+        ))
+    }
+}
+
+fn validate_verification_tool(tool_id: &str) -> AcResult<()> {
+    if matches!(
+        tool_id,
+        "dev.test" | "dev.check" | "dev.format" | "browser.verify" | "security.verify"
+    ) {
+        Ok(())
+    } else {
+        Err(AcError::validation(
+            "AGENT-VERIFICATION_TOOL_REJECTED",
+            format!("tool is not an approved verification tool: {tool_id}"),
         ))
     }
 }
@@ -4339,6 +4354,12 @@ mod tests {
         assert_eq!(report.state, AutonomousState::Completed);
         assert!(report.validation.unwrap().passed);
         assert!(agent.evidence().len() >= 5);
+    }
+
+    #[test]
+    fn verification_rejects_non_verification_tools_even_when_output_looks_passing() {
+        let err = validate_verification_tool("fs.read").unwrap_err();
+        assert_eq!(err.code(), "AGENT-VERIFICATION_TOOL_REJECTED");
     }
 
     #[test]

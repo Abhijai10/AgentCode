@@ -909,14 +909,32 @@ fn position_to_offset(
     let line_start = *line_starts.get(line).ok_or_else(|| {
         AcError::validation("EDIT-LSP_WORKSPACE_EDIT_RANGE", "line is outside document")
     })?;
-    let offset = line_start + character as usize;
-    if !content.is_char_boundary(offset) {
-        return Err(AcError::validation(
-            "EDIT-LSP_WORKSPACE_EDIT_RANGE",
-            "edit offset is not a UTF-8 boundary",
-        ));
+    let line_end = content[line_start..]
+        .find('\n')
+        .map(|index| line_start + index)
+        .unwrap_or(content.len());
+    let line_content = &content[line_start..line_end];
+    let mut utf16_units = 0_u32;
+    for (byte_offset, ch) in line_content.char_indices() {
+        if utf16_units == character {
+            return Ok(line_start + byte_offset);
+        }
+        utf16_units += ch.len_utf16() as u32;
+        if utf16_units > character {
+            return Err(AcError::validation(
+                "EDIT-LSP_WORKSPACE_EDIT_RANGE",
+                "UTF-16 position splits a character",
+            ));
+        }
     }
-    Ok(offset)
+    if utf16_units == character {
+        Ok(line_end)
+    } else {
+        Err(AcError::validation(
+            "EDIT-LSP_WORKSPACE_EDIT_RANGE",
+            "UTF-16 character position is outside the line",
+        ))
+    }
 }
 
 fn language_for_path(path: &str) -> &'static str {
@@ -1461,6 +1479,23 @@ mod tests {
                 .unwrap_err()
                 .code(),
             "EDIT-POLICY_GUARD"
+        );
+    }
+
+    #[test]
+    fn lsp_workspace_edit_positions_use_utf16_code_units() {
+        let content = "aé中😀z\n";
+        let starts = line_start_offsets(content);
+        assert_eq!(position_to_offset(&starts, content, 1, 1).unwrap(), 1);
+        assert_eq!(position_to_offset(&starts, content, 1, 2).unwrap(), 3);
+        assert_eq!(position_to_offset(&starts, content, 1, 3).unwrap(), 6);
+        assert_eq!(position_to_offset(&starts, content, 1, 5).unwrap(), 10);
+        assert_eq!(position_to_offset(&starts, content, 1, 6).unwrap(), 11);
+        assert_eq!(
+            position_to_offset(&starts, content, 1, 4)
+                .unwrap_err()
+                .code(),
+            "EDIT-LSP_WORKSPACE_EDIT_RANGE"
         );
     }
 }
