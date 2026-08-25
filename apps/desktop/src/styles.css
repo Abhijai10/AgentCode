@@ -16,3 +16,13 @@ strong { color:inherit; }
   .session { padding-inline:15px; }
   .tool-tabs { gap:10px; padding-inline:10px; }
 }
+
+.design-artifact { margin-top:12px; border:1px solid var(--line); border-radius:7px; background:#0b1726; padding:12px; font-size:11px; }
+.design-artifact p { color:var(--muted); font-size:10px; }
+.diagram { border:1px solid #293b62; background:#101f3b; border-radius:5px; color:#c6c0ff; padding:12px; text-align:center; font-size:10px; }
+.setting-list { margin-top:4px; }
+.setting-state { margin-left:auto; font-size:10px; color:#aebdce; }
+.setting-state.good { color:var(--green); }
+.setting-state.quiet { color:#aebdce; }
+.setting-select { display:grid; gap:6px; color:#96a8bf; font-size:10px; margin-bottom:12px; }
+.setting-select select { height:32px; background:#0b1829; border:1px solid var(--line); border-radius:6px; color:#d9e2ed; padding:0 9px; font-size:11px; }
