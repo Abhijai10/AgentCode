@@ -31,6 +31,58 @@ impl ScannerConfiguration {
     }
 }
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ScannerDataStatus {
+    Ready { path: PathBuf },
+    NeedsData { path: PathBuf, reason: String },
+    Unsupported,
+}
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ScannerDataOperation {
+    PrepareScannerData,
+    VerificationScan,
+}
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ScannerDataManager {
+    root: PathBuf,
+}
+impl ScannerDataManager {
+    pub fn new(root: PathBuf) -> Self { Self { root } }
+    pub fn default_runtime() -> Self { Self::new(default_scanner_data_root()) }
+    pub fn managed_path(&self, adapter: SecurityAdapter) -> PathBuf { self.root.join(scanner_data_name(adapter)) }
+    pub fn status(&self, adapter: SecurityAdapter) -> ScannerDataStatus {
+        match adapter {
+            SecurityAdapter::Trivy => {
+                let path = self.managed_path(adapter);
+                if path.join("db/trivy.db").is_file() && path.join("db/metadata.json").is_file() {
+                    ScannerDataStatus::Ready { path }
+                } else {
+                    ScannerDataStatus::NeedsData { path, reason: "Trivy database is not prepared in the managed cache".to_string() }
+                }
+            }
+            SecurityAdapter::Osv => {
+                let path = self.managed_path(adapter);
+                if path.exists() {
+                    ScannerDataStatus::Ready { path }
+                } else {
+                    ScannerDataStatus::NeedsData { path, reason: "OSV offline database is not prepared".to_string() }
+                }
+            }
+            _ => ScannerDataStatus::Unsupported,
+        }
+    }
+    pub fn verification_config(&self, adapter: SecurityAdapter) -> ScannerConfiguration {
+        let mut config = ScannerConfiguration::external(adapter);
+        config.data_dir = Some(self.managed_path(adapter));
+        config.network = ScannerNetworkPolicy::Deny;
+        config
+    }
+    pub fn prepare_request(&self, adapter: SecurityAdapter, workspace_root: &Path) -> AcResult<ScannerProcessRequest> {
+        let mut config = ScannerConfiguration::external(adapter);
+        config.data_dir = Some(self.managed_path(adapter));
+        scanner_data_prepare_request(&config, workspace_root)
+    }
+}
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ScannerCapabilities { pub scan_kinds: Vec<String>, pub requires_target_authorization: bool }
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ScannerProcessRequest { pub adapter: SecurityAdapter, pub executable: String, pub argv: Vec<String>, pub cwd: PathBuf, pub timeout_ms: u64, pub network: bool, pub cleanup_paths: Vec<PathBuf>, pub report_path: Option<PathBuf>, pub env: BTreeMap<String, String> }
@@ -157,11 +209,58 @@ fn scan_request(c: &ScannerConfiguration, input: &ManagedSecurityScanInput) -> A
     };
     Ok(ScannerProcessRequest { adapter: c.adapter, executable: c.executable.clone(), argv, cwd: input.workspace_root.clone(), timeout_ms: c.timeout_ms, network: c.network == ScannerNetworkPolicy::Allow, cleanup_paths, report_path, env })
 }
+fn scanner_data_prepare_request(c: &ScannerConfiguration, workspace_root: &Path) -> AcResult<ScannerProcessRequest> {
+    let data = scanner_data_dir(c, scanner_data_name(c.adapter));
+    let mut env = BTreeMap::new();
+    let argv = match c.adapter {
+        SecurityAdapter::Trivy => vec![
+            c.executable.clone(),
+            "--cache-dir".to_string(),
+            data.display().to_string(),
+            "image".to_string(),
+            "--download-db-only".to_string(),
+        ],
+        SecurityAdapter::Osv => {
+            fs::create_dir_all(&data).map_err(|error| AcError::new("SECURITY-SCANNER_DATA_PREPARE_FAILED", error.to_string(), ErrorKind::Unavailable, Retryability::NotRetryable))?;
+            env.insert("OSV_SCANNER_LOCAL_DB_CACHE_DIRECTORY".to_string(), data.join("osv").display().to_string());
+            env.insert("OSV_SCALIBR_LOCAL_DB_CACHE_DIRECTORY".to_string(), data.join("scalibr").display().to_string());
+            vec![
+                c.executable.clone(),
+                "scan".to_string(),
+                "source".to_string(),
+                "--offline-vulnerabilities".to_string(),
+                "--download-offline-databases".to_string(),
+                "--format".to_string(),
+                "json".to_string(),
+                workspace_root.display().to_string(),
+            ]
+        }
+        _ => return Err(AcError::validation("SECURITY-SCANNER_DATA_UNSUPPORTED", "scanner data preparation is only supported for Trivy and OSV")),
+    };
+    Ok(ScannerProcessRequest {
+        adapter: c.adapter,
+        executable: c.executable.clone(),
+        argv,
+        cwd: workspace_root.to_path_buf(),
+        timeout_ms: c.timeout_ms.max(180_000),
+        network: true,
+        cleanup_paths: Vec::new(),
+        report_path: None,
+        env,
+    })
+}
 fn scanner_data_dir(config: &ScannerConfiguration, scanner: &str) -> PathBuf {
     config
         .data_dir
         .clone()
         .unwrap_or_else(|| default_scanner_data_root().join(scanner))
+}
+fn scanner_data_name(adapter: SecurityAdapter) -> &'static str {
+    match adapter {
+        SecurityAdapter::Osv => "osv-scanner",
+        SecurityAdapter::Trivy => "trivy",
+        _ => adapter_name(adapter),
+    }
 }
 fn default_scanner_data_root() -> PathBuf {
     std::env::var_os("AGENTCODE_SCANNER_DATA_DIR")

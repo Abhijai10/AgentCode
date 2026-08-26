@@ -2566,6 +2566,55 @@ mod tests {
             .register_all(&mut broker)
             .unwrap();
         let mut evidence = EvidenceStore::new();
+        let workspace_file = root.join("workspace-readable.txt");
+        fs::write(&workspace_file, "workspace-ok\n").unwrap();
+        let result = broker
+            .invoke(
+                ToolRequest {
+                    id: StableId::new("toolreq"),
+                    tool_id: "cmd.exec".to_string(),
+                    tool_version: "1".to_string(),
+                    payload: format!("/bin/cat\n{}", workspace_file.display()),
+                    capabilities: vec![Capability::ProcessExec("/bin/cat".to_string())],
+                },
+                &mut evidence,
+            )
+            .unwrap();
+        assert_eq!(
+            result.status,
+            ToolStatus::Succeeded,
+            "workspace read must succeed: {}",
+            result.observation
+        );
+        assert!(result.observation.contains("workspace-ok"));
+        assert!(result
+            .observation
+            .contains("achieved_isolation:FilesystemIsolated"));
+
+        let workspace_write = root.join("workspace-write.txt");
+        let result = broker
+            .invoke(
+                ToolRequest {
+                    id: StableId::new("toolreq"),
+                    tool_id: "cmd.exec".to_string(),
+                    tool_version: "1".to_string(),
+                    payload: format!("/usr/bin/touch\n{}", workspace_write.display()),
+                    capabilities: vec![Capability::ProcessExec("/usr/bin/touch".to_string())],
+                },
+                &mut evidence,
+            )
+            .unwrap();
+        assert_eq!(
+            result.status,
+            ToolStatus::Succeeded,
+            "workspace write must succeed: {}",
+            result.observation
+        );
+        assert!(workspace_write.exists());
+        assert!(result
+            .observation
+            .contains("achieved_isolation:FilesystemIsolated"));
+
         let result = broker
             .invoke(
                 ToolRequest {
@@ -2578,15 +2627,19 @@ mod tests {
                 &mut evidence,
             )
             .unwrap();
-        if result.status == ToolStatus::Failed
-            && (result.observation.contains("SANDBOX-ISOLATION_UNSUPPORTED")
-                || result.observation.contains("SANDBOX-UNAVAILABLE"))
-        {
-            let _ = fs::remove_dir_all(root);
-            return;
-        }
-        assert_eq!(result.status, ToolStatus::Succeeded);
+        assert_eq!(
+            result.status,
+            ToolStatus::Succeeded,
+            "repo.status must succeed under macOS sandbox: {}",
+            result.observation
+        );
         assert!(result.observation.contains("ok"));
+        assert!(result
+            .observation
+            .contains("sandbox_backend:macos-sandbox-exec"));
+        assert!(result
+            .observation
+            .contains("achieved_isolation:FilesystemIsolated"));
     }
 
     #[test]
@@ -2630,15 +2683,19 @@ mod tests {
                 &mut evidence,
             )
             .unwrap();
-        if result.status == ToolStatus::Failed
-            && (result.observation.contains("SANDBOX-ISOLATION_UNSUPPORTED")
-                || result.observation.contains("SANDBOX-UNAVAILABLE"))
-        {
-            let _ = fs::remove_dir_all(root);
-            return;
-        }
-        assert_eq!(result.status, ToolStatus::Succeeded);
+        assert_eq!(
+            result.status,
+            ToolStatus::Succeeded,
+            "repo.status must succeed under macOS sandbox: {}",
+            result.observation
+        );
         assert!(result.observation.contains("README.md"));
+        assert!(result
+            .observation
+            .contains("sandbox_backend:macos-sandbox-exec"));
+        assert!(result
+            .observation
+            .contains("achieved_isolation:FilesystemIsolated"));
         assert_eq!(evidence.len(), 1);
         let _ = fs::remove_dir_all(root);
     }
@@ -2647,15 +2704,7 @@ mod tests {
     fn governed_network_request_is_denied_by_default() {
         let root = std::env::temp_dir().join(format!("agentcode-tool-{}", StableId::new("t")));
         fs::create_dir_all(&root).unwrap();
-        let listener = match std::net::TcpListener::bind("127.0.0.1:0") {
-            Ok(listener) => listener,
-            Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
-                eprintln!("localhost bind is environment-blocked; skipping network sandbox proof");
-                let _ = fs::remove_dir_all(root);
-                return;
-            }
-            Err(error) => panic!("unexpected localhost bind failure: {error}"),
-        };
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
         let done = Arc::new(AtomicBool::new(false));
         let done_signal = done.clone();
@@ -2716,6 +2765,71 @@ mod tests {
             "{}",
             result.observation
         );
+        assert!(result
+            .observation
+            .contains("sandbox_backend:macos-sandbox-exec"));
+        assert!(result
+            .observation
+            .contains("achieved_isolation:FilesystemIsolated"));
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let allow_port = listener.local_addr().unwrap().port();
+        let done = Arc::new(AtomicBool::new(false));
+        let done_signal = done.clone();
+        let handle = std::thread::spawn(move || {
+            listener.set_nonblocking(true).unwrap();
+            let deadline = Instant::now() + Duration::from_secs(30);
+            while Instant::now() < deadline && !done_signal.load(Ordering::Relaxed) {
+                if let Ok((mut stream, _)) = listener.accept() {
+                    let _ = std::io::Write::write_all(
+                        &mut stream,
+                        b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok",
+                    );
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        });
+        let allow_sandbox = SandboxManager::new(SandboxPolicy {
+            workspace_roots: vec![root.clone()],
+            capability_policy: CapabilityPolicy::new()
+                .allow(Capability::ProcessExec("*".to_string()))
+                .allow(Capability::Network("*".to_string())),
+            network_default_allow: true,
+            max_timeout_ms: 30_000,
+            required_isolation: ac_sandbox::IsolationLevel::FilesystemIsolated,
+            ..SandboxPolicy::new(vec![root.clone()])
+        });
+        let allow_plan = allow_sandbox
+            .prepare_execution(ExecRequest {
+                argv: vec![
+                    "/usr/bin/curl".to_string(),
+                    "-sS".to_string(),
+                    "-m".to_string(),
+                    "5".to_string(),
+                    format!("http://127.0.0.1:{allow_port}/"),
+                ],
+                cwd: root.clone(),
+                env: toolchain_env(),
+                network: true,
+                timeout_ms: 5_000,
+            })
+            .unwrap();
+        let allow_result = ProcessManager::default()
+            .run("network-allow", allow_plan)
+            .unwrap();
+        done.store(true, Ordering::Relaxed);
+        handle.join().unwrap();
+        assert_eq!(
+            allow_result.exit_code,
+            Some(0),
+            "{}",
+            format_process_observation(&allow_result)
+        );
+        assert_eq!(allow_result.stdout.trim(), "ok");
+        assert_eq!(
+            allow_result.record.sandbox.achieved_isolation,
+            ac_sandbox::IsolationLevel::FilesystemIsolated
+        );
         let _ = fs::remove_dir_all(root);
     }
 
@@ -2725,55 +2839,21 @@ mod tests {
         fs::create_dir_all(&root).unwrap();
         let home = std::env::var("HOME").unwrap_or_default();
         let documents_dir = Path::new(&home).join("Documents");
-        if let Err(error) = fs::create_dir_all(&documents_dir) {
-            if error.kind() == std::io::ErrorKind::PermissionDenied {
-                eprintln!(
-                    "home Documents setup is environment-blocked; skipping outside-home proof"
-                );
-                let _ = fs::remove_dir_all(root);
-                return;
-            }
-            panic!("unexpected Documents setup failure: {error}");
-        }
+        fs::create_dir_all(&documents_dir).unwrap();
         let outside_file = documents_dir.join(format!(
             "agentcode-outside-workspace-probe-{}",
             StableId::new("t")
         ));
-        if let Err(error) = fs::write(&outside_file, "harmless outside workspace probe\n") {
-            if error.kind() == std::io::ErrorKind::PermissionDenied {
-                eprintln!("home file setup is environment-blocked; skipping outside-home proof");
-                let _ = fs::remove_dir_all(root);
-                return;
-            }
-            panic!("unexpected outside file setup failure: {error}");
-        }
+        fs::write(&outside_file, "harmless outside workspace probe\n").unwrap();
         let outside_write = documents_dir.join(format!(
             "agentcode-outside-workspace-write-{}",
             StableId::new("t")
         ));
         let sensitive_dir = Path::new(&home).join(".ssh");
-        if let Err(error) = fs::create_dir_all(&sensitive_dir) {
-            if error.kind() == std::io::ErrorKind::PermissionDenied {
-                eprintln!(
-                    "home credential setup is environment-blocked; skipping sensitive-home proof"
-                );
-                let _ = fs::remove_file(&outside_file);
-                let _ = fs::remove_dir_all(root);
-                return;
-            }
-            panic!("unexpected sensitive directory setup failure: {error}");
-        }
+        fs::create_dir_all(&sensitive_dir).unwrap();
         let sensitive_file =
             sensitive_dir.join(format!("agentcode-sensitive-probe-{}", StableId::new("t")));
-        if let Err(error) = fs::write(&sensitive_file, "fake-secret-value\n") {
-            if error.kind() == std::io::ErrorKind::PermissionDenied {
-                eprintln!("home credential file setup is environment-blocked; skipping sensitive-home proof");
-                let _ = fs::remove_file(&outside_file);
-                let _ = fs::remove_dir_all(root);
-                return;
-            }
-            panic!("unexpected sensitive file setup failure: {error}");
-        }
+        fs::write(&sensitive_file, "fake-secret-value\n").unwrap();
         let mut broker = ToolBroker::new(
             CapabilityPolicy::new()
                 .allow(Capability::FilesystemRead("*".to_string()))
@@ -2807,6 +2887,12 @@ mod tests {
             "{}",
             result.observation
         );
+        assert!(result
+            .observation
+            .contains("sandbox_backend:macos-sandbox-exec"));
+        assert!(result
+            .observation
+            .contains("achieved_isolation:FilesystemIsolated"));
         let result = broker
             .invoke(
                 ToolRequest {
@@ -2830,6 +2916,12 @@ mod tests {
             "{}",
             result.observation
         );
+        assert!(result
+            .observation
+            .contains("sandbox_backend:macos-sandbox-exec"));
+        assert!(result
+            .observation
+            .contains("achieved_isolation:FilesystemIsolated"));
         assert!(!outside_write.exists());
         let result = broker
             .invoke(
@@ -2854,6 +2946,12 @@ mod tests {
             "{}",
             result.observation
         );
+        assert!(result
+            .observation
+            .contains("sandbox_backend:macos-sandbox-exec"));
+        assert!(result
+            .observation
+            .contains("achieved_isolation:FilesystemIsolated"));
         let _ = fs::remove_file(&outside_file);
         let _ = fs::remove_file(&sensitive_file);
         let _ = fs::remove_dir_all(root);
@@ -2865,21 +2963,15 @@ mod tests {
         fs::create_dir_all(&root).unwrap();
         let sandbox = workspace_sandbox(&root, ac_sandbox::IsolationLevel::FilesystemIsolated);
         let manager = ProcessManager::default();
-        let success = match sandbox.prepare_execution(ExecRequest {
-            argv: vec!["/bin/echo".to_string(), "cleanup".to_string()],
-            cwd: root.clone(),
-            env: BTreeMap::new(),
-            network: false,
-            timeout_ms: 1_000,
-        }) {
-            Ok(plan) => plan,
-            Err(error) if error.code() == "SANDBOX-ISOLATION_UNSUPPORTED" => {
-                eprintln!("filesystem sandbox is unavailable in this environment; skipping profile cleanup proof");
-                let _ = fs::remove_dir_all(root);
-                return;
-            }
-            Err(error) => panic!("unexpected sandbox prepare failure: {error:?}"),
-        };
+        let success = sandbox
+            .prepare_execution(ExecRequest {
+                argv: vec!["/bin/echo".to_string(), "cleanup".to_string()],
+                cwd: root.clone(),
+                env: BTreeMap::new(),
+                network: false,
+                timeout_ms: 1_000,
+            })
+            .unwrap();
         let success_profiles = success.cleanup_paths.clone();
         assert!(!success_profiles.is_empty(), "macOS plan owns a profile");
         manager.run("cleanup", success).unwrap();

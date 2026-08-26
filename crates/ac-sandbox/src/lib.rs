@@ -468,14 +468,14 @@ impl SandboxBackend for MacosSandboxExecBackend {
         if request.required_isolation <= IsolationLevel::ProcessRestricted {
             return ProcessRestrictedBackend.prepare(request);
         }
-        if !command_available("sandbox-exec") {
+        let Some(sandbox_exec) = command_path("sandbox-exec") else {
             return Err(AcError::new(
                 "SANDBOX-UNAVAILABLE",
                 "sandbox-exec is unavailable; execution blocked",
                 ac_common::ErrorKind::Unavailable,
                 ac_common::Retryability::NotRetryable,
             ));
-        }
+        };
         let caps = self.capabilities();
         if caps.max_isolation < request.required_isolation {
             return Err(AcError::policy_denied(
@@ -485,7 +485,7 @@ impl SandboxBackend for MacosSandboxExecBackend {
         }
         let profile = write_macos_profile(request)?;
         let mut argv = vec![
-            "/usr/bin/sandbox-exec".to_string(),
+            sandbox_exec.display().to_string(),
             "-f".to_string(),
             profile.display().to_string(),
         ];
@@ -582,12 +582,30 @@ impl SandboxBackend for LinuxBubblewrapBackend {
     }
 }
 
-fn command_available(command: &str) -> bool {
+fn command_path(command: &str) -> Option<PathBuf> {
+    let explicit = PathBuf::from(command);
+    if explicit.components().count() > 1 {
+        return explicit.is_file().then_some(explicit);
+    }
+    #[cfg(target_os = "macos")]
+    if command == "sandbox-exec" {
+        let path = PathBuf::from("/usr/bin/sandbox-exec");
+        return path.is_file().then_some(path);
+    }
     Command::new("/usr/bin/which")
         .arg(command)
         .output()
-        .map(|output| output.status.success())
-        .unwrap_or(false)
+        .ok()
+        .filter(|output| output.status.success())
+        .and_then(|output| {
+            let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            (!path.is_empty()).then(|| PathBuf::from(path))
+        })
+        .filter(|path| path.is_file())
+}
+
+fn command_available(command: &str) -> bool {
+    command_path(command).is_some()
 }
 
 /// Probes the macOS sandbox backend with the SAME deny-by-default profile the
@@ -597,9 +615,9 @@ fn command_available(command: &str) -> bool {
 /// when a real governed command succeeds under the production profile.
 #[cfg(target_os = "macos")]
 fn macos_sandbox_exec_usable() -> bool {
-    if !command_available("sandbox-exec") {
+    let Some(sandbox_exec) = command_path("sandbox-exec") else {
         return false;
-    }
+    };
     let workspace = std::env::temp_dir().join(format!(
         "agentcode-sandbox-probe-{}",
         StableId::new("probe")
@@ -624,7 +642,7 @@ fn macos_sandbox_exec_usable() -> bool {
             return false;
         }
     };
-    let usable = Command::new("/usr/bin/sandbox-exec")
+    let usable = Command::new(sandbox_exec)
         .arg("-f")
         .arg(&profile_path)
         .args(&request.argv)
@@ -661,16 +679,34 @@ fn write_macos_profile(request: &SandboxBackendRequest) -> AcResult<PathBuf> {
          (allow mach-lookup)\n\
          (allow signal)\n\
          (allow ipc-posix*)\n\
+         (allow file-read-data (literal \"/\"))\n\
+         (allow file-read* \
+             (literal \"/var\") \
+             (literal \"/etc\") \
+             (literal \"/private\") \
+             (literal \"/private/var\") \
+             (literal \"/private/etc\"))\n\
          (allow file-read* \
              (literal \"/dev/null\") \
              (literal \"/dev/urandom\") \
              (literal \"/dev/zero\") \
+             (literal \"/etc/gitconfig\") \
+             (literal \"/etc/ssl/openssl.cnf\") \
+             (literal \"/private/etc/gitconfig\") \
+             (literal \"/private/etc/ssl/openssl.cnf\") \
              (subpath \"/bin\") \
              (subpath \"/sbin\") \
              (subpath \"/usr\") \
              (subpath \"/System\") \
              (subpath \"/Library\") \
+             (subpath \"/Applications/Xcode.app/Contents\") \
              (subpath \"/opt/homebrew\") \
+             (subpath \"/private/var/db/dyld\") \
+             (subpath \"/var/db/dyld\") \
+             (literal \"/private/var/select/developer_dir\") \
+             (literal \"/var/select/developer_dir\") \
+             (subpath \"/private/var/select\") \
+             (subpath \"/var/select\") \
              (subpath \"/System/Volumes/Preboot/Cryptexes\") \
              (subpath \"/private/preboot/Cryptexes\"))\n",
     );
@@ -678,17 +714,10 @@ fn write_macos_profile(request: &SandboxBackendRequest) -> AcResult<PathBuf> {
         "(allow file-write* (literal \"/dev/null\") (literal \"/dev/urandom\") (literal \"/dev/zero\"))\n",
     );
     for root in &request.workspace_roots {
-        let root = fs::canonicalize(root).unwrap_or_else(|_| root.clone());
-        profile.push_str(&format!(
-            "(allow file-read* file-write* (subpath \"{}\"))\n",
-            escape_profile_string(&root.display().to_string())
-        ));
+        allow_profile_workspace_root(&mut profile, root);
     }
     let temp = std::env::temp_dir();
-    profile.push_str(&format!(
-        "(allow file-read* file-write* (subpath \"{}\"))\n",
-        escape_profile_string(&temp.display().to_string())
-    ));
+    allow_profile_workspace_root(&mut profile, &temp);
     profile.push_str(
         "(allow file-read* file-write* (subpath \"/private/tmp\"))\n\
          (allow file-write* (subpath \"/tmp\"))\n",
@@ -701,12 +730,28 @@ fn write_macos_profile(request: &SandboxBackendRequest) -> AcResult<PathBuf> {
     Ok(profile_path)
 }
 
+fn allow_profile_workspace_root(profile: &mut String, root: &Path) {
+    let mut roots = vec![root.to_path_buf()];
+    if let Ok(canonical) = fs::canonicalize(root) {
+        if !roots.iter().any(|existing| existing == &canonical) {
+            roots.push(canonical);
+        }
+    }
+    for root in roots {
+        profile.push_str(&format!(
+            "(allow file-read* file-write* (subpath \"{}\"))\n",
+            escape_profile_string(&root.display().to_string())
+        ));
+    }
+}
+
 fn resolve_backend_argv(request: &SandboxBackendRequest) -> AcResult<Vec<String>> {
     let Some(program) = request.argv.first() else {
         return Ok(Vec::new());
     };
     let mut argv = request.argv.clone();
     if program.contains('/') {
+        normalize_workspace_argv_paths(&mut argv, request);
         return Ok(argv);
     }
     let path = request
@@ -718,6 +763,7 @@ fn resolve_backend_argv(request: &SandboxBackendRequest) -> AcResult<Vec<String>
         let candidate = dir.join(program);
         if candidate.is_file() {
             argv[0] = candidate.display().to_string();
+            normalize_workspace_argv_paths(&mut argv, request);
             return Ok(argv);
         }
     }
@@ -727,6 +773,39 @@ fn resolve_backend_argv(request: &SandboxBackendRequest) -> AcResult<Vec<String>
         ac_common::ErrorKind::Validation,
         ac_common::Retryability::NotRetryable,
     ))
+}
+
+fn normalize_workspace_argv_paths(argv: &mut [String], request: &SandboxBackendRequest) {
+    let canonical_roots = request
+        .workspace_roots
+        .iter()
+        .filter_map(|root| fs::canonicalize(root).ok())
+        .collect::<Vec<_>>();
+    if canonical_roots.is_empty() {
+        return;
+    }
+    for arg in argv.iter_mut().skip(1) {
+        let path = PathBuf::from(arg.as_str());
+        if !path.is_absolute() {
+            continue;
+        }
+        let resolved = if path.exists() {
+            fs::canonicalize(&path).ok()
+        } else {
+            path.parent()
+                .and_then(|parent| fs::canonicalize(parent).ok())
+                .and_then(|parent| path.file_name().map(|name| parent.join(name)))
+        };
+        let Some(resolved) = resolved else {
+            continue;
+        };
+        if canonical_roots
+            .iter()
+            .any(|root| resolved.starts_with(root))
+        {
+            *arg = resolved.display().to_string();
+        }
+    }
 }
 
 fn escape_profile_string(value: &str) -> String {

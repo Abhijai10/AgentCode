@@ -614,4 +614,48 @@ mod tests {
         assert_eq!(error.code(), "SECURITY-SECRET_LEAK");
         assert!(review.report().release_blocked);
     }
+
+    #[test]
+    fn scanner_data_manager_separates_prepare_from_offline_verification() {
+        let root = std::env::temp_dir().join(format!("agentcode-scanner-data-{}", StableId::new("t")));
+        let workspace = std::env::temp_dir();
+        let manager = ScannerDataManager::new(root.clone());
+
+        assert!(matches!(
+            manager.status(SecurityAdapter::Trivy),
+            ScannerDataStatus::NeedsData { .. }
+        ));
+        assert!(matches!(
+            manager.status(SecurityAdapter::Osv),
+            ScannerDataStatus::NeedsData { .. }
+        ));
+
+        let trivy_prepare = manager
+            .prepare_request(SecurityAdapter::Trivy, &workspace)
+            .unwrap();
+        assert!(trivy_prepare.network);
+        let trivy_cache = root.join("trivy").display().to_string();
+        assert!(trivy_prepare
+            .argv
+            .windows(2)
+            .any(|args| args[0] == "--cache-dir" && args[1] == trivy_cache));
+        assert!(trivy_prepare.argv.contains(&"--download-db-only".to_string()));
+
+        let osv_prepare = manager.prepare_request(SecurityAdapter::Osv, &workspace).unwrap();
+        assert!(osv_prepare.network);
+        assert!(osv_prepare
+            .argv
+            .contains(&"--download-offline-databases".to_string()));
+        assert!(osv_prepare.env.contains_key("OSV_SCANNER_LOCAL_DB_CACHE_DIRECTORY"));
+        assert!(osv_prepare.env.contains_key("OSV_SCALIBR_LOCAL_DB_CACHE_DIRECTORY"));
+
+        let trivy_verify = manager.verification_config(SecurityAdapter::Trivy);
+        assert_eq!(trivy_verify.network, ScannerNetworkPolicy::Deny);
+        assert_eq!(trivy_verify.data_dir, Some(root.join("trivy")));
+        let osv_verify = manager.verification_config(SecurityAdapter::Osv);
+        assert_eq!(osv_verify.network, ScannerNetworkPolicy::Deny);
+        assert_eq!(osv_verify.data_dir, Some(root.join("osv-scanner")));
+
+        let _ = std::fs::remove_dir_all(root);
+    }
 }
