@@ -17,6 +17,10 @@ impl CancellationToken {
     pub fn is_cancelled(&self) -> bool {
         self.cancelled.load(Ordering::SeqCst)
     }
+
+    pub fn flag(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.cancelled)
+    }
 }
 
 impl Default for CancellationToken {
@@ -120,6 +124,14 @@ pub struct WorkerTask {
     pub retry_count: u32,
     pub max_retries: u32,
     pub evidence_refs: Vec<StableId>,
+    pub acceptance_criteria: Vec<AcceptanceCriterion>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct AcceptanceCriterion {
+    pub id: String,
+    pub description: String,
+    pub required: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

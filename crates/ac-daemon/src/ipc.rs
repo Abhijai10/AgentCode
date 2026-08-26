@@ -1,4 +1,5 @@
 use std::io::Read;
+use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use serde_json::{json, Value};
 
@@ -20,6 +21,8 @@ impl UnixIpcServer {
         }
         let listener = UnixListener::bind(&path)
             .map_err(|error| AcError::validation("DAEMON-IPC_BIND", error.to_string()))?;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+            .map_err(|error| AcError::validation("DAEMON-IPC_PERMISSIONS", error.to_string()))?;
         listener
             .set_nonblocking(true)
             .map_err(|error| AcError::validation("DAEMON-IPC_CONFIG", error.to_string()))?;
@@ -47,6 +50,7 @@ impl UnixIpcServer {
 
     pub fn cleanup(&self) { let _ = std::fs::remove_file(&self.path); }
 }
+
 
 pub struct UnixIpcClient { path: PathBuf }
 impl UnixIpcClient {
@@ -82,16 +86,25 @@ fn serve_client(stream: &mut UnixStream, daemon: &mut DaemonService) -> AcResult
         },
         "GetMission" | "GetTaskState" => match request.get("mission_id").and_then(Value::as_str) {
             Some(mission_id) => match daemon.task_states(mission_id) {
-                Ok(tasks) => json!({"id": correlation_id, "ok": true, "mission_id": mission_id, "tasks": tasks.into_iter().map(|(task_id, state)| json!({"task_id": task_id, "state": state})).collect::<Vec<_>>() }),
+                Ok(tasks) => { let status = daemon.mission_status(mission_id); json!({"id": correlation_id, "ok": true, "mission_id": mission_id, "session_id": status.as_ref().map(|status| status.session_id.to_string()), "state": status.as_ref().map(|status| status.state.clone()), "tasks": tasks.into_iter().map(|(task_id, state)| json!({"task_id": task_id, "state": state})).collect::<Vec<_>>() }) },
                 Err(error) => error_response(correlation_id, error.code(), error.to_string()),
             },
             None => error_response(correlation_id, "DAEMON-IPC_INVALID", "mission_id is required".to_string()),
         },
-        "GetRecentEvents" | "GetBlockedReason" | "PauseMission" | "ResumeMission" | "CancelMission" => error_response(correlation_id, "DAEMON-IPC_UNSUPPORTED", "command is not available in macOS V1 runtime".to_string()),
+        "PauseMission" | "ResumeMission" | "CancelMission" => match request.get("mission_id").and_then(Value::as_str) {
+            Some(mission_id) => {
+                let result = match command { "PauseMission" => daemon.pause_mission(mission_id), "ResumeMission" => daemon.resume_mission(mission_id), _ => daemon.cancel_mission(mission_id) };
+                match result { Ok(()) => json!({"id": correlation_id, "ok": true, "mission_id": mission_id, "state": daemon.mission_status(mission_id).map(|status| status.state)}), Err(error) => error_response(correlation_id, error.code(), error.to_string()) }
+            }
+            None => error_response(correlation_id, "DAEMON-IPC_INVALID", "mission_id is required".to_string()),
+        },
+        "GetRecentEvents" | "GetBlockedReason" => error_response(correlation_id, "DAEMON-IPC_UNSUPPORTED", "command is not available in macOS V1 runtime".to_string()),
         "ShutdownDaemon" => { let result = daemon.handle(DaemonCommand::Stop); match result { Ok(_) => json!({"id": correlation_id, "ok": true}), Err(error) => error_response(correlation_id, error.code(), error.to_string()) } }
         _ => error_response(correlation_id, "DAEMON-IPC_UNKNOWN_COMMAND", "unknown IPC command".to_string()),
     };
-    write_frame(stream, &response)?;
+    // A UI client is not part of daemon lifetime. A disconnect while writing a
+    // response is isolated to this client and must not unwind the accept loop.
+    let _ = write_frame(stream, &response);
     Ok(command == "ShutdownDaemon" && response.get("ok") == Some(&Value::Bool(true)))
 }
 

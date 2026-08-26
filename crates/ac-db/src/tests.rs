@@ -279,6 +279,57 @@ mod tests {
     }
 
     #[test]
+    fn durable_evidence_survives_reopen_without_secret_payloads() {
+        let path =
+            std::env::temp_dir().join(format!("agentcode-evidence-{}.sqlite", StableId::new("db")));
+        let mission_id = StableId::from_existing("mission-evidence").unwrap();
+        let session_id = StableId::from_existing("session-evidence").unwrap();
+        let task_id = StableId::from_existing("task-evidence").unwrap();
+        let evidence_id;
+        {
+            let mut db = ControlPlaneDb::open(&path).unwrap();
+            db.migrate().unwrap();
+            db.save_session(&session_id, &mission_id, "running").unwrap();
+            let mut evidence = ac_evidence::EvidenceStore::new();
+            evidence_id = evidence
+                .append_tool_output(
+                    ac_evidence::Provenance {
+                        source: format!("mission:{mission_id};session:{session_id}"),
+                        commit: None,
+                        worktree: Some("worktree-evidence".to_string()),
+                        tool: Some("dev.test".to_string()),
+                    },
+                    format!("mem://mission/{mission_id}/session/{session_id}/task/{task_id}"),
+                    "status:0\nstdout:SECRET_CANARY\nstderr:",
+                    &["SECRET_CANARY".to_string()],
+                )
+                .unwrap();
+            db.append_evidence(evidence.get(&evidence_id).unwrap()).unwrap();
+        }
+        {
+            let db = ControlPlaneDb::open(&path).unwrap();
+            let records = db.evidence_records().unwrap();
+            assert_eq!(records.len(), 1);
+            let restored = &records[0];
+            assert_eq!(restored.id, evidence_id);
+            assert_eq!(restored.kind, ac_evidence::EvidenceKind::CommandOutput);
+            assert_eq!(restored.provenance.tool.as_deref(), Some("dev.test"));
+            assert!(restored.provenance.source.contains(mission_id.as_str()));
+            assert!(restored.artifact_uri.contains(task_id.as_str()));
+            assert!(restored.sensitive);
+            assert!(restored.raw_content.is_none());
+            assert!(!restored
+                .model_summary
+                .as_deref()
+                .unwrap_or_default()
+                .contains("SECRET_CANARY"));
+            let hydrated = ac_evidence::EvidenceStore::from_records(records.clone());
+            assert_eq!(hydrated.get(&evidence_id).unwrap(), restored);
+        }
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
     fn tool_output_evidence_survives_reopen() {
         let path =
             std::env::temp_dir().join(format!("agentcode-tool-{}.sqlite", StableId::new("db")));

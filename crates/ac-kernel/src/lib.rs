@@ -136,6 +136,21 @@ impl<P: PolicyBoundary> Kernel<P> {
         Ok(id)
     }
 
+    /// Restores a durable mission identity during daemon recovery.  Recovery is
+    /// intentionally not an event-producing decision: it must not mint a new
+    /// mission or claim a state transition that did not occur.
+    pub fn restore_mission(&mut self, mission: Mission) -> AcResult<()> {
+        self.ensure_running()?;
+        if self.missions.contains_key(&mission.id) {
+            return Err(AcError::conflict(
+                "KERNEL-MISSION_ALREADY_RESTORED",
+                "mission identity already exists",
+            ));
+        }
+        self.missions.insert(mission.id.clone(), mission);
+        Ok(())
+    }
+
     pub fn transition_mission(
         &mut self,
         id: &StableId,

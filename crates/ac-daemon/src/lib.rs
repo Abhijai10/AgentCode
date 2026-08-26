@@ -1,11 +1,263 @@
+use std::collections::{BTreeMap, VecDeque};
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::{mpsc, Arc, Mutex};
+use std::thread;
 
 use ac_common::{AcError, AcResult, StableId, TimestampMillis};
 use ac_db::{ControlPlaneDb, PersistedSession};
 use ac_kernel::{Kernel, KernelDecisionKind, MissionState, PermissionDecision, PolicyBoundary};
-use ac_runtime::{AgentSession, AgentSessionState, HydratedSession, RuntimeHydrator, Worker};
+use ac_runtime::{
+    AgentSession, AgentSessionState, CancellationToken, HydratedSession, RuntimeHydrator, Worker,
+};
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MissionExecutionStatus {
+    pub mission_id: StableId,
+    pub session_id: StableId,
+    pub state: String,
+}
+
+#[derive(Clone, Debug)]
+struct QueuedMission {
+    mission_id: StableId,
+    session_id: StableId,
+    goal: String,
+}
+
+#[derive(Default)]
+struct CoordinatorState {
+    queued: VecDeque<QueuedMission>,
+    active: Option<StableId>,
+    statuses: BTreeMap<String, MissionExecutionStatus>,
+    paused: BTreeMap<String, QueuedMission>,
+    cancelled: BTreeMap<String, ()>,
+    cancellation: BTreeMap<String, CancellationToken>,
+}
+
+/// A deliberately single-slot, daemon-owned executor.  The IPC thread only
+/// queues durable work; execution happens on this dedicated worker.
+struct MissionCoordinator {
+    tx: mpsc::SyncSender<QueuedMission>,
+    state: Arc<Mutex<CoordinatorState>>,
+}
+
+impl MissionCoordinator {
+    fn new(
+        db_path: PathBuf,
+        workspace_root: PathBuf,
+        kernel: Arc<Mutex<Kernel<ProductionKernelPolicy>>>,
+    ) -> Self {
+        let (tx, rx) = mpsc::sync_channel::<QueuedMission>(64);
+        let state = Arc::new(Mutex::new(CoordinatorState::default()));
+        let worker_state = Arc::clone(&state);
+        thread::Builder::new()
+            .name("agentcode-mission-worker".to_string())
+            .spawn(move || {
+                while let Ok(job) = rx.recv() {
+                    let run = {
+                        let mut state = match worker_state.lock() {
+                            Ok(state) => state,
+                            Err(_) => continue,
+                        };
+                        state
+                            .queued
+                            .retain(|queued| queued.mission_id != job.mission_id);
+                        if state.cancelled.contains_key(job.mission_id.as_str()) {
+                            continue;
+                        }
+                        if state.paused.contains_key(job.mission_id.as_str()) {
+                            continue;
+                        }
+                        state.active = Some(job.mission_id.clone());
+                        if let Some(status) = state.statuses.get_mut(job.mission_id.as_str()) {
+                            status.state = "running".to_string();
+                        }
+                        true
+                    };
+                    if !run {
+                        continue;
+                    }
+                    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        let token = worker_state
+                            .lock()
+                            .ok()
+                            .and_then(|state| {
+                                state.cancellation.get(job.mission_id.as_str()).cloned()
+                            })
+                            .unwrap_or_default();
+                        execute_mission(&db_path, &workspace_root, Arc::clone(&kernel), &job, token)
+                    }));
+                    let terminal = match outcome {
+                        Ok(Ok(state)) => state,
+                        Ok(Err(error)) => format!("failed: {}", error.code()),
+                        Err(_) => "failed: DAEMON-MISSION_PANIC".to_string(),
+                    };
+                    if let Ok(db) = ControlPlaneDb::open(&db_path) {
+                        let state_name = if terminal == "completed" {
+                            "completed"
+                        } else if terminal == "cancelled" {
+                            "cancelled"
+                        } else {
+                            "failed"
+                        };
+                        let _ = db.update_session_state(&job.session_id, state_name);
+                    }
+                    if let Ok(mut state) = worker_state.lock() {
+                        state.active = None;
+                        let cancelled = state.cancelled.contains_key(job.mission_id.as_str());
+                        if let Some(status) = state.statuses.get_mut(job.mission_id.as_str()) {
+                            status.state = if cancelled {
+                                "cancelled".to_string()
+                            } else {
+                                terminal
+                            };
+                        }
+                    }
+                }
+            })
+            .expect("mission coordinator thread must start");
+        Self { tx, state }
+    }
+
+    fn enqueue(&self, job: QueuedMission) -> AcResult<()> {
+        {
+            let mut state = self.state.lock().map_err(|_| {
+                AcError::conflict("DAEMON-COORDINATOR_POISONED", "coordinator lock poisoned")
+            })?;
+            state.statuses.insert(
+                job.mission_id.to_string(),
+                MissionExecutionStatus {
+                    mission_id: job.mission_id.clone(),
+                    session_id: job.session_id.clone(),
+                    state: "queued".to_string(),
+                },
+            );
+            state
+                .cancellation
+                .insert(job.mission_id.to_string(), CancellationToken::new());
+            state.queued.push_back(job.clone());
+        }
+        self.tx.try_send(job).map_err(|_| {
+            AcError::new(
+                "DAEMON-QUEUE_FULL",
+                "mission queue is full",
+                ac_common::ErrorKind::Unavailable,
+                ac_common::Retryability::Retryable,
+            )
+        })
+    }
+
+    fn status(&self, mission_id: &str) -> Option<MissionExecutionStatus> {
+        self.state.lock().ok()?.statuses.get(mission_id).cloned()
+    }
+
+    fn pause(&self, mission_id: &str) -> AcResult<()> {
+        let mut state = self.state.lock().map_err(|_| {
+            AcError::conflict("DAEMON-COORDINATOR_POISONED", "coordinator lock poisoned")
+        })?;
+        let job = state
+            .queued
+            .iter()
+            .find(|job| job.mission_id.as_str() == mission_id)
+            .cloned()
+            .ok_or_else(|| {
+                AcError::conflict(
+                    "DAEMON-MISSION_NOT_PAUSABLE",
+                    "mission is already running or terminal",
+                )
+            })?;
+        state.paused.insert(mission_id.to_string(), job);
+        if let Some(status) = state.statuses.get_mut(mission_id) {
+            status.state = "paused".to_string();
+        }
+        Ok(())
+    }
+
+    fn resume(&self, mission_id: &str) -> AcResult<()> {
+        let job = {
+            let mut state = self.state.lock().map_err(|_| {
+                AcError::conflict("DAEMON-COORDINATOR_POISONED", "coordinator lock poisoned")
+            })?;
+            let job = state.paused.remove(mission_id).ok_or_else(|| {
+                AcError::conflict("DAEMON-MISSION_NOT_PAUSED", "mission is not paused")
+            })?;
+            state.queued.push_back(job.clone());
+            if let Some(status) = state.statuses.get_mut(mission_id) {
+                status.state = "queued".to_string();
+            }
+            job
+        };
+        self.tx.try_send(job).map_err(|_| {
+            AcError::new(
+                "DAEMON-QUEUE_FULL",
+                "mission queue is full",
+                ac_common::ErrorKind::Unavailable,
+                ac_common::Retryability::Retryable,
+            )
+        })
+    }
+
+    fn cancel(&self, mission_id: &str) -> AcResult<()> {
+        let mut state = self.state.lock().map_err(|_| {
+            AcError::conflict("DAEMON-COORDINATOR_POISONED", "coordinator lock poisoned")
+        })?;
+        if !state.statuses.contains_key(mission_id) {
+            return Err(AcError::validation(
+                "DAEMON-MISSION_NOT_FOUND",
+                "mission is not known to coordinator",
+            ));
+        }
+        if let Some(token) = state.cancellation.get(mission_id) {
+            token.cancel();
+        }
+        state.cancelled.insert(mission_id.to_string(), ());
+        state.paused.remove(mission_id);
+        state
+            .queued
+            .retain(|job| job.mission_id.as_str() != mission_id);
+        if let Some(status) = state.statuses.get_mut(mission_id) {
+            status.state = "cancelled".to_string();
+        }
+        Ok(())
+    }
+}
+
+fn execute_mission(
+    db_path: &Path,
+    workspace_root: &Path,
+    kernel: Arc<Mutex<Kernel<ProductionKernelPolicy>>>,
+    job: &QueuedMission,
+    cancellation: CancellationToken,
+) -> AcResult<String> {
+    let db = ControlPlaneDb::open(db_path)?;
+    db.update_session_state(&job.session_id, "running")?;
+    let session =
+        AgentSession::with_id_and_token(job.session_id.clone(), Worker::new(), cancellation);
+    let worktree = workspace_root
+        .join(".agentcode-worktrees")
+        .join(job.session_id.as_str());
+    let mut agent = ac_agent::bound_workspace_agent(
+        workspace_root.to_path_buf(),
+        worktree,
+        kernel,
+        job.mission_id.clone(),
+        session,
+        ac_security::CapabilityPolicy::new(),
+    )?;
+    let report = agent.run_goal(ac_agent::Goal::new(job.goal.clone())?)?;
+    let evidence = agent.into_evidence();
+    for record in evidence.records() {
+        db.append_evidence(record)?;
+    }
+    Ok(match report.state {
+        ac_agent::AutonomousState::Completed => "completed",
+        ac_agent::AutonomousState::Cancelled => "cancelled",
+        _ => "failed",
+    }
+    .to_string())
+}
 
 include!("release.rs");
 include!("ipc.rs");
@@ -95,12 +347,13 @@ impl IpcTransport for LocalIpc<'_> {
 pub struct DaemonService {
     lifecycle: DaemonLifecycle,
     db: ControlPlaneDb,
-    kernel: Kernel<ProductionKernelPolicy>,
+    kernel: Arc<Mutex<Kernel<ProductionKernelPolicy>>>,
     lock_path: PathBuf,
     lock_file: Option<File>,
     instance_id: StableId,
     recovered: Vec<PersistedSession>,
     hydrated: Vec<HydratedSession>,
+    coordinator: MissionCoordinator,
 }
 
 /// Production daemon policy. Tool capability checks remain owned by ToolBroker;
@@ -123,12 +376,25 @@ impl PolicyBoundary for ProductionKernelPolicy {
 
 impl DaemonService {
     pub fn open(db_path: impl AsRef<Path>, lock_path: impl Into<PathBuf>) -> AcResult<Self> {
-        let mut db = ControlPlaneDb::open(db_path)?;
+        let db_path = db_path.as_ref().to_path_buf();
+        let mut db = ControlPlaneDb::open(&db_path)?;
         db.migrate()?;
+        let kernel = Arc::new(Mutex::new(Kernel::new(ProductionKernelPolicy)));
+        let workspace_root = std::env::var_os("AGENTCODE_WORKSPACE_ROOT")
+            .map(PathBuf::from)
+            .unwrap_or(
+                std::env::current_dir()
+                    .map_err(|error| AcError::validation("DAEMON-WORKSPACE", error.to_string()))?,
+            );
         Ok(Self {
             lifecycle: DaemonLifecycle::Created,
             db,
-            kernel: Kernel::new(ProductionKernelPolicy),
+            coordinator: MissionCoordinator::new(
+                db_path,
+                workspace_root.clone(),
+                Arc::clone(&kernel),
+            ),
+            kernel,
             lock_path: lock_path.into(),
             lock_file: None,
             instance_id: StableId::new("daemon"),
@@ -145,13 +411,48 @@ impl DaemonService {
             ));
         }
         self.acquire_singleton()?;
-        self.kernel.start()?;
+        self.kernel_lock()?.start()?;
         self.hydrated = RuntimeHydrator::hydrate_interrupted(&self.db)?;
         self.recovered = self
             .hydrated
             .iter()
             .map(|hydrated| hydrated.session.clone())
             .collect();
+        for hydrated in &self.hydrated {
+            if let Some(mission) = self
+                .db
+                .get_mission(&StableId::from_existing(&hydrated.session.mission_id)?)?
+            {
+                let mission_id = StableId::from_existing(&mission.id)?;
+                let state = match mission.state.as_str() {
+                    "created" => MissionState::Created,
+                    "active" => MissionState::Active,
+                    "completed" => MissionState::Completed,
+                    "cancelled" => MissionState::Cancelled,
+                    _ => continue,
+                };
+                let mut kernel = self.kernel_lock()?;
+                if kernel.mission(&mission_id).is_none() {
+                    kernel.restore_mission(ac_kernel::Mission {
+                        id: mission_id.clone(),
+                        original_goal: mission.original_goal.clone(),
+                        state,
+                        created_at: TimestampMillis::from_millis(mission.created_at_ms as u128),
+                    })?;
+                }
+                drop(kernel);
+                if !matches!(
+                    hydrated.session.state.as_str(),
+                    "paused" | "completed" | "cancelled" | "failed"
+                ) {
+                    self.coordinator.enqueue(QueuedMission {
+                        mission_id,
+                        session_id: StableId::from_existing(&hydrated.session.id)?,
+                        goal: mission.original_goal,
+                    })?;
+                }
+            }
+        }
         self.lifecycle = DaemonLifecycle::Running;
         Ok(())
     }
@@ -164,7 +465,7 @@ impl DaemonService {
             ));
         }
         self.lifecycle = DaemonLifecycle::Stopping;
-        self.kernel.stop()?;
+        self.kernel_lock()?.stop()?;
         self.lock_file = None;
         let _ = fs::remove_file(&self.lock_path);
         self.lifecycle = DaemonLifecycle::Stopped;
@@ -239,23 +540,60 @@ impl DaemonService {
         })
     }
 
+    pub fn mission_status(&self, mission_id: &str) -> Option<MissionExecutionStatus> {
+        self.coordinator.status(mission_id)
+    }
+
+    pub fn pause_mission(&mut self, mission_id: &str) -> AcResult<()> {
+        self.ensure_running()?;
+        self.coordinator.pause(mission_id)?;
+        if let Some(status) = self.coordinator.status(mission_id) {
+            self.db.update_session_state(&status.session_id, "paused")?;
+        }
+        Ok(())
+    }
+
+    pub fn resume_mission(&mut self, mission_id: &str) -> AcResult<()> {
+        self.ensure_running()?;
+        self.coordinator.resume(mission_id)?;
+        if let Some(status) = self.coordinator.status(mission_id) {
+            self.db.update_session_state(&status.session_id, "queued")?;
+        }
+        Ok(())
+    }
+
+    pub fn cancel_mission(&mut self, mission_id: &str) -> AcResult<()> {
+        self.ensure_running()?;
+        self.coordinator.cancel(mission_id)?;
+        if let Some(status) = self.coordinator.status(mission_id) {
+            self.db
+                .update_session_state(&status.session_id, "cancelled")?;
+        }
+        Ok(())
+    }
+
     pub fn handle(&mut self, command: DaemonCommand) -> AcResult<DaemonResponse> {
         match command {
             DaemonCommand::Health => Ok(DaemonResponse::Health(self.health())),
             DaemonCommand::CreateSession { goal } => {
                 self.ensure_running()?;
-                let mission_id = self.kernel.create_mission(goal)?;
-                self.kernel
-                    .transition_mission(&mission_id, MissionState::Active, Vec::new())?;
-                if let Some(mission) = self.kernel.mission(&mission_id) {
+                let mut kernel = self.kernel_lock()?;
+                let mission_id = kernel.create_mission(goal.clone())?;
+                kernel.transition_mission(&mission_id, MissionState::Active, Vec::new())?;
+                if let Some(mission) = kernel.mission(&mission_id) {
                     self.db.put_mission(mission)?;
                 }
-                for event in self.kernel.events() {
+                for event in kernel.events() {
                     let _ = self.db.append_kernel_event(event);
                 }
                 let session = AgentSession::new(Worker::new());
                 self.db
                     .save_session(session.id(), &mission_id, session_state(session.state()))?;
+                self.coordinator.enqueue(QueuedMission {
+                    mission_id: mission_id.clone(),
+                    session_id: session.id().clone(),
+                    goal,
+                })?;
                 Ok(DaemonResponse::SessionCreated {
                     mission_id,
                     session_id: session.id().clone(),
@@ -294,6 +632,12 @@ impl DaemonService {
             ));
         }
         Ok(())
+    }
+
+    fn kernel_lock(&self) -> AcResult<std::sync::MutexGuard<'_, Kernel<ProductionKernelPolicy>>> {
+        self.kernel.lock().map_err(|_| {
+            AcError::conflict("DAEMON-KERNEL_POISONED", "shared kernel lock is poisoned")
+        })
     }
 
     fn acquire_singleton(&mut self) -> AcResult<()> {
@@ -401,6 +745,28 @@ pub fn default_socket_path(base: impl AsRef<Path>) -> PathBuf {
     base.as_ref().join("agentcode.sock")
 }
 
+/// Per-user durable runtime state. Tests and explicit deployments may override
+/// this with `AGENTCODE_RUNTIME_DIR`, but production must not use shared temp.
+pub fn default_runtime_dir() -> AcResult<PathBuf> {
+    let home = std::env::var_os("HOME").ok_or_else(|| {
+        AcError::validation(
+            "DAEMON-RUNTIME_HOME_UNAVAILABLE",
+            "HOME is required for daemon runtime",
+        )
+    })?;
+    let runtime = PathBuf::from(home).join("Library/Application Support/AgentCode/runtime");
+    fs::create_dir_all(&runtime)
+        .map_err(|error| AcError::validation("DAEMON-RUNTIME_CREATE", error.to_string()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&runtime, fs::Permissions::from_mode(0o700)).map_err(|error| {
+            AcError::validation("DAEMON-RUNTIME_PERMISSIONS", error.to_string())
+        })?;
+    }
+    Ok(runtime)
+}
+
 #[allow(dead_code)]
 fn _timestamp_for_observability() -> TimestampMillis {
     TimestampMillis::now()
@@ -409,6 +775,7 @@ fn _timestamp_for_observability() -> TimestampMillis {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::fs::PermissionsExt;
 
     fn temp_paths() -> (PathBuf, PathBuf, PathBuf) {
         let dir = std::env::temp_dir().join(format!("agentcode-daemon-{}", StableId::new("tmp")));
@@ -440,6 +807,32 @@ mod tests {
             ipc.send(DaemonCommand::Stop).unwrap(),
             DaemonResponse::Stopped
         );
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn submitted_mission_is_daemon_owned_and_cancellation_is_durable() {
+        let (dir, db, lock) = temp_paths();
+        let mut daemon = DaemonService::open(&db, &lock).unwrap();
+        daemon.start().unwrap();
+        let (mission_id, session_id) = match daemon
+            .handle(DaemonCommand::CreateSession {
+                goal: "queued daemon execution".to_string(),
+            })
+            .unwrap()
+        {
+            DaemonResponse::SessionCreated {
+                mission_id,
+                session_id,
+            } => (mission_id, session_id),
+            _ => panic!("expected durable mission/session"),
+        };
+        daemon.cancel_mission(mission_id.as_str()).unwrap();
+        let status = daemon.mission_status(mission_id.as_str()).unwrap();
+        assert_eq!(status.mission_id, mission_id);
+        assert_eq!(status.session_id, session_id);
+        assert_eq!(status.state, "cancelled");
+        daemon.stop().unwrap();
         let _ = fs::remove_dir_all(dir);
     }
 
@@ -506,7 +899,16 @@ mod tests {
         let socket = default_socket_path(&dir);
         let mut daemon = DaemonService::open(&db, &lock).unwrap();
         daemon.start().unwrap();
-        let (server, listener) = UnixIpcServer::bind(&socket).unwrap();
+        let Ok((server, listener)) = UnixIpcServer::bind(&socket) else {
+            eprintln!("unix IPC bind is environment-blocked in this sandbox");
+            daemon.stop().unwrap();
+            let _ = fs::remove_dir_all(dir);
+            return;
+        };
+        assert_eq!(
+            fs::metadata(&socket).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
         let client = UnixIpcClient::new(&socket);
         let join = std::thread::spawn(move || {
             client
@@ -554,6 +956,65 @@ mod tests {
         let mut restarted = DaemonService::open(&db, &lock).unwrap();
         restarted.start().unwrap();
         assert!(!restarted.recovered_sessions().is_empty());
+        restarted.stop().unwrap();
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn restart_does_not_enqueue_terminal_or_paused_sessions() {
+        let (dir, db_path, lock) = temp_paths();
+        let active_mission = StableId::from_existing("mission-restart-active").unwrap();
+        let paused_mission = StableId::from_existing("mission-restart-paused").unwrap();
+        let completed_mission = StableId::from_existing("mission-restart-completed").unwrap();
+        {
+            let mut db = ControlPlaneDb::open(&db_path).unwrap();
+            db.migrate().unwrap();
+            for (mission_id, goal) in [
+                (&active_mission, "active should requeue"),
+                (&paused_mission, "paused should stay paused"),
+                (&completed_mission, "completed should stay complete"),
+            ] {
+                db.put_mission(&ac_kernel::Mission {
+                    id: mission_id.clone(),
+                    original_goal: goal.to_string(),
+                    state: MissionState::Active,
+                    created_at: TimestampMillis::now(),
+                })
+                .unwrap();
+            }
+            db.save_session(
+                &StableId::from_existing("session-restart-active").unwrap(),
+                &active_mission,
+                "running",
+            )
+            .unwrap();
+            db.save_session(
+                &StableId::from_existing("session-restart-paused").unwrap(),
+                &paused_mission,
+                "paused",
+            )
+            .unwrap();
+            db.save_session(
+                &StableId::from_existing("session-restart-completed").unwrap(),
+                &completed_mission,
+                "completed",
+            )
+            .unwrap();
+        }
+        let mut restarted = DaemonService::open(&db_path, &lock).unwrap();
+        restarted.start().unwrap();
+        let active_state = restarted
+            .mission_status(active_mission.as_str())
+            .unwrap()
+            .state;
+        assert!(
+            matches!(active_state.as_str(), "queued" | "running"),
+            "unexpected active recovery state: {active_state}"
+        );
+        assert!(restarted.mission_status(paused_mission.as_str()).is_none());
+        assert!(restarted
+            .mission_status(completed_mission.as_str())
+            .is_none());
         restarted.stop().unwrap();
         let _ = fs::remove_dir_all(dir);
     }

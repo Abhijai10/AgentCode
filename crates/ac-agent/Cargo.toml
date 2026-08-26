@@ -15,6 +15,7 @@ ac-git = { path = "../ac-git" }
 ac-kernel = { path = "../ac-kernel" }
 ac-provider = { path = "../ac-provider" }
 ac-runtime = { path = "../ac-runtime" }
+ac-sandbox = { path = "../ac-sandbox" }
 ac-security = { path = "../ac-security" }
 ac-tool = { path = "../ac-tool" }
 ac-verification = { path = "../ac-verification" }

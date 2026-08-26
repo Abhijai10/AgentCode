@@ -15,6 +15,7 @@ dependencies = [
  "ac-kernel",
  "ac-provider",
  "ac-runtime",
+ "ac-sandbox",
  "ac-security",
  "ac-tool",
  "ac-verification",
@@ -70,12 +71,14 @@ dependencies = [
 name = "ac-daemon"
 version = "0.1.0"
 dependencies = [
+ "ac-agent",
  "ac-common",
  "ac-config",
  "ac-db",
  "ac-kernel",
  "ac-logging",
  "ac-runtime",
+ "ac-security",
  "serde",
  "serde_json",
 ]
@@ -107,6 +110,7 @@ name = "ac-evidence"
 version = "0.1.0"
 dependencies = [
  "ac-common",
+ "serde",
 ]
 
 [[package]]
@@ -160,6 +164,8 @@ dependencies = [
  "ac-provider",
  "ac-security",
  "ac-tool",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

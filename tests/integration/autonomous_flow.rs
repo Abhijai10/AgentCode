@@ -68,6 +68,7 @@ fn autonomous_flow_reaches_completion_only_after_verification_evidence() {
     );
 
     std::env::set_var("AGENTCODE_PROVIDER_MODE", "mock");
+    std::env::set_var("AGENTCODE_TEST_PROCESS_RESTRICTED_TOOLS", "1");
     let mut agent = isolated_workspace_agent(
         source.clone(),
         worktree.clone(),
@@ -78,6 +79,7 @@ fn autonomous_flow_reaches_completion_only_after_verification_evidence() {
             .allow(Capability::ProcessExec("*".to_string())),
     )
     .unwrap();
+    std::env::remove_var("AGENTCODE_TEST_PROCESS_RESTRICTED_TOOLS");
 
     let report = agent
         .run_goal(Goal::new("Fix the bug in src/lib.rs").unwrap())

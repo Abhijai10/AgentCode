@@ -11,6 +11,8 @@ ac-context = { path = "../ac-context" }
 ac-git = { path = "../ac-git" }
 ac-provider = { path = "../ac-provider" }
 ac-tool = { path = "../ac-tool" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1.0.151"
 
 [dev-dependencies]
 ac-evidence = { path = "../ac-evidence" }

@@ -44,12 +44,21 @@ pub trait RuntimeServices {
 
 impl AgentSession {
     pub fn new(worker: Worker) -> Self {
-        let id = StableId::new("session");
+        Self::with_id(StableId::new("session"), worker)
+    }
+
+    /// Rehydrates a durable daemon-owned session without allocating a second
+    /// identity for the same mission execution.
+    pub fn with_id(id: StableId, worker: Worker) -> Self {
+        Self::with_id_and_token(id, worker, CancellationToken::new())
+    }
+
+    pub fn with_id_and_token(id: StableId, worker: Worker, token: CancellationToken) -> Self {
         let mut session = Self {
             id,
             worker,
             state: AgentSessionState::Created,
-            token: CancellationToken::new(),
+            token,
             queue: VecDeque::new(),
             events: Vec::new(),
             checkpoints: Vec::new(),
@@ -64,6 +73,17 @@ impl AgentSession {
 
     pub fn worker(&self) -> &Worker {
         &self.worker
+    }
+
+    pub fn bind_workspace(&mut self, workspace_id: StableId) -> AcResult<()> {
+        if self.state != AgentSessionState::Created || self.worker.workspace_ref.is_some() {
+            return Err(AcError::conflict(
+                "RUNTIME-WORKSPACE_ALREADY_BOUND",
+                "workspace may only be bound before session execution",
+            ));
+        }
+        self.worker.workspace_ref = Some(workspace_id);
+        Ok(())
     }
 
     pub fn start_worker_for_mission(&mut self, mission_id: StableId) -> AcResult<()> {
@@ -166,6 +186,8 @@ impl AgentSession {
     pub fn request_cancel(&self) {
         self.token.cancel();
     }
+
+    pub fn cancellation_token(&self) -> CancellationToken { self.token.clone() }
 
     pub fn is_cancelled(&self) -> bool {
         self.token.is_cancelled()

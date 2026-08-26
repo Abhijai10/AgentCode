@@ -254,6 +254,7 @@ impl RuntimePlan {
                 retry_count: 0,
                 max_retries: 3,
                 evidence_refs: Vec::new(),
+                acceptance_criteria: proposal.acceptance_criteria.iter().enumerate().map(|(index, description)| AcceptanceCriterion { id: format!("{}:criterion:{index}", proposal.proposal_id), description: description.clone(), required: true }).collect(),
             })
             .collect::<Vec<_>>();
         let plan = Self {

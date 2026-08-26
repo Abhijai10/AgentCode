@@ -2,7 +2,7 @@ use std::path::Path;
 
 use ac_changeset::{ChangeSet, ChangeSetTransaction};
 use ac_common::{AcError, AcResult, StableId, TimestampMillis};
-use ac_evidence::EvidenceRecord;
+use ac_evidence::{EvidenceKind, EvidenceRecord, Provenance};
 use ac_git::{CheckpointRecord, WorktreeRecord};
 use ac_kernel::{KernelDecisionKind, KernelEvent, Mission, MissionState};
 use ac_security::{

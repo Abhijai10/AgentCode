@@ -1,8 +1,9 @@
 use std::collections::BTreeMap;
 
 use ac_common::{AcError, AcResult, StableId, TimestampMillis};
+use serde::{Deserialize, Serialize};
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
 pub enum EvidenceKind {
     CommandOutput,
     FileSnapshot,
@@ -11,7 +12,7 @@ pub enum EvidenceKind {
     DerivedContext,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
 pub struct Provenance {
     pub source: String,
     pub commit: Option<String>,
@@ -97,6 +98,19 @@ impl EvidenceStore {
 
     pub fn get(&self, id: &StableId) -> Option<&EvidenceRecord> {
         self.records.get(id)
+    }
+
+    pub fn records(&self) -> impl Iterator<Item = &EvidenceRecord> {
+        self.records.values()
+    }
+
+    pub fn from_records(records: impl IntoIterator<Item = EvidenceRecord>) -> Self {
+        Self {
+            records: records
+                .into_iter()
+                .map(|record| (record.id.clone(), record))
+                .collect(),
+        }
     }
 
     pub fn replace(&mut self, _id: &StableId, _record: EvidenceRecord) -> AcResult<()> {

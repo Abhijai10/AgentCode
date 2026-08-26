@@ -6,6 +6,7 @@ license.workspace = true
 
 [dependencies]
 ac-common = { path = "../ac-common" }
+serde = { version = "1", features = ["derive"] }
 
 [lints]
 workspace = true

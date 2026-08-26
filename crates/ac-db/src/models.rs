@@ -715,6 +715,7 @@ pub struct TaskRecord {
     pub retry_count: u32,
     pub max_retries: u32,
     pub updated_at_ms: i64,
+    pub acceptance_criteria_json: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

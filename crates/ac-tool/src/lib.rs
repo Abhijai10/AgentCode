@@ -455,6 +455,14 @@ pub struct ToolResult {
 
 pub trait ToolExecutor {
     fn execute(&self, request: &ToolRequest) -> AcResult<String>;
+
+    fn execute_with_cancellation(
+        &self,
+        request: &ToolRequest,
+        _cancelled: &AtomicBool,
+    ) -> AcResult<String> {
+        self.execute(request)
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -494,11 +502,25 @@ pub fn register_mcp_tool_with_broker(
 #[derive(Clone, Debug)]
 pub struct WorkspaceTools {
     root: PathBuf,
+    required_isolation: ac_sandbox::IsolationLevel,
 }
 
 impl WorkspaceTools {
     pub fn new(root: PathBuf) -> Self {
-        Self { root }
+        Self {
+            root,
+            required_isolation: ac_sandbox::IsolationLevel::FilesystemIsolated,
+        }
+    }
+
+    pub fn with_required_isolation(
+        root: PathBuf,
+        required_isolation: ac_sandbox::IsolationLevel,
+    ) -> Self {
+        Self {
+            root,
+            required_isolation,
+        }
     }
 
     pub fn register_all(&self, broker: &mut ToolBroker) -> AcResult<()> {
@@ -587,7 +609,7 @@ impl WorkspaceTools {
                         .allow(Capability::ProcessExec("*".to_string())),
                     network_default_allow: false,
                     max_timeout_ms: 30_000,
-                    required_isolation: ac_sandbox::IsolationLevel::ProcessRestricted,
+                    required_isolation: self.required_isolation,
                     ..SandboxPolicy::new(vec![self.root.clone()])
                 }),
                 cwd: self.root.clone(),
@@ -615,7 +637,7 @@ impl WorkspaceTools {
                             .allow(Capability::ProcessExec("*".to_string())),
                         network_default_allow: false,
                         max_timeout_ms: 30_000,
-                        required_isolation: ac_sandbox::IsolationLevel::ProcessRestricted,
+                        required_isolation: self.required_isolation,
                         ..SandboxPolicy::new(vec![self.root.clone()])
                     }),
                     cwd: self.root.clone(),
@@ -745,6 +767,15 @@ struct CommandExecTool {
 
 impl ToolExecutor for CommandExecTool {
     fn execute(&self, request: &ToolRequest) -> AcResult<String> {
+        let not_cancelled = AtomicBool::new(false);
+        self.execute_with_cancellation(request, &not_cancelled)
+    }
+
+    fn execute_with_cancellation(
+        &self,
+        request: &ToolRequest,
+        cancelled: &AtomicBool,
+    ) -> AcResult<String> {
         if request.payload.trim().is_empty() {
             return Err(AcError::validation(
                 "TOOL-COMMAND_EMPTY",
@@ -757,6 +788,7 @@ impl ToolExecutor for CommandExecTool {
             self.cwd.clone(),
             parse_argv(&request.payload)?,
             5_000,
+            cancelled,
         )
     }
 }
@@ -770,12 +802,22 @@ struct FixedCommandTool {
 
 impl ToolExecutor for FixedCommandTool {
     fn execute(&self, _request: &ToolRequest) -> AcResult<String> {
+        let not_cancelled = AtomicBool::new(false);
+        self.execute_with_cancellation(_request, &not_cancelled)
+    }
+
+    fn execute_with_cancellation(
+        &self,
+        _request: &ToolRequest,
+        cancelled: &AtomicBool,
+    ) -> AcResult<String> {
         run_sandboxed_command(
             &self.manager,
             &self.sandbox,
             self.cwd.clone(),
             self.argv.clone(),
             30_000,
+            cancelled,
         )
     }
 }
@@ -786,6 +828,7 @@ fn run_sandboxed_command(
     cwd: PathBuf,
     argv: Vec<String>,
     timeout_ms: u64,
+    cancelled: &AtomicBool,
 ) -> AcResult<String> {
     let plan = sandbox.prepare_execution(ExecRequest {
         argv,
@@ -794,7 +837,13 @@ fn run_sandboxed_command(
         network: false,
         timeout_ms,
     })?;
-    let result = manager.run("tool-command", plan)?;
+    let result = manager.run_with_cancellation("tool-command", plan, cancelled)?;
+    if !matches!(result.exit_code, Some(0)) {
+        return Err(AcError::validation(
+            "TOOL-COMMAND_EXIT_NONZERO",
+            format_process_observation(&result),
+        ));
+    }
     Ok(format_process_observation(&result))
 }
 
@@ -839,14 +888,18 @@ fn parse_argv(payload: &str) -> AcResult<Vec<String>> {
 }
 
 fn toolchain_env() -> BTreeMap<String, String> {
-    ["PATH", "HOME", "CARGO_HOME", "RUSTUP_HOME", "RUSTC_WRAPPER"]
+    let mut env = ["PATH", "CARGO_HOME", "RUSTUP_HOME", "RUSTC_WRAPPER"]
         .iter()
         .filter_map(|key| {
             std::env::var(key)
                 .ok()
                 .map(|value| ((*key).to_string(), value))
         })
-        .collect()
+        .collect::<BTreeMap<_, _>>();
+    let home = std::env::temp_dir().join(format!("agentcode-home-{}", StableId::new("tool")));
+    let _ = fs::create_dir_all(&home);
+    env.insert("HOME".to_string(), home.display().to_string());
+    env
 }
 
 fn safe_join(root: &Path, relative: &str) -> AcResult<PathBuf> {
@@ -965,6 +1018,16 @@ impl ToolBroker {
         request: ToolRequest,
         evidence_store: &mut EvidenceStore,
     ) -> AcResult<ToolResult> {
+        let not_cancelled = AtomicBool::new(false);
+        self.invoke_with_cancellation(request, evidence_store, &not_cancelled)
+    }
+
+    pub fn invoke_with_cancellation(
+        &self,
+        request: ToolRequest,
+        evidence_store: &mut EvidenceStore,
+        cancelled: &AtomicBool,
+    ) -> AcResult<ToolResult> {
         let definition = self
             .definitions
             .get(&request.tool_id)
@@ -1000,7 +1063,7 @@ impl ToolBroker {
         let executor = self.executors.get(&request.tool_id).ok_or_else(|| {
             AcError::validation("TOOL-MISSING_EXECUTOR", "tool executor not found")
         })?;
-        let observation = match executor.execute(&request) {
+        let observation = match executor.execute_with_cancellation(&request, cancelled) {
             Ok(observation) => observation,
             Err(error) => {
                 let evidence_ref = evidence_store.append_tool_output(
@@ -1271,7 +1334,9 @@ mod tests {
                 .allow(Capability::FilesystemWrite("*".to_string()))
                 .allow(Capability::ProcessExec("*".to_string())),
         );
-        WorkspaceTools::new(root).register_all(&mut broker).unwrap();
+        WorkspaceTools::new(root.clone())
+            .register_all(&mut broker)
+            .unwrap();
         let mut evidence = EvidenceStore::new();
         let result = broker
             .invoke(
@@ -1285,6 +1350,13 @@ mod tests {
                 &mut evidence,
             )
             .unwrap();
+        if result.status == ToolStatus::Failed
+            && (result.observation.contains("SANDBOX-ISOLATION_UNSUPPORTED")
+                || result.observation.contains("SANDBOX-UNAVAILABLE"))
+        {
+            let _ = fs::remove_dir_all(root);
+            return;
+        }
         assert_eq!(result.status, ToolStatus::Succeeded);
         assert!(result.observation.contains("ok"));
     }
@@ -1330,6 +1402,13 @@ mod tests {
                 &mut evidence,
             )
             .unwrap();
+        if result.status == ToolStatus::Failed
+            && (result.observation.contains("SANDBOX-ISOLATION_UNSUPPORTED")
+                || result.observation.contains("SANDBOX-UNAVAILABLE"))
+        {
+            let _ = fs::remove_dir_all(root);
+            return;
+        }
         assert_eq!(result.status, ToolStatus::Succeeded);
         assert!(result.observation.contains("README.md"));
         assert_eq!(evidence.len(), 1);

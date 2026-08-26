@@ -158,16 +158,16 @@ impl ControlPlaneDb {
 
     pub fn save_task(&self, record: &TaskRecord) -> AcResult<()> {
         self.connection.execute(
-            "INSERT INTO tasks (id, mission_id, title, state, dependencies_json, assigned_worker_id, retry_count, max_retries, updated_at_ms)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
-             ON CONFLICT(id) DO UPDATE SET state = excluded.state, assigned_worker_id = excluded.assigned_worker_id, retry_count = excluded.retry_count, updated_at_ms = excluded.updated_at_ms",
-            params![record.id, record.mission_id, record.title, record.state, record.dependencies_json, record.assigned_worker_id, record.retry_count, record.max_retries, record.updated_at_ms],
+                "INSERT INTO tasks (id, mission_id, title, state, dependencies_json, assigned_worker_id, retry_count, max_retries, updated_at_ms, acceptance_criteria_json)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+                 ON CONFLICT(id) DO UPDATE SET state = excluded.state, assigned_worker_id = excluded.assigned_worker_id, retry_count = excluded.retry_count, updated_at_ms = excluded.updated_at_ms, acceptance_criteria_json = excluded.acceptance_criteria_json",
+            params![record.id, record.mission_id, record.title, record.state, record.dependencies_json, record.assigned_worker_id, record.retry_count, record.max_retries, record.updated_at_ms, record.acceptance_criteria_json],
         ).map_err(db_error)?;
         Ok(())
     }
 
     pub fn tasks_for_mission(&self, mission_id: &str) -> AcResult<Vec<TaskRecord>> {
-        let mut stmt = self.connection.prepare("SELECT id, mission_id, title, state, dependencies_json, assigned_worker_id, retry_count, max_retries, updated_at_ms FROM tasks WHERE mission_id = ?1 ORDER BY id").map_err(db_error)?;
+        let mut stmt = self.connection.prepare("SELECT id, mission_id, title, state, dependencies_json, assigned_worker_id, retry_count, max_retries, updated_at_ms, acceptance_criteria_json FROM tasks WHERE mission_id = ?1 ORDER BY id").map_err(db_error)?;
         let rows = stmt
             .query_map([mission_id], |row| {
                 Ok(TaskRecord {
@@ -180,6 +180,7 @@ impl ControlPlaneDb {
                     retry_count: row.get(6)?,
                     max_retries: row.get(7)?,
                     updated_at_ms: row.get(8)?,
+                    acceptance_criteria_json: row.get(9)?,
                 })
             })
             .map_err(db_error)?;

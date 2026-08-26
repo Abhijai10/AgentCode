@@ -1,4 +1,4 @@
-pub const CURRENT_SCHEMA_VERSION: u32 = 19;
+pub const CURRENT_SCHEMA_VERSION: u32 = 20;
 
 impl ControlPlaneDb {
     pub fn open(path: impl AsRef<Path>) -> AcResult<Self> {
@@ -126,8 +126,12 @@ impl ControlPlaneDb {
             ))
             .map_err(db_error)?;
         }
-        if current_version < CURRENT_SCHEMA_VERSION {
+        if current_version < 19 {
             tx.execute_batch(include_str!("../../../migrations/0019_daemon_semantic_memory.sql"))
+                .map_err(db_error)?;
+        }
+        if current_version < 20 {
+            tx.execute_batch(include_str!("../../../migrations/0020_task_acceptance_criteria.sql"))
                 .map_err(db_error)?;
         }
         tx.pragma_update(None, "user_version", CURRENT_SCHEMA_VERSION)

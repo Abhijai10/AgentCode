@@ -1,5 +1,7 @@
 use ac_config::SettingsBuilder;
-use ac_daemon::{default_paths, default_socket_path, DaemonService, UnixIpcServer};
+use ac_daemon::{
+    default_paths, default_runtime_dir, default_socket_path, DaemonService, UnixIpcServer,
+};
 use ac_logging::{Redactor, Severity, StructuredLogger};
 
 fn main() {
@@ -10,8 +12,16 @@ fn main() {
         .expect("compiled defaults must be valid");
     let base = std::env::var_os("AGENTCODE_RUNTIME_DIR")
         .map(std::path::PathBuf::from)
-        .unwrap_or_else(|| std::env::temp_dir().join("agentcode-daemon"));
-    std::fs::create_dir_all(&base).expect("daemon temp dir should be creatable");
+        .map(Ok)
+        .unwrap_or_else(default_runtime_dir)
+        .unwrap_or_else(|error| {
+            eprintln!("daemon runtime initialization failed: {error}");
+            std::process::exit(1);
+        });
+    if let Err(error) = std::fs::create_dir_all(&base) {
+        eprintln!("daemon runtime initialization failed: {error}");
+        std::process::exit(1);
+    }
     let (db, lock) = default_paths(&base);
     let mut daemon = DaemonService::open(db, lock).expect("daemon should open");
     daemon.start().expect("daemon should start");

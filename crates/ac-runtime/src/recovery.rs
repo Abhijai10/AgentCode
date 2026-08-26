@@ -47,12 +47,13 @@ impl RuntimeHydrator {
                 state = TaskState::Retryable;
                 reconciled_tasks.push(id.clone());
             }
-            graph.tasks.insert(id.clone(), WorkerTask { id, mission_id, title: row.title, dependencies, state, assigned_worker: None, retry_count: row.retry_count, max_retries: row.max_retries, evidence_refs: Vec::new() });
+            let acceptance_criteria = serde_json::from_str(&row.acceptance_criteria_json).unwrap_or_default();
+            graph.tasks.insert(id.clone(), WorkerTask { id, mission_id, title: row.title, dependencies, state, assigned_worker: None, retry_count: row.retry_count, max_retries: row.max_retries, evidence_refs: Vec::new(), acceptance_criteria });
         }
         graph.refresh_ready();
         for task in graph.tasks.values() {
             if reconciled_tasks.contains(&task.id) {
-                db.save_task(&TaskRecord { id: task.id.to_string(), mission_id: task.mission_id.to_string(), title: task.title.clone(), state: task_state_name(task.state).to_string(), dependencies_json: task.dependencies.iter().map(ToString::to_string).collect::<Vec<_>>().join(","), assigned_worker_id: None, retry_count: task.retry_count, max_retries: task.max_retries, updated_at_ms: TimestampMillis::now().as_millis() as i64 })?;
+                db.save_task(&TaskRecord { id: task.id.to_string(), mission_id: task.mission_id.to_string(), title: task.title.clone(), state: task_state_name(task.state).to_string(), dependencies_json: task.dependencies.iter().map(ToString::to_string).collect::<Vec<_>>().join(","), assigned_worker_id: None, retry_count: task.retry_count, max_retries: task.max_retries, updated_at_ms: TimestampMillis::now().as_millis() as i64, acceptance_criteria_json: serde_json::to_string(&task.acceptance_criteria).map_err(|error| AcError::validation("RUNTIME-TASK_CRITERIA_SERIALIZE", error.to_string()))? })?;
             }
         }
         let session_id = StableId::from_existing(&session.id)?;

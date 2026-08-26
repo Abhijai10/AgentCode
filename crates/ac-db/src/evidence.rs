@@ -64,21 +64,87 @@ impl ControlPlaneDb {
     }
 
     pub fn append_evidence(&self, evidence: &EvidenceRecord) -> AcResult<()> {
+        let durable_raw_content = (!evidence.sensitive)
+            .then(|| evidence.raw_content.clone())
+            .flatten();
         self.connection
             .execute(
-                "INSERT INTO evidence_records (id, kind, provenance_json, artifact_uri, content_hash, created_at_ms)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                "INSERT OR IGNORE INTO evidence_records (
+                    id, kind, provenance_json, artifact_uri, content_hash,
+                    created_at_ms, raw_content, model_summary, sensitive
+                 )
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
                 params![
                     evidence.id.as_str(),
-                    format!("{:?}", evidence.kind),
-                    format!("{:?}", evidence.provenance),
-                    evidence.artifact_uri,
-                    evidence.content_hash,
-                    millis(evidence.created_at)
+                    serde_json::to_string(&evidence.kind).map_err(|error| {
+                        AcError::validation("DB-EVIDENCE_KIND_SERIALIZE", error.to_string())
+                    })?,
+                    serde_json::to_string(&evidence.provenance).map_err(|error| {
+                        AcError::validation("DB-EVIDENCE_PROVENANCE_SERIALIZE", error.to_string())
+                    })?,
+                    evidence.artifact_uri.as_str(),
+                    evidence.content_hash.as_str(),
+                    millis(evidence.created_at),
+                    durable_raw_content,
+                    evidence.model_summary.as_deref(),
+                    evidence.sensitive as i64
                 ],
             )
             .map_err(db_error)?;
         Ok(())
+    }
+
+    pub fn evidence_records(&self) -> AcResult<Vec<EvidenceRecord>> {
+        let mut stmt = self
+            .connection
+            .prepare(
+                "SELECT id, kind, provenance_json, artifact_uri, content_hash,
+                        created_at_ms, raw_content, model_summary, sensitive
+                 FROM evidence_records
+                 ORDER BY created_at_ms ASC, id ASC",
+            )
+            .map_err(db_error)?;
+        let rows = stmt
+            .query_map([], |row| {
+                let id: String = row.get(0)?;
+                let kind_json: String = row.get(1)?;
+                let provenance_json: String = row.get(2)?;
+                let created_at_ms: i64 = row.get(5)?;
+                let kind = serde_json::from_str::<EvidenceKind>(&kind_json).map_err(|error| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        1,
+                        rusqlite::types::Type::Text,
+                        Box::new(error),
+                    )
+                })?;
+                let provenance =
+                    serde_json::from_str::<Provenance>(&provenance_json).map_err(|error| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            2,
+                            rusqlite::types::Type::Text,
+                            Box::new(error),
+                        )
+                    })?;
+                Ok(EvidenceRecord {
+                    id: StableId::from_existing(&id).map_err(|error| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            0,
+                            rusqlite::types::Type::Text,
+                            Box::new(error),
+                        )
+                    })?,
+                    kind,
+                    provenance,
+                    artifact_uri: row.get(3)?,
+                    content_hash: row.get(4)?,
+                    raw_content: row.get(6)?,
+                    model_summary: row.get(7)?,
+                    sensitive: row.get::<_, i64>(8)? != 0,
+                    created_at: TimestampMillis::from_millis(created_at_ms as u128),
+                })
+            })
+            .map_err(db_error)?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(db_error)
     }
 
     pub fn save_routing_decision(&self, decision: &RoutingDecisionRecord) -> AcResult<()> {

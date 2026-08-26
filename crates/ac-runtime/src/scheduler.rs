@@ -139,6 +139,7 @@ impl TaskGraph {
                 retry_count: task.retry_count,
                 max_retries: task.max_retries,
                 updated_at_ms: TimestampMillis::now().as_millis() as i64,
+                acceptance_criteria_json: serde_json::to_string(&task.acceptance_criteria).map_err(|error| AcError::validation("RUNTIME-TASK_CRITERIA_SERIALIZE", error.to_string()))?,
             })?;
         }
         for attempt in &self.attempts {
@@ -180,6 +181,7 @@ impl TaskGraph {
                 retry_count: 0,
                 max_retries,
                 evidence_refs: Vec::new(),
+                acceptance_criteria: Vec::new(),
             },
         );
         id

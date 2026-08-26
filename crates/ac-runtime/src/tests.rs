@@ -155,6 +155,7 @@ mod tests {
             retry_count: 0,
             max_retries: 2,
             evidence_refs: Vec::new(),
+            acceptance_criteria: Vec::new(),
         };
         let modify = WorkerTask {
             id: StableId::from_existing("modify-dynamic").unwrap(),
@@ -166,6 +167,7 @@ mod tests {
             retry_count: 0,
             max_retries: 2,
             evidence_refs: Vec::new(),
+            acceptance_criteria: Vec::new(),
         };
         let plan = RuntimePlan {
             id: StableId::new("plan"),
@@ -212,6 +214,76 @@ mod tests {
     }
 
     #[test]
+    fn acceptance_criteria_persist_and_hydrate_with_stable_ids() {
+        let mission = StableId::new("mission");
+        let task_id = StableId::from_existing("task-acceptance-stable").unwrap();
+        let criterion_id = format!("{task_id}:criterion:0");
+        let task = WorkerTask {
+            id: task_id.clone(),
+            mission_id: mission.clone(),
+            title: "Verify acceptance persistence".to_string(),
+            dependencies: Vec::new(),
+            state: TaskState::Pending,
+            assigned_worker: None,
+            retry_count: 0,
+            max_retries: 2,
+            evidence_refs: Vec::new(),
+            acceptance_criteria: vec![
+                AcceptanceCriterion {
+                    id: criterion_id.clone(),
+                    description: "mandatory evidence exists".to_string(),
+                    required: true,
+                },
+                AcceptanceCriterion {
+                    id: format!("{task_id}:criterion:1"),
+                    description: "optional note captured".to_string(),
+                    required: false,
+                },
+            ],
+        };
+        let plan = RuntimePlan {
+            id: StableId::new("plan"),
+            mission_id: mission.clone(),
+            revision: 1,
+            tasks: vec![task],
+            proposals: Vec::new(),
+            supersedes: None,
+        };
+        let graph = TaskGraph::from_runtime_plan(&plan).unwrap();
+        let mut worker = Worker::new();
+        worker.assign(mission.clone()).unwrap();
+        worker.transition(WorkerState::Running).unwrap();
+        let session_id = StableId::new("session");
+        let path = std::env::temp_dir().join(format!(
+            "agentcode-runtime-criteria-{}.sqlite",
+            StableId::new("db")
+        ));
+        {
+            let mut db = ControlPlaneDb::open(&path).unwrap();
+            db.migrate().unwrap();
+            db.save_session(&session_id, &mission, "running").unwrap();
+            graph.persist(&db, &worker, &session_id).unwrap();
+        }
+        {
+            let db = ControlPlaneDb::open(&path).unwrap();
+            let rows = db.tasks_for_mission(mission.as_str()).unwrap();
+            assert_eq!(rows.len(), 1);
+            let stored: Vec<AcceptanceCriterion> =
+                serde_json::from_str(&rows[0].acceptance_criteria_json).unwrap();
+            assert_eq!(stored[0].id, criterion_id);
+            assert_eq!(stored[0].description, "mandatory evidence exists");
+            assert!(stored[0].required);
+            assert!(!stored[1].required);
+            let session = db.get_session(&session_id).unwrap().unwrap();
+            let hydrated = RuntimeHydrator::hydrate_session(&db, session).unwrap();
+            let hydrated_task = hydrated.graph.tasks().next().unwrap();
+            assert_eq!(hydrated_task.acceptance_criteria, stored);
+            assert_eq!(hydrated_task.acceptance_criteria[0].id, criterion_id);
+        }
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
     fn phase12_contract_planner_dag_scheduler_and_controls_work() {
         let mission_id = StableId::from_existing("mission-p12").unwrap();
         let mut autonomy = AutonomyKernel::from_goal(
@@ -236,6 +308,7 @@ mod tests {
             retry_count: 0,
             max_retries: 1,
             evidence_refs: Vec::new(),
+            acceptance_criteria: Vec::new(),
         };
         let second = WorkerTask {
             id: StableId::from_existing("cycle-b").unwrap(),
@@ -247,6 +320,7 @@ mod tests {
             retry_count: 0,
             max_retries: 1,
             evidence_refs: Vec::new(),
+            acceptance_criteria: Vec::new(),
         };
         let cyclic = RuntimePlan {
             id: StableId::new("plan"),

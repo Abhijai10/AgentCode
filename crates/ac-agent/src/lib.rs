@@ -2,6 +2,7 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fs;
 use std::path::Path;
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 
 use ac_changeset::{
     content_hash, ChangeOperation, ChangeSet, ChangeSetMetadata, ChangeSetState, EditEngine,
@@ -23,8 +24,8 @@ use ac_provider::{
     TaskProfile,
 };
 use ac_runtime::{
-    AgentSession, AgentSessionState, PlannerTaskProposal, RuntimePlan, RuntimeTaskRisk,
-    RuntimeTaskType, TaskAttemptOutcome, TaskGraph, TaskState, WorkerTask,
+    AcceptanceCriterion, AgentSession, AgentSessionState, PlannerTaskProposal, RuntimePlan,
+    RuntimeTaskRisk, RuntimeTaskType, TaskAttemptOutcome, TaskGraph, TaskState, WorkerTask,
 };
 use ac_security::{
     Capability, CapabilityPolicy, PermissionContext, RiskClass, SecurityDecision, ToolRole,
@@ -490,7 +491,7 @@ impl AgentPlanner {
                 priority: 100_u8.saturating_sub(tasks.len() as u8),
             });
             tasks.push(WorkerTask {
-                id: task_id,
+                id: task_id.clone(),
                 mission_id: mission_id.clone(),
                 title: task.title.clone(),
                 dependencies,
@@ -499,6 +500,16 @@ impl AgentPlanner {
                 retry_count: 0,
                 max_retries: 2,
                 evidence_refs: Vec::new(),
+                acceptance_criteria: task
+                    .verification_requirements
+                    .iter()
+                    .enumerate()
+                    .map(|(index, description)| AcceptanceCriterion {
+                        id: format!("{}:criterion:{index}", task_id),
+                        description: description.clone(),
+                        required: true,
+                    })
+                    .collect(),
             });
         }
         let runtime_plan = RuntimePlan {
@@ -661,7 +672,8 @@ pub struct CompletionRequest {
 }
 
 pub struct AutonomousAgent<P: PolicyBoundary> {
-    kernel: ac_kernel::Kernel<P>,
+    kernel: Arc<Mutex<ac_kernel::Kernel<P>>>,
+    bound_mission_id: Option<StableId>,
     planner: AgentPlanner,
     session: AgentSession,
     providers: ProviderRegistry,
@@ -693,8 +705,59 @@ impl<P: PolicyBoundary> AutonomousAgent<P> {
         git: GitCoordinator,
         verification: VerificationEngine,
     ) -> Self {
+        Self::from_kernel(
+            Arc::new(Mutex::new(kernel)),
+            None,
+            session,
+            providers,
+            tools,
+            evidence,
+            memory,
+            git,
+            verification,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_bound(
+        kernel: Arc<Mutex<ac_kernel::Kernel<P>>>,
+        mission_id: StableId,
+        session: AgentSession,
+        providers: ProviderRegistry,
+        tools: ToolBroker,
+        evidence: EvidenceStore,
+        memory: MemoryService,
+        git: GitCoordinator,
+        verification: VerificationEngine,
+    ) -> Self {
+        Self::from_kernel(
+            kernel,
+            Some(mission_id),
+            session,
+            providers,
+            tools,
+            evidence,
+            memory,
+            git,
+            verification,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn from_kernel(
+        kernel: Arc<Mutex<ac_kernel::Kernel<P>>>,
+        bound_mission_id: Option<StableId>,
+        session: AgentSession,
+        providers: ProviderRegistry,
+        tools: ToolBroker,
+        evidence: EvidenceStore,
+        memory: MemoryService,
+        git: GitCoordinator,
+        verification: VerificationEngine,
+    ) -> Self {
         Self {
             kernel,
+            bound_mission_id,
             planner: AgentPlanner,
             session,
             providers,
@@ -721,10 +784,16 @@ impl<P: PolicyBoundary> AutonomousAgent<P> {
     }
 
     pub fn run_goal(&mut self, goal: Goal) -> AcResult<AgentRunReport> {
-        self.kernel.start()?;
-        let mission_id = self.kernel.create_mission(goal.text.clone())?;
-        self.kernel
-            .transition_mission(&mission_id, MissionState::Active, Vec::new())?;
+        let mission_id = match self.bound_mission_id.clone() {
+            Some(mission_id) => mission_id,
+            None => {
+                let mut kernel = self.kernel_lock()?;
+                kernel.start()?;
+                let mission_id = kernel.create_mission(goal.text.clone())?;
+                kernel.transition_mission(&mission_id, MissionState::Active, Vec::new())?;
+                mission_id
+            }
+        };
         self.session.start_worker_for_mission(mission_id.clone())?;
         let mut evidence_refs = Vec::new();
         let mut validation = None;
@@ -741,7 +810,7 @@ impl<P: PolicyBoundary> AutonomousAgent<P> {
         evidence_refs.push(context.id.clone());
         if self.session.is_cancelled() || self.session.state() == AgentSessionState::Cancelling {
             self.state = AutonomousState::Cancelled;
-            self.kernel.transition_mission(
+            self.kernel_lock()?.transition_mission(
                 &mission_id,
                 MissionState::Cancelled,
                 evidence_refs.clone(),
@@ -762,7 +831,7 @@ impl<P: PolicyBoundary> AutonomousAgent<P> {
             if self.session.is_cancelled() || self.session.state() == AgentSessionState::Cancelling
             {
                 self.state = AutonomousState::Cancelled;
-                self.kernel.transition_mission(
+                self.kernel_lock()?.transition_mission(
                     &mission_id,
                     MissionState::Cancelled,
                     evidence_refs.clone(),
@@ -891,7 +960,14 @@ impl<P: PolicyBoundary> AutonomousAgent<P> {
             }
         }
         if self
-            .request_completion(&mission_id, &goal, &evidence_refs, validation.as_ref())
+            .request_completion(
+                &mission_id,
+                &goal,
+                &runtime_plan,
+                &completed_tasks,
+                &evidence_refs,
+                validation.as_ref(),
+            )
             .is_err()
         {
             self.state = AutonomousState::Failed;
@@ -1242,6 +1318,14 @@ impl<P: PolicyBoundary> AutonomousAgent<P> {
                     evidence_refs,
                     changeset,
                 )?;
+                if !report.passed {
+                    *validation = Some(report);
+                    self.state = AutonomousState::Executing;
+                    return Err(AcError::validation(
+                        "AGENT-VERIFICATION_FAILED",
+                        "verification completed but did not pass",
+                    ));
+                }
                 *validation = Some(report);
                 self.state = AutonomousState::Executing;
                 Ok(TaskProgress::Succeeded)
@@ -1329,7 +1413,7 @@ impl<P: PolicyBoundary> AutonomousAgent<P> {
             verification_passed: None,
         })?;
         proposed.validate()?;
-        self.kernel.approve_changeset(&mut proposed)?;
+        self.kernel_lock()?.approve_changeset(&mut proposed)?;
         Ok(proposed)
     }
 
@@ -1388,6 +1472,7 @@ impl<P: PolicyBoundary> AutonomousAgent<P> {
             retry_count: 0,
             max_retries: 1,
             evidence_refs: Vec::new(),
+            acceptance_criteria: Vec::new(),
         };
         let repair = ActionProposal::parse(&repair_reasoning.text)
             .or_else(|_| action_proposal_from_bundle(&repair_reasoning.text, &repair_task))?;
@@ -1433,7 +1518,8 @@ impl<P: PolicyBoundary> AutonomousAgent<P> {
         let mut attempts = VecDeque::from_iter(0..max_attempts.max(1));
         let mut last = None;
         while attempts.pop_front().is_some() {
-            let result = self.tools.invoke(
+            let cancelled = self.session.cancellation_token().flag();
+            let result = self.tools.invoke_with_cancellation(
                 ToolRequest {
                     id: StableId::new("toolreq"),
                     tool_id: tool_id.to_string(),
@@ -1442,6 +1528,7 @@ impl<P: PolicyBoundary> AutonomousAgent<P> {
                     capabilities: requested_capabilities(tool_id),
                 },
                 &mut self.evidence,
+                &cancelled,
             )?;
             if result.status == ToolStatus::Succeeded {
                 return Ok(result);
@@ -1529,6 +1616,8 @@ impl<P: PolicyBoundary> AutonomousAgent<P> {
         &mut self,
         mission_id: &StableId,
         goal: &Goal,
+        runtime_plan: &RuntimePlan,
+        completed_tasks: &BTreeSet<StableId>,
         evidence_refs: &[StableId],
         validation: Option<&ValidationRunReport>,
     ) -> AcResult<()> {
@@ -1546,11 +1635,46 @@ impl<P: PolicyBoundary> AutonomousAgent<P> {
         )?;
         let mut accepted = evidence_refs.to_vec();
         accepted.push(completion_evidence);
+        let mandatory = runtime_plan
+            .tasks
+            .iter()
+            .flat_map(|task| {
+                task.acceptance_criteria
+                    .iter()
+                    .filter(move |criterion| criterion.required)
+                    .map(move |criterion| (task.id.clone(), criterion))
+            })
+            .collect::<Vec<_>>();
+        let requirements = mandatory
+            .iter()
+            .map(|(_, criterion)| criterion.description.clone())
+            .collect::<Vec<_>>();
+        if requirements.is_empty() {
+            return Err(AcError::conflict(
+                "AGENT-COMPLETION_NO_CRITERIA",
+                "completion requires persisted mandatory acceptance criteria",
+            ));
+        }
+        let mut verified_requirement_ids = Vec::new();
+        for (task_id, criterion) in &mandatory {
+            let task_succeeded = completed_tasks.contains(task_id)
+                && self.observations.iter().any(|observation| {
+                    observation.task_id == *task_id
+                        && observation.success
+                        && !observation.evidence_refs.is_empty()
+                });
+            if task_succeeded
+                && validation.is_some_and(|report| report.passed)
+                && !evidence_refs.is_empty()
+            {
+                verified_requirement_ids.push(StableId::from_existing(&criterion.id)?);
+            }
+        }
         let audit = self.verification.final_audit(
             FinalAuditInput {
                 original_goal: goal.text.clone(),
-                requirements: vec![goal.stopping_condition.clone()],
-                verified_requirement_ids: vec![goal.id.clone()],
+                requirements,
+                verified_requirement_ids,
                 evidence_refs: accepted.clone(),
                 worker_completion_text: "worker requests completion with verification evidence"
                     .to_string(),
@@ -1569,8 +1693,14 @@ impl<P: PolicyBoundary> AutonomousAgent<P> {
             ));
         }
         accepted.push(audit.evidence_ref);
-        self.kernel
+        self.kernel_lock()?
             .transition_mission(mission_id, MissionState::Completed, accepted)
+    }
+
+    fn kernel_lock(&self) -> AcResult<std::sync::MutexGuard<'_, ac_kernel::Kernel<P>>> {
+        self.kernel.lock().map_err(|_| {
+            AcError::conflict("AGENT-KERNEL_POISONED", "shared kernel lock is poisoned")
+        })
     }
 }
 
@@ -2286,10 +2416,58 @@ pub fn isolated_workspace_agent<P: PolicyBoundary>(
         worker.id.clone(),
     )?;
     let mut tools = ToolBroker::new(policy);
-    ac_tool::WorkspaceTools::new(worktree_root).register_all(&mut tools)?;
+    let workspace_tools = if std::env::var("AGENTCODE_TEST_PROCESS_RESTRICTED_TOOLS")
+        .ok()
+        .as_deref()
+        == Some("1")
+    {
+        ac_tool::WorkspaceTools::with_required_isolation(
+            worktree_root,
+            ac_sandbox::IsolationLevel::ProcessRestricted,
+        )
+    } else {
+        ac_tool::WorkspaceTools::new(worktree_root)
+    };
+    workspace_tools.register_all(&mut tools)?;
     Ok(AutonomousAgent::new(
         kernel,
         AgentSession::new(ac_runtime::Worker::assigned_to(worktree_id)),
+        default_provider_registry()?,
+        tools,
+        EvidenceStore::new(),
+        MemoryService::new(),
+        git,
+        VerificationEngine::new(CapabilityPolicy::new()),
+    ))
+}
+
+/// Builds the production agent stack around daemon-owned identity.  Unlike the
+/// standalone helper above this deliberately neither creates a mission nor a
+/// session: both are durable control-plane records created by the daemon.
+pub fn bound_workspace_agent<P: PolicyBoundary>(
+    source_root: PathBuf,
+    worktree_root: PathBuf,
+    kernel: Arc<Mutex<ac_kernel::Kernel<P>>>,
+    mission_id: StableId,
+    session: AgentSession,
+    policy: CapabilityPolicy,
+) -> AcResult<AutonomousAgent<P>> {
+    let worker = session.worker().clone();
+    let mut git = GitCoordinator::new();
+    let worktree_id = git.create_task_workspace(
+        source_root,
+        worktree_root.clone(),
+        mission_id.clone(),
+        worker.id.clone(),
+    )?;
+    let mut tools = ToolBroker::new(policy);
+    ac_tool::WorkspaceTools::new(worktree_root).register_all(&mut tools)?;
+    let mut session = session;
+    session.bind_workspace(worktree_id)?;
+    Ok(AutonomousAgent::new_bound(
+        kernel,
+        mission_id,
+        session,
         default_provider_registry()?,
         tools,
         EvidenceStore::new(),
@@ -3119,6 +3297,9 @@ mod tests {
     }
 
     struct EchoTool;
+    struct FixtureWorkspaceTool {
+        root: PathBuf,
+    }
 
     struct PromptAwareProvider;
 
@@ -3148,6 +3329,91 @@ mod tests {
                 return Ok("status:0\nstdout:ok\nstderr:".to_string());
             }
             Ok(request.payload.clone())
+        }
+    }
+
+    impl FixtureWorkspaceTool {
+        fn resolve(&self, relative: &str) -> AcResult<PathBuf> {
+            let path = Path::new(relative);
+            if path.is_absolute() {
+                return Err(AcError::policy_denied(
+                    "TEST-WORKSPACE_ABSOLUTE_PATH",
+                    "fixture workspace paths must be relative",
+                ));
+            }
+            let root = std::fs::canonicalize(&self.root)
+                .map_err(|error| AcError::validation("TEST-WORKSPACE_ROOT", error.to_string()))?;
+            let candidate = root.join(path);
+            let resolved = if candidate.exists() {
+                std::fs::canonicalize(&candidate).map_err(|error| {
+                    AcError::validation("TEST-WORKSPACE_PATH", error.to_string())
+                })?
+            } else {
+                let parent = candidate.parent().ok_or_else(|| {
+                    AcError::validation("TEST-WORKSPACE_PATH", "path has no parent")
+                })?;
+                let parent = std::fs::canonicalize(parent).map_err(|error| {
+                    AcError::validation("TEST-WORKSPACE_PATH", error.to_string())
+                })?;
+                parent.join(candidate.file_name().ok_or_else(|| {
+                    AcError::validation("TEST-WORKSPACE_PATH", "path has no file name")
+                })?)
+            };
+            if !resolved.starts_with(&root) {
+                return Err(AcError::policy_denied(
+                    "TEST-WORKSPACE_ESCAPE",
+                    "fixture tool path escaped the workspace",
+                ));
+            }
+            Ok(resolved)
+        }
+    }
+
+    impl ToolExecutor for FixtureWorkspaceTool {
+        fn execute(&self, request: &ToolRequest) -> AcResult<String> {
+            match request.tool_id.as_str() {
+                "fs.read" => {
+                    let path = self.resolve(request.payload.trim())?;
+                    std::fs::read_to_string(path)
+                        .map_err(|error| AcError::validation("TEST-FS_READ", error.to_string()))
+                }
+                "fs.write" => {
+                    let (path, content) = request.payload.split_once('\n').ok_or_else(|| {
+                        AcError::validation(
+                            "TEST-FS_WRITE_PAYLOAD",
+                            "write payload missing newline",
+                        )
+                    })?;
+                    let path = self.resolve(path.trim())?;
+                    std::fs::write(path, content)
+                        .map_err(|error| AcError::validation("TEST-FS_WRITE", error.to_string()))?;
+                    Ok("write:ok".to_string())
+                }
+                "dev.test" => {
+                    let output = std::process::Command::new("cargo")
+                        .args(["test", "--quiet"])
+                        .current_dir(&self.root)
+                        .output()
+                        .map_err(|error| {
+                            AcError::validation("TEST-CARGO_SPAWN", error.to_string())
+                        })?;
+                    let observation = format!(
+                        "status:{}\nstdout:{}\nstderr:{}",
+                        output.status.code().unwrap_or(-1),
+                        String::from_utf8_lossy(&output.stdout),
+                        String::from_utf8_lossy(&output.stderr)
+                    );
+                    if output.status.success() {
+                        Ok(observation)
+                    } else {
+                        Err(AcError::validation("TEST-CARGO_FAILED", observation))
+                    }
+                }
+                _ => Err(AcError::validation(
+                    "TEST-UNKNOWN_TOOL",
+                    "fixture workspace tool received unknown tool id",
+                )),
+            }
         }
     }
 
@@ -3465,6 +3731,34 @@ mod tests {
             GitCoordinator::new(),
             VerificationEngine::new(CapabilityPolicy::new()),
         )
+    }
+
+    #[test]
+    fn bound_agent_reuses_daemon_mission_without_creating_another() {
+        let kernel = Arc::new(Mutex::new(ac_kernel::Kernel::new(AllowAllPolicy)));
+        let mission_id = {
+            let mut guard = kernel.lock().unwrap();
+            guard.start().unwrap();
+            let id = guard.create_mission("daemon-owned goal").unwrap();
+            guard
+                .transition_mission(&id, MissionState::Active, Vec::new())
+                .unwrap();
+            id
+        };
+        let mut agent = agent_with_tool(CapabilityPolicy::new(), 0);
+        agent.kernel = Arc::clone(&kernel);
+        agent.bound_mission_id = Some(mission_id.clone());
+        let _ = agent.run_goal(Goal::new("daemon-owned goal").unwrap());
+        let guard = kernel.lock().unwrap();
+        assert!(guard.mission(&mission_id).is_some());
+        assert_eq!(
+            guard
+                .events()
+                .iter()
+                .filter(|event| event.decision == ac_kernel::KernelDecisionKind::CreateMission)
+                .count(),
+            1
+        );
     }
 
     fn agent_with_provider(
@@ -4418,20 +4712,55 @@ mod tests {
             std::env::remove_var(key);
         }
         std::env::set_var("AGENTCODE_PROVIDER_MODE", "mock");
-        let mut agent = isolated_workspace_agent(
-            source.clone(),
-            worktree.clone(),
-            ac_kernel::Kernel::new(AllowAllPolicy),
+        let mission_id = StableId::new("mission");
+        let worker = Worker::new();
+        let mut git = GitCoordinator::new();
+        let worktree_id = git
+            .create_task_workspace(
+                source.clone(),
+                worktree.clone(),
+                mission_id,
+                worker.id.clone(),
+            )
+            .unwrap();
+        let mut tools = ToolBroker::new(
             CapabilityPolicy::new()
                 .allow(Capability::FilesystemRead("*".to_string()))
                 .allow(Capability::FilesystemWrite("*".to_string()))
                 .allow(Capability::ProcessExec("*".to_string())),
-        )
-        .unwrap();
+        );
+        for id in ["fs.read", "fs.write", "dev.test"] {
+            tools
+                .register_tool(
+                    ToolDefinition {
+                        id: id.to_string(),
+                        version: "1".to_string(),
+                        required_capabilities: Vec::new(),
+                    },
+                    Box::new(FixtureWorkspaceTool {
+                        root: worktree.clone(),
+                    }),
+                )
+                .unwrap();
+        }
+        let mut agent = AutonomousAgent::new(
+            ac_kernel::Kernel::new(AllowAllPolicy),
+            AgentSession::new(Worker::assigned_to(worktree_id)),
+            default_provider_registry().unwrap(),
+            tools,
+            EvidenceStore::new(),
+            MemoryService::new(),
+            git,
+            VerificationEngine::new(CapabilityPolicy::new()),
+        );
         let mut report = agent
             .run_goal(Goal::new("Fix the bug in src/lib.rs").unwrap())
             .unwrap();
-        assert_eq!(report.state, AutonomousState::Completed);
+        assert_eq!(
+            report.state,
+            AutonomousState::Completed,
+            "report={report:?}"
+        );
         assert_eq!(
             std::fs::read_to_string(source.join("src/lib.rs")).unwrap(),
             "pub fn fixture_answer() -> u32 {\n    41\n}\n"
