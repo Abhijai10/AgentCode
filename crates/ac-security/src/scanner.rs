@@ -23,17 +23,17 @@ pub enum ScannerAvailability { Available, Unavailable, Misconfigured, Failed }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ScannerNetworkPolicy { Deny, Allow }
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ScannerConfiguration { pub adapter: SecurityAdapter, pub enabled: bool, pub required: bool, pub executable: String, pub timeout_ms: u64, pub network: ScannerNetworkPolicy, pub rules_path: Option<String> }
+pub struct ScannerConfiguration { pub adapter: SecurityAdapter, pub enabled: bool, pub required: bool, pub executable: String, pub timeout_ms: u64, pub network: ScannerNetworkPolicy, pub rules_path: Option<String>, pub data_dir: Option<PathBuf> }
 impl ScannerConfiguration {
     pub fn external(adapter: SecurityAdapter) -> Self {
         let executable = discover_scanner_executable(adapter).unwrap_or_else(|| default_scanner_executable(adapter).to_string());
-        Self { adapter, enabled: true, required: false, executable, timeout_ms: 60_000, network: ScannerNetworkPolicy::Deny, rules_path: None }
+        Self { adapter, enabled: true, required: false, executable, timeout_ms: 60_000, network: ScannerNetworkPolicy::Deny, rules_path: None, data_dir: None }
     }
 }
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ScannerCapabilities { pub scan_kinds: Vec<String>, pub requires_target_authorization: bool }
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ScannerProcessRequest { pub adapter: SecurityAdapter, pub executable: String, pub argv: Vec<String>, pub cwd: PathBuf, pub timeout_ms: u64, pub network: bool, pub cleanup_paths: Vec<PathBuf>, pub report_path: Option<PathBuf> }
+pub struct ScannerProcessRequest { pub adapter: SecurityAdapter, pub executable: String, pub argv: Vec<String>, pub cwd: PathBuf, pub timeout_ms: u64, pub network: bool, pub cleanup_paths: Vec<PathBuf>, pub report_path: Option<PathBuf>, pub env: BTreeMap<String, String> }
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ScannerProcessResult { pub exit_code: Option<i32>, pub stdout: String, pub stderr: String, pub stdout_truncated: bool, pub stderr_truncated: bool }
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -117,16 +117,31 @@ fn validate_config(config: &ScannerConfiguration, input: &ManagedSecurityScanInp
 fn is_external(adapter: SecurityAdapter) -> bool { matches!(adapter, SecurityAdapter::Gitleaks | SecurityAdapter::Osv | SecurityAdapter::Trivy | SecurityAdapter::Semgrep | SecurityAdapter::Checkov | SecurityAdapter::Zap) }
 fn version_request(config: &ScannerConfiguration, cwd: &Path) -> ScannerProcessRequest {
     let version_arg = if config.adapter == SecurityAdapter::Zap { "-version" } else { "--version" };
-    ScannerProcessRequest { adapter: config.adapter, executable: config.executable.clone(), argv: vec![config.executable.clone(), version_arg.to_string()], cwd: cwd.to_path_buf(), timeout_ms: config.timeout_ms.min(10_000), network: false, cleanup_paths: Vec::new(), report_path: None }
+    ScannerProcessRequest { adapter: config.adapter, executable: config.executable.clone(), argv: vec![config.executable.clone(), version_arg.to_string()], cwd: cwd.to_path_buf(), timeout_ms: config.timeout_ms.min(10_000), network: false, cleanup_paths: Vec::new(), report_path: None, env: BTreeMap::new() }
 }
 fn scan_request(c: &ScannerConfiguration, input: &ManagedSecurityScanInput) -> AcResult<ScannerProcessRequest> {
     let root = input.workspace_root.display().to_string();
     let mut cleanup_paths = Vec::new();
     let report_path = None;
+    let mut env = BTreeMap::new();
     let argv = match c.adapter {
         SecurityAdapter::Gitleaks => vec![c.executable.clone(), "detect".to_string(), "--source".to_string(), root, "--report-format".to_string(), "json".to_string(), "--report-path".to_string(), "/dev/stdout".to_string(), "--no-banner".to_string()],
-        SecurityAdapter::Osv => vec![c.executable.clone(), "scan".to_string(), "source".to_string(), "--format".to_string(), "json".to_string(), root],
-        SecurityAdapter::Trivy => vec![c.executable.clone(), "fs".to_string(), "--format".to_string(), "json".to_string(), "--offline-scan".to_string(), "--skip-db-update".to_string(), root],
+        SecurityAdapter::Osv => {
+            let data = scanner_data_dir(c, "osv");
+            if !data.exists() {
+                return Err(scanner_data_unavailable("OSV offline database is not prepared"));
+            }
+            env.insert("OSV_SCANNER_LOCAL_DB_CACHE_DIRECTORY".to_string(), data.join("osv").display().to_string());
+            env.insert("OSV_SCALIBR_LOCAL_DB_CACHE_DIRECTORY".to_string(), data.join("scalibr").display().to_string());
+            vec![c.executable.clone(), "scan".to_string(), "source".to_string(), "--offline".to_string(), "--offline-vulnerabilities".to_string(), "--format".to_string(), "json".to_string(), root]
+        },
+        SecurityAdapter::Trivy => {
+            let data = scanner_data_dir(c, "trivy");
+            if !data.join("db/trivy.db").is_file() || !data.join("db/metadata.json").is_file() {
+                return Err(scanner_data_unavailable("Trivy database is not prepared in the managed cache"));
+            }
+            vec![c.executable.clone(), "--cache-dir".to_string(), data.display().to_string(), "fs".to_string(), "--format".to_string(), "json".to_string(), "--offline-scan".to_string(), "--skip-db-update".to_string(), "--skip-java-db-update".to_string(), root]
+        },
         SecurityAdapter::Semgrep => {
             let rules = c.rules_path.clone().ok_or_else(|| AcError::policy_denied("SECURITY-SEMGREP_RULES_REQUIRED", "Semgrep requires a configured local rules path"))?;
             vec![c.executable.clone(), "scan".to_string(), "--json".to_string(), "--config".to_string(), rules, root]
@@ -140,7 +155,23 @@ fn scan_request(c: &ScannerConfiguration, input: &ManagedSecurityScanInput) -> A
         },
         _ => return Err(AcError::validation("SECURITY-SCANNER_MISCONFIGURED", "unsupported scanner")),
     };
-    Ok(ScannerProcessRequest { adapter: c.adapter, executable: c.executable.clone(), argv, cwd: input.workspace_root.clone(), timeout_ms: c.timeout_ms, network: c.network == ScannerNetworkPolicy::Allow, cleanup_paths, report_path })
+    Ok(ScannerProcessRequest { adapter: c.adapter, executable: c.executable.clone(), argv, cwd: input.workspace_root.clone(), timeout_ms: c.timeout_ms, network: c.network == ScannerNetworkPolicy::Allow, cleanup_paths, report_path, env })
+}
+fn scanner_data_dir(config: &ScannerConfiguration, scanner: &str) -> PathBuf {
+    config
+        .data_dir
+        .clone()
+        .unwrap_or_else(|| default_scanner_data_root().join(scanner))
+}
+fn default_scanner_data_root() -> PathBuf {
+    std::env::var_os("AGENTCODE_SCANNER_DATA_DIR")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("AGENTCODE_RUNTIME_DIR").map(|dir| PathBuf::from(dir).join("scanner-data")))
+        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join("Library/Application Support/AgentCode/runtime/scanner-data")))
+        .unwrap_or_else(|| std::env::temp_dir().join("agentcode-scanner-data"))
+}
+fn scanner_data_unavailable(message: &'static str) -> AcError {
+    AcError::new("SECURITY-SCANNER_DATA_UNAVAILABLE", message, ErrorKind::Unavailable, Retryability::NotRetryable)
 }
 fn default_scanner_executable(adapter: SecurityAdapter) -> &'static str {
     match adapter {

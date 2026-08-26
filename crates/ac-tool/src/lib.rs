@@ -73,6 +73,8 @@ pub struct ProcessRecord {
     pub state: ProcessState,
     pub started_at: TimestampMillis,
     pub sandbox: SandboxEvidence,
+    /// Temporary resources removed when the record reaches a terminal state.
+    pub cleanup_paths: Vec<PathBuf>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -123,12 +125,14 @@ impl SecurityScannerExecutor for GovernedScannerExecutor {
     ) -> Result<ScannerProcessResult, ScannerFailure> {
         let cleanup_paths = request.cleanup_paths.clone();
         let report_path = request.report_path.clone();
+        let mut env = toolchain_env();
+        env.extend(request.env.clone());
         let plan = self
             .sandbox
             .prepare_execution(ExecRequest {
                 argv: request.argv,
                 cwd: request.cwd,
-                env: toolchain_env(),
+                env,
                 network: request.network,
                 timeout_ms: request.timeout_ms,
             })
@@ -218,12 +222,14 @@ impl ProcessManager {
             state: ProcessState::Running,
             started_at: TimestampMillis::now(),
             sandbox: plan.sandbox_evidence.clone(),
+            cleanup_paths: plan.cleanup_paths.clone(),
         };
         self.records
             .lock()
             .expect("process records lock")
             .insert(id.clone(), record.clone());
         let deadline = Instant::now() + Duration::from_millis(plan.timeout_ms);
+        let cleanup_paths = plan.cleanup_paths.clone();
         loop {
             match child.try_wait().map_err(|error| {
                 AcError::validation("TOOL-COMMAND_WAIT_FAILED", error.to_string())
@@ -242,6 +248,7 @@ impl ProcessManager {
                         .lock()
                         .expect("process records lock")
                         .insert(id, finished.clone());
+                    cleanup_plan_paths(&cleanup_paths);
                     return Ok(NativeProcessResult {
                         record: finished,
                         exit_code: status.code(),
@@ -260,6 +267,7 @@ impl ProcessManager {
                         .lock()
                         .expect("process records lock")
                         .insert(id, cancelled_record);
+                    cleanup_plan_paths(&cleanup_paths);
                     return Err(AcError::new(
                         "TOOL-COMMAND_CANCELLED",
                         "command was cancelled and was killed",
@@ -276,6 +284,7 @@ impl ProcessManager {
                         .lock()
                         .expect("process records lock")
                         .insert(id, timed_out);
+                    cleanup_plan_paths(&cleanup_paths);
                     return Err(AcError::new(
                         "TOOL-COMMAND_TIMEOUT",
                         "command timed out and was killed",
@@ -323,6 +332,7 @@ impl ProcessManager {
             state: ProcessState::Running,
             started_at: TimestampMillis::now(),
             sandbox: plan.sandbox_evidence,
+            cleanup_paths: plan.cleanup_paths.clone(),
         };
         self.children
             .lock()
@@ -361,8 +371,17 @@ impl ProcessManager {
         let record = records.get_mut(id).ok_or_else(|| {
             AcError::validation("TOOL-PROCESS_UNKNOWN", "process record is not registered")
         })?;
+        let cleanup_paths = record.cleanup_paths.clone();
         record.state = ProcessState::Cancelled;
+        drop(records);
+        cleanup_plan_paths(&cleanup_paths);
         Ok(())
+    }
+}
+
+fn cleanup_plan_paths(paths: &[PathBuf]) {
+    for path in paths {
+        let _ = fs::remove_file(path);
     }
 }
 
@@ -1321,6 +1340,7 @@ struct SecurityVerifyInput {
     required_scanners: Vec<SecurityAdapter>,
     optional_scanners: Vec<SecurityAdapter>,
     semgrep_rules_path: Option<String>,
+    scanner_data_dir: Option<PathBuf>,
     dast_target: Option<String>,
     dast_target_authorized: bool,
 }
@@ -1342,6 +1362,10 @@ impl SecurityVerifyInput {
                 .get("semgrep_rules_path")
                 .and_then(Value::as_str)
                 .map(ToString::to_string),
+            scanner_data_dir: value
+                .get("scanner_data_dir")
+                .and_then(Value::as_str)
+                .map(PathBuf::from),
             dast_target: value
                 .get("dast_target")
                 .and_then(Value::as_str)
@@ -1407,6 +1431,13 @@ fn scanner_configuration(
     config.required = required;
     if matches!(scanner, SecurityAdapter::Osv | SecurityAdapter::Trivy) {
         config.timeout_ms = 180_000;
+        config.data_dir = Some(
+            input
+                .scanner_data_dir
+                .clone()
+                .unwrap_or_else(default_scanner_data_root)
+                .join(scanner_name(scanner)),
+        );
     }
     if scanner == SecurityAdapter::Semgrep {
         config.rules_path = input.semgrep_rules_path.clone();
@@ -1432,6 +1463,22 @@ fn scanner_name(scanner: SecurityAdapter) -> &'static str {
         SecurityAdapter::Zap => "zap",
         _ => "agentcode",
     }
+}
+
+fn default_scanner_data_root() -> PathBuf {
+    std::env::var_os("AGENTCODE_SCANNER_DATA_DIR")
+        .map(PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("AGENTCODE_RUNTIME_DIR")
+                .map(|dir| PathBuf::from(dir).join("scanner-data"))
+        })
+        .or_else(|| {
+            std::env::var_os("HOME").map(|home| {
+                PathBuf::from(home)
+                    .join("Library/Application Support/AgentCode/runtime/scanner-data")
+            })
+        })
+        .unwrap_or_else(|| std::env::temp_dir().join("agentcode-scanner-data"))
 }
 
 fn source_revision_from_git_files(root: &Path) -> String {
@@ -2068,7 +2115,7 @@ mod tests {
     #[test]
     #[ignore = "requires local Chrome/Chromium"]
     fn operational_browser_verify_runs_real_cdp_through_toolbroker() {
-        let (url, handle) = localhost_fixture(
+        let fixture = localhost_fixture(
             "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: 83\r\n\r\n<html><body><main>AgentCode browser proof</main><button>Verify</button></body></html>",
         );
         let mut broker =
@@ -2091,7 +2138,7 @@ mod tests {
                     tool_id: "browser.verify".to_string(),
                     tool_version: "1".to_string(),
                     payload: json!({
-                        "target_url": url,
+                        "target_url": fixture.url(),
                         "assertions": [
                             {"kind": "visible_text_contains", "text": "AgentCode browser proof"},
                             {"kind": "no_console_errors"}
@@ -2104,7 +2151,7 @@ mod tests {
                 &mut evidence,
             )
             .unwrap();
-        handle.join().unwrap();
+        fixture.stop();
         assert_eq!(
             result.status,
             ToolStatus::Succeeded,
@@ -2206,6 +2253,10 @@ mod tests {
             .and_then(Path::parent)
             .unwrap()
             .to_path_buf();
+        let scanner_data =
+            std::env::temp_dir().join(format!("agentcode-scanner-data-{}", StableId::new("t")));
+        seed_trivy_cache(&scanner_data);
+        prepare_osv_offline_database(&root, &scanner_data);
         let mut broker = ToolBroker::new(
             CapabilityPolicy::new()
                 .allow(Capability::SecurityScan)
@@ -2223,7 +2274,11 @@ mod tests {
                     id: StableId::new("toolreq"),
                     tool_id: "security.verify".to_string(),
                     tool_version: "1".to_string(),
-                    payload: json!({"required_scanners": ["osv", "trivy"]}).to_string(),
+                    payload: json!({
+                        "required_scanners": ["osv", "trivy"],
+                        "scanner_data_dir": scanner_data.display().to_string()
+                    })
+                    .to_string(),
                     capabilities: Vec::new(),
                 },
                 &mut EvidenceStore::new(),
@@ -2240,6 +2295,7 @@ mod tests {
         assert!(result
             .observation
             .contains("\"provenance\":\"ExternalTool\""));
+        let _ = fs::remove_dir_all(scanner_data);
     }
 
     #[test]
@@ -2253,6 +2309,9 @@ mod tests {
             "AgentCode Trivy zero-finding fixture\n",
         )
         .unwrap();
+        let scanner_data =
+            std::env::temp_dir().join(format!("agentcode-scanner-data-{}", StableId::new("t")));
+        seed_trivy_cache(&scanner_data);
         let mut broker = ToolBroker::new(
             CapabilityPolicy::new()
                 .allow(Capability::SecurityScan)
@@ -2270,7 +2329,11 @@ mod tests {
                     id: StableId::new("toolreq"),
                     tool_id: "security.verify".to_string(),
                     tool_version: "1".to_string(),
-                    payload: json!({"required_scanners": ["trivy"]}).to_string(),
+                    payload: json!({
+                        "required_scanners": ["trivy"],
+                        "scanner_data_dir": scanner_data.display().to_string()
+                    })
+                    .to_string(),
                     capabilities: Vec::new(),
                 },
                 &mut EvidenceStore::new(),
@@ -2296,6 +2359,7 @@ mod tests {
             "{}",
             result.observation
         );
+        let _ = fs::remove_dir_all(scanner_data);
         let _ = fs::remove_dir_all(root);
     }
 
@@ -2349,7 +2413,7 @@ mod tests {
     #[test]
     #[ignore = "requires ZAP installed"]
     fn operational_security_verify_runs_real_zap_against_localhost_through_toolbroker() {
-        let (url, handle) = localhost_fixture(
+        let fixture = localhost_fixture(
             "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: 44\r\n\r\n<html><body>AgentCode ZAP proof</body></html>",
         );
         let root = std::env::temp_dir().join(format!("agentcode-real-zap-{}", StableId::new("t")));
@@ -2373,7 +2437,7 @@ mod tests {
                     tool_version: "1".to_string(),
                     payload: json!({
                         "required_scanners": ["zap"],
-                        "dast_target": url,
+                        "dast_target": fixture.url(),
                         "dast_target_authorized": true
                     })
                     .to_string(),
@@ -2382,7 +2446,7 @@ mod tests {
                 &mut EvidenceStore::new(),
             )
             .unwrap();
-        handle.join().unwrap();
+        fixture.stop();
         assert_eq!(
             result.status,
             ToolStatus::Succeeded,
@@ -2396,23 +2460,96 @@ mod tests {
         let _ = fs::remove_dir_all(root);
     }
 
-    fn localhost_fixture(response: &'static str) -> (String, thread::JoinHandle<()>) {
+    struct LocalhostFixture {
+        url: String,
+        stop: Arc<AtomicBool>,
+        handle: thread::JoinHandle<()>,
+    }
+
+    impl LocalhostFixture {
+        fn url(&self) -> String {
+            self.url.clone()
+        }
+
+        fn stop(self) {
+            self.stop.store(true, Ordering::Relaxed);
+            let _ = self.handle.join();
+        }
+    }
+
+    fn localhost_fixture(response: &'static str) -> LocalhostFixture {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         listener.set_nonblocking(true).unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
+        let stop = Arc::new(AtomicBool::new(false));
+        let signal = stop.clone();
         let handle = thread::spawn(move || {
             let deadline = Instant::now() + Duration::from_secs(120);
-            while Instant::now() < deadline {
+            while Instant::now() < deadline && !signal.load(Ordering::Relaxed) {
                 if let Ok((mut stream, _)) = listener.accept() {
                     let mut buffer = [0_u8; 1024];
                     let _ = std::io::Read::read(&mut stream, &mut buffer);
                     let _ = stream.write_all(response.as_bytes());
-                    return;
                 }
                 thread::sleep(Duration::from_millis(25));
             }
         });
-        (url, handle)
+        LocalhostFixture { url, stop, handle }
+    }
+
+    fn seed_trivy_cache(scanner_data: &Path) {
+        let Some(home) = std::env::var_os("HOME") else {
+            panic!("HOME is required to locate the preinstalled Trivy cache");
+        };
+        let source = PathBuf::from(home).join("Library/Caches/trivy");
+        assert!(
+            source.join("db/trivy.db").is_file() && source.join("db/metadata.json").is_file(),
+            "preinstalled Trivy cache is required for offline operational proof"
+        );
+        let target = scanner_data.join("trivy");
+        copy_dir_all(&source, &target).unwrap();
+    }
+
+    fn prepare_osv_offline_database(project_root: &Path, scanner_data: &Path) {
+        let target = scanner_data.join("osv-scanner");
+        fs::create_dir_all(&target).unwrap();
+        let output = Command::new("osv-scanner")
+            .args([
+                "scan",
+                "source",
+                "--offline-vulnerabilities",
+                "--download-offline-databases",
+                "--format",
+                "json",
+                project_root.to_str().unwrap(),
+            ])
+            .env("OSV_SCANNER_LOCAL_DB_CACHE_DIRECTORY", target.join("osv"))
+            .env(
+                "OSV_SCALIBR_LOCAL_DB_CACHE_DIRECTORY",
+                target.join("scalibr"),
+            )
+            .output()
+            .unwrap();
+        assert!(
+            matches!(output.status.code(), Some(0) | Some(1)),
+            "OSV offline database preparation failed: {}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    fn copy_dir_all(from: &Path, to: &Path) -> std::io::Result<()> {
+        fs::create_dir_all(to)?;
+        for entry in fs::read_dir(from)? {
+            let entry = entry?;
+            let target = to.join(entry.file_name());
+            if entry.file_type()?.is_dir() {
+                copy_dir_all(&entry.path(), &target)?;
+            } else {
+                fs::copy(entry.path(), target)?;
+            }
+        }
+        Ok(())
     }
 
     #[test]
@@ -2506,6 +2643,295 @@ mod tests {
         let _ = fs::remove_dir_all(root);
     }
 
+    #[test]
+    fn governed_network_request_is_denied_by_default() {
+        let root = std::env::temp_dir().join(format!("agentcode-tool-{}", StableId::new("t")));
+        fs::create_dir_all(&root).unwrap();
+        let listener = match std::net::TcpListener::bind("127.0.0.1:0") {
+            Ok(listener) => listener,
+            Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
+                eprintln!("localhost bind is environment-blocked; skipping network sandbox proof");
+                let _ = fs::remove_dir_all(root);
+                return;
+            }
+            Err(error) => panic!("unexpected localhost bind failure: {error}"),
+        };
+        let port = listener.local_addr().unwrap().port();
+        let done = Arc::new(AtomicBool::new(false));
+        let done_signal = done.clone();
+        let handle = std::thread::spawn(move || {
+            listener.set_nonblocking(true).unwrap();
+            let deadline = Instant::now() + Duration::from_secs(30);
+            while Instant::now() < deadline && !done_signal.load(Ordering::Relaxed) {
+                if let Ok((mut stream, _)) = listener.accept() {
+                    let _ = std::io::Write::write_all(
+                        &mut stream,
+                        b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok",
+                    );
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        });
+        let direct = Command::new("/usr/bin/curl")
+            .args(["-s", "-m", "5", &format!("http://127.0.0.1:{port}/")])
+            .output()
+            .unwrap();
+        assert_eq!(
+            String::from_utf8_lossy(&direct.stdout).trim(),
+            "ok",
+            "fixture must be reachable directly"
+        );
+        let mut broker = ToolBroker::new(
+            CapabilityPolicy::new()
+                .allow(Capability::FilesystemRead("*".to_string()))
+                .allow(Capability::ProcessExec("*".to_string())),
+        );
+        WorkspaceTools::new(root.clone())
+            .register_all(&mut broker)
+            .unwrap();
+        let mut evidence = EvidenceStore::new();
+        let result = broker
+            .invoke(
+                ToolRequest {
+                    id: StableId::new("toolreq"),
+                    tool_id: "cmd.exec".to_string(),
+                    tool_version: "1".to_string(),
+                    payload: format!("/usr/bin/curl\n-sS\n-m\n5\nhttp://127.0.0.1:{port}/"),
+                    capabilities: vec![Capability::ProcessExec("/usr/bin/curl".to_string())],
+                },
+                &mut evidence,
+            )
+            .unwrap();
+        done.store(true, Ordering::Relaxed);
+        handle.join().unwrap();
+        assert_eq!(
+            result.status,
+            ToolStatus::Failed,
+            "network must be denied by default: {}",
+            result.observation
+        );
+        assert!(
+            result.observation.contains("status:7")
+                || result.observation.contains("Operation not permitted"),
+            "{}",
+            result.observation
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn governed_command_cannot_read_sensitive_file_outside_workspace() {
+        let root = std::env::temp_dir().join(format!("agentcode-tool-{}", StableId::new("t")));
+        fs::create_dir_all(&root).unwrap();
+        let home = std::env::var("HOME").unwrap_or_default();
+        let documents_dir = Path::new(&home).join("Documents");
+        if let Err(error) = fs::create_dir_all(&documents_dir) {
+            if error.kind() == std::io::ErrorKind::PermissionDenied {
+                eprintln!(
+                    "home Documents setup is environment-blocked; skipping outside-home proof"
+                );
+                let _ = fs::remove_dir_all(root);
+                return;
+            }
+            panic!("unexpected Documents setup failure: {error}");
+        }
+        let outside_file = documents_dir.join(format!(
+            "agentcode-outside-workspace-probe-{}",
+            StableId::new("t")
+        ));
+        if let Err(error) = fs::write(&outside_file, "harmless outside workspace probe\n") {
+            if error.kind() == std::io::ErrorKind::PermissionDenied {
+                eprintln!("home file setup is environment-blocked; skipping outside-home proof");
+                let _ = fs::remove_dir_all(root);
+                return;
+            }
+            panic!("unexpected outside file setup failure: {error}");
+        }
+        let outside_write = documents_dir.join(format!(
+            "agentcode-outside-workspace-write-{}",
+            StableId::new("t")
+        ));
+        let sensitive_dir = Path::new(&home).join(".ssh");
+        if let Err(error) = fs::create_dir_all(&sensitive_dir) {
+            if error.kind() == std::io::ErrorKind::PermissionDenied {
+                eprintln!(
+                    "home credential setup is environment-blocked; skipping sensitive-home proof"
+                );
+                let _ = fs::remove_file(&outside_file);
+                let _ = fs::remove_dir_all(root);
+                return;
+            }
+            panic!("unexpected sensitive directory setup failure: {error}");
+        }
+        let sensitive_file =
+            sensitive_dir.join(format!("agentcode-sensitive-probe-{}", StableId::new("t")));
+        if let Err(error) = fs::write(&sensitive_file, "fake-secret-value\n") {
+            if error.kind() == std::io::ErrorKind::PermissionDenied {
+                eprintln!("home credential file setup is environment-blocked; skipping sensitive-home proof");
+                let _ = fs::remove_file(&outside_file);
+                let _ = fs::remove_dir_all(root);
+                return;
+            }
+            panic!("unexpected sensitive file setup failure: {error}");
+        }
+        let mut broker = ToolBroker::new(
+            CapabilityPolicy::new()
+                .allow(Capability::FilesystemRead("*".to_string()))
+                .allow(Capability::FilesystemWrite("*".to_string()))
+                .allow(Capability::ProcessExec("*".to_string())),
+        );
+        WorkspaceTools::new(root.clone())
+            .register_all(&mut broker)
+            .unwrap();
+        let mut evidence = EvidenceStore::new();
+        let result = broker
+            .invoke(
+                ToolRequest {
+                    id: StableId::new("toolreq"),
+                    tool_id: "cmd.exec".to_string(),
+                    tool_version: "1".to_string(),
+                    payload: format!("/bin/cat\n{}", outside_file.display()),
+                    capabilities: vec![Capability::ProcessExec("/bin/cat".to_string())],
+                },
+                &mut evidence,
+            )
+            .unwrap();
+        assert_eq!(
+            result.status,
+            ToolStatus::Failed,
+            "arbitrary home file read must be denied: {}",
+            result.observation
+        );
+        assert!(
+            result.observation.contains("Operation not permitted"),
+            "{}",
+            result.observation
+        );
+        let result = broker
+            .invoke(
+                ToolRequest {
+                    id: StableId::new("toolreq"),
+                    tool_id: "cmd.exec".to_string(),
+                    tool_version: "1".to_string(),
+                    payload: format!("/usr/bin/touch\n{}", outside_write.display()),
+                    capabilities: vec![Capability::ProcessExec("/usr/bin/touch".to_string())],
+                },
+                &mut evidence,
+            )
+            .unwrap();
+        assert_eq!(
+            result.status,
+            ToolStatus::Failed,
+            "outside workspace write must be denied: {}",
+            result.observation
+        );
+        assert!(
+            result.observation.contains("Operation not permitted"),
+            "{}",
+            result.observation
+        );
+        assert!(!outside_write.exists());
+        let result = broker
+            .invoke(
+                ToolRequest {
+                    id: StableId::new("toolreq"),
+                    tool_id: "cmd.exec".to_string(),
+                    tool_version: "1".to_string(),
+                    payload: format!("/bin/cat\n{}", sensitive_file.display()),
+                    capabilities: vec![Capability::ProcessExec("/bin/cat".to_string())],
+                },
+                &mut evidence,
+            )
+            .unwrap();
+        assert_eq!(
+            result.status,
+            ToolStatus::Failed,
+            "sensitive file read must be denied: {}",
+            result.observation
+        );
+        assert!(
+            result.observation.contains("Operation not permitted"),
+            "{}",
+            result.observation
+        );
+        let _ = fs::remove_file(&outside_file);
+        let _ = fs::remove_file(&sensitive_file);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn sandbox_profile_files_are_removed_after_success_cancellation_and_timeout() {
+        let root = std::env::temp_dir().join(format!("agentcode-tool-{}", StableId::new("t")));
+        fs::create_dir_all(&root).unwrap();
+        let sandbox = workspace_sandbox(&root, ac_sandbox::IsolationLevel::FilesystemIsolated);
+        let manager = ProcessManager::default();
+        let success = match sandbox.prepare_execution(ExecRequest {
+            argv: vec!["/bin/echo".to_string(), "cleanup".to_string()],
+            cwd: root.clone(),
+            env: BTreeMap::new(),
+            network: false,
+            timeout_ms: 1_000,
+        }) {
+            Ok(plan) => plan,
+            Err(error) if error.code() == "SANDBOX-ISOLATION_UNSUPPORTED" => {
+                eprintln!("filesystem sandbox is unavailable in this environment; skipping profile cleanup proof");
+                let _ = fs::remove_dir_all(root);
+                return;
+            }
+            Err(error) => panic!("unexpected sandbox prepare failure: {error:?}"),
+        };
+        let success_profiles = success.cleanup_paths.clone();
+        assert!(!success_profiles.is_empty(), "macOS plan owns a profile");
+        manager.run("cleanup", success).unwrap();
+        for profile in &success_profiles {
+            assert!(!profile.exists(), "profile leaked after successful exit");
+        }
+        let timeout = sandbox
+            .prepare_execution(ExecRequest {
+                argv: vec!["/bin/sleep".to_string(), "1".to_string()],
+                cwd: root.clone(),
+                env: BTreeMap::new(),
+                network: false,
+                timeout_ms: 20,
+            })
+            .unwrap();
+        let timeout_profiles = timeout.cleanup_paths.clone();
+        assert_eq!(
+            manager.run("timeout", timeout).unwrap_err().code(),
+            "TOOL-COMMAND_TIMEOUT"
+        );
+        for profile in &timeout_profiles {
+            assert!(!profile.exists(), "profile leaked after timeout");
+        }
+        let cancelled = sandbox
+            .prepare_execution(ExecRequest {
+                argv: vec!["/bin/sleep".to_string(), "1".to_string()],
+                cwd: root.clone(),
+                env: BTreeMap::new(),
+                network: false,
+                timeout_ms: 1_000,
+            })
+            .unwrap();
+        let cancelled_profiles = cancelled.cleanup_paths.clone();
+        let cancelled_flag = Arc::new(AtomicBool::new(false));
+        let signal = cancelled_flag.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(20));
+            signal.store(true, Ordering::Relaxed);
+        });
+        assert_eq!(
+            manager
+                .run_with_cancellation("cancel", cancelled, &cancelled_flag)
+                .unwrap_err()
+                .code(),
+            "TOOL-COMMAND_CANCELLED"
+        );
+        for profile in &cancelled_profiles {
+            assert!(!profile.exists(), "profile leaked after cancellation");
+        }
+        let _ = fs::remove_dir_all(root);
+    }
+
     fn permitted_sandbox(root: PathBuf, timeout_ms: u64) -> SandboxManager {
         SandboxManager::new(SandboxPolicy {
             workspace_roots: vec![root.clone()],
@@ -2593,6 +3019,7 @@ mod tests {
                 network: false,
                 cleanup_paths: Vec::new(),
                 report_path: None,
+                env: BTreeMap::new(),
             })
             .unwrap();
         assert_eq!(result.exit_code, Some(0));

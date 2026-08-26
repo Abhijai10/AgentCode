@@ -60,6 +60,9 @@ pub struct PreparedSandboxExecution {
     pub cwd: PathBuf,
     pub allowed_env: BTreeMap<String, String>,
     pub evidence: SandboxEvidence,
+    /// Temporary resources (e.g. generated sandbox profiles) that must be
+    /// removed once the governed process exits, is cancelled, or times out.
+    pub cleanup_paths: Vec<PathBuf>,
 }
 
 pub trait SandboxBackend: Send + Sync {
@@ -97,6 +100,9 @@ pub struct SandboxedExecutionPlan {
     pub timeout_ms: u64,
     pub max_output_bytes: usize,
     pub sandbox_evidence: SandboxEvidence,
+    /// Temporary resources owned by the plan that the executor must remove
+    /// after the governed process exits, is cancelled, or times out.
+    pub cleanup_paths: Vec<PathBuf>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -301,6 +307,7 @@ impl SandboxManager {
             timeout_ms: request.timeout_ms,
             max_output_bytes: self.policy.max_output_bytes,
             sandbox_evidence: prepared.evidence,
+            cleanup_paths: prepared.cleanup_paths,
         })
     }
 
@@ -427,6 +434,7 @@ impl SandboxBackend for ProcessRestrictedBackend {
             cwd: request.cwd.clone(),
             allowed_env: request.allowed_env.clone(),
             evidence: evidence_for(self.name(), request, IsolationLevel::ProcessRestricted),
+            cleanup_paths: Vec::new(),
         })
     }
 }
@@ -487,6 +495,7 @@ impl SandboxBackend for MacosSandboxExecBackend {
             cwd: request.cwd.clone(),
             allowed_env: request.allowed_env.clone(),
             evidence: evidence_for(self.name(), request, IsolationLevel::FilesystemIsolated),
+            cleanup_paths: vec![profile],
         })
     }
 }
@@ -568,6 +577,7 @@ impl SandboxBackend for LinuxBubblewrapBackend {
             cwd: request.cwd.clone(),
             allowed_env: request.allowed_env.clone(),
             evidence: evidence_for(self.name(), request, IsolationLevel::Strong),
+            cleanup_paths: Vec::new(),
         })
     }
 }
@@ -580,54 +590,95 @@ fn command_available(command: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// Probes the macOS sandbox backend with the SAME deny-by-default profile the
+/// production backend will generate. `(allow default)` is intentionally never
+/// used: that probe can report success while the real profile cannot execute
+/// a governed command. The backend only claims FilesystemIsolated capability
+/// when a real governed command succeeds under the production profile.
 #[cfg(target_os = "macos")]
 fn macos_sandbox_exec_usable() -> bool {
-    let path = std::env::temp_dir().join(format!(
-        "agentcode-sandbox-probe-{}.sb",
-        StableId::new("probe")
-    ));
-    if fs::write(&path, "(version 1)\n(allow default)\n").is_err() {
+    if !command_available("sandbox-exec") {
         return false;
     }
+    let workspace = std::env::temp_dir().join(format!(
+        "agentcode-sandbox-probe-{}",
+        StableId::new("probe")
+    ));
+    if fs::create_dir_all(&workspace).is_err() {
+        return false;
+    }
+    let request = SandboxBackendRequest {
+        argv: vec!["/bin/echo".to_string(), "agentcode-probe-ok".to_string()],
+        cwd: workspace.clone(),
+        allowed_env: BTreeMap::new(),
+        workspace_roots: vec![workspace.clone()],
+        timeout_ms: 10_000,
+        network_policy: NetworkPolicy::DenyAll,
+        required_isolation: IsolationLevel::FilesystemIsolated,
+        max_output_bytes: 128,
+    };
+    let profile_path = match write_macos_profile(&request) {
+        Ok(path) => path,
+        Err(_) => {
+            let _ = fs::remove_dir_all(&workspace);
+            return false;
+        }
+    };
     let usable = Command::new("/usr/bin/sandbox-exec")
         .arg("-f")
-        .arg(&path)
-        .arg("/usr/bin/true")
+        .arg(&profile_path)
+        .args(&request.argv)
         .env_clear()
-        .stdout(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null())
-        .status()
-        .map(|status| status.success())
+        .output()
+        .map(|output| {
+            output.status.success()
+                && String::from_utf8_lossy(&output.stdout).trim() == "agentcode-probe-ok"
+        })
         .unwrap_or(false);
-    let _ = fs::remove_file(path);
+    let _ = fs::remove_file(profile_path);
+    let _ = fs::remove_dir_all(workspace);
     usable
 }
 
+/// Generates the deny-by-default macOS sandbox profile used for real governed
+/// commands.
+///
+/// macOS 26.5 can load dyld shared-cache artifacts from Cryptex paths under
+/// `/System/Volumes/Preboot/Cryptexes`. The profile grants those platform
+/// mounts explicitly instead of granting root-wide reads. Workspace and managed
+/// temporary areas are writable; ordinary user-home files outside those roots
+/// remain unreadable and unwritable.
 fn write_macos_profile(request: &SandboxBackendRequest) -> AcResult<PathBuf> {
     let profile_path =
         std::env::temp_dir().join(format!("agentcode-sandbox-{}.sb", StableId::new("profile")));
-    let mut profile =
-        String::from("(version 1)\n(deny default)\n(allow process*)\n(allow sysctl-read)\n");
-    profile.push_str("(allow file-read* (literal \"/dev/null\") (literal \"/dev/urandom\") (subpath \"/usr\") (subpath \"/bin\") (subpath \"/System\") (subpath \"/Library\"))\n");
-    if let Ok(home) = std::env::var("HOME") {
-        let home = escape_profile_string(&home);
-        profile.push_str(&format!(
-            "(deny file-read* (subpath \"{home}/.ssh\") (subpath \"{home}/.aws\") (subpath \"{home}/.config/gcloud\"))\n"
-        ));
-    }
-    for key in ["CARGO_HOME", "RUSTUP_HOME"] {
-        if let Some(path) = request.allowed_env.get(key) {
-            allow_profile_subpath(&mut profile, path, true);
-        }
-    }
-    if let Some(path) = request.allowed_env.get("PATH") {
-        for dir in std::env::split_paths(path) {
-            allow_profile_subpath(&mut profile, &dir.display().to_string(), false);
-        }
-    }
+    let mut profile = String::from(
+        "(version 1)\n\
+         (deny default)\n\
+         (allow process*)\n\
+         (allow sysctl-read)\n\
+         (allow mach-lookup)\n\
+         (allow signal)\n\
+         (allow ipc-posix*)\n\
+         (allow file-read* \
+             (literal \"/dev/null\") \
+             (literal \"/dev/urandom\") \
+             (literal \"/dev/zero\") \
+             (subpath \"/bin\") \
+             (subpath \"/sbin\") \
+             (subpath \"/usr\") \
+             (subpath \"/System\") \
+             (subpath \"/Library\") \
+             (subpath \"/opt/homebrew\") \
+             (subpath \"/System/Volumes/Preboot/Cryptexes\") \
+             (subpath \"/private/preboot/Cryptexes\"))\n",
+    );
+    profile.push_str(
+        "(allow file-write* (literal \"/dev/null\") (literal \"/dev/urandom\") (literal \"/dev/zero\"))\n",
+    );
     for root in &request.workspace_roots {
-        let root = fs::canonicalize(root)
-            .map_err(|error| AcError::validation("SANDBOX-PATH_RESOLUTION", error.to_string()))?;
+        let root = fs::canonicalize(root).unwrap_or_else(|_| root.clone());
         profile.push_str(&format!(
             "(allow file-read* file-write* (subpath \"{}\"))\n",
             escape_profile_string(&root.display().to_string())
@@ -638,6 +689,10 @@ fn write_macos_profile(request: &SandboxBackendRequest) -> AcResult<PathBuf> {
         "(allow file-read* file-write* (subpath \"{}\"))\n",
         escape_profile_string(&temp.display().to_string())
     ));
+    profile.push_str(
+        "(allow file-read* file-write* (subpath \"/private/tmp\"))\n\
+         (allow file-write* (subpath \"/tmp\"))\n",
+    );
     if request.network_policy == NetworkPolicy::AllowAll {
         profile.push_str("(allow network*)\n");
     }
@@ -672,20 +727,6 @@ fn resolve_backend_argv(request: &SandboxBackendRequest) -> AcResult<Vec<String>
         ac_common::ErrorKind::Validation,
         ac_common::Retryability::NotRetryable,
     ))
-}
-
-fn allow_profile_subpath(profile: &mut String, path: &str, writable: bool) {
-    let path = PathBuf::from(path);
-    let resolved = fs::canonicalize(&path).unwrap_or(path);
-    let access = if writable {
-        "file-read* file-write*"
-    } else {
-        "file-read*"
-    };
-    profile.push_str(&format!(
-        "(allow {access} (subpath \"{}\"))\n",
-        escape_profile_string(&resolved.display().to_string())
-    ));
 }
 
 fn escape_profile_string(value: &str) -> String {
@@ -771,6 +812,33 @@ mod tests {
             })
             .unwrap_err();
         assert_eq!(err.code(), "SANDBOX-ISOLATION_UNSUPPORTED");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn macos_profile_does_not_grant_root_wide_reads() {
+        let root = std::env::temp_dir().join(format!("agentcode-sandbox-{}", StableId::new("t")));
+        std::fs::create_dir_all(&root).unwrap();
+        let profile = write_macos_profile(&SandboxBackendRequest {
+            argv: vec!["/bin/echo".to_string(), "ok".to_string()],
+            cwd: root.clone(),
+            allowed_env: BTreeMap::new(),
+            workspace_roots: vec![root.clone()],
+            timeout_ms: 1_000,
+            network_policy: NetworkPolicy::DenyAll,
+            required_isolation: IsolationLevel::FilesystemIsolated,
+            max_output_bytes: 1024,
+        })
+        .unwrap();
+        let text = std::fs::read_to_string(&profile).unwrap();
+        assert!(!text.contains("(allow file-read* (subpath \"/\"))"));
+        assert!(text.contains("(subpath \"/System/Volumes/Preboot/Cryptexes\")"));
+        let resolved_root = std::fs::canonicalize(&root).unwrap_or_else(|_| root.clone());
+        assert!(text.contains(&format!(
+            "(allow file-read* file-write* (subpath \"{}\"))",
+            escape_profile_string(&resolved_root.display().to_string())
+        )));
+        let _ = std::fs::remove_file(profile);
         let _ = std::fs::remove_dir_all(root);
     }
 }
