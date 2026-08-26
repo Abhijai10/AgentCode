@@ -80,6 +80,8 @@ pub struct ProjectCapabilities {
     pub cargo: bool,
     pub makefile: bool,
     pub package_json: bool,
+    pub python: bool,
+    pub go: bool,
     pub browser: bool,
     pub security: bool,
 }
@@ -811,7 +813,8 @@ impl VerificationEngine {
     ) -> VerificationProfile {
         let mut layers = BTreeSet::new();
         layers.insert(VerificationLayer::Format);
-        if capabilities.cargo || capabilities.package_json {
+        if capabilities.cargo || capabilities.package_json || capabilities.python || capabilities.go
+        {
             layers.insert(VerificationLayer::Lint);
             layers.insert(VerificationLayer::Typecheck);
             layers.insert(VerificationLayer::Unit);
@@ -2687,11 +2690,21 @@ pub fn detect_project_capabilities(root: &Path) -> ProjectCapabilities {
         cargo: root.join("Cargo.toml").exists(),
         makefile: root.join("Makefile").exists(),
         package_json: root.join("package.json").exists(),
+        python: has_python_test_capability(root),
+        go: root.join("go.mod").exists(),
         browser: root.join("playwright.config.ts").exists()
             || root.join("playwright.config.js").exists(),
         security: root.join("deny.toml").exists()
             || root.join(".cargo").join("audit.toml").exists(),
     }
+}
+
+fn has_python_test_capability(root: &Path) -> bool {
+    root.join("pytest.ini").exists()
+        || root.join("tox.ini").exists()
+        || root.join("setup.cfg").exists()
+        || root.join("pyproject.toml").exists()
+        || root.join("requirements.txt").exists()
 }
 
 fn command_for_layer(
@@ -2734,17 +2747,43 @@ fn command_for_layer(
     {
         (vec!["make", "test"], "Makefile")
     } else if capabilities.package_json {
+        let package_manager = node_package_manager(root);
+        let package_json = fs::read_to_string(root.join("package.json")).unwrap_or_default();
+        let has_script = |script: &str| package_json_has_script(&package_json, script);
         match layer {
-            VerificationLayer::Format => (
-                vec!["npm", "run", "format", "--", "--check"],
+            VerificationLayer::Format if has_script("format") => (
+                node_run_command(package_manager, "format", &["--check"]),
                 "package.json",
             ),
-            VerificationLayer::Lint => (vec!["npm", "run", "lint"], "package.json"),
-            VerificationLayer::Typecheck => (vec!["npm", "run", "typecheck"], "package.json"),
-            VerificationLayer::Unit | VerificationLayer::Integration => {
-                (vec!["npm", "test"], "package.json")
+            VerificationLayer::Lint if has_script("lint") => (
+                node_run_command(package_manager, "lint", &[]),
+                "package.json",
+            ),
+            VerificationLayer::Typecheck if has_script("typecheck") => (
+                node_run_command(package_manager, "typecheck", &[]),
+                "package.json",
+            ),
+            VerificationLayer::Unit | VerificationLayer::Integration if has_script("test") => {
+                (node_test_command(package_manager), "package.json")
             }
-            VerificationLayer::Build => (vec!["npm", "run", "build"], "package.json"),
+            VerificationLayer::Build if has_script("build") => (
+                node_run_command(package_manager, "build", &[]),
+                "package.json",
+            ),
+            _ => return None,
+        }
+    } else if capabilities.python {
+        match layer {
+            VerificationLayer::Unit | VerificationLayer::Integration => {
+                (vec!["pytest"], python_detected_from(root))
+            }
+            _ => return None,
+        }
+    } else if capabilities.go {
+        match layer {
+            VerificationLayer::Unit | VerificationLayer::Integration => {
+                (vec!["go", "test", "./..."], "go.mod")
+            }
             _ => return None,
         }
     } else {
@@ -2756,6 +2795,66 @@ fn command_for_layer(
         argv: argv.iter().map(ToString::to_string).collect(),
         detected_from: root.join(detected_from).display().to_string(),
     })
+}
+
+fn node_package_manager(root: &Path) -> &'static str {
+    if root.join("pnpm-lock.yaml").exists() {
+        "pnpm"
+    } else if root.join("yarn.lock").exists() {
+        "yarn"
+    } else {
+        "npm"
+    }
+}
+
+fn node_test_command(package_manager: &str) -> Vec<&'static str> {
+    match package_manager {
+        "pnpm" => vec!["pnpm", "test"],
+        "yarn" => vec!["yarn", "test"],
+        _ => vec!["npm", "test"],
+    }
+}
+
+fn node_run_command(
+    package_manager: &str,
+    script: &'static str,
+    extra: &[&'static str],
+) -> Vec<&'static str> {
+    let mut argv = match package_manager {
+        "pnpm" => vec!["pnpm", "run", script],
+        "yarn" => vec!["yarn", "run", script],
+        _ => vec!["npm", "run", script],
+    };
+    if !extra.is_empty() {
+        argv.push("--");
+        argv.extend(extra.iter().copied());
+    }
+    argv
+}
+
+fn package_json_has_script(package_json: &str, script: &str) -> bool {
+    let Ok(value) = serde_json::from_str::<Value>(package_json) else {
+        return false;
+    };
+    value
+        .get("scripts")
+        .and_then(Value::as_object)
+        .is_some_and(|scripts| scripts.contains_key(script))
+}
+
+fn python_detected_from(root: &Path) -> &'static str {
+    for marker in [
+        "pytest.ini",
+        "pyproject.toml",
+        "tox.ini",
+        "setup.cfg",
+        "requirements.txt",
+    ] {
+        if root.join(marker).exists() {
+            return marker;
+        }
+    }
+    "pyproject.toml"
 }
 
 fn collect_tests(root: &Path, current: &Path, tests: &mut Vec<TestIdentity>) -> AcResult<()> {
@@ -2973,6 +3072,65 @@ mod tests {
             .unwrap();
         assert_eq!(gate.status, GateStatus::Passed);
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn project_aware_test_command_selection_supports_rust_node_python_and_go() {
+        let engine = VerificationEngine::new(CapabilityPolicy::new());
+        let profile = VerificationProfile {
+            id: StableId::new("verifyprofile"),
+            task_id: StableId::new("task"),
+            risk: VerificationRisk::Medium,
+            required_layers: vec![VerificationLayer::Unit],
+            created_at: TimestampMillis::now(),
+        };
+
+        let rust = test_root("verify-rust");
+        fs::write(rust.join("Cargo.toml"), "[package]\nname=\"demo\"\n").unwrap();
+        assert_eq!(
+            engine.detect_commands(&rust, &profile)[0].argv,
+            vec!["cargo", "test", "--workspace"]
+        );
+
+        let node = test_root("verify-node");
+        fs::write(
+            node.join("package.json"),
+            "{\"scripts\":{\"test\":\"node test.js\"}}",
+        )
+        .unwrap();
+        fs::write(node.join("pnpm-lock.yaml"), "lockfileVersion: 9").unwrap();
+        assert_eq!(
+            engine.detect_commands(&node, &profile)[0].argv,
+            vec!["pnpm", "test"]
+        );
+
+        let python = test_root("verify-python");
+        fs::write(python.join("pytest.ini"), "[pytest]\n").unwrap();
+        assert_eq!(
+            engine.detect_commands(&python, &profile)[0].argv,
+            vec!["pytest"]
+        );
+
+        let go = test_root("verify-go");
+        fs::write(go.join("go.mod"), "module example.com/demo\n").unwrap();
+        assert_eq!(
+            engine.detect_commands(&go, &profile)[0].argv,
+            vec!["go", "test", "./..."]
+        );
+
+        let none = test_root("verify-none");
+        assert!(engine.detect_commands(&none, &profile).is_empty());
+
+        for root in [rust, node, python, go, none] {
+            let _ = fs::remove_dir_all(root);
+        }
+    }
+
+    fn test_root(prefix: &str) -> PathBuf {
+        let root =
+            std::env::temp_dir().join(format!("agentcode-{prefix}-{}", StableId::new("tmp")));
+        fs::create_dir_all(&root).unwrap();
+        root
     }
 
     #[test]

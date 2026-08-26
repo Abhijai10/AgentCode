@@ -881,6 +881,8 @@ mod tests {
                 cargo: true,
                 makefile: false,
                 package_json: false,
+                python: false,
+                go: false,
                 browser: false,
                 security: false,
             },

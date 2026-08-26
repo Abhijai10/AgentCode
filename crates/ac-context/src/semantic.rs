@@ -1,7 +1,9 @@
-use std::path::PathBuf;
+use std::fs;
+use std::path::{Path, PathBuf};
 
 use ac_common::{AcError, AcResult, StableId, TimestampMillis};
 use fastembed::{EmbeddingModel, TextEmbedding, TextInitOptions};
+use sha2::{Digest, Sha256};
 
 use crate::{FreshnessState, MemoryFact};
 
@@ -14,6 +16,7 @@ pub enum EmbeddingAvailability {
     Loading,
     Ready,
     Failed(String),
+    Unavailable(String),
 }
 
 pub trait EmbeddingProvider {
@@ -26,6 +29,7 @@ pub trait EmbeddingProvider {
 pub struct LocalEmbeddingProvider {
     model: Option<TextEmbedding>,
     availability: EmbeddingAvailability,
+    manifest: Option<ModelArtifactManifest>,
 }
 
 impl Default for LocalEmbeddingProvider {
@@ -33,6 +37,7 @@ impl Default for LocalEmbeddingProvider {
         Self {
             model: None,
             availability: EmbeddingAvailability::NeedsModel,
+            manifest: None,
         }
     }
 }
@@ -40,13 +45,16 @@ impl Default for LocalEmbeddingProvider {
 impl LocalEmbeddingProvider {
     pub fn load(&mut self, cache_dir: PathBuf) -> AcResult<()> {
         self.availability = EmbeddingAvailability::Loading;
+        verify_manifest_if_present(&cache_dir)?;
         let options = TextInitOptions::new(EmbeddingModel::AllMiniLML6V2)
-            .with_cache_dir(cache_dir)
+            .with_cache_dir(cache_dir.clone())
             .with_show_download_progress(false)
             .with_intra_threads(2);
         match TextEmbedding::try_new(options) {
             Ok(model) => {
+                let manifest = record_or_load_manifest(&cache_dir)?;
                 self.model = Some(model);
+                self.manifest = Some(manifest);
                 self.availability = EmbeddingAvailability::Ready;
                 Ok(())
             }
@@ -96,6 +104,23 @@ impl EmbeddingProvider for LocalEmbeddingProvider {
     }
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ModelTrustState {
+    TrustOnFirstUse,
+    VerifiedAgainstLocalManifest,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ModelArtifactManifest {
+    pub model_id: String,
+    pub revision: Option<String>,
+    pub dimension: usize,
+    pub artifact_root: PathBuf,
+    pub sha256: String,
+    pub trust_state: ModelTrustState,
+    pub created_at: TimestampMillis,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct SemanticChunk {
     pub id: StableId,
@@ -133,14 +158,7 @@ impl SemanticMemoryIndex {
         self.chunks.clone()
     }
     pub fn restore(&mut self, chunks: Vec<SemanticChunk>) {
-        self.chunks = chunks
-            .into_iter()
-            .filter(|chunk| {
-                chunk.model_id == LOCAL_MODEL_ID
-                    && chunk.dimension == LOCAL_DIMENSION
-                    && chunk.vector.len() == LOCAL_DIMENSION
-            })
-            .collect();
+        self.chunks = chunks.into_iter().filter(vector_chunk_is_usable).collect();
     }
     pub fn index_fact(&mut self, fact: &MemoryFact) -> AcResult<bool> {
         if contains_secret(&fact.statement) {
@@ -164,6 +182,12 @@ impl SemanticMemoryIndex {
                     "embedding provider returned no vector",
                 )
             })?;
+        if !vector_values_are_usable(&vector) {
+            return Err(AcError::validation(
+                "EMBEDDING-VECTOR_INVALID",
+                "embedding provider returned an unusable vector",
+            ));
+        }
         self.chunks.retain(|chunk| chunk.fact_id != fact.id);
         self.chunks.push(SemanticChunk {
             id: StableId::new("semchunk"),
@@ -190,11 +214,19 @@ impl SemanticMemoryIndex {
                     "embedding provider returned no query vector",
                 )
             })?;
+        if !vector_values_are_usable(&query) {
+            return Err(AcError::validation(
+                "EMBEDDING-VECTOR_INVALID",
+                "embedding provider returned an unusable query vector",
+            ));
+        }
         let mut matches = self
             .chunks
             .iter()
             .filter(|chunk| {
-                chunk.freshness != FreshnessState::Invalid && chunk.dimension == query.len()
+                chunk.freshness != FreshnessState::Invalid
+                    && chunk.dimension == query.len()
+                    && vector_values_are_usable(&chunk.vector)
             })
             .cloned()
             .map(|chunk| SemanticMatch {
@@ -206,6 +238,150 @@ impl SemanticMemoryIndex {
         matches.truncate(limit);
         Ok(matches)
     }
+}
+
+fn vector_chunk_is_usable(chunk: &SemanticChunk) -> bool {
+    chunk.model_id == LOCAL_MODEL_ID
+        && chunk.dimension == LOCAL_DIMENSION
+        && chunk.vector.len() == LOCAL_DIMENSION
+        && vector_values_are_usable(&chunk.vector)
+}
+
+fn vector_values_are_usable(vector: &[f32]) -> bool {
+    !vector.is_empty()
+        && vector.iter().all(|value| value.is_finite())
+        && vector.iter().any(|value| *value != 0.0)
+}
+
+const MANIFEST_FILE: &str = "agentcode-fastembed-manifest.txt";
+
+fn verify_manifest_if_present(cache_dir: &Path) -> AcResult<()> {
+    let manifest_path = cache_dir.join(MANIFEST_FILE);
+    if !manifest_path.exists() {
+        return Ok(());
+    }
+    let manifest = read_manifest(&manifest_path)?;
+    let actual = hash_artifact_root(cache_dir)?;
+    if manifest.sha256 != actual {
+        return Err(AcError::new(
+            "EMBEDDING-MODEL_INTEGRITY",
+            "FastEmbed artifact digest does not match AgentCode local manifest",
+            ac_common::ErrorKind::Unavailable,
+            ac_common::Retryability::NotRetryable,
+        ));
+    }
+    Ok(())
+}
+
+fn record_or_load_manifest(cache_dir: &Path) -> AcResult<ModelArtifactManifest> {
+    fs::create_dir_all(cache_dir)
+        .map_err(|error| AcError::validation("EMBEDDING-MODEL_CACHE", error.to_string()))?;
+    let manifest_path = cache_dir.join(MANIFEST_FILE);
+    if manifest_path.exists() {
+        let mut manifest = read_manifest(&manifest_path)?;
+        manifest.trust_state = ModelTrustState::VerifiedAgainstLocalManifest;
+        return Ok(manifest);
+    }
+    let manifest = ModelArtifactManifest {
+        model_id: LOCAL_MODEL_ID.to_string(),
+        revision: None,
+        dimension: LOCAL_DIMENSION,
+        artifact_root: cache_dir.to_path_buf(),
+        sha256: hash_artifact_root(cache_dir)?,
+        trust_state: ModelTrustState::TrustOnFirstUse,
+        created_at: TimestampMillis::now(),
+    };
+    write_manifest(&manifest_path, &manifest)?;
+    Ok(manifest)
+}
+
+fn read_manifest(path: &Path) -> AcResult<ModelArtifactManifest> {
+    let content = fs::read_to_string(path)
+        .map_err(|error| AcError::validation("EMBEDDING-MODEL_MANIFEST", error.to_string()))?;
+    let mut model_id = String::new();
+    let mut dimension = 0;
+    let mut sha256 = String::new();
+    let mut created_at = 0;
+    for line in content.lines() {
+        if let Some((key, value)) = line.split_once('=') {
+            match key {
+                "model_id" => model_id = value.to_string(),
+                "dimension" => dimension = value.parse().unwrap_or(0),
+                "sha256" => sha256 = value.to_string(),
+                "created_at" => created_at = value.parse().unwrap_or(0),
+                _ => {}
+            }
+        }
+    }
+    if model_id != LOCAL_MODEL_ID || dimension != LOCAL_DIMENSION || sha256.len() != 64 {
+        return Err(AcError::new(
+            "EMBEDDING-MODEL_MANIFEST_INVALID",
+            "FastEmbed artifact manifest does not match the configured local model",
+            ac_common::ErrorKind::Unavailable,
+            ac_common::Retryability::NotRetryable,
+        ));
+    }
+    Ok(ModelArtifactManifest {
+        model_id,
+        revision: None,
+        dimension,
+        artifact_root: path.parent().unwrap_or_else(|| Path::new("")).to_path_buf(),
+        sha256,
+        trust_state: ModelTrustState::VerifiedAgainstLocalManifest,
+        created_at: TimestampMillis::from_millis(created_at),
+    })
+}
+
+fn write_manifest(path: &Path, manifest: &ModelArtifactManifest) -> AcResult<()> {
+    let content = format!(
+        "model_id={}\ndimension={}\nsha256={}\ncreated_at={}\ntrust_state=TOFU\n",
+        manifest.model_id,
+        manifest.dimension,
+        manifest.sha256,
+        manifest.created_at.as_millis()
+    );
+    fs::write(path, content)
+        .map_err(|error| AcError::validation("EMBEDDING-MODEL_MANIFEST_WRITE", error.to_string()))
+}
+
+fn hash_artifact_root(root: &Path) -> AcResult<String> {
+    let mut files = Vec::new();
+    collect_artifact_files(root, &mut files)?;
+    files.sort();
+    let mut hasher = Sha256::new();
+    for path in files {
+        let relative = path.strip_prefix(root).unwrap_or(&path);
+        hasher.update(relative.display().to_string().as_bytes());
+        hasher.update([0]);
+        let bytes = fs::read(&path)
+            .map_err(|error| AcError::validation("EMBEDDING-MODEL_HASH", error.to_string()))?;
+        hasher.update(bytes);
+        hasher.update([0]);
+    }
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+fn collect_artifact_files(root: &Path, files: &mut Vec<PathBuf>) -> AcResult<()> {
+    if !root.exists() {
+        return Ok(());
+    }
+    for entry in fs::read_dir(root)
+        .map_err(|error| AcError::validation("EMBEDDING-MODEL_CACHE_READ", error.to_string()))?
+    {
+        let entry = entry.map_err(|error| {
+            AcError::validation("EMBEDDING-MODEL_CACHE_READ", error.to_string())
+        })?;
+        let path = entry.path();
+        if path.file_name().and_then(|name| name.to_str()) == Some(MANIFEST_FILE) {
+            continue;
+        }
+        if path.is_dir() {
+            collect_artifact_files(&path, files)?;
+        } else if path.is_file() {
+            files.push(path);
+        }
+    }
+    Ok(())
 }
 
 fn cosine(left: &[f32], right: &[f32]) -> f32 {
@@ -234,4 +410,88 @@ fn contains_secret(value: &str) -> bool {
         || upper.contains("PASSWORD=")
         || upper.contains("TOKEN=")
         || value.contains("AKIA")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn restore_drops_model_mismatch_corrupt_nonfinite_and_zero_vectors() {
+        let mut index = SemanticMemoryIndex::default();
+        let usable = chunk(
+            "fact-good",
+            LOCAL_MODEL_ID,
+            LOCAL_DIMENSION,
+            vec![0.1; LOCAL_DIMENSION],
+        );
+        let wrong_model = chunk(
+            "fact-model",
+            "other-model",
+            LOCAL_DIMENSION,
+            vec![0.1; LOCAL_DIMENSION],
+        );
+        let wrong_dimension = chunk("fact-dim", LOCAL_MODEL_ID, 3, vec![0.1; 3]);
+        let corrupt = chunk(
+            "fact-corrupt",
+            LOCAL_MODEL_ID,
+            LOCAL_DIMENSION,
+            vec![0.1; 4],
+        );
+        let nonfinite = chunk("fact-nan", LOCAL_MODEL_ID, LOCAL_DIMENSION, {
+            let mut vector = vec![0.1; LOCAL_DIMENSION];
+            vector[0] = f32::NAN;
+            vector
+        });
+        let zero = chunk(
+            "fact-zero",
+            LOCAL_MODEL_ID,
+            LOCAL_DIMENSION,
+            vec![0.0; LOCAL_DIMENSION],
+        );
+
+        index.restore(vec![
+            usable,
+            wrong_model,
+            wrong_dimension,
+            corrupt,
+            nonfinite,
+            zero,
+        ]);
+        let restored = index.chunks();
+        assert_eq!(restored.len(), 1);
+        assert_eq!(restored[0].fact_id.as_str(), "fact-good");
+    }
+
+    #[test]
+    fn manifest_detects_tampered_local_artifact_bytes() {
+        let root = std::env::temp_dir().join(format!(
+            "agentcode-model-integrity-{}",
+            StableId::new("tmp")
+        ));
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("model.bin"), "trusted bytes").unwrap();
+        let manifest = record_or_load_manifest(&root).unwrap();
+        assert_eq!(manifest.trust_state, ModelTrustState::TrustOnFirstUse);
+        verify_manifest_if_present(&root).unwrap();
+        fs::write(root.join("model.bin"), "tampered bytes").unwrap();
+        let err = verify_manifest_if_present(&root).unwrap_err();
+        assert_eq!(err.code(), "EMBEDDING-MODEL_INTEGRITY");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    fn chunk(fact: &str, model_id: &str, dimension: usize, vector: Vec<f32>) -> SemanticChunk {
+        SemanticChunk {
+            id: StableId::new("semchunk"),
+            repository_id: StableId::new("repo"),
+            fact_id: StableId::from_existing(fact).unwrap(),
+            content: fact.to_string(),
+            content_hash: stable_hash(fact),
+            model_id: model_id.to_string(),
+            dimension,
+            vector,
+            freshness: FreshnessState::Fresh,
+            created_at: TimestampMillis::now(),
+        }
+    }
 }

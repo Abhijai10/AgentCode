@@ -19,6 +19,10 @@ Protocol browser backend. See
 Batch 7 admits fastembed 6.0.1 (Apache-2.0) for explicit local ONNX embedding
 inference. See `docs/policy/dependency-admissions/DEP-ADM-004-fastembed.md`.
 
+This backend closure admits sha2 0.10.9 (MIT OR Apache-2.0) for local FastEmbed
+artifact SHA-256 integrity manifests. See
+`docs/policy/dependency-admissions/DEP-ADM-005-sha2.md`.
+
 Required fields per shipped component:
 
 - Name

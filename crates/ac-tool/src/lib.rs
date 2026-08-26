@@ -10,10 +10,17 @@ use std::time::{Duration, Instant};
 use ac_common::{AcError, AcResult, StableId, TimestampMillis};
 use ac_evidence::{EvidenceStore, Provenance};
 use ac_sandbox::{ExecRequest, SandboxEvidence, SandboxManager, SandboxPolicy, SecretBroker};
-use ac_security::{Capability, CapabilityPolicy, McpToolRecord, SecurityDecision};
 use ac_security::{
-    ScannerFailure, ScannerProcessRequest, ScannerProcessResult, SecurityScannerExecutor,
+    BaselineSecurityOrchestrator, ManagedSecurityScanInput, ScannerConfiguration, ScannerFailure,
+    ScannerNetworkPolicy, ScannerProcessRequest, ScannerProcessResult, SecurityAdapter,
+    SecurityPolicy, SecurityScannerExecutor,
 };
+use ac_security::{Capability, CapabilityPolicy, McpToolRecord, SecurityDecision};
+use ac_verification::{
+    BrowserAction, BrowserRuntime, VerificationEngine, VerificationLayer, VerificationProfile,
+    VerificationRisk, ViewportProfile,
+};
+use serde_json::{json, Value};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ToolDescriptor {
@@ -114,6 +121,7 @@ impl SecurityScannerExecutor for GovernedScannerExecutor {
         &self,
         request: ScannerProcessRequest,
     ) -> Result<ScannerProcessResult, ScannerFailure> {
+        let cleanup_paths = request.cleanup_paths.clone();
         let plan = self
             .sandbox
             .prepare_execution(ExecRequest {
@@ -130,7 +138,8 @@ impl SecurityScannerExecutor for GovernedScannerExecutor {
                 }
                 _ => ScannerFailure::Misconfigured(error.to_string()),
             })?;
-        self.manager
+        let result = self
+            .manager
             .run("security-scanner", plan)
             .map(|result| ScannerProcessResult {
                 exit_code: result.exit_code,
@@ -144,7 +153,11 @@ impl SecurityScannerExecutor for GovernedScannerExecutor {
                 "TOOL-COMMAND_CANCELLED" => ScannerFailure::Cancelled,
                 "TOOL-COMMAND_SPAWN_FAILED" => ScannerFailure::Unavailable(error.to_string()),
                 _ => ScannerFailure::ExecutionFailed(error.to_string()),
-            })
+            });
+        for path in cleanup_paths {
+            let _ = fs::remove_dir_all(path);
+        }
+        result
     }
 }
 
@@ -463,6 +476,15 @@ pub trait ToolExecutor {
     ) -> AcResult<String> {
         self.execute(request)
     }
+
+    fn execute_with_evidence_and_cancellation(
+        &self,
+        request: &ToolRequest,
+        _evidence_store: &mut EvidenceStore,
+        cancelled: &AtomicBool,
+    ) -> AcResult<String> {
+        self.execute_with_cancellation(request, cancelled)
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -616,11 +638,41 @@ impl WorkspaceTools {
                 manager: ProcessManager::default(),
             }),
         )?;
+        broker.register_tool(
+            ToolDefinition {
+                id: "dev.test".to_string(),
+                version: "1".to_string(),
+                required_capabilities: vec![Capability::ProcessExec("*".to_string())],
+            },
+            Box::new(ProjectTestTool {
+                sandbox: workspace_sandbox(&self.root, self.required_isolation),
+                cwd: self.root.clone(),
+                manager: ProcessManager::default(),
+            }),
+        )?;
+        broker.register_tool(
+            ToolDefinition {
+                id: "browser.verify".to_string(),
+                version: "1".to_string(),
+                required_capabilities: vec![Capability::BrowserAutomation],
+            },
+            Box::new(BrowserVerifyTool),
+        )?;
+        broker.register_tool(
+            ToolDefinition {
+                id: "security.verify".to_string(),
+                version: "1".to_string(),
+                required_capabilities: vec![Capability::SecurityScan],
+            },
+            Box::new(SecurityVerifyTool {
+                root: self.root.clone(),
+                required_isolation: self.required_isolation,
+            }),
+        )?;
         for (id, command) in [
             ("repo.status", vec!["git", "status", "--short"]),
             ("repo.diff", vec!["git", "diff", "--", "."]),
             ("repo.branch", vec!["git", "branch", "--show-current"]),
-            ("dev.test", vec!["cargo", "test", "--quiet"]),
             ("dev.format", vec!["cargo", "fmt", "--all"]),
             ("dev.check", vec!["cargo", "check", "--quiet"]),
         ] {
@@ -631,15 +683,7 @@ impl WorkspaceTools {
                     required_capabilities: vec![Capability::ProcessExec(command[0].to_string())],
                 },
                 Box::new(FixedCommandTool {
-                    sandbox: SandboxManager::new(SandboxPolicy {
-                        workspace_roots: vec![self.root.clone()],
-                        capability_policy: CapabilityPolicy::new()
-                            .allow(Capability::ProcessExec("*".to_string())),
-                        network_default_allow: false,
-                        max_timeout_ms: 30_000,
-                        required_isolation: self.required_isolation,
-                        ..SandboxPolicy::new(vec![self.root.clone()])
-                    }),
+                    sandbox: workspace_sandbox(&self.root, self.required_isolation),
                     cwd: self.root.clone(),
                     argv: command.iter().map(ToString::to_string).collect(),
                     manager: ProcessManager::default(),
@@ -822,6 +866,221 @@ impl ToolExecutor for FixedCommandTool {
     }
 }
 
+struct ProjectTestTool {
+    sandbox: SandboxManager,
+    cwd: PathBuf,
+    manager: ProcessManager,
+}
+
+impl ToolExecutor for ProjectTestTool {
+    fn execute(&self, request: &ToolRequest) -> AcResult<String> {
+        let not_cancelled = AtomicBool::new(false);
+        self.execute_with_cancellation(request, &not_cancelled)
+    }
+
+    fn execute_with_cancellation(
+        &self,
+        _request: &ToolRequest,
+        cancelled: &AtomicBool,
+    ) -> AcResult<String> {
+        let engine = VerificationEngine::new(CapabilityPolicy::new());
+        let profile = VerificationProfile {
+            id: StableId::new("verifyprofile"),
+            task_id: StableId::new("task"),
+            risk: VerificationRisk::Medium,
+            required_layers: vec![VerificationLayer::Unit],
+            created_at: TimestampMillis::now(),
+        };
+        let command = engine
+            .detect_commands(&self.cwd, &profile)
+            .into_iter()
+            .find(|command| command.layer == VerificationLayer::Unit)
+            .ok_or_else(|| {
+                AcError::new(
+                    "TOOL-VERIFY_NO_KNOWN_TEST_COMMAND",
+                    "NoKnownTestCommand",
+                    ac_common::ErrorKind::Unavailable,
+                    ac_common::Retryability::NotRetryable,
+                )
+            })?;
+        run_sandboxed_command(
+            &self.manager,
+            &self.sandbox,
+            self.cwd.clone(),
+            command.argv,
+            30_000,
+            cancelled,
+        )
+    }
+}
+
+struct BrowserVerifyTool;
+
+impl ToolExecutor for BrowserVerifyTool {
+    fn execute(&self, request: &ToolRequest) -> AcResult<String> {
+        let mut evidence_store = EvidenceStore::new();
+        let not_cancelled = AtomicBool::new(false);
+        self.execute_with_evidence_and_cancellation(request, &mut evidence_store, &not_cancelled)
+    }
+
+    fn execute_with_evidence_and_cancellation(
+        &self,
+        request: &ToolRequest,
+        evidence_store: &mut EvidenceStore,
+        _cancelled: &AtomicBool,
+    ) -> AcResult<String> {
+        let input = BrowserVerifyInput::parse(&request.payload)?;
+        authorize_browser_target(&input.target_url)?;
+        let task_id = request.id.clone();
+        let mut runtime =
+            BrowserRuntime::new(CapabilityPolicy::new().allow(Capability::BrowserAutomation));
+        let process = runtime.launch(task_id.clone())?;
+        let session = runtime.create_session(task_id.clone(), process.id.clone())?;
+        let navigation = runtime.act(
+            &session.id,
+            BrowserAction::Navigate {
+                url: input.target_url.clone(),
+            },
+            evidence_store,
+        )?;
+        let dom = runtime.inspect_dom(&session.id, evidence_store)?;
+        let diagnostics = runtime.diagnostics(&session.id, evidence_store)?;
+        let screenshot = if input.screenshot {
+            Some(runtime.capture_screenshot(
+                &session.id,
+                task_id,
+                "working-tree",
+                input.viewport,
+                evidence_store,
+            )?)
+        } else {
+            None
+        };
+        let assertions = evaluate_browser_assertions(&input.assertions, &dom, &diagnostics);
+        let passed = assertions
+            .iter()
+            .all(|assertion| assertion["passed"] == true);
+        let output = json!({
+            "target": redact_url(&input.target_url),
+            "authorized": true,
+            "mode": "real-cdp",
+            "profile_isolated": process.profile_dir.contains("agentcode-browser-profile"),
+            "navigation": {
+                "ok": navigation.ok,
+                "status": diagnostics.http_status,
+                "evidence_ref": navigation.evidence_ref.to_string()
+            },
+            "diagnostics": {
+                "console_errors": diagnostics.console_errors,
+                "page_errors": diagnostics.page_errors,
+                "network_failures": diagnostics.network_failures,
+                "evidence_ref": diagnostics.evidence_ref.to_string()
+            },
+            "dom": {
+                "visible_text_hash": local_hash(&dom.visible_text),
+                "controls": dom.controls,
+                "accessibility": input.include_accessibility.then_some(dom.accessibility_tree),
+                "evidence_ref": dom.evidence_ref.to_string()
+            },
+            "screenshot_evidence_ref": screenshot.map(|shot| shot.evidence_ref.to_string()),
+            "assertions": assertions,
+            "passed": passed
+        });
+        Ok(output.to_string())
+    }
+}
+
+struct SecurityVerifyTool {
+    root: PathBuf,
+    required_isolation: ac_sandbox::IsolationLevel,
+}
+
+impl ToolExecutor for SecurityVerifyTool {
+    fn execute(&self, request: &ToolRequest) -> AcResult<String> {
+        let mut evidence_store = EvidenceStore::new();
+        let not_cancelled = AtomicBool::new(false);
+        self.execute_with_evidence_and_cancellation(request, &mut evidence_store, &not_cancelled)
+    }
+
+    fn execute_with_evidence_and_cancellation(
+        &self,
+        request: &ToolRequest,
+        evidence_store: &mut EvidenceStore,
+        _cancelled: &AtomicBool,
+    ) -> AcResult<String> {
+        let input = SecurityVerifyInput::parse(&request.payload)?;
+        let root = input
+            .scope
+            .as_deref()
+            .map(|scope| safe_join(&self.root, scope))
+            .transpose()?
+            .unwrap_or_else(|| self.root.clone());
+        let mut configurations = Vec::new();
+        for scanner in input.required_scanners.iter().copied() {
+            let mut config = scanner_configuration(scanner, true, &input)?;
+            config.required = true;
+            configurations.push(config);
+        }
+        for scanner in input.optional_scanners.iter().copied() {
+            let mut config = scanner_configuration(scanner, false, &input)?;
+            config.required = false;
+            configurations.push(config);
+        }
+        if configurations.is_empty() {
+            return Err(AcError::validation(
+                "TOOL-SECURITY_VERIFY_EMPTY_PROFILE",
+                "security.verify requires at least one scanner",
+            ));
+        }
+        let scan = ManagedSecurityScanInput {
+            repository_id: StableId::new("repo"),
+            commit: source_revision_from_git_files(&root),
+            workspace_root: root.clone(),
+            configurations,
+            target_url: input.dast_target.clone(),
+            target_authorized: input.dast_target_authorized,
+        };
+        let sandbox = SandboxManager::new(SandboxPolicy {
+            workspace_roots: vec![root.clone()],
+            capability_policy: CapabilityPolicy::new()
+                .allow(Capability::ProcessExec("*".to_string())),
+            network_default_allow: input.dast_target.is_some(),
+            max_timeout_ms: 180_000,
+            required_isolation: self.required_isolation,
+            ..SandboxPolicy::new(vec![root.clone()])
+        });
+        let executor = GovernedScannerExecutor::new(sandbox);
+        let orchestrator = BaselineSecurityOrchestrator::new(SecurityPolicy::baseline());
+        let report = orchestrator.run_managed(&scan, &executor, evidence_store)?;
+        let output = json!({
+            "source_revision": scan.commit,
+            "workspace": root.display().to_string(),
+            "adapters_run": report.adapters_run.iter().map(|adapter| scanner_name(*adapter)).collect::<Vec<_>>(),
+            "missing_adapters": report.missing_adapters,
+            "finding_count": report.instances.len(),
+            "findings": report.instances.iter().map(|finding| json!({
+                "scanner": scanner_name(finding.adapter),
+                "rule_id": finding.rule_id,
+                "severity": format!("{:?}", finding.severity),
+                "file_path": finding.file_path,
+                "line": finding.line,
+                "fingerprint": finding.fingerprint,
+                "redacted_evidence": finding.redacted_evidence,
+                "raw_evidence_ref": finding.raw_evidence_ref.to_string(),
+                "proof_level": format!("{:?}", finding.proof_level)
+            })).collect::<Vec<_>>(),
+            "executions": report.executions.iter().map(|execution| json!({
+                "scanner": scanner_name(execution.adapter),
+                "version": execution.version,
+                "status": format!("{:?}", execution.availability),
+                "raw_evidence_ref": execution.raw_evidence_ref.as_ref().map(ToString::to_string),
+                "provenance": execution.version.as_ref().map(|_| "ExternalTool")
+            })).collect::<Vec<_>>()
+        });
+        Ok(output.to_string())
+    }
+}
+
 fn run_sandboxed_command(
     manager: &ProcessManager,
     sandbox: &SandboxManager,
@@ -845,6 +1104,367 @@ fn run_sandboxed_command(
         ));
     }
     Ok(format_process_observation(&result))
+}
+
+fn workspace_sandbox(
+    root: &Path,
+    required_isolation: ac_sandbox::IsolationLevel,
+) -> SandboxManager {
+    SandboxManager::new(SandboxPolicy {
+        workspace_roots: vec![root.to_path_buf()],
+        capability_policy: CapabilityPolicy::new().allow(Capability::ProcessExec("*".to_string())),
+        network_default_allow: false,
+        max_timeout_ms: 30_000,
+        required_isolation,
+        ..SandboxPolicy::new(vec![root.to_path_buf()])
+    })
+}
+
+struct BrowserVerifyInput {
+    target_url: String,
+    assertions: Vec<BrowserAssertion>,
+    viewport: ViewportProfile,
+    include_accessibility: bool,
+    screenshot: bool,
+}
+
+enum BrowserAssertion {
+    VisibleTextContains(String),
+    AccessibilityContains(String),
+    NoConsoleErrors,
+    NoPageErrors,
+    NoNetworkFailures,
+}
+
+impl BrowserVerifyInput {
+    fn parse(payload: &str) -> AcResult<Self> {
+        let value = parse_json_payload(payload)?;
+        let target_url = value
+            .get("target_url")
+            .or_else(|| value.get("url"))
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                AcError::validation("TOOL-BROWSER_VERIFY_TARGET", "target_url is required")
+            })?
+            .to_string();
+        let assertions = value
+            .get("assertions")
+            .and_then(Value::as_array)
+            .map(|items| {
+                items
+                    .iter()
+                    .map(parse_browser_assertion)
+                    .collect::<AcResult<Vec<_>>>()
+            })
+            .transpose()?
+            .unwrap_or_default();
+        Ok(Self {
+            target_url,
+            assertions,
+            viewport: parse_viewport(value.get("viewport")),
+            include_accessibility: value
+                .get("include_accessibility")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+            screenshot: value
+                .get("screenshot")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+        })
+    }
+}
+
+fn parse_browser_assertion(value: &Value) -> AcResult<BrowserAssertion> {
+    let kind = value
+        .get("kind")
+        .or_else(|| value.get("type"))
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            AcError::validation("TOOL-BROWSER_ASSERTION", "assertion kind is required")
+        })?;
+    match kind {
+        "visible_text_contains" => Ok(BrowserAssertion::VisibleTextContains(
+            value
+                .get("text")
+                .or_else(|| value.get("value"))
+                .and_then(Value::as_str)
+                .ok_or_else(|| {
+                    AcError::validation("TOOL-BROWSER_ASSERTION", "assertion text is required")
+                })?
+                .to_string(),
+        )),
+        "accessibility_contains" => Ok(BrowserAssertion::AccessibilityContains(
+            value
+                .get("text")
+                .or_else(|| value.get("value"))
+                .and_then(Value::as_str)
+                .ok_or_else(|| {
+                    AcError::validation("TOOL-BROWSER_ASSERTION", "assertion text is required")
+                })?
+                .to_string(),
+        )),
+        "no_console_errors" => Ok(BrowserAssertion::NoConsoleErrors),
+        "no_page_errors" => Ok(BrowserAssertion::NoPageErrors),
+        "no_network_failures" => Ok(BrowserAssertion::NoNetworkFailures),
+        _ => Err(AcError::validation(
+            "TOOL-BROWSER_ASSERTION_UNSUPPORTED",
+            "unsupported browser assertion kind",
+        )),
+    }
+}
+
+fn parse_viewport(value: Option<&Value>) -> ViewportProfile {
+    match value
+        .and_then(Value::as_str)
+        .unwrap_or("desktop")
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "mobile" => ViewportProfile {
+            name: "mobile",
+            width: 390,
+            height: 844,
+        },
+        "tablet" => ViewportProfile {
+            name: "tablet",
+            width: 820,
+            height: 1180,
+        },
+        _ => ViewportProfile {
+            name: "desktop",
+            width: 1440,
+            height: 900,
+        },
+    }
+}
+
+fn evaluate_browser_assertions(
+    assertions: &[BrowserAssertion],
+    dom: &ac_verification::DomSnapshot,
+    diagnostics: &ac_verification::BrowserDiagnostics,
+) -> Vec<Value> {
+    assertions
+        .iter()
+        .map(|assertion| match assertion {
+            BrowserAssertion::VisibleTextContains(text) => json!({
+                "kind": "visible_text_contains",
+                "expected": text,
+                "passed": dom.visible_text.contains(text)
+            }),
+            BrowserAssertion::AccessibilityContains(text) => json!({
+                "kind": "accessibility_contains",
+                "expected": text,
+                "passed": dom.accessibility_tree.iter().any(|item| item.contains(text))
+            }),
+            BrowserAssertion::NoConsoleErrors => json!({
+                "kind": "no_console_errors",
+                "passed": diagnostics.console_errors.is_empty()
+            }),
+            BrowserAssertion::NoPageErrors => json!({
+                "kind": "no_page_errors",
+                "passed": diagnostics.page_errors.is_empty()
+            }),
+            BrowserAssertion::NoNetworkFailures => json!({
+                "kind": "no_network_failures",
+                "passed": diagnostics.network_failures.is_empty()
+            }),
+        })
+        .collect()
+}
+
+fn authorize_browser_target(url: &str) -> AcResult<()> {
+    let lower = url.to_ascii_lowercase();
+    if lower.starts_with("file:")
+        || lower.starts_with("chrome:")
+        || lower.starts_with("chrome-extension:")
+        || lower.starts_with("about:")
+        || lower.starts_with("devtools:")
+    {
+        return Err(AcError::policy_denied(
+            "TOOL-BROWSER_TARGET_UNAUTHORIZED",
+            "browser.verify may not browse local files or browser-internal URLs",
+        ));
+    }
+    let local_http = lower.starts_with("http://localhost")
+        || lower.starts_with("https://localhost")
+        || lower.starts_with("http://127.0.0.1")
+        || lower.starts_with("https://127.0.0.1")
+        || lower.starts_with("http://[::1]")
+        || lower.starts_with("https://[::1]");
+    let metadata = lower.contains("169.254.169.254") || lower.contains("[fe80:");
+    if local_http && !metadata {
+        return Ok(());
+    }
+    Err(AcError::policy_denied(
+        "TOOL-BROWSER_TARGET_UNAUTHORIZED",
+        "browser.verify target must be localhost unless explicitly authorized by mission policy",
+    ))
+}
+
+struct SecurityVerifyInput {
+    scope: Option<String>,
+    required_scanners: Vec<SecurityAdapter>,
+    optional_scanners: Vec<SecurityAdapter>,
+    semgrep_rules_path: Option<String>,
+    dast_target: Option<String>,
+    dast_target_authorized: bool,
+}
+
+impl SecurityVerifyInput {
+    fn parse(payload: &str) -> AcResult<Self> {
+        let value = parse_json_payload(payload)?;
+        let required_scanners = parse_scanner_array(value.get("required_scanners"))?;
+        let optional_scanners = parse_scanner_array(value.get("optional_scanners"))?;
+        Ok(Self {
+            scope: value
+                .get("scope")
+                .or_else(|| value.get("repository_scope"))
+                .and_then(Value::as_str)
+                .map(ToString::to_string),
+            required_scanners,
+            optional_scanners,
+            semgrep_rules_path: value
+                .get("semgrep_rules_path")
+                .and_then(Value::as_str)
+                .map(ToString::to_string),
+            dast_target: value
+                .get("dast_target")
+                .and_then(Value::as_str)
+                .map(ToString::to_string),
+            dast_target_authorized: value
+                .get("dast_target_authorized")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+        })
+    }
+}
+
+fn parse_json_payload(payload: &str) -> AcResult<Value> {
+    if payload.trim().is_empty() {
+        return Ok(json!({}));
+    }
+    serde_json::from_str(payload)
+        .map_err(|error| AcError::validation("TOOL-PAYLOAD_JSON", error.to_string()))
+}
+
+fn parse_scanner_array(value: Option<&Value>) -> AcResult<Vec<SecurityAdapter>> {
+    value
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .map(|item| {
+                    item.as_str()
+                        .ok_or_else(|| {
+                            AcError::validation(
+                                "TOOL-SECURITY_SCANNER_NAME",
+                                "scanner names must be strings",
+                            )
+                        })
+                        .and_then(scanner_from_name)
+                })
+                .collect()
+        })
+        .unwrap_or_else(|| Ok(Vec::new()))
+}
+
+fn scanner_from_name(name: &str) -> AcResult<SecurityAdapter> {
+    match name.to_ascii_lowercase().as_str() {
+        "gitleaks" => Ok(SecurityAdapter::Gitleaks),
+        "osv" | "osv-scanner" => Ok(SecurityAdapter::Osv),
+        "trivy" => Ok(SecurityAdapter::Trivy),
+        "semgrep" => Ok(SecurityAdapter::Semgrep),
+        "checkov" => Ok(SecurityAdapter::Checkov),
+        "zap" | "zaproxy" => Ok(SecurityAdapter::Zap),
+        _ => Err(AcError::validation(
+            "TOOL-SECURITY_SCANNER_UNSUPPORTED",
+            "unsupported scanner name",
+        )),
+    }
+}
+
+fn scanner_configuration(
+    scanner: SecurityAdapter,
+    required: bool,
+    input: &SecurityVerifyInput,
+) -> AcResult<ScannerConfiguration> {
+    let mut config = ScannerConfiguration::external(scanner);
+    config.required = required;
+    if matches!(scanner, SecurityAdapter::Osv | SecurityAdapter::Trivy) {
+        config.timeout_ms = 180_000;
+    }
+    if scanner == SecurityAdapter::Semgrep {
+        config.rules_path = input.semgrep_rules_path.clone();
+    }
+    if scanner == SecurityAdapter::Zap {
+        let target = input.dast_target.as_deref().ok_or_else(|| {
+            AcError::validation("TOOL-SECURITY_ZAP_TARGET", "ZAP requires dast_target")
+        })?;
+        authorize_browser_target(target)?;
+        config.network = ScannerNetworkPolicy::Allow;
+        config.timeout_ms = config.timeout_ms.max(120_000);
+    }
+    Ok(config)
+}
+
+fn scanner_name(scanner: SecurityAdapter) -> &'static str {
+    match scanner {
+        SecurityAdapter::Gitleaks => "gitleaks",
+        SecurityAdapter::Osv => "osv-scanner",
+        SecurityAdapter::Trivy => "trivy",
+        SecurityAdapter::Semgrep => "semgrep",
+        SecurityAdapter::Checkov => "checkov",
+        SecurityAdapter::Zap => "zap",
+        _ => "agentcode",
+    }
+}
+
+fn source_revision_from_git_files(root: &Path) -> String {
+    let git = root.join(".git");
+    let git_dir = if git.is_dir() {
+        git
+    } else {
+        fs::read_to_string(&git)
+            .ok()
+            .and_then(|content| {
+                content
+                    .strip_prefix("gitdir:")
+                    .map(str::trim)
+                    .map(PathBuf::from)
+            })
+            .unwrap_or(git)
+    };
+    let head = fs::read_to_string(git_dir.join("HEAD")).unwrap_or_default();
+    let head = head.trim();
+    if let Some(reference) = head.strip_prefix("ref: ") {
+        return fs::read_to_string(git_dir.join(reference))
+            .unwrap_or_else(|_| "working-tree".to_string())
+            .trim()
+            .to_string();
+    }
+    if head.is_empty() {
+        "working-tree".to_string()
+    } else {
+        head.to_string()
+    }
+}
+
+fn redact_url(url: &str) -> String {
+    let without_fragment = url.split('#').next().unwrap_or(url);
+    let without_query = without_fragment
+        .split('?')
+        .next()
+        .unwrap_or(without_fragment);
+    without_query.to_string()
+}
+
+fn local_hash(value: &str) -> String {
+    let mut hash = 0xcbf29ce484222325_u64;
+    for byte in value.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    format!("{hash:016x}")
 }
 
 fn format_process_observation(result: &NativeProcessResult) -> String {
@@ -899,6 +1519,9 @@ fn toolchain_env() -> BTreeMap<String, String> {
     let home = std::env::temp_dir().join(format!("agentcode-home-{}", StableId::new("tool")));
     let _ = fs::create_dir_all(&home);
     env.insert("HOME".to_string(), home.display().to_string());
+    env.insert("SEMGREP_SEND_METRICS".to_string(), "off".to_string());
+    env.insert("SEMGREP_ENABLE_VERSION_CHECK".to_string(), "0".to_string());
+    env.insert("OTEL_SDK_DISABLED".to_string(), "true".to_string());
     env
 }
 
@@ -1063,7 +1686,11 @@ impl ToolBroker {
         let executor = self.executors.get(&request.tool_id).ok_or_else(|| {
             AcError::validation("TOOL-MISSING_EXECUTOR", "tool executor not found")
         })?;
-        let observation = match executor.execute_with_cancellation(&request, cancelled) {
+        let observation = match executor.execute_with_evidence_and_cancellation(
+            &request,
+            evidence_store,
+            cancelled,
+        ) {
             Ok(observation) => observation,
             Err(error) => {
                 let evidence_ref = evidence_store.append_tool_output(
@@ -1272,6 +1899,9 @@ impl<'a> CommandPlanner<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write as _;
+    use std::net::TcpListener;
+    use std::thread;
 
     struct EchoExecutor;
 
@@ -1322,6 +1952,388 @@ mod tests {
             .unwrap();
         assert_eq!(result.status, ToolStatus::Denied);
         assert_eq!(evidence.len(), 1);
+    }
+
+    #[test]
+    fn workspace_registers_browser_and_security_verification_tools() {
+        let root = std::env::temp_dir().join(format!("agentcode-tool-reg-{}", StableId::new("t")));
+        fs::create_dir_all(&root).unwrap();
+        let mut broker = ToolBroker::new(
+            CapabilityPolicy::new()
+                .allow(Capability::FilesystemRead("*".to_string()))
+                .allow(Capability::FilesystemWrite("*".to_string()))
+                .allow(Capability::ProcessExec("*".to_string()))
+                .allow(Capability::BrowserAutomation)
+                .allow(Capability::SecurityScan),
+        );
+        WorkspaceTools::with_required_isolation(
+            root.clone(),
+            ac_sandbox::IsolationLevel::ProcessRestricted,
+        )
+        .register_all(&mut broker)
+        .unwrap();
+        assert!(broker.definitions.contains_key("browser.verify"));
+        assert!(broker.definitions.contains_key("security.verify"));
+        assert!(broker.definitions["browser.verify"]
+            .required_capabilities
+            .contains(&Capability::BrowserAutomation));
+        assert!(broker.definitions["security.verify"]
+            .required_capabilities
+            .contains(&Capability::SecurityScan));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn dev_test_without_known_project_command_fails_unavailable_not_passed() {
+        let root =
+            std::env::temp_dir().join(format!("agentcode-tool-no-test-{}", StableId::new("t")));
+        fs::create_dir_all(&root).unwrap();
+        let mut broker = ToolBroker::new(
+            CapabilityPolicy::new().allow(Capability::ProcessExec("*".to_string())),
+        );
+        WorkspaceTools::with_required_isolation(
+            root.clone(),
+            ac_sandbox::IsolationLevel::ProcessRestricted,
+        )
+        .register_all(&mut broker)
+        .unwrap();
+        let result = broker
+            .invoke(
+                ToolRequest {
+                    id: StableId::new("toolreq"),
+                    tool_id: "dev.test".to_string(),
+                    tool_version: "1".to_string(),
+                    payload: String::new(),
+                    capabilities: Vec::new(),
+                },
+                &mut EvidenceStore::new(),
+            )
+            .unwrap();
+        assert_eq!(result.status, ToolStatus::Failed);
+        assert!(result.observation.contains("NoKnownTestCommand"));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn browser_verify_rejects_unauthorized_targets_before_launch() {
+        let mut broker =
+            ToolBroker::new(CapabilityPolicy::new().allow(Capability::BrowserAutomation));
+        broker
+            .register_tool(
+                ToolDefinition {
+                    id: "browser.verify".to_string(),
+                    version: "1".to_string(),
+                    required_capabilities: vec![Capability::BrowserAutomation],
+                },
+                Box::new(BrowserVerifyTool),
+            )
+            .unwrap();
+        let result = broker
+            .invoke(
+                ToolRequest {
+                    id: StableId::new("toolreq"),
+                    tool_id: "browser.verify".to_string(),
+                    tool_version: "1".to_string(),
+                    payload: "{\"target_url\":\"file:///etc/passwd\"}".to_string(),
+                    capabilities: Vec::new(),
+                },
+                &mut EvidenceStore::new(),
+            )
+            .unwrap();
+        assert_eq!(result.status, ToolStatus::Failed);
+        assert!(result
+            .observation
+            .contains("TOOL-BROWSER_TARGET_UNAUTHORIZED"));
+    }
+
+    #[test]
+    #[ignore = "requires local Chrome/Chromium"]
+    fn operational_browser_verify_runs_real_cdp_through_toolbroker() {
+        let (url, handle) = localhost_fixture(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: 83\r\n\r\n<html><body><main>AgentCode browser proof</main><button>Verify</button></body></html>",
+        );
+        let mut broker =
+            ToolBroker::new(CapabilityPolicy::new().allow(Capability::BrowserAutomation));
+        broker
+            .register_tool(
+                ToolDefinition {
+                    id: "browser.verify".to_string(),
+                    version: "1".to_string(),
+                    required_capabilities: vec![Capability::BrowserAutomation],
+                },
+                Box::new(BrowserVerifyTool),
+            )
+            .unwrap();
+        let mut evidence = EvidenceStore::new();
+        let result = broker
+            .invoke(
+                ToolRequest {
+                    id: StableId::new("toolreq"),
+                    tool_id: "browser.verify".to_string(),
+                    tool_version: "1".to_string(),
+                    payload: json!({
+                        "target_url": url,
+                        "assertions": [
+                            {"kind": "visible_text_contains", "text": "AgentCode browser proof"},
+                            {"kind": "no_console_errors"}
+                        ],
+                        "include_accessibility": true
+                    })
+                    .to_string(),
+                    capabilities: Vec::new(),
+                },
+                &mut evidence,
+            )
+            .unwrap();
+        handle.join().unwrap();
+        assert_eq!(
+            result.status,
+            ToolStatus::Succeeded,
+            "{}",
+            result.observation
+        );
+        assert!(result.observation.contains("\"mode\":\"real-cdp\""));
+        assert!(result.observation.contains("\"passed\":true"));
+        assert!(evidence.records().count() >= 3);
+    }
+
+    #[test]
+    #[ignore = "requires gitleaks and semgrep installed"]
+    fn operational_security_verify_runs_real_gitleaks_and_semgrep_through_toolbroker() {
+        let root =
+            std::env::temp_dir().join(format!("agentcode-real-scanners-{}", StableId::new("t")));
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(
+            root.join("src/app.py"),
+            "AWS_ACCESS_KEY_ID = 'AKIAIOSFODNN7EXAMPLE'\nprint('hello')\n",
+        )
+        .unwrap();
+        let rules = root.join("semgrep-rule.yml");
+        fs::write(
+            &rules,
+            "rules:\n  - id: agentcode-print\n    message: print call\n    severity: WARNING\n    languages: [python]\n    pattern: print(...)\n",
+        )
+        .unwrap();
+        run_git(&root, ["init"]);
+        run_git(&root, ["config", "user.email", "agentcode@example.invalid"]);
+        run_git(&root, ["config", "user.name", "AgentCode Test"]);
+        run_git(&root, ["add", "."]);
+        run_git(&root, ["commit", "-m", "fixture"]);
+
+        let mut broker = ToolBroker::new(
+            CapabilityPolicy::new()
+                .allow(Capability::SecurityScan)
+                .allow(Capability::ProcessExec("*".to_string())),
+        );
+        WorkspaceTools::with_required_isolation(
+            root.clone(),
+            ac_sandbox::IsolationLevel::ProcessRestricted,
+        )
+        .register_all(&mut broker)
+        .unwrap();
+        let mut evidence = EvidenceStore::new();
+        let result = broker
+            .invoke(
+                ToolRequest {
+                    id: StableId::new("toolreq"),
+                    tool_id: "security.verify".to_string(),
+                    tool_version: "1".to_string(),
+                    payload: json!({
+                        "required_scanners": ["gitleaks", "semgrep"],
+                        "semgrep_rules_path": rules.display().to_string()
+                    })
+                    .to_string(),
+                    capabilities: Vec::new(),
+                },
+                &mut evidence,
+            )
+            .unwrap();
+        assert_eq!(
+            result.status,
+            ToolStatus::Succeeded,
+            "{}",
+            result.observation
+        );
+        let value: Value = serde_json::from_str(&result.observation).unwrap();
+        let executions = value["executions"].as_array().unwrap();
+        for scanner in ["gitleaks", "semgrep"] {
+            assert!(
+                executions.iter().any(|execution| {
+                    execution["scanner"] == scanner
+                        && execution["status"] == "Available"
+                        && execution["provenance"] == "ExternalTool"
+                }),
+                "{}",
+                result.observation
+            );
+        }
+        assert!(result.observation.contains("\"scanner\":\"gitleaks\""));
+        assert!(result.observation.contains("\"scanner\":\"semgrep\""));
+        assert!(result
+            .observation
+            .contains("\"provenance\":\"ExternalTool\""));
+        assert!(!result.observation.contains("AKIAIOSFODNN7EXAMPLE"));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    #[ignore = "requires osv-scanner and trivy installed"]
+    fn operational_security_verify_runs_real_osv_and_trivy_through_toolbroker() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(Path::parent)
+            .unwrap()
+            .to_path_buf();
+        let mut broker = ToolBroker::new(
+            CapabilityPolicy::new()
+                .allow(Capability::SecurityScan)
+                .allow(Capability::ProcessExec("*".to_string())),
+        );
+        WorkspaceTools::with_required_isolation(
+            root.clone(),
+            ac_sandbox::IsolationLevel::ProcessRestricted,
+        )
+        .register_all(&mut broker)
+        .unwrap();
+        let result = broker
+            .invoke(
+                ToolRequest {
+                    id: StableId::new("toolreq"),
+                    tool_id: "security.verify".to_string(),
+                    tool_version: "1".to_string(),
+                    payload: json!({"required_scanners": ["osv", "trivy"]}).to_string(),
+                    capabilities: Vec::new(),
+                },
+                &mut EvidenceStore::new(),
+            )
+            .unwrap();
+        assert_eq!(
+            result.status,
+            ToolStatus::Succeeded,
+            "{}",
+            result.observation
+        );
+        assert!(result.observation.contains("\"scanner\":\"osv-scanner\""));
+        assert!(result.observation.contains("\"scanner\":\"trivy\""));
+        assert!(result
+            .observation
+            .contains("\"provenance\":\"ExternalTool\""));
+    }
+
+    #[test]
+    #[ignore = "requires checkov installed"]
+    fn operational_security_verify_runs_real_checkov_through_toolbroker() {
+        let root =
+            std::env::temp_dir().join(format!("agentcode-real-checkov-{}", StableId::new("t")));
+        fs::create_dir_all(&root).unwrap();
+        fs::write(
+            root.join("main.tf"),
+            "resource \"aws_security_group\" \"bad\" {\n  ingress {\n    from_port = 22\n    to_port = 22\n    protocol = \"tcp\"\n    cidr_blocks = [\"0.0.0.0/0\"]\n  }\n}\n",
+        )
+        .unwrap();
+        let mut broker = ToolBroker::new(
+            CapabilityPolicy::new()
+                .allow(Capability::SecurityScan)
+                .allow(Capability::ProcessExec("*".to_string())),
+        );
+        WorkspaceTools::with_required_isolation(
+            root.clone(),
+            ac_sandbox::IsolationLevel::ProcessRestricted,
+        )
+        .register_all(&mut broker)
+        .unwrap();
+        let result = broker
+            .invoke(
+                ToolRequest {
+                    id: StableId::new("toolreq"),
+                    tool_id: "security.verify".to_string(),
+                    tool_version: "1".to_string(),
+                    payload: json!({"required_scanners": ["checkov"]}).to_string(),
+                    capabilities: Vec::new(),
+                },
+                &mut EvidenceStore::new(),
+            )
+            .unwrap();
+        assert_eq!(
+            result.status,
+            ToolStatus::Succeeded,
+            "{}",
+            result.observation
+        );
+        assert!(result.observation.contains("\"scanner\":\"checkov\""));
+        assert!(result
+            .observation
+            .contains("\"provenance\":\"ExternalTool\""));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    #[ignore = "requires ZAP installed"]
+    fn operational_security_verify_runs_real_zap_against_localhost_through_toolbroker() {
+        let (url, handle) = localhost_fixture(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: 44\r\n\r\n<html><body>AgentCode ZAP proof</body></html>",
+        );
+        let root = std::env::temp_dir().join(format!("agentcode-real-zap-{}", StableId::new("t")));
+        fs::create_dir_all(&root).unwrap();
+        let mut broker = ToolBroker::new(
+            CapabilityPolicy::new()
+                .allow(Capability::SecurityScan)
+                .allow(Capability::ProcessExec("*".to_string())),
+        );
+        WorkspaceTools::with_required_isolation(
+            root.clone(),
+            ac_sandbox::IsolationLevel::ProcessRestricted,
+        )
+        .register_all(&mut broker)
+        .unwrap();
+        let result = broker
+            .invoke(
+                ToolRequest {
+                    id: StableId::new("toolreq"),
+                    tool_id: "security.verify".to_string(),
+                    tool_version: "1".to_string(),
+                    payload: json!({
+                        "required_scanners": ["zap"],
+                        "dast_target": url,
+                        "dast_target_authorized": true
+                    })
+                    .to_string(),
+                    capabilities: Vec::new(),
+                },
+                &mut EvidenceStore::new(),
+            )
+            .unwrap();
+        handle.join().unwrap();
+        assert_eq!(
+            result.status,
+            ToolStatus::Succeeded,
+            "{}",
+            result.observation
+        );
+        assert!(result.observation.contains("\"scanner\":\"zap\""));
+        assert!(result
+            .observation
+            .contains("\"provenance\":\"ExternalTool\""));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    fn localhost_fixture(response: &'static str) -> (String, thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let handle = thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(30);
+            while Instant::now() < deadline {
+                if let Ok((mut stream, _)) = listener.accept() {
+                    let mut buffer = [0_u8; 1024];
+                    let _ = std::io::Read::read(&mut stream, &mut buffer);
+                    let _ = stream.write_all(response.as_bytes());
+                    return;
+                }
+                thread::sleep(Duration::from_millis(25));
+            }
+        });
+        (url, handle)
     }
 
     #[test]
@@ -1500,6 +2512,7 @@ mod tests {
                 cwd: root.clone(),
                 timeout_ms: 1_000,
                 network: false,
+                cleanup_paths: Vec::new(),
             })
             .unwrap();
         assert_eq!(result.exit_code, Some(0));

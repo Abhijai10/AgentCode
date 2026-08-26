@@ -244,7 +244,7 @@ fn execute_mission(
         kernel,
         job.mission_id.clone(),
         session,
-        ac_security::CapabilityPolicy::new(),
+        backend_tool_policy(),
     )?;
     let report = agent.run_goal(ac_agent::Goal::new(job.goal.clone())?)?;
     let evidence = agent.into_evidence();
@@ -257,6 +257,15 @@ fn execute_mission(
         _ => "failed",
     }
     .to_string())
+}
+
+fn backend_tool_policy() -> ac_security::CapabilityPolicy {
+    ac_security::CapabilityPolicy::new()
+        .allow(ac_security::Capability::FilesystemRead("*".to_string()))
+        .allow(ac_security::Capability::FilesystemWrite("*".to_string()))
+        .allow(ac_security::Capability::ProcessExec("*".to_string()))
+        .allow(ac_security::Capability::BrowserAutomation)
+        .allow(ac_security::Capability::SecurityScan)
 }
 
 include!("release.rs");
@@ -932,28 +941,30 @@ mod tests {
 
     #[test]
     fn restart_recovers_interrupted_session() {
-        let (dir, db, lock) = temp_paths();
-        let session_id;
+        let (dir, db_path, lock) = temp_paths();
         {
-            let mut daemon = DaemonService::open(&db, &lock).unwrap();
-            daemon.start().unwrap();
-            let mut ipc = LocalIpc::new(&mut daemon);
-            let response = ipc
-                .send(DaemonCommand::CreateSession {
-                    goal: "Recover me".to_string(),
-                })
-                .unwrap();
-            session_id = match response {
-                DaemonResponse::SessionCreated { session_id, .. } => session_id,
-                _ => panic!("expected session"),
-            };
-            ipc.send(DaemonCommand::CheckpointSession {
-                session_id,
-                next_step: 3,
+            let mut db = ControlPlaneDb::open(&db_path).unwrap();
+            db.migrate().unwrap();
+            let mission_id = StableId::from_existing("mission-restart-recover").unwrap();
+            let session_id = StableId::from_existing("session-restart-recover").unwrap();
+            db.put_mission(&ac_kernel::Mission {
+                id: mission_id.clone(),
+                original_goal: "Recover me".to_string(),
+                state: MissionState::Active,
+                created_at: TimestampMillis::now(),
             })
             .unwrap();
+            db.save_session(&session_id, &mission_id, "executing")
+                .unwrap();
+            db.save_checkpoint(
+                &StableId::from_existing("checkpoint-restart-recover").unwrap(),
+                &session_id,
+                3,
+                "executing",
+            )
+            .unwrap();
         }
-        let mut restarted = DaemonService::open(&db, &lock).unwrap();
+        let mut restarted = DaemonService::open(&db_path, &lock).unwrap();
         restarted.start().unwrap();
         assert!(!restarted.recovered_sessions().is_empty());
         restarted.stop().unwrap();
@@ -1043,7 +1054,7 @@ mod tests {
         let build = release
             .capture_build("1.0.0", "commit-a", "release", "macos-arm64")
             .unwrap();
-        assert!(build.reproducible);
+        assert!(!build.reproducible);
         let version = ReleaseVersion {
             version: "1.0.1".to_string(),
             source_commit: "commit-b".to_string(),

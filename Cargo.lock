@@ -65,6 +65,7 @@ version = "0.1.0"
 dependencies = [
  "ac-common",
  "fastembed",
+ "sha2",
 ]
 
 [[package]]
@@ -193,6 +194,8 @@ dependencies = [
  "ac-evidence",
  "ac-sandbox",
  "ac-security",
+ "ac-verification",
+ "serde_json",
 ]
 
 [[package]]

@@ -420,6 +420,22 @@
       "admission_record": "docs/policy/dependency-admissions/DEP-ADM-003-browser-cdp-backend.md",
       "adopting_phase": "Batch 4",
       "notes": "pinned in Cargo.lock for ac-verification"
+    },
+    {
+      "id": "CAND-0027",
+      "name": "sha2",
+      "status": "ACTUAL",
+      "resolved_version": "0.10.9",
+      "declared_license": "MIT OR Apache-2.0",
+      "license_review": "INSPECTED",
+      "license_file": "~/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/sha2-0.10.9/LICENSE-*",
+      "classification": "DIRECT_RUNTIME_DEPENDENCY",
+      "source": "https://github.com/RustCrypto/hashes",
+      "usage": "SHA-256 digest calculation for AgentCode FastEmbed local artifact manifests",
+      "attribution_required": true,
+      "admission_record": "docs/policy/dependency-admissions/DEP-ADM-005-sha2.md",
+      "adopting_phase": "Final backend capability/security closure",
+      "notes": "Used only for local artifact integrity verification; pinned in Cargo.lock for ac-context"
     }
   ],
   "reference_research_entries": "see docs/reference/LICENSE_PROVENANCE_MATRIX.md (P01-WP02) — reference-library repos are research input only, never admitted as dependencies",

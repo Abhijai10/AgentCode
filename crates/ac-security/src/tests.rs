@@ -46,6 +46,21 @@ mod tests {
     }
 
     #[test]
+    fn osv_parser_preserves_package_advisory_and_informational_severity() {
+        let parsed = parse_external_output(
+            SecurityAdapter::Osv,
+            r#"{"results":[{"source":{"path":"Cargo.lock"},"packages":[{"package":{"name":"paste"},"version":"1.0.15","vulnerabilities":[{"id":"RUSTSEC-2024-0436","summary":"paste is unmaintained","database_specific":{"severity":"informational"}}]}]}]}"#,
+            StableId::new("evidence"),
+        )
+        .unwrap();
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].adapter, SecurityAdapter::Osv);
+        assert_eq!(parsed[0].rule_id, "RUSTSEC-2024-0436");
+        assert_eq!(parsed[0].severity, SecuritySeverity::Low);
+        assert!(parsed[0].fingerprint.contains("paste:1.0.15"));
+    }
+
+    #[test]
     fn denied_capability_overrides_allow() {
         let capability = Capability::Network("*".to_string());
         let policy = CapabilityPolicy::new()

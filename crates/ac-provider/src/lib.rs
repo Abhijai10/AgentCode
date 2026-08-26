@@ -463,6 +463,7 @@ pub fn validate_provider_events(
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ProviderFailureClass {
     RateLimited,
+    RateLimitedAfter(u64),
     Timeout,
     ServerError,
     Network,
@@ -964,6 +965,8 @@ pub struct ProviderRegistry {
     attempts: Vec<RouteAttempt>,
 }
 
+const MAX_PROVIDER_HISTORY: usize = 256;
+
 impl ProviderRegistry {
     pub fn new() -> Self {
         Self::default()
@@ -1237,6 +1240,7 @@ impl ProviderRegistry {
             events: Vec::new(),
             failure: None,
         });
+        truncate_front(&mut self.attempts, MAX_PROVIDER_HISTORY);
         Ok(id)
     }
 
@@ -1311,6 +1315,10 @@ impl ProviderRegistry {
                     self.finish_failed(&attempt_id, ProviderFailureClass::StreamAborted)
                         .map_err(|_| ProviderFailureClass::MalformedResponse)?;
                     last_failure = Some(ProviderFailureClass::StreamAborted);
+                    sleep_retry_delay(
+                        ProviderFailureClass::StreamAborted,
+                        max_attempts - remaining.len(),
+                    );
                 }
                 Err(failure) => {
                     self.finish_failed(&attempt_id, failure)
@@ -1319,6 +1327,7 @@ impl ProviderRegistry {
                         return Err(failure);
                     }
                     last_failure = Some(failure);
+                    sleep_retry_delay(failure, max_attempts - remaining.len());
                 }
             }
         }
@@ -1472,6 +1481,7 @@ impl ProviderRegistry {
                             cost,
                         );
                         self.routing_decisions.push(decision.clone());
+                        truncate_front(&mut self.routing_decisions, MAX_PROVIDER_HISTORY);
                         return Ok(RouteExecution { events, decision });
                     }
                     Ok(events) => {
@@ -1498,7 +1508,7 @@ impl ProviderRegistry {
                         {
                             break;
                         }
-                        bounded_backoff(attempt_index);
+                        sleep_retry_delay(ProviderFailureClass::StreamAborted, attempt_index);
                     }
                     Err(failure) => {
                         self.finish_failed(&attempt_id, failure)
@@ -1519,7 +1529,7 @@ impl ProviderRegistry {
                         if !is_retryable(failure) || attempt_index == 1 {
                             break;
                         }
-                        bounded_backoff(attempt_index);
+                        sleep_retry_delay(failure, attempt_index);
                     }
                 }
             }
@@ -1546,6 +1556,7 @@ impl ProviderRegistry {
             },
         );
         self.routing_decisions.push(decision);
+        truncate_front(&mut self.routing_decisions, MAX_PROVIDER_HISTORY);
         Err(last_failure.unwrap_or(ProviderFailureClass::UnsupportedCapability))
     }
 
@@ -1703,6 +1714,7 @@ impl ProviderRegistry {
             latency_ms,
             created_at: TimestampMillis::now(),
         });
+        truncate_front(&mut self.health_observations, MAX_PROVIDER_HISTORY);
     }
 
     fn record_route_failure(
@@ -1720,6 +1732,7 @@ impl ProviderRegistry {
             latency_ms,
             created_at: TimestampMillis::now(),
         });
+        truncate_front(&mut self.health_observations, MAX_PROVIDER_HISTORY);
     }
 
     fn estimate_cost(
@@ -1758,6 +1771,7 @@ fn is_retryable(failure: ProviderFailureClass) -> bool {
     matches!(
         failure,
         ProviderFailureClass::RateLimited
+            | ProviderFailureClass::RateLimitedAfter(_)
             | ProviderFailureClass::Timeout
             | ProviderFailureClass::ServerError
             | ProviderFailureClass::Network
@@ -1765,14 +1779,27 @@ fn is_retryable(failure: ProviderFailureClass) -> bool {
     )
 }
 
-fn bounded_backoff(attempt_index: usize) {
-    let millis = 5_u64.saturating_mul(1_u64 << attempt_index.min(3));
-    std::thread::sleep(Duration::from_millis(millis));
+fn sleep_retry_delay(failure: ProviderFailureClass, attempt_index: usize) {
+    std::thread::sleep(Duration::from_millis(retry_delay_millis(
+        failure,
+        attempt_index,
+    )));
+}
+
+fn retry_delay_millis(failure: ProviderFailureClass, attempt_index: usize) -> u64 {
+    if let ProviderFailureClass::RateLimitedAfter(seconds) = failure {
+        return seconds.saturating_mul(1_000).min(30_000);
+    }
+    let base = 100_u64.saturating_mul(1_u64 << attempt_index.min(5));
+    let jitter = (attempt_index as u64).wrapping_mul(37) % 41;
+    base.saturating_add(jitter).min(5_000)
 }
 
 pub fn normalize_failure(failure: ProviderFailureClass) -> NormalizedProviderFailure {
     match failure {
-        ProviderFailureClass::RateLimited => NormalizedProviderFailure::RateLimit,
+        ProviderFailureClass::RateLimited | ProviderFailureClass::RateLimitedAfter(_) => {
+            NormalizedProviderFailure::RateLimit
+        }
         ProviderFailureClass::Timeout => NormalizedProviderFailure::Timeout,
         ProviderFailureClass::ServerError | ProviderFailureClass::Network => {
             NormalizedProviderFailure::ProviderUnavailable
@@ -1902,9 +1929,15 @@ fn validate_endpoint(endpoint: &str, allow_plain_http_remote: bool) -> AcResult<
             "provider endpoint must be a valid URL",
         )
     })?;
+    if is_metadata_or_link_local_endpoint(&url) {
+        return Err(AcError::validation(
+            "PROVIDER-METADATA_ENDPOINT_DENIED",
+            "provider endpoint may not target metadata or link-local hosts",
+        ));
+    }
     match url.scheme() {
         "https" => Ok(()),
-        "http" if is_local_endpoint(&url) || allow_plain_http_remote => Ok(()),
+        "http" if is_loopback_endpoint(&url) || allow_plain_http_remote => Ok(()),
         "http" => Err(AcError::validation(
             "PROVIDER-INSECURE_REMOTE_ENDPOINT",
             "remote provider endpoints must use HTTPS unless explicitly enabled",
@@ -1916,20 +1949,21 @@ fn validate_endpoint(endpoint: &str, allow_plain_http_remote: bool) -> AcResult<
     }
 }
 
-fn is_local_endpoint(url: &Url) -> bool {
+fn is_loopback_endpoint(url: &Url) -> bool {
     let Some(host) = url.host_str() else {
         return false;
     };
-    host == "localhost"
-        || host == "127.0.0.1"
-        || host == "::1"
-        || host.starts_with("10.")
-        || host.starts_with("192.168.")
-        || host
-            .strip_prefix("172.")
-            .and_then(|rest| rest.split('.').next())
-            .and_then(|octet| octet.parse::<u8>().ok())
-            .is_some_and(|octet| (16..=31).contains(&octet))
+    host == "localhost" || host == "127.0.0.1" || host == "::1" || host == "[::1]"
+}
+
+fn is_metadata_or_link_local_endpoint(url: &Url) -> bool {
+    let Some(host) = url.host_str().map(|host| host.trim_matches(['[', ']'])) else {
+        return false;
+    };
+    host == "169.254.169.254"
+        || host.starts_with("169.254.")
+        || host.eq_ignore_ascii_case("metadata.google.internal")
+        || host.to_ascii_lowercase().starts_with("fe80:")
 }
 
 fn validate_custom_headers(headers: &[(String, String)]) -> AcResult<()> {
@@ -2033,6 +2067,11 @@ fn events_from_response(
     cancel: &dyn Fn() -> bool,
 ) -> Result<Vec<ProviderStreamEvent>, ProviderFailureClass> {
     let status = response.status().as_u16();
+    let retry_after_seconds = response
+        .headers()
+        .get("retry-after")
+        .and_then(|value| value.to_str().ok())
+        .and_then(parse_retry_after_seconds);
     let mut body = Vec::new();
     let mut chunk = [0_u8; 256];
     loop {
@@ -2055,19 +2094,31 @@ fn events_from_response(
         }
     }
     let body = String::from_utf8(body).map_err(|_| ProviderFailureClass::MalformedResponse)?;
-    events_from_status_and_body(status, &body, provider_kind)
+    events_from_status_and_body_with_retry_after(status, &body, provider_kind, retry_after_seconds)
 }
 
+#[cfg(test)]
 fn events_from_status_and_body(
     status: u16,
     body: &str,
     provider_kind: HttpProviderKind,
 ) -> Result<Vec<ProviderStreamEvent>, ProviderFailureClass> {
+    events_from_status_and_body_with_retry_after(status, body, provider_kind, None)
+}
+
+fn events_from_status_and_body_with_retry_after(
+    status: u16,
+    body: &str,
+    provider_kind: HttpProviderKind,
+    retry_after_seconds: Option<u64>,
+) -> Result<Vec<ProviderStreamEvent>, ProviderFailureClass> {
     match status {
         200..=299 => parse_provider_body(body, provider_kind),
         401 | 403 => Err(ProviderFailureClass::Auth),
         408 | 504 => Err(ProviderFailureClass::Timeout),
-        429 => Err(ProviderFailureClass::RateLimited),
+        429 => Err(retry_after_seconds
+            .map(ProviderFailureClass::RateLimitedAfter)
+            .unwrap_or(ProviderFailureClass::RateLimited)),
         400 => provider_error_class(body).map_err(|failure| {
             if failure == ProviderFailureClass::MalformedResponse {
                 ProviderFailureClass::InvalidRequest
@@ -2085,6 +2136,21 @@ fn events_from_status_and_body(
         413 => Err(ProviderFailureClass::ContextOverflow),
         status if (400..=499).contains(&status) => provider_error_class(body),
         _ => Err(ProviderFailureClass::ServerError),
+    }
+}
+
+fn parse_retry_after_seconds(value: &str) -> Option<u64> {
+    value
+        .trim()
+        .parse::<u64>()
+        .ok()
+        .map(|seconds| seconds.min(30))
+}
+
+fn truncate_front<T>(items: &mut Vec<T>, limit: usize) {
+    let overflow = items.len().saturating_sub(limit);
+    if overflow > 0 {
+        items.drain(0..overflow);
     }
 }
 
@@ -3199,5 +3265,71 @@ data: [DONE]\n\n";
         let verification = registry.ranked_candidates(&verification);
         assert_eq!(implementation[0].model_identity_id, impl_identity);
         assert_eq!(verification[0].model_identity_id, verify_identity);
+    }
+
+    #[test]
+    fn endpoint_policy_blocks_metadata_and_requires_private_lan_http_opt_in() {
+        assert!(
+            HttpProviderAdapter::new("http://127.0.0.1:11434/api/chat", None, "m", 100).is_ok()
+        );
+        assert_eq!(
+            HttpProviderAdapter::new("http://169.254.169.254/latest", None, "m", 100)
+                .unwrap_err()
+                .code(),
+            "PROVIDER-METADATA_ENDPOINT_DENIED"
+        );
+        assert_eq!(
+            HttpProviderAdapter::new("http://192.168.1.5:8080/v1/chat", None, "m", 100)
+                .unwrap_err()
+                .code(),
+            "PROVIDER-INSECURE_REMOTE_ENDPOINT"
+        );
+        let mut options = HttpProviderOptions::new("http://192.168.1.5:8080/v1/chat", "m");
+        options.allow_plain_http_remote = true;
+        assert!(HttpProviderAdapter::new_kind(options, HttpProviderKind::OpenAiCompatible).is_ok());
+    }
+
+    #[test]
+    fn retry_after_and_backoff_are_bounded_without_sleeping() {
+        assert_eq!(parse_retry_after_seconds("2"), Some(2));
+        assert_eq!(parse_retry_after_seconds("999"), Some(30));
+        assert_eq!(
+            events_from_status_and_body_with_retry_after(
+                429,
+                "rate limited",
+                HttpProviderKind::OpenAiCompatible,
+                Some(2),
+            )
+            .unwrap_err(),
+            ProviderFailureClass::RateLimitedAfter(2)
+        );
+        assert_eq!(
+            retry_delay_millis(ProviderFailureClass::RateLimitedAfter(99), 0),
+            30_000
+        );
+        assert!(retry_delay_millis(ProviderFailureClass::Timeout, 7) <= 5_000);
+    }
+
+    #[test]
+    fn provider_transient_histories_are_bounded() {
+        let mut registry = ProviderRegistry::new();
+        let _ = register_route(
+            &mut registry,
+            "bounded",
+            Box::new(ScriptedProvider::new(vec![Ok(successful_events("ok"))])),
+            "family",
+            "model",
+            80,
+            80,
+            false,
+            false,
+        );
+        let request = registry
+            .normalize_request("hello", vec![ProviderCapability::Chat], 64)
+            .unwrap();
+        for _ in 0..(MAX_PROVIDER_HISTORY + 10) {
+            let _ = registry.start_attempt(&request).unwrap();
+        }
+        assert_eq!(registry.attempts().len(), MAX_PROVIDER_HISTORY);
     }
 }

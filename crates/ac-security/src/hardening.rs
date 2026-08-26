@@ -95,7 +95,7 @@ impl SecurityHardeningReview {
             source: non_empty(source.into(), "SECURITY-SUPPLY_SOURCE")?,
             version: non_empty(version.into(), "SECURITY-SUPPLY_VERSION")?,
             checksum: non_empty(checksum.into(), "SECURITY-SUPPLY_CHECKSUM")?,
-            reproducible: true,
+            reproducible: false,
         };
         self.supply_chain.push(record.clone());
         Ok(record)

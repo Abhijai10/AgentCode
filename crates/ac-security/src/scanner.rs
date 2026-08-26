@@ -1,6 +1,7 @@
+use std::fs;
 use std::path::{Path, PathBuf};
 
-use ac_evidence::{EvidenceKind, EvidenceStore, Provenance};
+use ac_evidence::{EvidenceStore, Provenance};
 use serde_json::Value;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
@@ -23,11 +24,16 @@ pub enum ScannerAvailability { Available, Unavailable, Misconfigured, Failed }
 pub enum ScannerNetworkPolicy { Deny, Allow }
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ScannerConfiguration { pub adapter: SecurityAdapter, pub enabled: bool, pub required: bool, pub executable: String, pub timeout_ms: u64, pub network: ScannerNetworkPolicy, pub rules_path: Option<String> }
-impl ScannerConfiguration { pub fn external(adapter: SecurityAdapter) -> Self { let executable = match adapter { SecurityAdapter::Gitleaks => "gitleaks", SecurityAdapter::Osv => "osv-scanner", SecurityAdapter::Trivy => "trivy", SecurityAdapter::Semgrep => "semgrep", SecurityAdapter::Checkov => "checkov", SecurityAdapter::Zap => "zap.sh", _ => "" }; Self { adapter, enabled: true, required: false, executable: executable.to_string(), timeout_ms: 60_000, network: ScannerNetworkPolicy::Deny, rules_path: None } } }
+impl ScannerConfiguration {
+    pub fn external(adapter: SecurityAdapter) -> Self {
+        let executable = discover_scanner_executable(adapter).unwrap_or_else(|| default_scanner_executable(adapter).to_string());
+        Self { adapter, enabled: true, required: false, executable, timeout_ms: 60_000, network: ScannerNetworkPolicy::Deny, rules_path: None }
+    }
+}
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ScannerCapabilities { pub scan_kinds: Vec<String>, pub requires_target_authorization: bool }
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ScannerProcessRequest { pub adapter: SecurityAdapter, pub executable: String, pub argv: Vec<String>, pub cwd: PathBuf, pub timeout_ms: u64, pub network: bool }
+pub struct ScannerProcessRequest { pub adapter: SecurityAdapter, pub executable: String, pub argv: Vec<String>, pub cwd: PathBuf, pub timeout_ms: u64, pub network: bool, pub cleanup_paths: Vec<PathBuf> }
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ScannerProcessResult { pub exit_code: Option<i32>, pub stdout: String, pub stderr: String, pub stdout_truncated: bool, pub stderr_truncated: bool }
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -84,7 +90,7 @@ impl BaselineSecurityOrchestrator {
             let output = match executor.execute(scan_request(config, input)?) { Ok(out) if scan_exit_is_result(config.adapter, out.exit_code) => out, Ok(out) => { self.record_failure(&mut report, config, input, ScannerFailure::ExecutionFailed(redact_output(&out.stderr)))?; continue; }, Err(failure) => { self.record_failure(&mut report, config, input, failure)?; continue; } };
             if output.stdout_truncated || output.stderr_truncated { return Err(AcError::new("SECURITY-SCANNER_OUTPUT_TRUNCATED", "scanner output exceeded governed limit", ErrorKind::Unavailable, Retryability::NotRetryable)); }
             let raw = redact_output(&output.stdout);
-            let evidence_ref = evidence.append(EvidenceKind::TestReport, Provenance { source: "security-orchestrator".to_string(), commit: Some(input.commit.clone()), worktree: Some(input.workspace_root.display().to_string()), tool: Some(adapter_name(config.adapter).to_string()) }, format!("mem://security/{}/{}", adapter_name(config.adapter), StableId::new("raw")), raw.clone())?;
+            let evidence_ref = evidence.append_tool_output(Provenance { source: "security-orchestrator".to_string(), commit: Some(input.commit.clone()), worktree: Some(input.workspace_root.display().to_string()), tool: Some(adapter_name(config.adapter).to_string()) }, format!("mem://security/{}/{}", adapter_name(config.adapter), StableId::new("raw")), raw.clone(), &[])?;
             report.instances.extend(parse_external_output(config.adapter, &raw, evidence_ref.clone())?);
             report.adapters_run.push(config.adapter);
             report.executions.push(ScannerExecution { adapter: config.adapter, availability: ScannerAvailability::Available, version: Some(version), raw_evidence_ref: Some(evidence_ref), source_commit: input.commit.clone(), failure: None });
@@ -109,10 +115,113 @@ impl BaselineSecurityOrchestrator {
 #[allow(clippy::possible_missing_else)]
 fn validate_config(config: &ScannerConfiguration, input: &ManagedSecurityScanInput) -> AcResult<()> { if !is_external(config.adapter) || config.executable.trim().is_empty() || config.timeout_ms == 0 { return Err(AcError::validation("SECURITY-SCANNER_MISCONFIGURED", "scanner executable and timeout are required")); } if config.adapter == SecurityAdapter::Zap && (!input.target_authorized || !input.target_url.as_deref().is_some_and(|url| url.starts_with("http://127.0.0.1") || url.starts_with("http://localhost"))) { return Err(AcError::policy_denied("SECURITY-ZAP_TARGET_UNAUTHORIZED", "ZAP requires an explicitly authorized localhost target")); } Ok(()) }
 fn is_external(adapter: SecurityAdapter) -> bool { matches!(adapter, SecurityAdapter::Gitleaks | SecurityAdapter::Osv | SecurityAdapter::Trivy | SecurityAdapter::Semgrep | SecurityAdapter::Checkov | SecurityAdapter::Zap) }
-fn version_request(config: &ScannerConfiguration, cwd: &Path) -> ScannerProcessRequest { ScannerProcessRequest { adapter: config.adapter, executable: config.executable.clone(), argv: vec![config.executable.clone(), "--version".to_string()], cwd: cwd.to_path_buf(), timeout_ms: config.timeout_ms.min(10_000), network: false } }
-fn scan_request(c: &ScannerConfiguration, input: &ManagedSecurityScanInput) -> AcResult<ScannerProcessRequest> { let root = input.workspace_root.display().to_string(); let argv = match c.adapter { SecurityAdapter::Gitleaks => vec![c.executable.clone(), "detect".to_string(), "--source".to_string(), root, "--report-format".to_string(), "json".to_string(), "--report-path".to_string(), "/dev/stdout".to_string(), "--no-banner".to_string()], SecurityAdapter::Osv => vec![c.executable.clone(), "scan".to_string(), "source".to_string(), "--format".to_string(), "json".to_string(), root], SecurityAdapter::Trivy => vec![c.executable.clone(), "fs".to_string(), "--format".to_string(), "json".to_string(), "--offline-scan".to_string(), root], SecurityAdapter::Semgrep => { let rules = c.rules_path.clone().ok_or_else(|| AcError::policy_denied("SECURITY-SEMGREP_RULES_REQUIRED", "Semgrep requires a configured local rules path"))?; vec![c.executable.clone(), "scan".to_string(), "--json".to_string(), "--config".to_string(), rules, root] }, SecurityAdapter::Checkov => vec![c.executable.clone(), "-d".to_string(), root, "-o".to_string(), "json".to_string()], SecurityAdapter::Zap => vec![c.executable.clone(), "-cmd".to_string(), "-quickurl".to_string(), input.target_url.clone().unwrap_or_default(), "-quickprogress".to_string(), "-quickout".to_string(), "-".to_string()], _ => return Err(AcError::validation("SECURITY-SCANNER_MISCONFIGURED", "unsupported scanner")) }; Ok(ScannerProcessRequest { adapter: c.adapter, executable: c.executable.clone(), argv, cwd: input.workspace_root.clone(), timeout_ms: c.timeout_ms, network: c.network == ScannerNetworkPolicy::Allow }) }
-fn scan_exit_is_result(adapter: SecurityAdapter, code: Option<i32>) -> bool { code == Some(0) || matches!(adapter, SecurityAdapter::Gitleaks | SecurityAdapter::Checkov) && code == Some(1) }
-fn parse_external_output(adapter: SecurityAdapter, raw: &str, evidence: StableId) -> AcResult<Vec<SecurityFindingInstance>> { let value: Value = serde_json::from_str(raw).map_err(|e| AcError::new("SECURITY-SCANNER_OUTPUT_MALFORMED", e.to_string(), ErrorKind::Validation, Retryability::NotRetryable))?; let items = match adapter { SecurityAdapter::Gitleaks => value.as_array().cloned().unwrap_or_default(), SecurityAdapter::Semgrep => at(&value, &["results"]), SecurityAdapter::Trivy => value.get("Results").and_then(Value::as_array).into_iter().flatten().flat_map(|r| ["Vulnerabilities", "Misconfigurations"].into_iter().flat_map(|k| at(r, &[k]))).collect(), SecurityAdapter::Checkov => at(&value, &["results", "failed_checks"]), SecurityAdapter::Osv => at(&value, &["results"]), SecurityAdapter::Zap => value.get("site").and_then(Value::as_array).into_iter().flatten().flat_map(|s| at(s, &["alerts"])).collect(), _ => Vec::new() }; Ok(items.iter().map(|v| normalize_item(adapter, v, evidence.clone())).collect()) }
+fn version_request(config: &ScannerConfiguration, cwd: &Path) -> ScannerProcessRequest { ScannerProcessRequest { adapter: config.adapter, executable: config.executable.clone(), argv: vec![config.executable.clone(), "--version".to_string()], cwd: cwd.to_path_buf(), timeout_ms: config.timeout_ms.min(10_000), network: false, cleanup_paths: Vec::new() } }
+fn scan_request(c: &ScannerConfiguration, input: &ManagedSecurityScanInput) -> AcResult<ScannerProcessRequest> {
+    let root = input.workspace_root.display().to_string();
+    let mut cleanup_paths = Vec::new();
+    let argv = match c.adapter {
+        SecurityAdapter::Gitleaks => vec![c.executable.clone(), "detect".to_string(), "--source".to_string(), root, "--report-format".to_string(), "json".to_string(), "--report-path".to_string(), "/dev/stdout".to_string(), "--no-banner".to_string()],
+        SecurityAdapter::Osv => vec![c.executable.clone(), "scan".to_string(), "source".to_string(), "--format".to_string(), "json".to_string(), root],
+        SecurityAdapter::Trivy => vec![c.executable.clone(), "fs".to_string(), "--format".to_string(), "json".to_string(), "--offline-scan".to_string(), root],
+        SecurityAdapter::Semgrep => {
+            let rules = c.rules_path.clone().ok_or_else(|| AcError::policy_denied("SECURITY-SEMGREP_RULES_REQUIRED", "Semgrep requires a configured local rules path"))?;
+            vec![c.executable.clone(), "scan".to_string(), "--json".to_string(), "--config".to_string(), rules, root]
+        },
+        SecurityAdapter::Checkov => vec![c.executable.clone(), "-d".to_string(), root, "-o".to_string(), "json".to_string()],
+        SecurityAdapter::Zap => {
+            let zap_home = std::env::temp_dir().join(format!("agentcode-zap-home-{}", StableId::new("zap")));
+            fs::create_dir_all(&zap_home).map_err(|error| AcError::new("SECURITY-ZAP_HOME_CREATE", error.to_string(), ErrorKind::Unavailable, Retryability::NotRetryable))?;
+            cleanup_paths.push(zap_home.clone());
+            vec![c.executable.clone(), "-cmd".to_string(), "-dir".to_string(), zap_home.display().to_string(), "-quickurl".to_string(), input.target_url.clone().unwrap_or_default(), "-quickprogress".to_string(), "-quickout".to_string(), "-".to_string()]
+        },
+        _ => return Err(AcError::validation("SECURITY-SCANNER_MISCONFIGURED", "unsupported scanner")),
+    };
+    Ok(ScannerProcessRequest { adapter: c.adapter, executable: c.executable.clone(), argv, cwd: input.workspace_root.clone(), timeout_ms: c.timeout_ms, network: c.network == ScannerNetworkPolicy::Allow, cleanup_paths })
+}
+fn default_scanner_executable(adapter: SecurityAdapter) -> &'static str {
+    match adapter {
+        SecurityAdapter::Gitleaks => "gitleaks",
+        SecurityAdapter::Osv => "osv-scanner",
+        SecurityAdapter::Trivy => "trivy",
+        SecurityAdapter::Semgrep => "semgrep",
+        SecurityAdapter::Checkov => "checkov",
+        SecurityAdapter::Zap => "zap.sh",
+        _ => "",
+    }
+}
+fn discover_scanner_executable(adapter: SecurityAdapter) -> Option<String> {
+    let override_key = match adapter {
+        SecurityAdapter::Gitleaks => "AGENTCODE_GITLEAKS_EXECUTABLE",
+        SecurityAdapter::Osv => "AGENTCODE_OSV_SCANNER_EXECUTABLE",
+        SecurityAdapter::Trivy => "AGENTCODE_TRIVY_EXECUTABLE",
+        SecurityAdapter::Semgrep => "AGENTCODE_SEMGREP_EXECUTABLE",
+        SecurityAdapter::Checkov => "AGENTCODE_CHECKOV_EXECUTABLE",
+        SecurityAdapter::Zap => "AGENTCODE_ZAP_EXECUTABLE",
+        _ => "",
+    };
+    if !override_key.is_empty() {
+        if let Ok(value) = std::env::var(override_key) {
+            let path = PathBuf::from(value);
+            if path.is_file() {
+                return Some(path.display().to_string());
+            }
+        }
+    }
+    let name = default_scanner_executable(adapter);
+    let mut candidates = ["/opt/homebrew/bin", "/usr/local/bin", "/usr/bin", "/bin"]
+        .iter()
+        .map(|dir| Path::new(dir).join(name))
+        .collect::<Vec<_>>();
+    if adapter == SecurityAdapter::Zap {
+        candidates.push(PathBuf::from("/Applications/ZAP.app/Contents/Java/zap.sh"));
+    }
+    candidates
+        .into_iter()
+        .find(|path| path.is_file())
+        .map(|path| path.display().to_string())
+}
+fn scan_exit_is_result(adapter: SecurityAdapter, code: Option<i32>) -> bool { code == Some(0) || matches!(adapter, SecurityAdapter::Gitleaks | SecurityAdapter::Osv | SecurityAdapter::Semgrep | SecurityAdapter::Checkov) && code == Some(1) }
+fn parse_external_output(adapter: SecurityAdapter, raw: &str, evidence: StableId) -> AcResult<Vec<SecurityFindingInstance>> {
+    if raw.trim().is_empty() {
+        return Ok(Vec::new());
+    }
+    let value: Value = serde_json::from_str(raw).map_err(|e| AcError::new("SECURITY-SCANNER_OUTPUT_MALFORMED", e.to_string(), ErrorKind::Validation, Retryability::NotRetryable))?;
+    if adapter == SecurityAdapter::Osv {
+        return Ok(normalize_osv_output(&value, evidence));
+    }
+    let items = match adapter { SecurityAdapter::Gitleaks => value.as_array().cloned().unwrap_or_default(), SecurityAdapter::Semgrep => at(&value, &["results"]), SecurityAdapter::Trivy => value.get("Results").and_then(Value::as_array).into_iter().flatten().flat_map(|r| ["Vulnerabilities", "Misconfigurations"].into_iter().flat_map(|k| at(r, &[k]))).collect(), SecurityAdapter::Checkov => at(&value, &["results", "failed_checks"]), SecurityAdapter::Zap => value.get("site").and_then(Value::as_array).into_iter().flatten().flat_map(|s| at(s, &["alerts"])).collect(), _ => Vec::new() };
+    Ok(items.iter().map(|v| normalize_item(adapter, v, evidence.clone())).collect())
+}
+fn normalize_osv_output(value: &Value, evidence: StableId) -> Vec<SecurityFindingInstance> {
+    let mut instances = Vec::new();
+    for result in at(value, &["results"]) {
+        let source = result
+            .get("source")
+            .and_then(|source| field(source, &["path"]))
+            .unwrap_or_else(|| "workspace".to_string());
+        for package in at(&result, &["packages"]) {
+            let package_name = package
+                .get("package")
+                .and_then(|package| field(package, &["name"]))
+                .unwrap_or_else(|| "unknown-package".to_string());
+            let version = field(&package, &["version"]).unwrap_or_else(|| "unknown".to_string());
+            for vulnerability in at(&package, &["vulnerabilities"]) {
+                let rule = field(&vulnerability, &["id", "modified"]).unwrap_or_else(|| "OSV".to_string());
+                let title = field(&vulnerability, &["summary", "details"]).unwrap_or_else(|| "OSV advisory".to_string());
+                let severity = vulnerability
+                    .get("database_specific")
+                    .and_then(|specific| field(specific, &["severity"]))
+                    .map(|severity| severity.to_ascii_uppercase())
+                    .filter(|severity| severity != "INFORMATIONAL")
+                    .map(|severity| self::severity(Some(&severity)))
+                    .unwrap_or(SecuritySeverity::Low);
+                let fingerprint = format!("osv-scanner:{}:{}:{}", package_name, version, rule);
+                instances.push(external_instance(SecurityAdapter::Osv, &rule, severity, ProofLevel::ExternalTool, &source, 1, &fingerprint, redact_output(&title), evidence.clone()));
+            }
+        }
+    }
+    instances
+}
 #[allow(clippy::manual_try_fold)]
 fn at(value: &Value, path: &[&str]) -> Vec<Value> { path.iter().fold(Some(value), |v, p| v.and_then(|v| v.get(*p))).and_then(Value::as_array).cloned().unwrap_or_default() }
 fn normalize_item(adapter: SecurityAdapter, v: &Value, evidence: StableId) -> SecurityFindingInstance { let rule = field(v, &["RuleID", "check_id", "VulnerabilityID", "alertRef", "pluginId"]).unwrap_or_else(|| adapter_name(adapter).to_string()); let file = field(v, &["File", "path", "file_path", "Target", "resource", "url", "uri"]).unwrap_or_else(|| "workspace".to_string()); let line = number(v, &["StartLine", "line", "line_number"]).unwrap_or(1); let title = field(v, &["Description", "message", "check_name", "Title", "alert", "name"]).unwrap_or_else(|| "external scanner finding".to_string()); let severity = severity(field(v, &["Severity", "severity", "risk", "riskcode"]).as_deref()); let fingerprint = format!("{}:{}:{}:{}", adapter_name(adapter), rule, file, line); external_instance(adapter, &rule, severity, ProofLevel::ExternalTool, &file, line, &fingerprint, redact_output(&title), evidence) }

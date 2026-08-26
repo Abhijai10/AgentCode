@@ -410,7 +410,7 @@ impl ReleaseEngineer {
             commit_ref: required(commit_ref.into(), "RELEASE-COMMIT_EMPTY")?,
             build_profile: required(profile.into(), "RELEASE-PROFILE_EMPTY")?,
             environment: required(environment.into(), "RELEASE-ENV_EMPTY")?,
-            reproducible: true,
+            reproducible: false,
             created_at: TimestampMillis::now(),
         };
         self.builds.push(build.clone());

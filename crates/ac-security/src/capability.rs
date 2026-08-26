@@ -99,7 +99,9 @@ pub fn role_policy(role: ToolRole) -> CapabilityPolicy {
             .allow(Capability::Network("*".to_string())),
         ToolRole::Verifier => CapabilityPolicy::new()
             .allow(Capability::FilesystemRead("*".to_string()))
-            .allow(Capability::ProcessExec("*".to_string())),
+            .allow(Capability::ProcessExec("*".to_string()))
+            .allow(Capability::BrowserAutomation)
+            .allow(Capability::SecurityScan),
     }
 }
 
