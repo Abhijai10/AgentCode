@@ -480,6 +480,48 @@ mod tests {
         let _ = fs::remove_dir_all(root);
     }
 
+    #[test]
+    fn unchanged_content_with_same_model_is_not_reembedded() {
+        let mut index = SemanticMemoryIndex::default();
+        let fact = MemoryFact {
+            id: StableId::from_existing("fact-no-reembed").unwrap(),
+            statement: "durable memory persists trusted architecture facts".to_string(),
+            fact_type: crate::FactType::ArchitectureFact,
+            source: crate::FactSource::Runtime,
+            source_evidence: vec![StableId::new("evidence")],
+            confidence: 100,
+            freshness: FreshnessState::Fresh,
+            scope: crate::MemoryScope {
+                repository_id: StableId::new("repo"),
+                mission_id: None,
+                task_id: None,
+                branch: None,
+            },
+            memory_class: crate::MemoryClass::Decision,
+            observed_commit: "abc".to_string(),
+            dependencies: Vec::new(),
+            conflict_set: None,
+            valid_from: TimestampMillis::now(),
+            valid_until: None,
+            superseded_by: None,
+            last_validation: TimestampMillis::now(),
+        };
+        index.restore(vec![SemanticChunk {
+            id: StableId::new("semchunk"),
+            repository_id: fact.scope.repository_id.clone(),
+            fact_id: fact.id.clone(),
+            content: fact.statement.clone(),
+            content_hash: stable_hash(&fact.statement),
+            model_id: LOCAL_MODEL_ID.to_string(),
+            dimension: LOCAL_DIMENSION,
+            vector: vec![0.1; LOCAL_DIMENSION],
+            freshness: FreshnessState::Fresh,
+            created_at: TimestampMillis::now(),
+        }]);
+        assert!(!index.index_fact(&fact).unwrap());
+        assert_eq!(index.chunks().len(), 1);
+    }
+
     fn chunk(fact: &str, model_id: &str, dimension: usize, vector: Vec<f32>) -> SemanticChunk {
         SemanticChunk {
             id: StableId::new("semchunk"),

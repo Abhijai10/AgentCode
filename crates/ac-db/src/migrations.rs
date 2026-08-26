@@ -1,4 +1,4 @@
-pub const CURRENT_SCHEMA_VERSION: u32 = 20;
+pub const CURRENT_SCHEMA_VERSION: u32 = 21;
 
 impl ControlPlaneDb {
     pub fn open(path: impl AsRef<Path>) -> AcResult<Self> {
@@ -134,6 +134,22 @@ impl ControlPlaneDb {
             tx.execute_batch(include_str!("../../../migrations/0020_task_acceptance_criteria.sql"))
                 .map_err(db_error)?;
         }
+        if current_version < 21 {
+            add_column_if_missing(
+                &tx,
+                "tasks",
+                "acceptance_criteria_json",
+                "TEXT NOT NULL DEFAULT '[]'",
+            )?;
+            add_column_if_missing(&tx, "evidence_records", "raw_content", "TEXT")?;
+            add_column_if_missing(&tx, "evidence_records", "model_summary", "TEXT")?;
+            add_column_if_missing(
+                &tx,
+                "evidence_records",
+                "sensitive",
+                "INTEGER NOT NULL DEFAULT 0",
+            )?;
+        }
         tx.pragma_update(None, "user_version", CURRENT_SCHEMA_VERSION)
             .map_err(db_error)?;
         tx.commit().map_err(db_error)?;
@@ -145,4 +161,36 @@ impl ControlPlaneDb {
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .map_err(db_error)
     }
+}
+
+fn add_column_if_missing(
+    tx: &rusqlite::Transaction<'_>,
+    table: &str,
+    column: &str,
+    definition: &str,
+) -> AcResult<()> {
+    if table_has_column(tx, table, column)? {
+        return Ok(());
+    }
+    tx.execute_batch(&format!("ALTER TABLE {table} ADD COLUMN {column} {definition}"))
+        .map_err(db_error)
+}
+
+fn table_has_column(
+    tx: &rusqlite::Transaction<'_>,
+    table: &str,
+    column: &str,
+) -> AcResult<bool> {
+    let mut stmt = tx
+        .prepare(&format!("PRAGMA table_info({table})"))
+        .map_err(db_error)?;
+    let columns = stmt
+        .query_map([], |row| row.get::<_, String>(1))
+        .map_err(db_error)?;
+    for candidate in columns {
+        if candidate.map_err(db_error)? == column {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }

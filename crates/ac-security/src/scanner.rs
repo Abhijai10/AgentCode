@@ -33,7 +33,7 @@ impl ScannerConfiguration {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ScannerCapabilities { pub scan_kinds: Vec<String>, pub requires_target_authorization: bool }
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ScannerProcessRequest { pub adapter: SecurityAdapter, pub executable: String, pub argv: Vec<String>, pub cwd: PathBuf, pub timeout_ms: u64, pub network: bool, pub cleanup_paths: Vec<PathBuf> }
+pub struct ScannerProcessRequest { pub adapter: SecurityAdapter, pub executable: String, pub argv: Vec<String>, pub cwd: PathBuf, pub timeout_ms: u64, pub network: bool, pub cleanup_paths: Vec<PathBuf>, pub report_path: Option<PathBuf> }
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ScannerProcessResult { pub exit_code: Option<i32>, pub stdout: String, pub stderr: String, pub stdout_truncated: bool, pub stderr_truncated: bool }
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -86,7 +86,7 @@ impl BaselineSecurityOrchestrator {
         let mut report = SecurityScanReport { id: StableId::new("secscan"), adapters_run: Vec::new(), missing_adapters: Vec::new(), threat_model: empty_threat_model(), instances: Vec::new(), findings: Vec::new(), executions: Vec::new() };
         for config in input.configurations.iter().filter(|c| c.enabled) {
             validate_config(config, input)?;
-            let version = match executor.execute(version_request(config, &input.workspace_root)) { Ok(out) if out.exit_code == Some(0) => first_line(&out.stdout), Ok(out) => { self.record_failure(&mut report, config, input, ScannerFailure::Unavailable(redact_output(&out.stderr)))?; continue; }, Err(failure) => { self.record_failure(&mut report, config, input, failure)?; continue; } };
+            let version = match executor.execute(version_request(config, &input.workspace_root)) { Ok(out) if out.exit_code == Some(0) => scanner_version(config.adapter, &out.stdout), Ok(out) => { self.record_failure(&mut report, config, input, ScannerFailure::Unavailable(redact_output(&out.stderr)))?; continue; }, Err(failure) => { self.record_failure(&mut report, config, input, failure)?; continue; } };
             let output = match executor.execute(scan_request(config, input)?) { Ok(out) if scan_exit_is_result(config.adapter, out.exit_code) => out, Ok(out) => { self.record_failure(&mut report, config, input, ScannerFailure::ExecutionFailed(redact_output(&out.stderr)))?; continue; }, Err(failure) => { self.record_failure(&mut report, config, input, failure)?; continue; } };
             if output.stdout_truncated || output.stderr_truncated { return Err(AcError::new("SECURITY-SCANNER_OUTPUT_TRUNCATED", "scanner output exceeded governed limit", ErrorKind::Unavailable, Retryability::NotRetryable)); }
             let raw = redact_output(&output.stdout);
@@ -115,14 +115,18 @@ impl BaselineSecurityOrchestrator {
 #[allow(clippy::possible_missing_else)]
 fn validate_config(config: &ScannerConfiguration, input: &ManagedSecurityScanInput) -> AcResult<()> { if !is_external(config.adapter) || config.executable.trim().is_empty() || config.timeout_ms == 0 { return Err(AcError::validation("SECURITY-SCANNER_MISCONFIGURED", "scanner executable and timeout are required")); } if config.adapter == SecurityAdapter::Zap && (!input.target_authorized || !input.target_url.as_deref().is_some_and(|url| url.starts_with("http://127.0.0.1") || url.starts_with("http://localhost"))) { return Err(AcError::policy_denied("SECURITY-ZAP_TARGET_UNAUTHORIZED", "ZAP requires an explicitly authorized localhost target")); } Ok(()) }
 fn is_external(adapter: SecurityAdapter) -> bool { matches!(adapter, SecurityAdapter::Gitleaks | SecurityAdapter::Osv | SecurityAdapter::Trivy | SecurityAdapter::Semgrep | SecurityAdapter::Checkov | SecurityAdapter::Zap) }
-fn version_request(config: &ScannerConfiguration, cwd: &Path) -> ScannerProcessRequest { ScannerProcessRequest { adapter: config.adapter, executable: config.executable.clone(), argv: vec![config.executable.clone(), "--version".to_string()], cwd: cwd.to_path_buf(), timeout_ms: config.timeout_ms.min(10_000), network: false, cleanup_paths: Vec::new() } }
+fn version_request(config: &ScannerConfiguration, cwd: &Path) -> ScannerProcessRequest {
+    let version_arg = if config.adapter == SecurityAdapter::Zap { "-version" } else { "--version" };
+    ScannerProcessRequest { adapter: config.adapter, executable: config.executable.clone(), argv: vec![config.executable.clone(), version_arg.to_string()], cwd: cwd.to_path_buf(), timeout_ms: config.timeout_ms.min(10_000), network: false, cleanup_paths: Vec::new(), report_path: None }
+}
 fn scan_request(c: &ScannerConfiguration, input: &ManagedSecurityScanInput) -> AcResult<ScannerProcessRequest> {
     let root = input.workspace_root.display().to_string();
     let mut cleanup_paths = Vec::new();
+    let report_path = None;
     let argv = match c.adapter {
         SecurityAdapter::Gitleaks => vec![c.executable.clone(), "detect".to_string(), "--source".to_string(), root, "--report-format".to_string(), "json".to_string(), "--report-path".to_string(), "/dev/stdout".to_string(), "--no-banner".to_string()],
         SecurityAdapter::Osv => vec![c.executable.clone(), "scan".to_string(), "source".to_string(), "--format".to_string(), "json".to_string(), root],
-        SecurityAdapter::Trivy => vec![c.executable.clone(), "fs".to_string(), "--format".to_string(), "json".to_string(), "--offline-scan".to_string(), root],
+        SecurityAdapter::Trivy => vec![c.executable.clone(), "fs".to_string(), "--format".to_string(), "json".to_string(), "--offline-scan".to_string(), "--skip-db-update".to_string(), root],
         SecurityAdapter::Semgrep => {
             let rules = c.rules_path.clone().ok_or_else(|| AcError::policy_denied("SECURITY-SEMGREP_RULES_REQUIRED", "Semgrep requires a configured local rules path"))?;
             vec![c.executable.clone(), "scan".to_string(), "--json".to_string(), "--config".to_string(), rules, root]
@@ -132,11 +136,11 @@ fn scan_request(c: &ScannerConfiguration, input: &ManagedSecurityScanInput) -> A
             let zap_home = std::env::temp_dir().join(format!("agentcode-zap-home-{}", StableId::new("zap")));
             fs::create_dir_all(&zap_home).map_err(|error| AcError::new("SECURITY-ZAP_HOME_CREATE", error.to_string(), ErrorKind::Unavailable, Retryability::NotRetryable))?;
             cleanup_paths.push(zap_home.clone());
-            vec![c.executable.clone(), "-cmd".to_string(), "-dir".to_string(), zap_home.display().to_string(), "-quickurl".to_string(), input.target_url.clone().unwrap_or_default(), "-quickprogress".to_string(), "-quickout".to_string(), "-".to_string()]
+            vec![c.executable.clone(), "-cmd".to_string(), "-silent".to_string(), "-notel".to_string(), "-dir".to_string(), zap_home.display().to_string(), "-zapit".to_string(), input.target_url.clone().unwrap_or_default()]
         },
         _ => return Err(AcError::validation("SECURITY-SCANNER_MISCONFIGURED", "unsupported scanner")),
     };
-    Ok(ScannerProcessRequest { adapter: c.adapter, executable: c.executable.clone(), argv, cwd: input.workspace_root.clone(), timeout_ms: c.timeout_ms, network: c.network == ScannerNetworkPolicy::Allow, cleanup_paths })
+    Ok(ScannerProcessRequest { adapter: c.adapter, executable: c.executable.clone(), argv, cwd: input.workspace_root.clone(), timeout_ms: c.timeout_ms, network: c.network == ScannerNetworkPolicy::Allow, cleanup_paths, report_path })
 }
 fn default_scanner_executable(adapter: SecurityAdapter) -> &'static str {
     match adapter {
@@ -185,12 +189,47 @@ fn parse_external_output(adapter: SecurityAdapter, raw: &str, evidence: StableId
     if raw.trim().is_empty() {
         return Ok(Vec::new());
     }
+    if adapter == SecurityAdapter::Zap {
+        return Ok(normalize_zapit_output(raw, evidence));
+    }
     let value: Value = serde_json::from_str(raw).map_err(|e| AcError::new("SECURITY-SCANNER_OUTPUT_MALFORMED", e.to_string(), ErrorKind::Validation, Retryability::NotRetryable))?;
     if adapter == SecurityAdapter::Osv {
         return Ok(normalize_osv_output(&value, evidence));
     }
     let items = match adapter { SecurityAdapter::Gitleaks => value.as_array().cloned().unwrap_or_default(), SecurityAdapter::Semgrep => at(&value, &["results"]), SecurityAdapter::Trivy => value.get("Results").and_then(Value::as_array).into_iter().flatten().flat_map(|r| ["Vulnerabilities", "Misconfigurations"].into_iter().flat_map(|k| at(r, &[k]))).collect(), SecurityAdapter::Checkov => at(&value, &["results", "failed_checks"]), SecurityAdapter::Zap => value.get("site").and_then(Value::as_array).into_iter().flatten().flat_map(|s| at(s, &["alerts"])).collect(), _ => Vec::new() };
     Ok(items.iter().map(|v| normalize_item(adapter, v, evidence.clone())).collect())
+}
+fn normalize_zapit_output(raw: &str, evidence: StableId) -> Vec<SecurityFindingInstance> {
+    raw.lines()
+        .filter_map(|line| {
+            let line = line.trim();
+            let (severity_text, rest) = line.split_once(':')?;
+            let severity = match severity_text {
+                "Critical" | "High" | "Medium" | "Low" | "Informational" => {
+                    severity(Some(severity_text))
+                }
+                _ => return None,
+            };
+            let rule = rest
+                .split(':')
+                .next()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .unwrap_or("ZAP alert");
+            let fingerprint = format!("zap:{rule}:localhost");
+            Some(external_instance(
+                SecurityAdapter::Zap,
+                rule,
+                severity,
+                ProofLevel::ExternalTool,
+                "localhost",
+                1,
+                &fingerprint,
+                redact_output(line),
+                evidence.clone(),
+            ))
+        })
+        .collect()
 }
 fn normalize_osv_output(value: &Value, evidence: StableId) -> Vec<SecurityFindingInstance> {
     let mut instances = Vec::new();
@@ -234,7 +273,18 @@ fn instance(spec: InstanceSpec<'_>) -> SecurityFindingInstance { external_instan
 #[allow(clippy::too_many_arguments)]
 fn external_instance(adapter: SecurityAdapter, rule: &str, severity: SecuritySeverity, proof: ProofLevel, file: &str, line: u32, fingerprint: &str, evidence: String, raw: StableId) -> SecurityFindingInstance { SecurityFindingInstance { id: StableId::new("secinst"), adapter, rule_id: rule.to_string(), severity, confidence: if proof == ProofLevel::ExternalTool { 95 } else { 60 }, proof_level: proof, file_path: file.to_string(), line, fingerprint: fingerprint.to_string(), redacted_evidence: evidence, raw_evidence_ref: raw } }
 fn empty_threat_model() -> ThreatModel { ThreatModel { id: StableId::new("threat"), entry_points: Vec::new(), auth_boundaries: Vec::new(), data_stores: Vec::new(), admin_operations: Vec::new(), cloud_configuration: Vec::new(), sensitive_assets: Vec::new(), evidence_refs: vec![StableId::new("evidence")] } }
-fn first_line(s: &str) -> String { redact_output(s.lines().next().unwrap_or("unknown")) }
+fn scanner_version(adapter: SecurityAdapter, s: &str) -> String {
+    if adapter == SecurityAdapter::Zap {
+        return s
+            .lines()
+            .rev()
+            .map(str::trim)
+            .find(|line| line.chars().any(|c| c.is_ascii_digit()) && line.contains('.'))
+            .map(redact_output)
+            .unwrap_or_else(|| "unknown".to_string());
+    }
+    redact_output(s.lines().next().unwrap_or("unknown"))
+}
 fn redact_secret(value: &str) -> String { redact_output(value) }
 fn redact_output(value: &str) -> String { value.split_whitespace().map(|part| if part.contains("AKIA") || part.contains("SECRET=") || part.contains("Authorization:") || part.contains("Cookie:") || part.contains("token=") || part.contains("password=") { "[REDACTED]" } else { part }).collect::<Vec<_>>().join(" ") }
 fn remediation_for(f: &str) -> String { if f.contains("secret") { "remove committed secret and rotate credential".to_string() } else if f.contains("vulnerab") { "upgrade vulnerable dependency".to_string() } else { "review and remediate security finding".to_string() } }

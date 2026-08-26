@@ -1937,10 +1937,11 @@ fn validate_endpoint(endpoint: &str, allow_plain_http_remote: bool) -> AcResult<
     }
     match url.scheme() {
         "https" => Ok(()),
-        "http" if is_loopback_endpoint(&url) || allow_plain_http_remote => Ok(()),
+        "http" if is_loopback_endpoint(&url) => Ok(()),
+        "http" if allow_plain_http_remote && is_private_lan_endpoint(&url) => Ok(()),
         "http" => Err(AcError::validation(
             "PROVIDER-INSECURE_REMOTE_ENDPOINT",
-            "remote provider endpoints must use HTTPS unless explicitly enabled",
+            "remote provider endpoints must use HTTPS; plain HTTP is limited to loopback or explicitly opted-in private LAN model endpoints",
         )),
         _ => Err(AcError::validation(
             "PROVIDER-INVALID_HTTP_CONFIG",
@@ -1954,6 +1955,25 @@ fn is_loopback_endpoint(url: &Url) -> bool {
         return false;
     };
     host == "localhost" || host == "127.0.0.1" || host == "::1" || host == "[::1]"
+}
+
+fn is_private_lan_endpoint(url: &Url) -> bool {
+    let Some(host) = url.host_str().map(|host| host.trim_matches(['[', ']'])) else {
+        return false;
+    };
+    if host.starts_with("10.") || host.starts_with("192.168.") {
+        return true;
+    }
+    let mut parts = host.split('.');
+    matches!(
+        (
+            parts.next().and_then(|part| part.parse::<u8>().ok()),
+            parts.next().and_then(|part| part.parse::<u8>().ok()),
+            parts.next(),
+            parts.next(),
+        ),
+        (Some(172), Some(16..=31), Some(_), Some(_))
+    )
 }
 
 fn is_metadata_or_link_local_endpoint(url: &Url) -> bool {
@@ -1970,8 +1990,12 @@ fn validate_custom_headers(headers: &[(String, String)]) -> AcResult<()> {
     for (name, value) in headers {
         let normalized = name.to_ascii_lowercase();
         if normalized == "authorization"
+            || normalized == "proxy-authorization"
+            || normalized == "api-key"
             || normalized == "x-api-key"
             || normalized == "x-goog-api-key"
+            || normalized == "x-auth-token"
+            || normalized == "x-api-token"
             || normalized == "cookie"
         {
             return Err(AcError::validation(
@@ -2927,6 +2951,26 @@ data: [DONE]\n\n";
                 .code(),
             "PROVIDER-UNSAFE_CUSTOM_HEADER"
         );
+        let mut options = HttpProviderOptions::new("https://api.example.test/v1/chat", "model");
+        options
+            .custom_headers
+            .push(("Proxy-Authorization".to_string(), "secret".to_string()));
+        assert_eq!(
+            HttpProviderAdapter::new_kind(options, HttpProviderKind::OpenAiCompatible)
+                .unwrap_err()
+                .code(),
+            "PROVIDER-UNSAFE_CUSTOM_HEADER"
+        );
+        let mut options = HttpProviderOptions::new("https://api.example.test/v1/chat", "model");
+        options
+            .custom_headers
+            .push(("API-Key".to_string(), "secret".to_string()));
+        assert_eq!(
+            HttpProviderAdapter::new_kind(options, HttpProviderKind::OpenAiCompatible)
+                .unwrap_err()
+                .code(),
+            "PROVIDER-UNSAFE_CUSTOM_HEADER"
+        );
     }
 
     #[test]
@@ -3287,6 +3331,14 @@ data: [DONE]\n\n";
         let mut options = HttpProviderOptions::new("http://192.168.1.5:8080/v1/chat", "m");
         options.allow_plain_http_remote = true;
         assert!(HttpProviderAdapter::new_kind(options, HttpProviderKind::OpenAiCompatible).is_ok());
+        let mut options = HttpProviderOptions::new("http://203.0.113.10:8080/v1/chat", "m");
+        options.allow_plain_http_remote = true;
+        assert_eq!(
+            HttpProviderAdapter::new_kind(options, HttpProviderKind::OpenAiCompatible)
+                .unwrap_err()
+                .code(),
+            "PROVIDER-INSECURE_REMOTE_ENDPOINT"
+        );
     }
 
     #[test]

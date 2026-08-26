@@ -284,6 +284,145 @@ mod tests {
     }
 
     #[test]
+    fn restart_preserves_completed_dependency_and_reconciles_only_interrupted_task() {
+        let mission = StableId::new("mission");
+        let task_a = StableId::from_existing("task-restart-a").unwrap();
+        let task_b = StableId::from_existing("task-restart-b").unwrap();
+        let task_c = StableId::from_existing("task-restart-c").unwrap();
+        let plan = RuntimePlan {
+            id: StableId::new("plan"),
+            mission_id: mission.clone(),
+            revision: 1,
+            tasks: vec![
+                worker_task(task_a.clone(), mission.clone(), "A", Vec::new()),
+                worker_task(task_b.clone(), mission.clone(), "B", vec![task_a.clone()]),
+                worker_task(task_c.clone(), mission.clone(), "C", vec![task_b.clone()]),
+            ],
+            proposals: Vec::new(),
+            supersedes: None,
+        };
+        let mut graph = TaskGraph::from_runtime_plan(&plan).unwrap();
+        let mut worker = Worker::new();
+        worker.assign(mission.clone()).unwrap();
+        worker.transition(WorkerState::Running).unwrap();
+        graph.start(&task_a, &worker).unwrap();
+        graph
+            .finish(
+                &task_a,
+                &worker,
+                TaskAttemptOutcome::Succeeded,
+                vec![StableId::new("evidence")],
+                None,
+            )
+            .unwrap();
+        graph.start(&task_b, &worker).unwrap();
+        let path = std::env::temp_dir().join(format!(
+            "agentcode-runtime-restart-{}.sqlite",
+            StableId::new("db")
+        ));
+        let session_id = StableId::new("session");
+        {
+            let mut db = ControlPlaneDb::open(&path).unwrap();
+            db.migrate().unwrap();
+            db.save_session(&session_id, &mission, "running").unwrap();
+            graph.persist(&db, &worker, &session_id).unwrap();
+        }
+        {
+            let db = ControlPlaneDb::open(&path).unwrap();
+            let session = db.get_session(&session_id).unwrap().unwrap();
+            let hydrated = RuntimeHydrator::hydrate_session(&db, session).unwrap();
+            let states = hydrated
+                .graph
+                .tasks()
+                .map(|task| (task.id.clone(), task.state))
+                .collect::<std::collections::BTreeMap<_, _>>();
+            assert_eq!(states[&task_a], TaskState::Completed);
+            assert_eq!(states[&task_b], TaskState::Ready);
+            assert_eq!(states[&task_c], TaskState::Pending);
+            assert_eq!(hydrated.reconciled_tasks, vec![task_b.clone()]);
+        }
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn verification_only_restart_retries_verification_without_reopening_completed_edit() {
+        let mission = StableId::new("mission");
+        let edit = StableId::from_existing("task-edit-complete").unwrap();
+        let verify = StableId::from_existing("task-verify-running").unwrap();
+        let plan = RuntimePlan {
+            id: StableId::new("plan"),
+            mission_id: mission.clone(),
+            revision: 1,
+            tasks: vec![
+                worker_task(edit.clone(), mission.clone(), "edit", Vec::new()),
+                worker_task(verify.clone(), mission.clone(), "verify", vec![edit.clone()]),
+            ],
+            proposals: Vec::new(),
+            supersedes: None,
+        };
+        let mut graph = TaskGraph::from_runtime_plan(&plan).unwrap();
+        let mut worker = Worker::new();
+        worker.assign(mission.clone()).unwrap();
+        worker.transition(WorkerState::Running).unwrap();
+        graph.start(&edit, &worker).unwrap();
+        graph
+            .finish(
+                &edit,
+                &worker,
+                TaskAttemptOutcome::Succeeded,
+                vec![StableId::new("mutation-evidence")],
+                None,
+            )
+            .unwrap();
+        graph.start(&verify, &worker).unwrap();
+        let path = std::env::temp_dir().join(format!(
+            "agentcode-runtime-verify-restart-{}.sqlite",
+            StableId::new("db")
+        ));
+        let session_id = StableId::new("session");
+        {
+            let mut db = ControlPlaneDb::open(&path).unwrap();
+            db.migrate().unwrap();
+            db.save_session(&session_id, &mission, "running").unwrap();
+            graph.persist(&db, &worker, &session_id).unwrap();
+        }
+        {
+            let db = ControlPlaneDb::open(&path).unwrap();
+            let session = db.get_session(&session_id).unwrap().unwrap();
+            let hydrated = RuntimeHydrator::hydrate_session(&db, session).unwrap();
+            let states = hydrated
+                .graph
+                .tasks()
+                .map(|task| (task.id.clone(), task.state))
+                .collect::<std::collections::BTreeMap<_, _>>();
+            assert_eq!(states[&edit], TaskState::Completed);
+            assert_eq!(states[&verify], TaskState::Ready);
+            assert_eq!(hydrated.reconciled_tasks, vec![verify.clone()]);
+        }
+        let _ = std::fs::remove_file(path);
+    }
+
+    fn worker_task(
+        id: StableId,
+        mission_id: StableId,
+        title: &str,
+        dependencies: Vec<StableId>,
+    ) -> WorkerTask {
+        WorkerTask {
+            id,
+            mission_id,
+            title: title.to_string(),
+            dependencies,
+            state: TaskState::Pending,
+            assigned_worker: None,
+            retry_count: 0,
+            max_retries: 2,
+            evidence_refs: Vec::new(),
+            acceptance_criteria: Vec::new(),
+        }
+    }
+
+    #[test]
     fn phase12_contract_planner_dag_scheduler_and_controls_work() {
         let mission_id = StableId::from_existing("mission-p12").unwrap();
         let mut autonomy = AutonomyKernel::from_goal(

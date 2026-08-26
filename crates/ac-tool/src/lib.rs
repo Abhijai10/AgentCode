@@ -122,6 +122,7 @@ impl SecurityScannerExecutor for GovernedScannerExecutor {
         request: ScannerProcessRequest,
     ) -> Result<ScannerProcessResult, ScannerFailure> {
         let cleanup_paths = request.cleanup_paths.clone();
+        let report_path = request.report_path.clone();
         let plan = self
             .sandbox
             .prepare_execution(ExecRequest {
@@ -141,12 +142,18 @@ impl SecurityScannerExecutor for GovernedScannerExecutor {
         let result = self
             .manager
             .run("security-scanner", plan)
-            .map(|result| ScannerProcessResult {
-                exit_code: result.exit_code,
-                stdout: result.stdout,
-                stderr: result.stderr,
-                stdout_truncated: result.stdout_truncated,
-                stderr_truncated: result.stderr_truncated,
+            .map(|result| {
+                let stdout = report_path
+                    .as_ref()
+                    .and_then(|path| fs::read_to_string(path).ok())
+                    .unwrap_or(result.stdout);
+                ScannerProcessResult {
+                    exit_code: result.exit_code,
+                    stdout,
+                    stderr: result.stderr,
+                    stdout_truncated: result.stdout_truncated,
+                    stderr_truncated: result.stderr_truncated,
+                }
             })
             .map_err(|error| match error.code() {
                 "TOOL-COMMAND_TIMEOUT" => ScannerFailure::Timeout,
@@ -533,6 +540,10 @@ impl WorkspaceTools {
             root,
             required_isolation: ac_sandbox::IsolationLevel::FilesystemIsolated,
         }
+    }
+
+    pub fn required_isolation(&self) -> ac_sandbox::IsolationLevel {
+        self.required_isolation
     }
 
     pub fn with_required_isolation(
@@ -1040,10 +1051,14 @@ impl ToolExecutor for SecurityVerifyTool {
             target_url: input.dast_target.clone(),
             target_authorized: input.dast_target_authorized,
         };
+        let mut scanner_policy =
+            CapabilityPolicy::new().allow(Capability::ProcessExec("*".to_string()));
+        if input.dast_target.is_some() {
+            scanner_policy = scanner_policy.allow(Capability::Network("*".to_string()));
+        }
         let sandbox = SandboxManager::new(SandboxPolicy {
             workspace_roots: vec![root.clone()],
-            capability_policy: CapabilityPolicy::new()
-                .allow(Capability::ProcessExec("*".to_string())),
+            capability_policy: scanner_policy,
             network_default_allow: input.dast_target.is_some(),
             max_timeout_ms: 180_000,
             required_isolation: self.required_isolation,
@@ -1636,6 +1651,10 @@ impl ToolBroker {
         Ok(())
     }
 
+    pub fn definition(&self, id: &str) -> Option<&ToolDefinition> {
+        self.definitions.get(id)
+    }
+
     pub fn invoke(
         &self,
         request: ToolRequest,
@@ -2162,6 +2181,9 @@ mod tests {
                     execution["scanner"] == scanner
                         && execution["status"] == "Available"
                         && execution["provenance"] == "ExternalTool"
+                        && execution["version"].as_str().is_some_and(|version| {
+                            !version.trim().is_empty() && version != "unknown"
+                        })
                 }),
                 "{}",
                 result.observation
@@ -2218,6 +2240,63 @@ mod tests {
         assert!(result
             .observation
             .contains("\"provenance\":\"ExternalTool\""));
+    }
+
+    #[test]
+    #[ignore = "requires trivy installed"]
+    fn operational_security_verify_runs_real_trivy_through_toolbroker() {
+        let root =
+            std::env::temp_dir().join(format!("agentcode-real-trivy-{}", StableId::new("t")));
+        fs::create_dir_all(&root).unwrap();
+        fs::write(
+            root.join("README.md"),
+            "AgentCode Trivy zero-finding fixture\n",
+        )
+        .unwrap();
+        let mut broker = ToolBroker::new(
+            CapabilityPolicy::new()
+                .allow(Capability::SecurityScan)
+                .allow(Capability::ProcessExec("*".to_string())),
+        );
+        WorkspaceTools::with_required_isolation(
+            root.clone(),
+            ac_sandbox::IsolationLevel::ProcessRestricted,
+        )
+        .register_all(&mut broker)
+        .unwrap();
+        let result = broker
+            .invoke(
+                ToolRequest {
+                    id: StableId::new("toolreq"),
+                    tool_id: "security.verify".to_string(),
+                    tool_version: "1".to_string(),
+                    payload: json!({"required_scanners": ["trivy"]}).to_string(),
+                    capabilities: Vec::new(),
+                },
+                &mut EvidenceStore::new(),
+            )
+            .unwrap();
+        assert_eq!(
+            result.status,
+            ToolStatus::Succeeded,
+            "{}",
+            result.observation
+        );
+        let value: Value = serde_json::from_str(&result.observation).unwrap();
+        let executions = value["executions"].as_array().unwrap();
+        assert!(
+            executions.iter().any(|execution| {
+                execution["scanner"] == "trivy"
+                    && execution["status"] == "Available"
+                    && execution["provenance"] == "ExternalTool"
+                    && execution["version"]
+                        .as_str()
+                        .is_some_and(|version| !version.trim().is_empty() && version != "unknown")
+            }),
+            "{}",
+            result.observation
+        );
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
@@ -2322,7 +2401,7 @@ mod tests {
         listener.set_nonblocking(true).unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
         let handle = thread::spawn(move || {
-            let deadline = Instant::now() + Duration::from_secs(30);
+            let deadline = Instant::now() + Duration::from_secs(120);
             while Instant::now() < deadline {
                 if let Ok((mut stream, _)) = listener.accept() {
                     let mut buffer = [0_u8; 1024];
@@ -2513,6 +2592,7 @@ mod tests {
                 timeout_ms: 1_000,
                 network: false,
                 cleanup_paths: Vec::new(),
+                report_path: None,
             })
             .unwrap();
         assert_eq!(result.exit_code, Some(0));

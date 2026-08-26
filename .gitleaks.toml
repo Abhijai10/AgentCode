@@ -1,0 +1,7 @@
+title = "AgentCode Gitleaks configuration"
+
+[[allowlists]]
+description = "Reference catalog commit SHAs can match sourcegraph-access-token heuristics"
+condition = "AND"
+paths = ['''^docs/reference/agentcode_reference_catalog\.json$''']
+regexes = ['''"head_sha"\s*:\s*"[a-f0-9]{40}"''']

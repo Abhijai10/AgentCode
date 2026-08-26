@@ -436,6 +436,22 @@
       "admission_record": "docs/policy/dependency-admissions/DEP-ADM-005-sha2.md",
       "adopting_phase": "Final backend capability/security closure",
       "notes": "Used only for local artifact integrity verification; pinned in Cargo.lock for ac-context"
+    },
+    {
+      "id": "CAND-0028",
+      "name": "tokio",
+      "status": "ACTUAL",
+      "resolved_version": "1.53.1",
+      "declared_license": "MIT",
+      "license_review": "INSPECTED",
+      "license_file": "~/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tokio-1.53.1/LICENSE",
+      "classification": "DIRECT_RUNTIME_DEPENDENCY",
+      "source": "https://github.com/tokio-rs/tokio",
+      "usage": "Safe Unix peer credential extraction for daemon IPC authentication",
+      "attribution_required": true,
+      "admission_record": "docs/policy/dependency-admissions/DEP-ADM-006-tokio-peer-cred.md",
+      "adopting_phase": "Final backend runtime/capability closure",
+      "notes": "Already present in Cargo.lock; ac-daemon enables only net and rt for UnixStream::peer_cred"
     }
   ],
   "reference_research_entries": "see docs/reference/LICENSE_PROVENANCE_MATRIX.md (P01-WP02) — reference-library repos are research input only, never admitted as dependencies",

@@ -1310,6 +1310,36 @@ mod tests {
     }
 
     #[test]
+    fn applied_change_not_acknowledged_reconciles_without_duplicate_apply() {
+        let mut repo = MemoryFileRepository::new("rev-a");
+        repo.put("src/lib.rs", "pub fn value() -> u32 { 1 }\n");
+        let engine = EditEngine;
+        let mut transaction = engine
+            .prepare(
+                &repo,
+                vec![request(
+                    "src/lib.rs",
+                    &repo,
+                    EditStrategy::SearchReplace {
+                        search: "1".to_string(),
+                        replace: "2".to_string(),
+                        expected_matches: 1,
+                    },
+                )],
+            )
+            .unwrap();
+        engine.apply(&mut repo, &mut transaction).unwrap();
+        assert_eq!(
+            repo.read("src/lib.rs").unwrap(),
+            "pub fn value() -> u32 { 2 }\n"
+        );
+        let decision = engine.reconcile(&repo, &transaction).unwrap();
+        assert_eq!(decision.action, RecoveryAction::Finish);
+        assert_eq!(decision.reason, "before:0;after:1;unknown:0");
+        assert_eq!(repo.read("src/lib.rs").unwrap().matches("{ 2 }").count(), 1);
+    }
+
+    #[test]
     fn phase13_structured_ast_lsp_format_and_metrics_are_available() {
         let mut repo = MemoryFileRepository::new("rev-a");
         repo.put(

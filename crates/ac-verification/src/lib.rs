@@ -449,6 +449,8 @@ struct CdpClient {
     http_status: u16,
 }
 
+const MAX_BROWSER_EVENT_EVIDENCE: usize = 256;
+
 pub struct VerificationEngine {
     policy: CapabilityPolicy,
 }
@@ -2374,7 +2376,7 @@ impl CdpClient {
                                 .join(" ")
                         })
                         .unwrap_or_else(|| "console error".to_string());
-                    self.console_errors.push(redact_url(&text));
+                    push_bounded(&mut self.console_errors, redact_url(&text));
                 }
             }
             "Runtime.exceptionThrown" => {
@@ -2383,7 +2385,7 @@ impl CdpClient {
                     .and_then(|details| details.get("text"))
                     .and_then(Value::as_str)
                     .unwrap_or("page exception");
-                self.page_errors.push(redact_url(text));
+                push_bounded(&mut self.page_errors, redact_url(text));
             }
             "Network.responseReceived" => {
                 if let Some(status) = params
@@ -2398,8 +2400,10 @@ impl CdpClient {
                             .and_then(|response| response.get("url"))
                             .and_then(Value::as_str)
                             .unwrap_or("network response");
-                        self.network_failures
-                            .push(format!("http {status}: {}", redact_url(url)));
+                        push_bounded(
+                            &mut self.network_failures,
+                            format!("http {status}: {}", redact_url(url)),
+                        );
                     }
                 }
             }
@@ -2408,11 +2412,18 @@ impl CdpClient {
                     .get("errorText")
                     .and_then(Value::as_str)
                     .unwrap_or("network loading failed");
-                self.network_failures.push(redact_url(text));
+                push_bounded(&mut self.network_failures, redact_url(text));
             }
             _ => {}
         }
     }
+}
+
+fn push_bounded(items: &mut Vec<String>, value: String) {
+    if items.len() >= MAX_BROWSER_EVENT_EVIDENCE {
+        items.remove(0);
+    }
+    items.push(value);
 }
 
 fn discover_chromium_executable() -> Option<PathBuf> {
@@ -3330,6 +3341,81 @@ mod tests {
                 .allowed
         );
         assert!(!engine.completion_gate(&complete, "").allowed);
+    }
+
+    #[test]
+    fn mandatory_acceptance_coverage_blocks_until_all_required_items_are_verified() {
+        let engine = VerificationEngine::new(CapabilityPolicy::new());
+        let mut evidence = EvidenceStore::new();
+        let evidence_ref = evidence
+            .append(
+                EvidenceKind::TestReport,
+                Provenance {
+                    source: "acceptance-test".to_string(),
+                    commit: None,
+                    worktree: None,
+                    tool: Some("verification".to_string()),
+                },
+                "mem://acceptance/proof",
+                "verified",
+            )
+            .unwrap();
+        let required_a = StableId::from_existing("criterion-a").unwrap();
+        let required_b = StableId::from_existing("criterion-b").unwrap();
+        let only_a = engine
+            .final_audit(
+                FinalAuditInput {
+                    original_goal: "ship covered requirements".to_string(),
+                    requirements: vec!["A".to_string(), "B".to_string()],
+                    verified_requirement_ids: vec![required_a.clone()],
+                    evidence_refs: vec![evidence_ref.clone()],
+                    worker_completion_text: "all requirements are satisfied".to_string(),
+                    unresolved_limitations: Vec::new(),
+                },
+                &mut evidence,
+            )
+            .unwrap();
+        assert!(
+            !engine
+                .completion_gate(&only_a, "all requirements are satisfied")
+                .allowed
+        );
+
+        let required_covered_optional_uncovered = engine
+            .final_audit(
+                FinalAuditInput {
+                    original_goal: "ship covered requirements".to_string(),
+                    requirements: vec!["A".to_string(), "B".to_string()],
+                    verified_requirement_ids: vec![required_a, required_b],
+                    evidence_refs: vec![evidence_ref],
+                    worker_completion_text: "verified by deterministic evidence".to_string(),
+                    unresolved_limitations: Vec::new(),
+                },
+                &mut evidence,
+            )
+            .unwrap();
+        assert!(
+            engine
+                .completion_gate(
+                    &required_covered_optional_uncovered,
+                    "verified by deterministic evidence"
+                )
+                .allowed
+        );
+    }
+
+    #[test]
+    fn browser_event_evidence_buffers_are_bounded_to_recent_events() {
+        let mut events = Vec::new();
+        for index in 0..(MAX_BROWSER_EVENT_EVIDENCE + 10) {
+            push_bounded(&mut events, format!("event-{index}"));
+        }
+        assert_eq!(events.len(), MAX_BROWSER_EVENT_EVIDENCE);
+        assert_eq!(events.first().unwrap(), "event-10");
+        assert_eq!(
+            events.last().unwrap(),
+            &format!("event-{}", MAX_BROWSER_EVENT_EVIDENCE + 9)
+        );
     }
 
     #[test]

@@ -23,6 +23,11 @@ This backend closure admits sha2 0.10.9 (MIT OR Apache-2.0) for local FastEmbed
 artifact SHA-256 integrity manifests. See
 `docs/policy/dependency-admissions/DEP-ADM-005-sha2.md`.
 
+This backend closure also admits direct ac-daemon use of the already locked tokio
+1.53.1 crate (MIT) for safe Unix peer credential extraction during IPC
+authentication. See
+`docs/policy/dependency-admissions/DEP-ADM-006-tokio-peer-cred.md`.
+
 Required fields per shipped component:
 
 - Name

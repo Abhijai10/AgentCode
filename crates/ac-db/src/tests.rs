@@ -1740,4 +1740,66 @@ mod tests {
         let error = db.migrate().unwrap_err();
         assert_eq!(error.code(), "DB-FUTURE_VERSION");
     }
+
+    #[test]
+    fn schema_21_repairs_schema_20_acceptance_columns_without_losing_rows() {
+        let path = std::env::temp_dir().join(format!(
+            "agentcode-schema20-repair-{}.sqlite",
+            StableId::new("db")
+        ));
+        {
+            let connection = rusqlite::Connection::open(&path).unwrap();
+            for sql in [
+                include_str!("../../../migrations/0001_kernel_schema.sql"),
+                include_str!("../../../migrations/0002_git_worktree_hardening.sql"),
+                include_str!("../../../migrations/0003_code_intelligence.sql"),
+                include_str!("../../../migrations/0004_semantic_repository_graph.sql"),
+                include_str!("../../../migrations/0005_persistent_memory.sql"),
+                include_str!("../../../migrations/0006_context_engine.sql"),
+                include_str!("../../../migrations/0007_full_autonomy_kernel.sql"),
+                include_str!("../../../migrations/0008_advanced_edit_engine.sql"),
+                include_str!("../../../migrations/0009_verification_evidence_engine.sql"),
+                include_str!("../../../migrations/0010_browser_runtime.sql"),
+                include_str!("../../../migrations/0011_extensions_skills_hooks_mcp.sql"),
+                include_str!("../../../migrations/0012_baseline_security.sql"),
+                include_str!("../../../migrations/0013_advanced_ai_security.sql"),
+                include_str!("../../../migrations/0014_discuss_design_modes.sql"),
+                include_str!("../../../migrations/0015_desktop_optimization.sql"),
+                include_str!("../../../migrations/0016_chaos_dogfood.sql"),
+                include_str!("../../../migrations/0017_security_release.sql"),
+                include_str!("../../../migrations/0018_release_candidate_v1.sql"),
+                include_str!("../../../migrations/0019_daemon_semantic_memory.sql"),
+            ] {
+                connection.execute_batch(sql).unwrap();
+            }
+            connection.execute("INSERT INTO missions VALUES ('mission-old', 'upgrade', 'active', 1, 1)", []).unwrap();
+            connection.execute("INSERT INTO agent_sessions VALUES ('session-old', 'mission-old', 'running', 1)", []).unwrap();
+            connection.execute("INSERT INTO tasks VALUES ('task-old', 'mission-old', 'old task', 'running', '', NULL, 0, 3, 1)", []).unwrap();
+            connection.execute("INSERT INTO evidence_records VALUES ('evidence-old', 'TestReport', '{}', 'mem://old', 'hash', 1)", []).unwrap();
+            connection.pragma_update(None, "user_version", 20).unwrap();
+        }
+        {
+            let mut db = ControlPlaneDb::open(&path).unwrap();
+            db.migrate().unwrap();
+            assert_eq!(db.user_version().unwrap(), CURRENT_SCHEMA_VERSION);
+            assert_eq!(db.tasks_for_mission("mission-old").unwrap()[0].id, "task-old");
+            assert!(table_columns(&db, "tasks").contains(&"acceptance_criteria_json".to_string()));
+            let evidence_columns = table_columns(&db, "evidence_records");
+            assert!(evidence_columns.contains(&"raw_content".to_string()));
+            assert!(evidence_columns.contains(&"model_summary".to_string()));
+            assert!(evidence_columns.contains(&"sensitive".to_string()));
+        }
+        let _ = fs::remove_file(path);
+    }
+
+    fn table_columns(db: &ControlPlaneDb, table: &str) -> Vec<String> {
+        let mut stmt = db
+            .connection
+            .prepare(&format!("PRAGMA table_info({table})"))
+            .unwrap();
+        stmt.query_map([], |row| row.get::<_, String>(1))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect()
+    }
 }

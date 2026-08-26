@@ -2,7 +2,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use ac_agent::{isolated_workspace_agent, AutonomousState, Goal};
+use ac_agent::{AutonomousState, Goal};
 use ac_changeset::ChangeSetState;
 use ac_kernel::{AllowAllPolicy, Kernel};
 use ac_security::{Capability, CapabilityPolicy};
@@ -68,8 +68,7 @@ fn autonomous_flow_reaches_completion_only_after_verification_evidence() {
     );
 
     std::env::set_var("AGENTCODE_PROVIDER_MODE", "mock");
-    std::env::set_var("AGENTCODE_TEST_PROCESS_RESTRICTED_TOOLS", "1");
-    let mut agent = isolated_workspace_agent(
+    let mut agent = ac_agent::isolated_workspace_agent_for_process_restricted_test(
         source.clone(),
         worktree.clone(),
         Kernel::new(AllowAllPolicy),
@@ -79,7 +78,6 @@ fn autonomous_flow_reaches_completion_only_after_verification_evidence() {
             .allow(Capability::ProcessExec("*".to_string())),
     )
     .unwrap();
-    std::env::remove_var("AGENTCODE_TEST_PROCESS_RESTRICTED_TOOLS");
 
     let report = agent
         .run_goal(Goal::new("Fix the bug in src/lib.rs").unwrap())
