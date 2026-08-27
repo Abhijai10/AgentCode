@@ -229,7 +229,14 @@ fn dispatch_request(request: &Value, daemon: &mut DaemonService) -> (Value, bool
         },
         "GetMission" | "GetTaskState" => match request.get("mission_id").and_then(Value::as_str) {
             Some(mission_id) => match daemon.task_states(mission_id) {
-                Ok(tasks) => { let status = daemon.mission_status(mission_id); json!({"id": correlation_id, "ok": true, "mission_id": mission_id, "session_id": status.as_ref().map(|status| status.session_id.to_string()), "state": status.as_ref().map(|status| status.state.clone()), "tasks": tasks.into_iter().map(|(task_id, state)| json!({"task_id": task_id, "state": state})).collect::<Vec<_>>() }) },
+                Ok(tasks) => {
+                    let status = daemon.mission_status(mission_id);
+                    let state = match &status {
+                        Some(status) => Some(status.state.clone()),
+                        None => daemon.persisted_mission_state(mission_id).ok().flatten(),
+                    };
+                    json!({"id": correlation_id, "ok": true, "mission_id": mission_id, "session_id": status.as_ref().map(|status| status.session_id.to_string()), "state": state, "tasks": tasks.into_iter().map(|(task_id, state)| json!({"task_id": task_id, "state": state})).collect::<Vec<_>>() })
+                },
                 Err(error) => error_response(correlation_id, error.code(), error.to_string()),
             },
             None => error_response(correlation_id, "DAEMON-IPC_INVALID", "mission_id is required".to_string()),

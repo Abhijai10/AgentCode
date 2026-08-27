@@ -241,7 +241,7 @@ fn execute_mission(
     let mut agent = ac_agent::bound_workspace_agent(
         workspace_root.to_path_buf(),
         worktree,
-        kernel,
+        Arc::clone(&kernel),
         job.mission_id.clone(),
         session,
         backend_tool_policy(),
@@ -250,6 +250,20 @@ fn execute_mission(
     let evidence = agent.into_evidence();
     for record in evidence.records() {
         db.append_evidence(record)?;
+    }
+    {
+        let kernel = kernel.lock().map_err(|_| {
+            AcError::conflict(
+                "DAEMON-KERNEL_POISONED",
+                "kernel lock poisoned after mission",
+            )
+        })?;
+        if let Some(mission) = kernel.mission(&job.mission_id) {
+            db.put_mission(mission)?;
+        }
+        for event in kernel.events() {
+            let _ = db.append_kernel_event(event);
+        }
     }
     Ok(match report.state {
         ac_agent::AutonomousState::Completed => "completed",
@@ -366,8 +380,8 @@ pub struct DaemonService {
 }
 
 /// Production daemon policy. Tool capability checks remain owned by ToolBroker;
-/// this boundary retains authority over kernel state and refuses autonomous
-/// completion until the agent's verification gate supplies evidence.
+/// the bound agent's deterministic final-audit/completion gate supplies
+/// evidence before it asks the kernel to mark a mission completed.
 #[derive(Default)]
 struct ProductionKernelPolicy;
 
@@ -377,8 +391,8 @@ impl PolicyBoundary for ProductionKernelPolicy {
             KernelDecisionKind::CreateMission
             | KernelDecisionKind::ActivateMission
             | KernelDecisionKind::CancelMission
-            | KernelDecisionKind::ApproveChangeSet => PermissionDecision::Allow,
-            KernelDecisionKind::CompleteMission => PermissionDecision::RequireApproval,
+            | KernelDecisionKind::ApproveChangeSet
+            | KernelDecisionKind::CompleteMission => PermissionDecision::Allow,
         }
     }
 }
@@ -551,6 +565,11 @@ impl DaemonService {
 
     pub fn mission_status(&self, mission_id: &str) -> Option<MissionExecutionStatus> {
         self.coordinator.status(mission_id)
+    }
+
+    pub fn persisted_mission_state(&self, mission_id: &str) -> AcResult<Option<String>> {
+        let id = StableId::from_existing(mission_id)?;
+        Ok(self.db.get_mission(&id)?.map(|mission| mission.state))
     }
 
     pub fn pause_mission(&mut self, mission_id: &str) -> AcResult<()> {

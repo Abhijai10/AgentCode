@@ -683,6 +683,8 @@ fn write_macos_profile(request: &SandboxBackendRequest) -> AcResult<PathBuf> {
          (allow file-read* \
              (literal \"/var\") \
              (literal \"/etc\") \
+             (literal \"/Applications\") \
+             (literal \"/Applications/Xcode.app\") \
              (literal \"/private\") \
              (literal \"/private/var\") \
              (literal \"/private/etc\"))\n\
@@ -716,6 +718,7 @@ fn write_macos_profile(request: &SandboxBackendRequest) -> AcResult<PathBuf> {
     for root in &request.workspace_roots {
         allow_profile_workspace_root(&mut profile, root);
     }
+    allow_profile_toolchain_paths(&mut profile, request);
     let temp = std::env::temp_dir();
     allow_profile_workspace_root(&mut profile, &temp);
     profile.push_str(
@@ -741,6 +744,51 @@ fn allow_profile_workspace_root(profile: &mut String, root: &Path) {
         profile.push_str(&format!(
             "(allow file-read* file-write* (subpath \"{}\"))\n",
             escape_profile_string(&root.display().to_string())
+        ));
+    }
+}
+
+fn allow_profile_toolchain_paths(profile: &mut String, request: &SandboxBackendRequest) {
+    if let Some(path) = request.allowed_env.get("PATH") {
+        for dir in std::env::split_paths(path) {
+            if is_developer_tool_dir(&dir) {
+                allow_profile_read_subpath(profile, &dir);
+            }
+        }
+    }
+    if let Some(cargo_home) = request.allowed_env.get("CARGO_HOME") {
+        let cargo_home = PathBuf::from(cargo_home);
+        allow_profile_read_subpath(profile, &cargo_home.join("bin"));
+        allow_profile_read_subpath(profile, &cargo_home.join("registry"));
+        allow_profile_read_subpath(profile, &cargo_home.join("git"));
+    }
+    if let Some(rustup_home) = request.allowed_env.get("RUSTUP_HOME") {
+        let rustup_home = PathBuf::from(rustup_home);
+        allow_profile_read_subpath(profile, &rustup_home.join("toolchains"));
+        allow_profile_read_subpath(profile, &rustup_home.join("settings.toml"));
+    }
+}
+
+fn is_developer_tool_dir(path: &Path) -> bool {
+    let text = path.display().to_string();
+    text.starts_with("/usr/")
+        || text.starts_with("/bin")
+        || text.starts_with("/sbin")
+        || text.starts_with("/opt/homebrew/")
+        || text.ends_with("/.cargo/bin")
+}
+
+fn allow_profile_read_subpath(profile: &mut String, path: &Path) {
+    let mut paths = vec![path.to_path_buf()];
+    if let Ok(canonical) = fs::canonicalize(path) {
+        if !paths.iter().any(|existing| existing == &canonical) {
+            paths.push(canonical);
+        }
+    }
+    for path in paths {
+        profile.push_str(&format!(
+            "(allow file-read* (subpath \"{}\"))\n",
+            escape_profile_string(&path.display().to_string())
         ));
     }
 }

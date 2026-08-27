@@ -1578,6 +1578,13 @@ fn toolchain_env() -> BTreeMap<String, String> {
                 .map(|value| ((*key).to_string(), value))
         })
         .collect::<BTreeMap<_, _>>();
+    if let Some(toolchain_bin) = rustup_toolchain_bin() {
+        let path = env.get("PATH").cloned().unwrap_or_default();
+        env.insert(
+            "PATH".to_string(),
+            format!("{}:{path}", toolchain_bin.display()),
+        );
+    }
     let home = std::env::temp_dir().join(format!("agentcode-home-{}", StableId::new("tool")));
     let _ = fs::create_dir_all(&home);
     env.insert("HOME".to_string(), home.display().to_string());
@@ -1585,6 +1592,22 @@ fn toolchain_env() -> BTreeMap<String, String> {
     env.insert("SEMGREP_ENABLE_VERSION_CHECK".to_string(), "0".to_string());
     env.insert("OTEL_SDK_DISABLED".to_string(), "true".to_string());
     env
+}
+
+fn rustup_toolchain_bin() -> Option<PathBuf> {
+    let output = Command::new("rustup")
+        .args(["which", "cargo"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let cargo = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let cargo = PathBuf::from(cargo);
+    cargo
+        .parent()
+        .map(Path::to_path_buf)
+        .filter(|path| path.is_dir())
 }
 
 fn safe_join(root: &Path, relative: &str) -> AcResult<PathBuf> {

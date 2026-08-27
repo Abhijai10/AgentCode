@@ -29,6 +29,10 @@ path = "security_release_flow.rs"
 name = "final_release_flow"
 path = "final_release_flow.rs"
 
+[[test]]
+name = "daemon_process_boundary"
+path = "daemon_process_boundary.rs"
+
 [dev-dependencies]
 ac-agent = { path = "../../crates/ac-agent" }
 ac-changeset = { path = "../../crates/ac-changeset" }
@@ -42,3 +46,4 @@ ac-sandbox = { path = "../../crates/ac-sandbox" }
 ac-security = { path = "../../crates/ac-security" }
 ac-tool = { path = "../../crates/ac-tool" }
 ac-verification = { path = "../../crates/ac-verification" }
+serde_json = "1"
