@@ -1062,6 +1062,12 @@ impl ToolExecutor for SecurityVerifyTool {
                 "security.verify requires at least one scanner",
             ));
         }
+        let mut workspace_roots = vec![root.clone()];
+        for config in &configurations {
+            if let Some(data_dir) = &config.data_dir {
+                workspace_roots.push(data_dir.clone());
+            }
+        }
         let scan = ManagedSecurityScanInput {
             repository_id: StableId::new("repo"),
             commit: source_revision_from_git_files(&root),
@@ -1076,7 +1082,7 @@ impl ToolExecutor for SecurityVerifyTool {
             scanner_policy = scanner_policy.allow(Capability::Network("*".to_string()));
         }
         let sandbox = SandboxManager::new(SandboxPolicy {
-            workspace_roots: vec![root.clone()],
+            workspace_roots,
             capability_policy: scanner_policy,
             network_default_allow: input.dast_target.is_some(),
             max_timeout_ms: 180_000,
@@ -1431,13 +1437,7 @@ fn scanner_configuration(
     config.required = required;
     if matches!(scanner, SecurityAdapter::Osv | SecurityAdapter::Trivy) {
         config.timeout_ms = 180_000;
-        config.data_dir = Some(
-            input
-                .scanner_data_dir
-                .clone()
-                .unwrap_or_else(default_scanner_data_root)
-                .join(scanner_name(scanner)),
-        );
+        config.data_dir = Some(trusted_scanner_data_root(input)?.join(scanner_name(scanner)));
     }
     if scanner == SecurityAdapter::Semgrep {
         config.rules_path = input.semgrep_rules_path.clone();
@@ -1479,6 +1479,34 @@ fn default_scanner_data_root() -> PathBuf {
             })
         })
         .unwrap_or_else(|| std::env::temp_dir().join("agentcode-scanner-data"))
+}
+
+fn trusted_scanner_data_root(input: &SecurityVerifyInput) -> AcResult<PathBuf> {
+    let default = default_scanner_data_root();
+    let Some(explicit) = &input.scanner_data_dir else {
+        return Ok(default);
+    };
+    let canonical_default = fs::canonicalize(&default).map_err(|error| {
+        AcError::validation(
+            "TOOL-SCANNER_DATA_ROOT_UNAVAILABLE",
+            format!("managed scanner-data root is unavailable: {error}"),
+        )
+    })?;
+    let canonical_explicit = fs::canonicalize(explicit).map_err(|error| {
+        AcError::validation(
+            "TOOL-SCANNER_DATA_ROOT_UNAVAILABLE",
+            format!("scanner_data_dir is unavailable: {error}"),
+        )
+    })?;
+    if canonical_explicit != canonical_default
+        && !canonical_explicit.starts_with(&canonical_default)
+    {
+        return Err(AcError::policy_denied(
+            "TOOL-SCANNER_DATA_ROOT_DENIED",
+            "scanner_data_dir must be inside AgentCode-managed scanner-data",
+        ));
+    }
+    Ok(canonical_explicit)
 }
 
 fn source_revision_from_git_files(root: &Path) -> String {
@@ -2057,7 +2085,7 @@ mod tests {
         );
         WorkspaceTools::with_required_isolation(
             root.clone(),
-            ac_sandbox::IsolationLevel::ProcessRestricted,
+            ac_sandbox::IsolationLevel::FilesystemIsolated,
         )
         .register_all(&mut broker)
         .unwrap();
@@ -2082,7 +2110,7 @@ mod tests {
         );
         WorkspaceTools::with_required_isolation(
             root.clone(),
-            ac_sandbox::IsolationLevel::ProcessRestricted,
+            ac_sandbox::IsolationLevel::FilesystemIsolated,
         )
         .register_all(&mut broker)
         .unwrap();
@@ -2216,7 +2244,7 @@ mod tests {
         );
         WorkspaceTools::with_required_isolation(
             root.clone(),
-            ac_sandbox::IsolationLevel::ProcessRestricted,
+            ac_sandbox::IsolationLevel::FilesystemIsolated,
         )
         .register_all(&mut broker)
         .unwrap();
@@ -2269,6 +2297,32 @@ mod tests {
     }
 
     #[test]
+    fn scanner_data_dir_outside_managed_root_is_denied() {
+        let managed =
+            std::env::temp_dir().join(format!("agentcode-managed-scanners-{}", StableId::new("t")));
+        let attacker = std::env::temp_dir().join(format!(
+            "agentcode-attacker-scanners-{}",
+            StableId::new("t")
+        ));
+        fs::create_dir_all(&managed).unwrap();
+        fs::create_dir_all(&attacker).unwrap();
+        std::env::set_var("AGENTCODE_SCANNER_DATA_DIR", &managed);
+        let input = SecurityVerifyInput::parse(
+            &json!({
+                "required_scanners": ["trivy"],
+                "scanner_data_dir": attacker.display().to_string()
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let err = trusted_scanner_data_root(&input).unwrap_err();
+        assert_eq!(err.code(), "TOOL-SCANNER_DATA_ROOT_DENIED");
+        std::env::remove_var("AGENTCODE_SCANNER_DATA_DIR");
+        let _ = fs::remove_dir_all(managed);
+        let _ = fs::remove_dir_all(attacker);
+    }
+
+    #[test]
     #[ignore = "requires osv-scanner and trivy installed"]
     fn operational_security_verify_runs_real_osv_and_trivy_through_toolbroker() {
         let root = Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -2280,6 +2334,7 @@ mod tests {
             std::env::temp_dir().join(format!("agentcode-scanner-data-{}", StableId::new("t")));
         seed_trivy_cache(&scanner_data);
         prepare_osv_offline_database(&root, &scanner_data);
+        std::env::set_var("AGENTCODE_SCANNER_DATA_DIR", &scanner_data);
         let mut broker = ToolBroker::new(
             CapabilityPolicy::new()
                 .allow(Capability::SecurityScan)
@@ -2287,7 +2342,7 @@ mod tests {
         );
         WorkspaceTools::with_required_isolation(
             root.clone(),
-            ac_sandbox::IsolationLevel::ProcessRestricted,
+            ac_sandbox::IsolationLevel::FilesystemIsolated,
         )
         .register_all(&mut broker)
         .unwrap();
@@ -2318,6 +2373,7 @@ mod tests {
         assert!(result
             .observation
             .contains("\"provenance\":\"ExternalTool\""));
+        std::env::remove_var("AGENTCODE_SCANNER_DATA_DIR");
         let _ = fs::remove_dir_all(scanner_data);
     }
 
@@ -2335,6 +2391,7 @@ mod tests {
         let scanner_data =
             std::env::temp_dir().join(format!("agentcode-scanner-data-{}", StableId::new("t")));
         seed_trivy_cache(&scanner_data);
+        std::env::set_var("AGENTCODE_SCANNER_DATA_DIR", &scanner_data);
         let mut broker = ToolBroker::new(
             CapabilityPolicy::new()
                 .allow(Capability::SecurityScan)
@@ -2382,6 +2439,7 @@ mod tests {
             "{}",
             result.observation
         );
+        std::env::remove_var("AGENTCODE_SCANNER_DATA_DIR");
         let _ = fs::remove_dir_all(scanner_data);
         let _ = fs::remove_dir_all(root);
     }

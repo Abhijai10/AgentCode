@@ -5,9 +5,9 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use ac_changeset::{
-    content_hash, ChangeOperation, ChangeSet, ChangeSetMetadata, ChangeSetState, EditEngine,
-    EditPrecondition, EditRequest, EditStrategy, FileChangeSummary, LocalWorkspaceFileRepository,
-    RollbackPlan,
+    content_hash, ChangeOperation, ChangeSet, ChangeSetMetadata, ChangeSetState,
+    ChangeSetTransaction, EditEngine, EditPrecondition, EditRequest, EditStrategy,
+    FileChangeSummary, FileRepository, LocalWorkspaceFileRepository, RollbackPlan,
 };
 use ac_code_intel::{
     CodeIntelligenceService, ContextCandidate, RepositoryScope, SourceFileIdentity,
@@ -16,8 +16,8 @@ use ac_common::{AcError, AcResult, StableId, TimestampMillis};
 use ac_context::{
     AuthorityClass, ContextEngine, ContextNode, ContextPack, EmbeddingAvailability, MemoryService,
 };
-use ac_evidence::{EvidenceKind, EvidenceStore, Provenance};
-use ac_git::GitCoordinator;
+use ac_evidence::{EvidenceKind, EvidenceRecord, EvidenceStore, Provenance};
+use ac_git::{GitCoordinator, WorktreeRecord};
 use ac_kernel::{MissionState, PolicyBoundary};
 use ac_provider::{
     AnthropicProviderAdapter, GeminiProviderAdapter, HttpProviderOptions, LMStudioProviderAdapter,
@@ -684,6 +684,13 @@ pub struct AgentRunReport {
     pub replans: Vec<String>,
 }
 
+struct CompletionEvidenceInput<'a> {
+    graph: &'a TaskGraph,
+    completed_tasks: &'a BTreeSet<StableId>,
+    evidence_refs: &'a [StableId],
+    validation: Option<&'a ValidationRunReport>,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CompletionRequest {
     pub id: StableId,
@@ -692,6 +699,35 @@ pub struct CompletionRequest {
     pub evidence_refs: Vec<StableId>,
     pub verification_passed: bool,
     pub created_at: TimestampMillis,
+}
+
+pub trait AgentDurabilityObserver: Send {
+    fn worktree_bound(&mut self, _worktree: &WorktreeRecord) -> AcResult<()> {
+        Ok(())
+    }
+
+    fn graph_updated(
+        &mut self,
+        _graph: &TaskGraph,
+        _worker: &ac_runtime::Worker,
+        _session_id: &StableId,
+    ) -> AcResult<()> {
+        Ok(())
+    }
+
+    fn changeset_updated(&mut self, _changeset: &ChangeSet) -> AcResult<()> {
+        Ok(())
+    }
+
+    fn edit_transaction_updated(
+        &mut self,
+        _transaction: &ChangeSetTransaction,
+        _task_id: Option<&StableId>,
+        _worktree_id: Option<&StableId>,
+        _base_revision: &str,
+    ) -> AcResult<()> {
+        Ok(())
+    }
 }
 
 pub struct AutonomousAgent<P: PolicyBoundary> {
@@ -714,6 +750,8 @@ pub struct AutonomousAgent<P: PolicyBoundary> {
     observations: Vec<AgentObservation>,
     replans: Vec<String>,
     max_replans: usize,
+    durability: Option<Box<dyn AgentDurabilityObserver>>,
+    resume_graph: Option<TaskGraph>,
 }
 
 impl<P: PolicyBoundary> AutonomousAgent<P> {
@@ -798,12 +836,51 @@ impl<P: PolicyBoundary> AutonomousAgent<P> {
             observations: Vec::new(),
             replans: Vec::new(),
             max_replans: 2,
+            durability: None,
+            resume_graph: None,
         }
     }
 
     pub fn with_verification_failures(mut self, failures: usize) -> Self {
         self.verification_failures_remaining = failures;
         self
+    }
+
+    pub fn with_durability_observer(mut self, observer: Box<dyn AgentDurabilityObserver>) -> Self {
+        self.durability = Some(observer);
+        self
+    }
+
+    pub fn with_resume_graph(mut self, graph: TaskGraph) -> Self {
+        self.resume_graph = Some(graph);
+        self
+    }
+
+    fn persist_graph(&mut self, graph: &TaskGraph) -> AcResult<()> {
+        if let Some(observer) = &mut self.durability {
+            observer.graph_updated(graph, self.session.worker(), self.session.id())?;
+        }
+        Ok(())
+    }
+
+    fn persist_changeset(&mut self, changeset: &ChangeSet) -> AcResult<()> {
+        if let Some(observer) = &mut self.durability {
+            observer.changeset_updated(changeset)?;
+        }
+        Ok(())
+    }
+
+    fn persist_edit_transaction(
+        &mut self,
+        transaction: &ChangeSetTransaction,
+        task_id: Option<&StableId>,
+        worktree_id: Option<&StableId>,
+        base_revision: &str,
+    ) -> AcResult<()> {
+        if let Some(observer) = &mut self.durability {
+            observer.edit_transaction_updated(transaction, task_id, worktree_id, base_revision)?;
+        }
+        Ok(())
     }
 
     pub fn run_goal(&mut self, goal: Goal) -> AcResult<AgentRunReport> {
@@ -845,10 +922,23 @@ impl<P: PolicyBoundary> AutonomousAgent<P> {
         self.state = AutonomousState::Planning;
         let (_planner_response, mut runtime_plan) =
             self.plan_with_repair(mission_id.clone(), &reasoning)?;
-        let mut graph = TaskGraph::from_runtime_plan(&runtime_plan)?;
+        let mut graph = match self.resume_graph.take() {
+            Some(graph) => graph,
+            None => TaskGraph::from_runtime_plan(&runtime_plan)?,
+        };
+        runtime_plan.tasks = graph.tasks().cloned().collect();
         self.state = AutonomousState::Executing;
-        let mut completed_tasks = BTreeSet::new();
-        let mut completed_task_titles = BTreeSet::new();
+        self.persist_graph(&graph)?;
+        let mut completed_tasks = graph
+            .tasks()
+            .filter(|task| task.state == TaskState::Completed)
+            .map(|task| task.id.clone())
+            .collect::<BTreeSet<_>>();
+        let mut completed_task_titles = graph
+            .tasks()
+            .filter(|task| task.state == TaskState::Completed)
+            .map(|task| task.title.clone())
+            .collect::<BTreeSet<_>>();
 
         loop {
             if self.session.is_cancelled() || self.session.state() == AgentSessionState::Cancelling
@@ -888,6 +978,7 @@ impl<P: PolicyBoundary> AutonomousAgent<P> {
             let checkpoint = self.checkpoint(self.checkpoints.len());
             self.checkpoints.push(checkpoint);
             graph.start(&task.id, self.session.worker())?;
+            self.persist_graph(&graph)?;
             let task_context = self.build_task_context(&goal, &task, &evidence_refs)?;
             let action_reasoning =
                 self.ask_provider_for_role("implementer", &goal, &task_context, Some(&task))?;
@@ -907,6 +998,7 @@ impl<P: PolicyBoundary> AutonomousAgent<P> {
                         task_observation_refs(&self.observations, &task.id),
                         None,
                     )?;
+                    self.persist_graph(&graph)?;
                     completed_tasks.insert(task.id.clone());
                     completed_task_titles.insert(task.title.clone());
                 }
@@ -918,6 +1010,7 @@ impl<P: PolicyBoundary> AutonomousAgent<P> {
                         task_observation_refs(&self.observations, &task.id),
                         Some("replan-requested".to_string()),
                     )?;
+                    self.persist_graph(&graph)?;
                     if self.replans.len() >= self.max_replans {
                         self.state = AutonomousState::Failed;
                         return Ok(self.report(
@@ -937,6 +1030,7 @@ impl<P: PolicyBoundary> AutonomousAgent<P> {
                     runtime_plan =
                         preserve_completed_tasks(revised, &completed_tasks, &completed_task_titles);
                     graph = TaskGraph::from_runtime_plan(&runtime_plan)?;
+                    self.persist_graph(&graph)?;
                 }
                 Ok(TaskProgress::Blocked(reason)) => {
                     graph.finish(
@@ -946,6 +1040,7 @@ impl<P: PolicyBoundary> AutonomousAgent<P> {
                         task_observation_refs(&self.observations, &task.id),
                         Some(reason),
                     )?;
+                    self.persist_graph(&graph)?;
                     self.state = AutonomousState::Failed;
                     return Ok(self.report(
                         goal.id,
@@ -963,6 +1058,7 @@ impl<P: PolicyBoundary> AutonomousAgent<P> {
                         task_observation_refs(&self.observations, &task.id),
                         Some(err.code().to_string()),
                     )?;
+                    self.persist_graph(&graph)?;
                     self.state = AutonomousState::Failed;
                     return Ok(self.report(
                         goal.id,
@@ -987,9 +1083,12 @@ impl<P: PolicyBoundary> AutonomousAgent<P> {
                 &mission_id,
                 &goal,
                 &runtime_plan,
-                &completed_tasks,
-                &evidence_refs,
-                validation.as_ref(),
+                CompletionEvidenceInput {
+                    graph: &graph,
+                    completed_tasks: &completed_tasks,
+                    evidence_refs: &evidence_refs,
+                    validation: validation.as_ref(),
+                },
             )
             .is_err()
         {
@@ -1282,7 +1381,7 @@ impl<P: PolicyBoundary> AutonomousAgent<P> {
     fn execute_action(
         &mut self,
         goal: &Goal,
-        _task: &WorkerTask,
+        task: &WorkerTask,
         action: &ProposedAction,
         evidence_refs: &mut Vec<StableId>,
         changeset: &mut Option<ChangeSet>,
@@ -1327,8 +1426,13 @@ impl<P: PolicyBoundary> AutonomousAgent<P> {
                 }
             }
             ProposedAction::PrepareEdit { path, content } => {
-                *changeset =
-                    Some(self.prepare_and_write_changeset(goal, path, content, evidence_refs)?);
+                *changeset = Some(self.prepare_and_write_changeset(
+                    goal,
+                    task,
+                    path,
+                    content,
+                    evidence_refs,
+                )?);
                 Ok(TaskProgress::Succeeded)
             }
             ProposedAction::RunVerification { tool_id, plan_name } => {
@@ -1337,7 +1441,7 @@ impl<P: PolicyBoundary> AutonomousAgent<P> {
                     plan_name,
                     tool_id,
                     goal,
-                    _task,
+                    task,
                     evidence_refs,
                     changeset,
                 )?;
@@ -1374,39 +1478,24 @@ impl<P: PolicyBoundary> AutonomousAgent<P> {
     fn prepare_and_write_changeset(
         &mut self,
         goal: &Goal,
+        task: &WorkerTask,
         path: &str,
         content: &str,
         evidence_refs: &[StableId],
     ) -> AcResult<ChangeSet> {
-        let mut proposed = self
-            .prepare_advanced_changeset(path, content)
-            .unwrap_or_else(|_| {
-                ChangeSet::propose(
-                    vec![ChangeOperation::WriteFile {
-                        path: path.to_string(),
-                        expected_hash: None,
-                        new_hash: format!("len:{}", content.len()),
-                    }],
-                    Some(RollbackPlan {
-                        checkpoint_ref: self
-                            .checkpoints
-                            .last()
-                            .map(|checkpoint| checkpoint.id.to_string())
-                            .unwrap_or_else(|| "none".to_string()),
-                        description: "rollback to prior agent checkpoint".to_string(),
-                    }),
-                )
-                .expect("fallback changeset is valid")
-            });
-        let write = self.invoke_with_retry("fs.write", &format!("{}\n{}", path, content), 2)?;
-        if write.status != ToolStatus::Succeeded {
-            return Err(AcError::validation(
-                "AGENT-TOOL_ACTION_FAILED",
-                write.observation,
-            ));
-        }
-        let mut refs = evidence_refs.to_vec();
-        refs.push(write.evidence_ref);
+        let worktree = self
+            .session
+            .worker()
+            .workspace_ref
+            .as_ref()
+            .and_then(|worktree_id| self.git.worktree(worktree_id))
+            .cloned()
+            .ok_or_else(|| AcError::validation("AGENT-NO_WORKTREE", "agent has no worktree"))?;
+        let mut repo =
+            LocalWorkspaceFileRepository::new(worktree.path.clone(), worktree.base_commit.clone());
+        let mut transaction = self.prepare_edit_transaction(&repo, path, content)?;
+        let refs = evidence_refs.to_vec();
+        let worktree_id = self.session.worker().workspace_ref.clone();
         let (files_changed, additions, removals) = self
             .session
             .worker()
@@ -1426,7 +1515,7 @@ impl<P: PolicyBoundary> AutonomousAgent<P> {
                     0,
                 )
             });
-        proposed.attach_metadata(ChangeSetMetadata {
+        transaction.changeset.attach_metadata(ChangeSetMetadata {
             originating_task: goal.id.clone(),
             originating_agent_session: self.session.id().clone(),
             files_changed,
@@ -1435,9 +1524,44 @@ impl<P: PolicyBoundary> AutonomousAgent<P> {
             evidence_refs: refs,
             verification_passed: None,
         })?;
-        proposed.validate()?;
-        self.kernel_lock()?.approve_changeset(&mut proposed)?;
-        Ok(proposed)
+        transaction.changeset.validate()?;
+        self.persist_changeset(&transaction.changeset)?;
+        {
+            let mut approved = transaction.changeset.clone();
+            self.kernel_lock()?.approve_changeset(&mut approved)?;
+            transaction.changeset = approved;
+        }
+        self.persist_changeset(&transaction.changeset)?;
+        self.persist_edit_transaction(
+            &transaction,
+            Some(&task.id),
+            worktree_id.as_ref(),
+            &worktree.base_commit,
+        )?;
+        EditEngine.apply(&mut repo, &mut transaction)?;
+        let applied_evidence = self.evidence.append(
+            EvidenceKind::FileSnapshot,
+            provenance("agent.changeset.apply"),
+            format!(
+                "mem://agent/{}/changeset/{}",
+                goal.id, transaction.changeset.id
+            ),
+            format!(
+                "changeset:{};state:{:?};path:{}",
+                transaction.changeset.id, transaction.changeset.state, path
+            ),
+        )?;
+        if let Some(metadata) = &mut transaction.changeset.metadata {
+            metadata.evidence_refs.push(applied_evidence);
+        }
+        self.persist_changeset(&transaction.changeset)?;
+        self.persist_edit_transaction(
+            &transaction,
+            Some(&task.id),
+            worktree_id.as_ref(),
+            &worktree.base_commit,
+        )?;
+        Ok(transaction.changeset)
     }
 
     fn run_verification_action(
@@ -1508,6 +1632,7 @@ impl<P: PolicyBoundary> AutonomousAgent<P> {
                 if let ProposedAction::PrepareEdit { path, content } = action {
                     *changeset = Some(self.prepare_and_write_changeset(
                         goal,
+                        task,
                         &path,
                         &content,
                         evidence_refs,
@@ -1563,35 +1688,28 @@ impl<P: PolicyBoundary> AutonomousAgent<P> {
         last.ok_or_else(|| AcError::conflict("AGENT-NO_TOOL_ATTEMPT", "tool was not attempted"))
     }
 
-    fn prepare_advanced_changeset(&self, path: &str, content: &str) -> AcResult<ChangeSet> {
-        let worktree = self
-            .session
-            .worker()
-            .workspace_ref
-            .as_ref()
-            .and_then(|worktree_id| self.git.worktree(worktree_id))
-            .ok_or_else(|| AcError::validation("AGENT-NO_WORKTREE", "agent has no worktree"))?;
-        let repo =
-            LocalWorkspaceFileRepository::new(worktree.path.clone(), worktree.base_commit.clone());
-        let current = std::fs::read_to_string(worktree.path.join(path)).map_err(|error| {
-            AcError::validation("AGENT-EDIT_PREPARE_READ_FAILED", error.to_string())
-        })?;
-        let transaction = EditEngine.prepare(
-            &repo,
+    fn prepare_edit_transaction(
+        &self,
+        repo: &LocalWorkspaceFileRepository,
+        path: &str,
+        content: &str,
+    ) -> AcResult<ChangeSetTransaction> {
+        let current = repo.read(path)?;
+        EditEngine.prepare(
+            repo,
             vec![EditRequest {
                 path: path.to_string(),
                 precondition: EditPrecondition {
                     path: path.to_string(),
                     expected_hash: content_hash(&current),
-                    base_revision: worktree.base_commit.clone(),
+                    base_revision: repo.base_revision()?,
                     symbol_fingerprint: None,
                 },
                 strategy: EditStrategy::WholeFile {
                     content: content.to_string(),
                 },
             }],
-        )?;
-        Ok(transaction.changeset)
+        )
     }
 
     fn checkpoint(&self, next_step: usize) -> AgentCheckpoint {
@@ -1640,11 +1758,11 @@ impl<P: PolicyBoundary> AutonomousAgent<P> {
         mission_id: &StableId,
         goal: &Goal,
         runtime_plan: &RuntimePlan,
-        completed_tasks: &BTreeSet<StableId>,
-        evidence_refs: &[StableId],
-        validation: Option<&ValidationRunReport>,
+        completion: CompletionEvidenceInput<'_>,
     ) -> AcResult<()> {
-        if evidence_refs.is_empty() || !validation.is_some_and(|report| report.passed) {
+        if completion.evidence_refs.is_empty()
+            || !completion.validation.is_some_and(|report| report.passed)
+        {
             return Err(AcError::conflict(
                 "AGENT-COMPLETION_UNSUPPORTED",
                 "completion requires passing verification and evidence",
@@ -1654,9 +1772,9 @@ impl<P: PolicyBoundary> AutonomousAgent<P> {
             EvidenceKind::DerivedContext,
             provenance("agent.completion-request"),
             format!("mem://agent/{}/completion", goal.id),
-            format!("evidence:{};verified:true", evidence_refs.len()),
+            format!("evidence:{};verified:true", completion.evidence_refs.len()),
         )?;
-        let mut accepted = evidence_refs.to_vec();
+        let mut accepted = completion.evidence_refs.to_vec();
         accepted.push(completion_evidence);
         let mandatory = runtime_plan
             .tasks
@@ -1672,6 +1790,10 @@ impl<P: PolicyBoundary> AutonomousAgent<P> {
             .iter()
             .map(|(_, criterion)| criterion.description.clone())
             .collect::<Vec<_>>();
+        let required_requirement_ids = mandatory
+            .iter()
+            .map(|(_, criterion)| StableId::from_existing(&criterion.id))
+            .collect::<AcResult<Vec<_>>>()?;
         if requirements.is_empty() {
             return Err(AcError::conflict(
                 "AGENT-COMPLETION_NO_CRITERIA",
@@ -1680,15 +1802,26 @@ impl<P: PolicyBoundary> AutonomousAgent<P> {
         }
         let mut verified_requirement_ids = Vec::new();
         for (task_id, criterion) in &mandatory {
-            let task_succeeded = completed_tasks.contains(task_id)
-                && self.observations.iter().any(|observation| {
-                    observation.task_id == *task_id
-                        && observation.success
-                        && !observation.evidence_refs.is_empty()
-                });
+            let has_current_observation = self.observations.iter().any(|observation| {
+                observation.task_id == *task_id
+                    && observation.success
+                    && !observation.evidence_refs.is_empty()
+            });
+            let has_recovered_evidence = completion
+                .graph
+                .task(task_id)
+                .is_some_and(|task| !task.evidence_refs.is_empty());
+            let task_succeeded = completion.completed_tasks.contains(task_id)
+                && (has_current_observation || has_recovered_evidence);
             if task_succeeded
-                && validation.is_some_and(|report| report.passed)
-                && !evidence_refs.is_empty()
+                && completion.validation.is_some_and(|report| report.passed)
+                && self.criterion_has_specific_evidence(
+                    task_id,
+                    criterion,
+                    &mandatory,
+                    completion.evidence_refs,
+                    completion.graph,
+                )
             {
                 verified_requirement_ids.push(StableId::from_existing(&criterion.id)?);
             }
@@ -1697,6 +1830,7 @@ impl<P: PolicyBoundary> AutonomousAgent<P> {
             FinalAuditInput {
                 original_goal: goal.text.clone(),
                 requirements,
+                required_requirement_ids,
                 verified_requirement_ids,
                 evidence_refs: accepted.clone(),
                 worker_completion_text: "worker requests completion with verification evidence"
@@ -1718,6 +1852,39 @@ impl<P: PolicyBoundary> AutonomousAgent<P> {
         accepted.push(audit.evidence_ref);
         self.kernel_lock()?
             .transition_mission(mission_id, MissionState::Completed, accepted)
+    }
+
+    fn criterion_has_specific_evidence(
+        &self,
+        task_id: &StableId,
+        criterion: &AcceptanceCriterion,
+        mandatory: &[(StableId, &AcceptanceCriterion)],
+        evidence_refs: &[StableId],
+        graph: &TaskGraph,
+    ) -> bool {
+        let task_mandatory_count = mandatory
+            .iter()
+            .filter(|(candidate, _)| candidate == task_id)
+            .count();
+        if task_mandatory_count == 1 && !evidence_refs.is_empty() {
+            return true;
+        }
+        let mut candidate_refs = evidence_refs.to_vec();
+        for observation in self
+            .observations
+            .iter()
+            .filter(|observation| observation.task_id == *task_id)
+        {
+            candidate_refs.extend(observation.evidence_refs.iter().cloned());
+        }
+        if let Some(task) = graph.task(task_id) {
+            candidate_refs.extend(task.evidence_refs.iter().cloned());
+        }
+        candidate_refs.iter().any(|evidence_ref| {
+            self.evidence
+                .get(evidence_ref)
+                .is_some_and(|record| evidence_record_covers_criterion(record, criterion))
+        })
     }
 
     fn kernel_lock(&self) -> AcResult<std::sync::MutexGuard<'_, ac_kernel::Kernel<P>>> {
@@ -2497,19 +2664,65 @@ pub fn bound_workspace_agent<P: PolicyBoundary>(
     session: AgentSession,
     policy: CapabilityPolicy,
 ) -> AcResult<AutonomousAgent<P>> {
+    bound_workspace_agent_with_durability(
+        source_root,
+        worktree_root,
+        kernel,
+        mission_id,
+        session,
+        policy,
+        None,
+        None,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn bound_workspace_agent_with_durability<P: PolicyBoundary>(
+    source_root: PathBuf,
+    worktree_root: PathBuf,
+    kernel: Arc<Mutex<ac_kernel::Kernel<P>>>,
+    mission_id: StableId,
+    session: AgentSession,
+    policy: CapabilityPolicy,
+    existing_worktree: Option<WorktreeRecord>,
+    resume_graph: Option<TaskGraph>,
+    mut durability: Option<Box<dyn AgentDurabilityObserver>>,
+) -> AcResult<AutonomousAgent<P>> {
     let worker = session.worker().clone();
     let mut git = GitCoordinator::new();
-    let worktree_id = git.create_task_workspace(
-        source_root,
-        worktree_root.clone(),
-        mission_id.clone(),
-        worker.id.clone(),
-    )?;
+    let worktree_id = if let Some(worktree) = existing_worktree {
+        if worktree.owner_mission_id != mission_id {
+            return Err(AcError::conflict(
+                "AGENT-WORKTREE_MISSION_MISMATCH",
+                "persisted worktree belongs to a different mission",
+            ));
+        }
+        if worktree.path != worktree_root {
+            return Err(AcError::conflict(
+                "AGENT-WORKTREE_PATH_MISMATCH",
+                "persisted worktree path does not match expected session path",
+            ));
+        }
+        git.register_existing_worktree(source_root, worktree)?
+    } else {
+        git.create_task_workspace(
+            source_root,
+            worktree_root.clone(),
+            mission_id.clone(),
+            worker.id.clone(),
+        )?
+    };
+    if let Some(observer) = &mut durability {
+        if let Some(worktree) = git.worktree(&worktree_id) {
+            observer.worktree_bound(worktree)?;
+        }
+    }
     let mut tools = ToolBroker::new(policy);
     ac_tool::WorkspaceTools::new(worktree_root).register_all(&mut tools)?;
     let mut session = session;
     session.bind_workspace(worktree_id)?;
-    Ok(AutonomousAgent::new_bound(
+    let mut agent = AutonomousAgent::new_bound(
         kernel,
         mission_id,
         session,
@@ -2519,7 +2732,14 @@ pub fn bound_workspace_agent<P: PolicyBoundary>(
         MemoryService::new(),
         git,
         VerificationEngine::new(CapabilityPolicy::new()),
-    ))
+    );
+    if let Some(observer) = durability {
+        agent = agent.with_durability_observer(observer);
+    }
+    if let Some(graph) = resume_graph {
+        agent = agent.with_resume_graph(graph);
+    }
+    Ok(agent)
 }
 
 pub fn rank_candidates(mut candidates: Vec<ContextCandidate>) -> Vec<ContextCandidate> {
@@ -3112,6 +3332,26 @@ fn provider_error(failure: ProviderFailureClass) -> AcError {
         ac_common::ErrorKind::Unavailable,
         ac_common::Retryability::Retryable,
     )
+}
+
+fn evidence_record_covers_criterion(
+    record: &EvidenceRecord,
+    criterion: &AcceptanceCriterion,
+) -> bool {
+    let needle_id = criterion.id.as_str();
+    let needle_description = criterion.description.trim();
+    [
+        Some(record.artifact_uri.as_str()),
+        Some(record.content_hash.as_str()),
+        record.raw_content.as_deref(),
+        record.model_summary.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    .any(|value| {
+        value.contains(needle_id)
+            || (!needle_description.is_empty() && value.contains(needle_description))
+    })
 }
 
 fn provenance(source: &str) -> Provenance {
@@ -3782,7 +4022,7 @@ mod tests {
                 )
                 .unwrap();
         }
-        AutonomousAgent::new(
+        let mut agent = AutonomousAgent::new(
             ac_kernel::Kernel::new(AllowAllPolicy),
             AgentSession::new(Worker::new()),
             {
@@ -3795,7 +4035,9 @@ mod tests {
             MemoryService::new(),
             GitCoordinator::new(),
             VerificationEngine::new(CapabilityPolicy::new()),
-        )
+        );
+        bind_unit_test_workspace(&mut agent);
+        agent
     }
 
     #[test]
@@ -3843,7 +4085,7 @@ mod tests {
                 )
                 .unwrap();
         }
-        AutonomousAgent::new(
+        let mut agent = AutonomousAgent::new(
             ac_kernel::Kernel::new(AllowAllPolicy),
             AgentSession::new(Worker::new()),
             provider_registry_with("test-provider", provider),
@@ -3852,7 +4094,55 @@ mod tests {
             MemoryService::new(),
             GitCoordinator::new(),
             VerificationEngine::new(CapabilityPolicy::new()),
+        );
+        bind_unit_test_workspace(&mut agent);
+        agent
+    }
+
+    fn bind_unit_test_workspace(agent: &mut AutonomousAgent<AllowAllPolicy>) {
+        let source =
+            std::env::temp_dir().join(format!("agentcode-agent-src-{}", StableId::new("tmp")));
+        let worktree =
+            std::env::temp_dir().join(format!("agentcode-agent-wt-{}", StableId::new("tmp")));
+        let _ = std::fs::remove_dir_all(&source);
+        let _ = std::fs::remove_dir_all(&worktree);
+        std::fs::create_dir_all(source.join("src")).unwrap();
+        std::fs::write(
+            source.join("Cargo.toml"),
+            "[package]\nname = \"agentcode_agent_unit\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
         )
+        .unwrap();
+        std::fs::write(source.join("README.md"), "old\n").unwrap();
+        std::fs::write(
+            source.join("src/lib.rs"),
+            "pub fn fixture_answer() -> u32 {\n    41\n}\n",
+        )
+        .unwrap();
+        run_git(&source, ["init"]);
+        run_git(&source, ["add", "."]);
+        run_git(
+            &source,
+            [
+                "-c",
+                "user.name=AgentCode Test",
+                "-c",
+                "user.email=agentcode@example.test",
+                "commit",
+                "-m",
+                "initial",
+            ],
+        );
+        let mut git = GitCoordinator::new();
+        let worktree_id = git
+            .create_task_workspace(
+                source,
+                worktree,
+                StableId::new("mission"),
+                agent.session.worker().id.clone(),
+            )
+            .unwrap();
+        agent.git = git;
+        agent.session.bind_workspace(worktree_id).unwrap();
     }
 
     fn agent_with_empty_provider_registry(
@@ -4634,9 +4924,134 @@ mod tests {
             .is_empty());
         assert_eq!(
             report.changeset.as_ref().unwrap().state,
-            ac_changeset::ChangeSetState::Approved
+            ac_changeset::ChangeSetState::Applied
         );
         assert!(report.validation.unwrap().passed);
+    }
+
+    #[test]
+    fn multi_criterion_completion_requires_specific_evidence_per_requirement() {
+        let mut agent = agent_with_tool(
+            CapabilityPolicy::new()
+                .allow(Capability::FilesystemRead("*".to_string()))
+                .allow(Capability::FilesystemWrite("*".to_string()))
+                .allow(Capability::ProcessExec("*".to_string())),
+            0,
+        );
+        let mission_id = StableId::new("mission");
+        let task_id = StableId::new("task");
+        let criterion_a = AcceptanceCriterion {
+            id: format!("{task_id}:criterion:0"),
+            description: "A is verified".to_string(),
+            required: true,
+        };
+        let criterion_b = AcceptanceCriterion {
+            id: format!("{task_id}:criterion:1"),
+            description: "B is verified".to_string(),
+            required: true,
+        };
+        let evidence_a = agent
+            .evidence
+            .append(
+                EvidenceKind::TestReport,
+                provenance("test.acceptance"),
+                "mem://acceptance/a",
+                format!("covered:{}", criterion_a.id),
+            )
+            .unwrap();
+        let task = WorkerTask {
+            id: task_id.clone(),
+            mission_id,
+            title: "multi criterion".to_string(),
+            dependencies: Vec::new(),
+            state: TaskState::Completed,
+            assigned_worker: None,
+            retry_count: 0,
+            max_retries: 1,
+            evidence_refs: vec![evidence_a.clone()],
+            acceptance_criteria: vec![criterion_a.clone(), criterion_b.clone()],
+        };
+        let runtime_plan = RuntimePlan {
+            id: StableId::new("plan"),
+            mission_id: task.mission_id.clone(),
+            revision: 1,
+            tasks: vec![task.clone()],
+            proposals: Vec::new(),
+            supersedes: None,
+        };
+        let graph = TaskGraph::from_runtime_plan(&runtime_plan).unwrap();
+        let mandatory = vec![(&task_id, &criterion_a), (&task_id, &criterion_b)]
+            .into_iter()
+            .map(|(task_id, criterion)| (task_id.clone(), criterion))
+            .collect::<Vec<_>>();
+        assert!(agent.criterion_has_specific_evidence(
+            &task_id,
+            &criterion_a,
+            &mandatory,
+            &[evidence_a],
+            &graph
+        ));
+        assert!(!agent.criterion_has_specific_evidence(
+            &task_id,
+            &criterion_b,
+            &mandatory,
+            &[],
+            &graph
+        ));
+    }
+
+    #[test]
+    fn concurrent_mutation_between_prepare_and_apply_is_preserved() {
+        let agent = agent_with_tool(
+            CapabilityPolicy::new()
+                .allow(Capability::FilesystemRead("*".to_string()))
+                .allow(Capability::FilesystemWrite("*".to_string()))
+                .allow(Capability::ProcessExec("*".to_string())),
+            0,
+        );
+        agent.kernel_lock().unwrap().start().unwrap();
+        let worktree = agent
+            .session
+            .worker()
+            .workspace_ref
+            .as_ref()
+            .and_then(|id| agent.git.worktree(id))
+            .unwrap()
+            .clone();
+        let mut repo =
+            LocalWorkspaceFileRepository::new(worktree.path.clone(), worktree.base_commit.clone());
+        let mut transaction = agent
+            .prepare_edit_transaction(&repo, "README.md", "# Project\n")
+            .unwrap();
+        transaction
+            .changeset
+            .attach_metadata(ChangeSetMetadata {
+                originating_task: StableId::new("task"),
+                originating_agent_session: agent.session.id().clone(),
+                files_changed: vec![FileChangeSummary {
+                    path: "README.md".to_string(),
+                    additions: 1,
+                    removals: 1,
+                }],
+                additions: 1,
+                removals: 1,
+                evidence_refs: vec![StableId::new("ev")],
+                verification_passed: None,
+            })
+            .unwrap();
+        transaction.changeset.validate().unwrap();
+        agent
+            .kernel_lock()
+            .unwrap()
+            .approve_changeset(&mut transaction.changeset)
+            .unwrap();
+        std::fs::write(worktree.path.join("README.md"), "external change\n").unwrap();
+        let err = EditEngine.apply(&mut repo, &mut transaction).unwrap_err();
+        assert_eq!(err.code(), "EDIT-CONCURRENT_MUTATION");
+        assert_eq!(
+            std::fs::read_to_string(worktree.path.join("README.md")).unwrap(),
+            "external change\n"
+        );
     }
 
     #[test]
@@ -4835,7 +5250,7 @@ mod tests {
             "pub fn fixture_answer() -> u32 {\n    42\n}"
         );
         let changeset = report.changeset.as_ref().unwrap();
-        assert_eq!(changeset.state, ChangeSetState::Approved);
+        assert_eq!(changeset.state, ChangeSetState::Applied);
         assert!(matches!(
             &changeset.operations[0],
             ChangeOperation::WriteFile {

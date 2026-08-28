@@ -29,6 +29,10 @@ impl TaskGraph {
     pub fn tasks(&self) -> impl Iterator<Item = &WorkerTask> {
         self.tasks.values()
     }
+
+    pub fn task(&self, id: &StableId) -> Option<&WorkerTask> {
+        self.tasks.get(id)
+    }
     pub fn attempts(&self) -> &[TaskAttempt] {
         &self.attempts
     }

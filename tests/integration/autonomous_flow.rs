@@ -87,7 +87,7 @@ fn autonomous_flow_reaches_completion_only_after_verification_evidence() {
     assert!(report.validation.as_ref().unwrap().passed);
     assert_eq!(
         report.changeset.as_ref().unwrap().state,
-        ChangeSetState::Approved
+        ChangeSetState::Applied
     );
     let completion = report.completion_request.as_ref().unwrap();
     assert!(completion.verification_passed);

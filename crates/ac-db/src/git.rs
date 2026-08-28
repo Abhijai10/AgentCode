@@ -59,6 +59,42 @@ impl ControlPlaneDb {
         Ok(None)
     }
 
+    pub fn worktree_for_mission(
+        &self,
+        mission_id: &StableId,
+    ) -> AcResult<Option<PersistedWorktree>> {
+        let mut stmt = self
+            .connection
+            .prepare(
+                "SELECT id, repository_id, owner_mission_id, owner_worker_id, lease_epoch, path, branch,
+                        base_commit, current_commit, status, created_at_ms
+                 FROM worktrees
+                 WHERE owner_mission_id = ?1
+                 ORDER BY created_at_ms DESC
+                 LIMIT 1",
+            )
+            .map_err(db_error)?;
+        let mut rows = stmt
+            .query(params![mission_id.as_str()])
+            .map_err(db_error)?;
+        if let Some(row) = rows.next().map_err(db_error)? {
+            return Ok(Some(PersistedWorktree {
+                id: row.get(0).map_err(db_error)?,
+                repository_id: row.get(1).map_err(db_error)?,
+                owner_mission_id: row.get(2).map_err(db_error)?,
+                owner_worker_id: row.get(3).map_err(db_error)?,
+                lease_epoch: row.get(4).map_err(db_error)?,
+                path: row.get(5).map_err(db_error)?,
+                branch: row.get(6).map_err(db_error)?,
+                base_commit: row.get(7).map_err(db_error)?,
+                current_commit: row.get(8).map_err(db_error)?,
+                status: row.get(9).map_err(db_error)?,
+                created_at_ms: row.get(10).map_err(db_error)?,
+            }));
+        }
+        Ok(None)
+    }
+
     pub fn save_git_checkpoint(&self, checkpoint: &CheckpointRecord) -> AcResult<()> {
         self.connection
             .execute(

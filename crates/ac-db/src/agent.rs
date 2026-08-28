@@ -112,6 +112,29 @@ impl ControlPlaneDb {
         Ok(None)
     }
 
+    pub fn session_for_mission(&self, mission_id: &StableId) -> AcResult<Option<PersistedSession>> {
+        let mut stmt = self
+            .connection
+            .prepare(
+                "SELECT id, mission_id, state, updated_at_ms
+                 FROM agent_sessions
+                 WHERE mission_id = ?1
+                 ORDER BY updated_at_ms DESC
+                 LIMIT 1",
+            )
+            .map_err(db_error)?;
+        let mut rows = stmt.query(params![mission_id.as_str()]).map_err(db_error)?;
+        if let Some(row) = rows.next().map_err(db_error)? {
+            return Ok(Some(PersistedSession {
+                id: row.get(0).map_err(db_error)?,
+                mission_id: row.get(1).map_err(db_error)?,
+                state: row.get(2).map_err(db_error)?,
+                updated_at_ms: row.get(3).map_err(db_error)?,
+            }));
+        }
+        Ok(None)
+    }
+
     pub fn checkpoints_for_session(
         &self,
         session_id: &StableId,
@@ -189,7 +212,12 @@ impl ControlPlaneDb {
 
     pub fn save_task_attempt(&self, record: &TaskAttemptRecord) -> AcResult<()> {
         self.connection.execute(
-            "INSERT INTO task_attempts (id, task_id, worker_id, outcome, evidence_refs, failure_class, created_at_ms) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            "INSERT INTO task_attempts (id, task_id, worker_id, outcome, evidence_refs, failure_class, created_at_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+             ON CONFLICT(id) DO UPDATE SET
+                outcome=excluded.outcome,
+                evidence_refs=excluded.evidence_refs,
+                failure_class=excluded.failure_class",
             params![record.id, record.task_id, record.worker_id, record.outcome, record.evidence_refs, record.failure_class, record.created_at_ms],
         ).map_err(db_error)?;
         Ok(())

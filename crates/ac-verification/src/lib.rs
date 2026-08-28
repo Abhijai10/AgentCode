@@ -225,6 +225,7 @@ pub struct IntegrationVerificationReport {
 pub struct FinalAuditInput {
     pub original_goal: String,
     pub requirements: Vec<String>,
+    pub required_requirement_ids: Vec<StableId>,
     pub verified_requirement_ids: Vec<StableId>,
     pub evidence_refs: Vec<StableId>,
     pub worker_completion_text: String,
@@ -447,6 +448,8 @@ struct CdpClient {
     page_errors: Vec<String>,
     network_failures: Vec<String>,
     http_status: u16,
+    current_url_hint: Option<String>,
+    document_ready_seen: bool,
 }
 
 const MAX_BROWSER_EVENT_EVIDENCE: usize = 256;
@@ -1158,7 +1161,17 @@ impl VerificationEngine {
             ));
         }
         let mut findings = Vec::new();
-        if input.verified_requirement_ids.len() < input.requirements.len() {
+        let required_ids = input
+            .required_requirement_ids
+            .iter()
+            .collect::<BTreeSet<_>>();
+        let verified_ids = input
+            .verified_requirement_ids
+            .iter()
+            .collect::<BTreeSet<_>>();
+        if input.required_requirement_ids.len() != input.requirements.len()
+            || !required_ids.is_subset(&verified_ids)
+        {
             findings.push(blocking(
                 "VERIFY-FINAL_AUDIT_MISSING_REQUIREMENT",
                 "not every requirement has accepted evidence",
@@ -1992,10 +2005,15 @@ impl RealBrowserPage {
     }
 
     fn navigate(&mut self, url: &str) -> AcResult<()> {
+        self.client.reset_navigation_watch();
         self.client
             .call("Page.navigate", json!({ "url": url.to_string() }))?;
         self.client.wait_for_load(Some(url))?;
-        self.url = self.current_url()?;
+        self.url = self
+            .client
+            .current_url_hint
+            .clone()
+            .unwrap_or_else(|| url.to_string());
         Ok(())
     }
 
@@ -2193,10 +2211,16 @@ impl CdpClient {
             page_errors: Vec::new(),
             network_failures: Vec::new(),
             http_status: 0,
+            current_url_hint: None,
+            document_ready_seen: false,
         })
     }
 
     fn call(&mut self, method: &str, params: Value) -> AcResult<Value> {
+        self.call_until(method, params, Instant::now() + Duration::from_secs(8))
+    }
+
+    fn call_until(&mut self, method: &str, params: Value, deadline: Instant) -> AcResult<Value> {
         let id = self.next_id;
         self.next_id += 1;
         let payload = json!({
@@ -2207,7 +2231,6 @@ impl CdpClient {
         self.socket
             .send(Message::Text(payload.to_string().into()))
             .map_err(|err| AcError::validation("BROWSER-CDP_SEND", err.to_string()))?;
-        let deadline = Instant::now() + Duration::from_secs(8);
         while Instant::now() < deadline {
             match self.socket.read() {
                 Ok(message) => {
@@ -2238,8 +2261,12 @@ impl CdpClient {
             "BROWSER-CDP_TIMEOUT",
             format!("timed out waiting for {method}"),
             ac_common::ErrorKind::Unavailable,
-            ac_common::Retryability::NotRetryable,
+            ac_common::Retryability::Retryable,
         ))
+    }
+
+    fn reset_navigation_watch(&mut self) {
+        self.document_ready_seen = false;
     }
 
     fn drain_events(&mut self, duration: Duration) -> AcResult<()> {
@@ -2269,11 +2296,59 @@ impl CdpClient {
     fn wait_for_load(&mut self, expected_url: Option<&str>) -> AcResult<()> {
         let deadline = Instant::now() + Duration::from_secs(10);
         while Instant::now() < deadline {
-            self.drain_events(Duration::from_millis(100))?;
-            let ready = self.evaluate_string("(() => document.readyState)()")?;
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            self.drain_events(remaining.min(Duration::from_millis(75)))?;
+            if self.document_ready_seen
+                && expected_url.is_none_or(|expected| {
+                    self.current_url_hint
+                        .as_deref()
+                        .is_some_and(|actual| actual == expected || actual.starts_with(expected))
+                })
+            {
+                return Ok(());
+            }
+            let poll_deadline = Instant::now() + remaining.min(Duration::from_millis(500));
+            let ready_value = match self.call_until(
+                "Runtime.evaluate",
+                json!({
+                    "expression": "(() => document.readyState)()",
+                    "returnByValue": true
+                }),
+                poll_deadline,
+            ) {
+                Ok(value) => value,
+                Err(error) if error.code() == "BROWSER-CDP_TIMEOUT" => continue,
+                Err(error) => return Err(error),
+            };
+            let ready = ready_value
+                .get("result")
+                .and_then(|result| result.get("value"))
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
             let url_matches = if let Some(expected_url) = expected_url {
-                self.evaluate_string("(() => location.href)()")?
-                    .starts_with(expected_url)
+                let url_deadline = Instant::now()
+                    + deadline
+                        .saturating_duration_since(Instant::now())
+                        .min(Duration::from_millis(500));
+                let value = match self.call_until(
+                    "Runtime.evaluate",
+                    json!({
+                        "expression": "(() => location.href)()",
+                        "returnByValue": true
+                    }),
+                    url_deadline,
+                ) {
+                    Ok(value) => value,
+                    Err(error) if error.code() == "BROWSER-CDP_TIMEOUT" => continue,
+                    Err(error) => return Err(error),
+                };
+                let href = value
+                    .get("result")
+                    .and_then(|result| result.get("value"))
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                href == expected_url || href.starts_with(expected_url)
             } else {
                 true
             };
@@ -2285,7 +2360,7 @@ impl CdpClient {
             "BROWSER-NAVIGATION_TIMEOUT",
             "navigation did not reach an interactive document state",
             ac_common::ErrorKind::Unavailable,
-            ac_common::Retryability::NotRetryable,
+            ac_common::Retryability::Retryable,
         ))
     }
 
@@ -2360,6 +2435,18 @@ impl CdpClient {
 
     fn observe_event(&mut self, method: &str, params: &Value) {
         match method {
+            "Page.frameNavigated" => {
+                if let Some(url) = params
+                    .get("frame")
+                    .and_then(|frame| frame.get("url"))
+                    .and_then(Value::as_str)
+                {
+                    self.current_url_hint = Some(url.to_string());
+                }
+            }
+            "Page.loadEventFired" | "Page.domContentEventFired" => {
+                self.document_ready_seen = true;
+            }
             "Runtime.consoleAPICalled" => {
                 if matches!(params.get("type").and_then(Value::as_str), Some("error")) {
                     let text = params
@@ -3305,6 +3392,7 @@ mod tests {
                 FinalAuditInput {
                     original_goal: "implement auth".to_string(),
                     requirements: vec!["route wired".to_string(), "tests prove it".to_string()],
+                    required_requirement_ids: vec![StableId::new("req-a"), StableId::new("req-b")],
                     verified_requirement_ids: vec![StableId::new("req")],
                     evidence_refs: vec![StableId::new("ev")],
                     worker_completion_text: "done, trust me".to_string(),
@@ -3321,12 +3409,14 @@ mod tests {
                 .allowed
         );
 
+        let complete_requirement = StableId::new("req");
         let complete = engine
             .final_audit(
                 FinalAuditInput {
                     original_goal: "implement auth".to_string(),
                     requirements: vec!["route wired".to_string()],
-                    verified_requirement_ids: vec![StableId::new("req")],
+                    required_requirement_ids: vec![complete_requirement.clone()],
+                    verified_requirement_ids: vec![complete_requirement],
                     evidence_refs: vec![StableId::new("ev")],
                     worker_completion_text: "verified with evidence".to_string(),
                     unresolved_limitations: Vec::new(),
@@ -3362,11 +3452,13 @@ mod tests {
             .unwrap();
         let required_a = StableId::from_existing("criterion-a").unwrap();
         let required_b = StableId::from_existing("criterion-b").unwrap();
+        let optional_c = StableId::from_existing("criterion-c").unwrap();
         let only_a = engine
             .final_audit(
                 FinalAuditInput {
                     original_goal: "ship covered requirements".to_string(),
                     requirements: vec!["A".to_string(), "B".to_string()],
+                    required_requirement_ids: vec![required_a.clone(), required_b.clone()],
                     verified_requirement_ids: vec![required_a.clone()],
                     evidence_refs: vec![evidence_ref.clone()],
                     worker_completion_text: "all requirements are satisfied".to_string(),
@@ -3386,7 +3478,8 @@ mod tests {
                 FinalAuditInput {
                     original_goal: "ship covered requirements".to_string(),
                     requirements: vec!["A".to_string(), "B".to_string()],
-                    verified_requirement_ids: vec![required_a, required_b],
+                    required_requirement_ids: vec![required_a.clone(), required_b.clone()],
+                    verified_requirement_ids: vec![required_a, required_b, optional_c],
                     evidence_refs: vec![evidence_ref],
                     worker_completion_text: "verified by deterministic evidence".to_string(),
                     unresolved_limitations: Vec::new(),

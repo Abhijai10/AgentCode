@@ -154,7 +154,13 @@ fn bounded_summary(value: &str) -> String {
     if value.len() <= LIMIT {
         value.to_string()
     } else {
-        format!("{}\n[output truncated]", &value[..LIMIT])
+        let boundary = value
+            .char_indices()
+            .map(|(index, _)| index)
+            .take_while(|index| *index <= LIMIT)
+            .last()
+            .unwrap_or(0);
+        format!("{}\n[output truncated]", &value[..boundary])
     }
 }
 
@@ -215,5 +221,57 @@ mod tests {
             .as_ref()
             .unwrap()
             .contains("error: failed"));
+    }
+
+    #[test]
+    fn bounded_summary_keeps_ascii_below_limit_unchanged() {
+        let value = "a".repeat(4096);
+        assert_eq!(bounded_summary(&value), value);
+    }
+
+    #[test]
+    fn bounded_summary_truncates_ascii_above_limit_with_marker() {
+        let value = "a".repeat(4097);
+        let summary = bounded_summary(&value);
+        assert!(summary.starts_with(&"a".repeat(4096)));
+        assert!(summary.ends_with("\n[output truncated]"));
+    }
+
+    #[test]
+    fn bounded_summary_does_not_split_multibyte_boundary() {
+        let value = format!("{}étail", "a".repeat(4095));
+        let summary = bounded_summary(&value);
+        assert!(summary.starts_with(&"a".repeat(4095)));
+        assert!(!summary.contains('é'));
+        assert!(summary.ends_with("\n[output truncated]"));
+    }
+
+    #[test]
+    fn bounded_summary_handles_emoji_and_cjk_boundary() {
+        let value = format!("{}😀漢字", "a".repeat(4094));
+        let summary = bounded_summary(&value);
+        assert!(summary.starts_with(&"a".repeat(4094)));
+        assert!(!summary.contains('😀'));
+        assert!(!summary.contains('漢'));
+        assert!(summary.ends_with("\n[output truncated]"));
+    }
+
+    #[test]
+    fn tool_output_records_large_unicode_without_panic() {
+        let mut store = EvidenceStore::new();
+        let raw = format!("{}😀漢字-secret", "界".repeat(1500));
+        let id = store
+            .append_tool_output(
+                provenance(),
+                "mem://tool/unicode-output",
+                raw.clone(),
+                &["unicode-secret".to_string()],
+            )
+            .unwrap();
+        let record = store.get(&id).unwrap();
+        assert_eq!(record.raw_content.as_deref(), Some(raw.as_str()));
+        let summary = record.model_summary.as_ref().unwrap();
+        assert!(summary.ends_with("\n[output truncated]"));
+        assert!(!summary.contains("unicode-secret"));
     }
 }

@@ -144,6 +144,7 @@ impl ChangeSet {
                 | (ChangeSetState::Proposed, ChangeSetState::Rejected)
                 | (ChangeSetState::Validated, ChangeSetState::Approved)
                 | (ChangeSetState::Validated, ChangeSetState::Rejected)
+                | (ChangeSetState::Approved, ChangeSetState::Applying)
                 | (ChangeSetState::Approved, ChangeSetState::Applied)
                 | (ChangeSetState::Applying, ChangeSetState::Applied)
                 | (ChangeSetState::Applying, ChangeSetState::RollingBack)

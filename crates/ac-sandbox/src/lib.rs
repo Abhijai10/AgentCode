@@ -723,7 +723,7 @@ fn write_macos_profile(request: &SandboxBackendRequest) -> AcResult<PathBuf> {
     allow_profile_workspace_root(&mut profile, &temp);
     profile.push_str(
         "(allow file-read* file-write* (subpath \"/private/tmp\"))\n\
-         (allow file-write* (subpath \"/tmp\"))\n",
+         (allow file-read* file-write* (subpath \"/tmp\"))\n",
     );
     if request.network_policy == NetworkPolicy::AllowAll {
         profile.push_str("(allow network*)\n");
@@ -749,33 +749,66 @@ fn allow_profile_workspace_root(profile: &mut String, root: &Path) {
 }
 
 fn allow_profile_toolchain_paths(profile: &mut String, request: &SandboxBackendRequest) {
-    if let Some(path) = request.allowed_env.get("PATH") {
-        for dir in std::env::split_paths(path) {
-            if is_developer_tool_dir(&dir) {
-                allow_profile_read_subpath(profile, &dir);
-            }
+    if let Some(executable) = trusted_executable_path(request) {
+        if let Some(parent) = executable.parent() {
+            allow_profile_read_subpath(profile, parent);
+        }
+        if let Some(toolchain_root) = trusted_rustup_toolchain_root(&executable) {
+            allow_profile_read_subpath(profile, &toolchain_root);
         }
     }
-    if let Some(cargo_home) = request.allowed_env.get("CARGO_HOME") {
-        let cargo_home = PathBuf::from(cargo_home);
+    if let Some(cargo_home) = trusted_cargo_home(request) {
         allow_profile_read_subpath(profile, &cargo_home.join("bin"));
         allow_profile_read_subpath(profile, &cargo_home.join("registry"));
         allow_profile_read_subpath(profile, &cargo_home.join("git"));
     }
-    if let Some(rustup_home) = request.allowed_env.get("RUSTUP_HOME") {
-        let rustup_home = PathBuf::from(rustup_home);
-        allow_profile_read_subpath(profile, &rustup_home.join("toolchains"));
-        allow_profile_read_subpath(profile, &rustup_home.join("settings.toml"));
-    }
 }
 
-fn is_developer_tool_dir(path: &Path) -> bool {
+fn trusted_executable_path(request: &SandboxBackendRequest) -> Option<PathBuf> {
+    let program = request.argv.first()?;
+    let candidate = if program.contains('/') {
+        PathBuf::from(program)
+    } else {
+        let path = request.allowed_env.get("PATH")?;
+        std::env::split_paths(path)
+            .map(|dir| dir.join(program))
+            .find(|candidate| candidate.is_file())?
+    };
+    let canonical = fs::canonicalize(candidate).ok()?;
+    is_trusted_toolchain_path(&canonical).then_some(canonical)
+}
+
+fn is_trusted_toolchain_path(path: &Path) -> bool {
     let text = path.display().to_string();
     text.starts_with("/usr/")
-        || text.starts_with("/bin")
-        || text.starts_with("/sbin")
+        || text.starts_with("/bin/")
+        || text.starts_with("/sbin/")
         || text.starts_with("/opt/homebrew/")
-        || text.ends_with("/.cargo/bin")
+        || text.starts_with("/Applications/Xcode.app/Contents/")
+        || text.contains("/.rustup/toolchains/")
+        || text == "/bin/sh"
+        || text == "/usr/bin/env"
+}
+
+fn trusted_rustup_toolchain_root(executable: &Path) -> Option<PathBuf> {
+    let parts = executable.components().collect::<Vec<_>>();
+    let rustup = parts.windows(2).position(|window| {
+        window[0].as_os_str() == ".rustup" && window[1].as_os_str() == "toolchains"
+    })?;
+    let toolchain = parts.get(rustup + 2)?;
+    let mut root = PathBuf::new();
+    for part in parts.iter().take(rustup + 3) {
+        root.push(part.as_os_str());
+    }
+    (!toolchain.as_os_str().is_empty()).then_some(root)
+}
+
+fn trusted_cargo_home(request: &SandboxBackendRequest) -> Option<PathBuf> {
+    let cargo_home = PathBuf::from(request.allowed_env.get("CARGO_HOME")?);
+    let home = std::env::var_os("HOME").map(PathBuf::from)?;
+    let expected = fs::canonicalize(home.join(".cargo")).ok()?;
+    let canonical = fs::canonicalize(cargo_home).ok()?;
+    (canonical == expected).then_some(canonical)
 }
 
 fn allow_profile_read_subpath(profile: &mut String, path: &Path) {
@@ -965,6 +998,83 @@ mod tests {
             "(allow file-read* file-write* (subpath \"{}\"))",
             escape_profile_string(&resolved_root.display().to_string())
         )));
+        let _ = std::fs::remove_file(profile);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn macos_profile_does_not_trust_fake_path_or_toolchain_env() {
+        let root = std::env::temp_dir().join(format!("agentcode-sandbox-{}", StableId::new("t")));
+        let fake_home = root.join("fake-home");
+        let fake_bin = fake_home.join(".cargo/bin");
+        let fake_cargo_home = root.join("cargo-home");
+        let fake_rustup_home = root.join("rustup-home");
+        std::fs::create_dir_all(&fake_bin).unwrap();
+        std::fs::create_dir_all(fake_cargo_home.join("registry")).unwrap();
+        std::fs::create_dir_all(fake_rustup_home.join("toolchains/stable/bin")).unwrap();
+        std::fs::write(fake_bin.join("cargo"), "#!/bin/sh\n").unwrap();
+        let mut allowed_env = BTreeMap::new();
+        allowed_env.insert("PATH".to_string(), fake_bin.display().to_string());
+        allowed_env.insert(
+            "CARGO_HOME".to_string(),
+            fake_cargo_home.display().to_string(),
+        );
+        allowed_env.insert(
+            "RUSTUP_HOME".to_string(),
+            fake_rustup_home.display().to_string(),
+        );
+        let profile = write_macos_profile(&SandboxBackendRequest {
+            argv: vec!["cargo".to_string(), "test".to_string()],
+            cwd: root.clone(),
+            allowed_env,
+            workspace_roots: vec![root.clone()],
+            timeout_ms: 1_000,
+            network_policy: NetworkPolicy::DenyAll,
+            required_isolation: IsolationLevel::FilesystemIsolated,
+            max_output_bytes: 1024,
+        })
+        .unwrap();
+        let text = std::fs::read_to_string(&profile).unwrap();
+        assert!(!text.contains(&format!(
+            "(allow file-read* (subpath \"{}\"))",
+            escape_profile_string(&fake_bin.display().to_string())
+        )));
+        assert!(!text.contains(&escape_profile_string(
+            &fake_cargo_home.join("registry").display().to_string()
+        )));
+        assert!(!text.contains(&escape_profile_string(
+            &fake_rustup_home.join("toolchains").display().to_string()
+        )));
+        let _ = std::fs::remove_file(profile);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn macos_profile_rejects_path_symlink_to_untrusted_home() {
+        let root = std::env::temp_dir().join(format!("agentcode-sandbox-{}", StableId::new("t")));
+        let target = root.join("target-bin");
+        let link = root.join(".cargo/bin");
+        std::fs::create_dir_all(&target).unwrap();
+        std::fs::create_dir_all(link.parent().unwrap()).unwrap();
+        std::fs::write(target.join("cargo"), "#!/bin/sh\n").unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        let mut allowed_env = BTreeMap::new();
+        allowed_env.insert("PATH".to_string(), link.display().to_string());
+        let profile = write_macos_profile(&SandboxBackendRequest {
+            argv: vec!["cargo".to_string(), "test".to_string()],
+            cwd: root.clone(),
+            allowed_env,
+            workspace_roots: vec![root.clone()],
+            timeout_ms: 1_000,
+            network_policy: NetworkPolicy::DenyAll,
+            required_isolation: IsolationLevel::FilesystemIsolated,
+            max_output_bytes: 1024,
+        })
+        .unwrap();
+        let text = std::fs::read_to_string(&profile).unwrap();
+        assert!(!text.contains(&escape_profile_string(&target.display().to_string())));
+        assert!(!text.contains(&escape_profile_string(&link.display().to_string())));
         let _ = std::fs::remove_file(profile);
         let _ = std::fs::remove_dir_all(root);
     }

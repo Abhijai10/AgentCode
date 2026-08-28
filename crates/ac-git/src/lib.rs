@@ -174,6 +174,69 @@ impl GitCoordinator {
         Ok(id)
     }
 
+    pub fn register_existing_worktree(
+        &mut self,
+        source_root: PathBuf,
+        worktree: WorktreeRecord,
+    ) -> AcResult<StableId> {
+        if !worktree.path.exists() || !worktree.path.is_dir() {
+            return Err(AcError::conflict(
+                "GIT-WORKTREE_REATTACH_MISSING",
+                "expected interrupted worktree directory is missing",
+            ));
+        }
+        let expected_path = canonical_path(&worktree.path)?;
+        let actual_root = canonical_path(Path::new(&git_output(
+            &worktree.path,
+            ["rev-parse", "--show-toplevel"],
+        )?))?;
+        if actual_root != expected_path {
+            return Err(AcError::conflict(
+                "GIT-WORKTREE_REATTACH_PATH",
+                "existing directory is not the expected git worktree",
+            ));
+        }
+        let source_common = canonical_path(&source_root.join(".git"))?;
+        let actual_common = canonical_path(&worktree.path.join(git_output(
+            &worktree.path,
+            ["rev-parse", "--git-common-dir"],
+        )?))?;
+        if actual_common != source_common {
+            return Err(AcError::conflict(
+                "GIT-WORKTREE_REATTACH_REPOSITORY",
+                "existing worktree belongs to a different source repository",
+            ));
+        }
+        let branch = git_output(&worktree.path, ["branch", "--show-current"])?;
+        if branch != worktree.branch {
+            return Err(AcError::conflict(
+                "GIT-WORKTREE_REATTACH_BRANCH",
+                "existing worktree branch does not match the persisted branch",
+            ));
+        }
+        let base_present = git_output(&worktree.path, ["cat-file", "-t", &worktree.base_commit])?;
+        if base_present != "commit" {
+            return Err(AcError::conflict(
+                "GIT-WORKTREE_REATTACH_BASE",
+                "persisted base commit is not present in the worktree repository",
+            ));
+        }
+        let default_branch = git_output(&source_root, ["branch", "--show-current"])
+            .unwrap_or_else(|_| "main".to_string());
+        self.repositories.insert(
+            worktree.repository_id.clone(),
+            RepositoryRecord {
+                id: worktree.repository_id.clone(),
+                root: source_root,
+                head: worktree.base_commit.clone(),
+                default_branch,
+            },
+        );
+        let id = worktree.id.clone();
+        self.worktrees.insert(id.clone(), worktree);
+        Ok(id)
+    }
+
     pub fn checkpoint(
         &mut self,
         worktree_id: &StableId,
@@ -367,7 +430,7 @@ impl GitCoordinator {
         owner_mission_id: StableId,
         owner_worker_id: StableId,
     ) -> AcResult<StableId> {
-        if !git_output(&source_root, ["status", "--porcelain"])?.is_empty() {
+        if !dirty_status_excluding_managed_worktrees(&source_root)?.is_empty() {
             return Err(AcError::conflict(
                 "GIT-DIRTY_BASE",
                 "source repository has uncommitted user changes",
@@ -687,6 +750,28 @@ fn git_output<const N: usize>(cwd: &Path, args: [&str; N]) -> AcResult<String> {
         ));
     }
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+fn dirty_status_excluding_managed_worktrees(source_root: &Path) -> AcResult<Vec<String>> {
+    Ok(git_output(source_root, ["status", "--porcelain"])?
+        .lines()
+        .filter(|line| !is_managed_worktree_status(line))
+        .map(ToString::to_string)
+        .collect())
+}
+
+fn is_managed_worktree_status(line: &str) -> bool {
+    line.get(3..)
+        .is_some_and(|path| path.starts_with(".agentcode-worktrees/"))
+}
+
+fn canonical_path(path: &Path) -> AcResult<PathBuf> {
+    path.canonicalize().map_err(|error| {
+        AcError::validation(
+            "GIT-CANONICALIZE_PATH",
+            format!("{}: {error}", path.display()),
+        )
+    })
 }
 
 pub fn validate_branch(branch: &str) -> AcResult<()> {
@@ -1074,5 +1159,55 @@ mod tests {
         git.cleanup_worktree(&id).unwrap();
         git.cleanup_worktree(&other).unwrap();
         let _ = fs::remove_dir_all(source);
+    }
+
+    #[test]
+    fn managed_worktree_directory_does_not_make_source_base_dirty() {
+        let source = std::env::temp_dir().join(format!("agentcode-src-{}", StableId::new("tmp")));
+        let worktree = std::env::temp_dir().join(format!("agentcode-wt-{}", StableId::new("tmp")));
+        let _ = fs::remove_dir_all(&source);
+        let _ = fs::remove_dir_all(&worktree);
+        fs::create_dir_all(&source).unwrap();
+        fs::write(source.join("README.md"), "base\n").unwrap();
+        run_git(&source, ["init"]);
+        run_git(&source, ["add", "."]);
+        run_git(
+            &source,
+            [
+                "-c",
+                "user.name=AgentCode Test",
+                "-c",
+                "user.email=agentcode@example.test",
+                "commit",
+                "-m",
+                "initial",
+            ],
+        );
+        fs::create_dir_all(source.join(".agentcode-worktrees/session/src")).unwrap();
+        fs::write(
+            source.join(".agentcode-worktrees/session/src/lib.rs"),
+            "pub fn generated() {}\n",
+        )
+        .unwrap();
+        let mut git = GitCoordinator::new();
+        git.create_task_workspace(
+            source.clone(),
+            worktree.clone(),
+            StableId::new("mission"),
+            StableId::new("worker"),
+        )
+        .unwrap();
+        fs::write(source.join("user-notes.txt"), "untracked user work\n").unwrap();
+        let err = git
+            .create_task_workspace(
+                source.clone(),
+                worktree.join("second"),
+                StableId::new("mission"),
+                StableId::new("worker"),
+            )
+            .unwrap_err();
+        assert_eq!(err.code(), "GIT-DIRTY_BASE");
+        let _ = fs::remove_dir_all(&source);
+        let _ = fs::remove_dir_all(&worktree);
     }
 }

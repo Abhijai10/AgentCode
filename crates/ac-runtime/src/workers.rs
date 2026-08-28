@@ -152,7 +152,7 @@ pub enum TaskAttemptOutcome {
     Cancelled,
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct TaskGraph {
     tasks: BTreeMap<StableId, WorkerTask>,
     attempts: Vec<TaskAttempt>,

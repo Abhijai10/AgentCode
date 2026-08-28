@@ -73,9 +73,11 @@ name = "ac-daemon"
 version = "0.1.0"
 dependencies = [
  "ac-agent",
+ "ac-changeset",
  "ac-common",
  "ac-config",
  "ac-db",
+ "ac-git",
  "ac-kernel",
  "ac-logging",
  "ac-runtime",

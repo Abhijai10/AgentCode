@@ -905,6 +905,7 @@ mod tests {
                 ac_verification::FinalAuditInput {
                     original_goal: "finish phase 14".to_string(),
                     requirements: vec!["verification evidence exists".to_string()],
+                    required_requirement_ids: vec![requirement_id.clone()],
                     verified_requirement_ids: vec![requirement_id.clone()],
                     evidence_refs: vec![manifest.evidence_ref.clone()],
                     worker_completion_text: "verified".to_string(),

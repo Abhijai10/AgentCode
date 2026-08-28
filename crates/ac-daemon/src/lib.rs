@@ -3,13 +3,15 @@ use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::{mpsc, Arc, Mutex};
-use std::thread;
+use std::thread::{self, JoinHandle};
 
 use ac_common::{AcError, AcResult, StableId, TimestampMillis};
-use ac_db::{ControlPlaneDb, PersistedSession};
+use ac_db::{ControlPlaneDb, PersistedSession, PersistedWorktree};
+use ac_git::{WorktreeRecord, WorktreeStatus};
 use ac_kernel::{Kernel, KernelDecisionKind, MissionState, PermissionDecision, PolicyBoundary};
 use ac_runtime::{
-    AgentSession, AgentSessionState, CancellationToken, HydratedSession, RuntimeHydrator, Worker,
+    AgentSession, AgentSessionState, CancellationToken, HydratedSession, RuntimeHydrator,
+    TaskGraph, Worker,
 };
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -26,6 +28,56 @@ struct QueuedMission {
     goal: String,
 }
 
+enum CoordinatorMessage {
+    Run(QueuedMission),
+    Shutdown,
+}
+
+struct SqliteAgentDurability {
+    db_path: PathBuf,
+}
+
+impl SqliteAgentDurability {
+    fn db(&self) -> AcResult<ControlPlaneDb> {
+        ControlPlaneDb::open(&self.db_path)
+    }
+}
+
+impl ac_agent::AgentDurabilityObserver for SqliteAgentDurability {
+    fn worktree_bound(&mut self, worktree: &WorktreeRecord) -> AcResult<()> {
+        self.db()?.save_worktree(worktree)
+    }
+
+    fn graph_updated(
+        &mut self,
+        graph: &TaskGraph,
+        worker: &Worker,
+        session_id: &StableId,
+    ) -> AcResult<()> {
+        graph.persist(&self.db()?, worker, session_id)
+    }
+
+    fn changeset_updated(&mut self, changeset: &ac_changeset::ChangeSet) -> AcResult<()> {
+        self.db()?.save_changeset(changeset)
+    }
+
+    fn edit_transaction_updated(
+        &mut self,
+        transaction: &ac_changeset::ChangeSetTransaction,
+        task_id: Option<&StableId>,
+        worktree_id: Option<&StableId>,
+        base_revision: &str,
+    ) -> AcResult<()> {
+        self.db()?.save_changeset_transaction(
+            transaction,
+            task_id.map(StableId::as_str),
+            worktree_id.map(StableId::as_str),
+            base_revision,
+            "rust",
+        )
+    }
+}
+
 #[derive(Default)]
 struct CoordinatorState {
     queued: VecDeque<QueuedMission>,
@@ -39,8 +91,9 @@ struct CoordinatorState {
 /// A deliberately single-slot, daemon-owned executor.  The IPC thread only
 /// queues durable work; execution happens on this dedicated worker.
 struct MissionCoordinator {
-    tx: mpsc::SyncSender<QueuedMission>,
+    tx: mpsc::SyncSender<CoordinatorMessage>,
     state: Arc<Mutex<CoordinatorState>>,
+    worker: Mutex<Option<JoinHandle<()>>>,
 }
 
 impl MissionCoordinator {
@@ -49,13 +102,16 @@ impl MissionCoordinator {
         workspace_root: PathBuf,
         kernel: Arc<Mutex<Kernel<ProductionKernelPolicy>>>,
     ) -> Self {
-        let (tx, rx) = mpsc::sync_channel::<QueuedMission>(64);
+        let (tx, rx) = mpsc::sync_channel::<CoordinatorMessage>(64);
         let state = Arc::new(Mutex::new(CoordinatorState::default()));
         let worker_state = Arc::clone(&state);
-        thread::Builder::new()
+        let worker = thread::Builder::new()
             .name("agentcode-mission-worker".to_string())
             .spawn(move || {
-                while let Ok(job) = rx.recv() {
+                while let Ok(message) = rx.recv() {
+                    let CoordinatorMessage::Run(job) = message else {
+                        break;
+                    };
                     let run = {
                         let mut state = match worker_state.lock() {
                             Ok(state) => state,
@@ -94,6 +150,19 @@ impl MissionCoordinator {
                         Ok(Err(error)) => format!("failed: {}", error.code()),
                         Err(_) => "failed: DAEMON-MISSION_PANIC".to_string(),
                     };
+                    let was_cancelled_in_memory = worker_state
+                        .lock()
+                        .ok()
+                        .is_some_and(|state| state.cancelled.contains_key(job.mission_id.as_str()));
+                    let was_cancelled_durably = ControlPlaneDb::open(&db_path)
+                        .ok()
+                        .and_then(|db| db.get_session(&job.session_id).ok().flatten())
+                        .is_some_and(|session| session.state == "cancelled");
+                    let terminal = if was_cancelled_in_memory || was_cancelled_durably {
+                        "cancelled".to_string()
+                    } else {
+                        terminal
+                    };
                     if let Ok(db) = ControlPlaneDb::open(&db_path) {
                         let state_name = if terminal == "completed" {
                             "completed"
@@ -106,19 +175,19 @@ impl MissionCoordinator {
                     }
                     if let Ok(mut state) = worker_state.lock() {
                         state.active = None;
-                        let cancelled = state.cancelled.contains_key(job.mission_id.as_str());
                         if let Some(status) = state.statuses.get_mut(job.mission_id.as_str()) {
-                            status.state = if cancelled {
-                                "cancelled".to_string()
-                            } else {
-                                terminal
-                            };
+                            status.state = terminal;
                         }
+                        prune_terminal_statuses(&mut state);
                     }
                 }
             })
             .expect("mission coordinator thread must start");
-        Self { tx, state }
+        Self {
+            tx,
+            state,
+            worker: Mutex::new(Some(worker)),
+        }
     }
 
     fn enqueue(&self, job: QueuedMission) -> AcResult<()> {
@@ -139,14 +208,26 @@ impl MissionCoordinator {
                 .insert(job.mission_id.to_string(), CancellationToken::new());
             state.queued.push_back(job.clone());
         }
-        self.tx.try_send(job).map_err(|_| {
-            AcError::new(
+        if self
+            .tx
+            .try_send(CoordinatorMessage::Run(job.clone()))
+            .is_err()
+        {
+            if let Ok(mut state) = self.state.lock() {
+                state
+                    .queued
+                    .retain(|queued| queued.mission_id != job.mission_id);
+                state.statuses.remove(job.mission_id.as_str());
+                state.cancellation.remove(job.mission_id.as_str());
+            }
+            return Err(AcError::new(
                 "DAEMON-QUEUE_FULL",
                 "mission queue is full",
                 ac_common::ErrorKind::Unavailable,
                 ac_common::Retryability::Retryable,
-            )
-        })
+            ));
+        }
+        Ok(())
     }
 
     fn status(&self, mission_id: &str) -> Option<MissionExecutionStatus> {
@@ -189,7 +270,7 @@ impl MissionCoordinator {
             }
             job
         };
-        self.tx.try_send(job).map_err(|_| {
+        self.tx.try_send(CoordinatorMessage::Run(job)).map_err(|_| {
             AcError::new(
                 "DAEMON-QUEUE_FULL",
                 "mission queue is full",
@@ -197,6 +278,22 @@ impl MissionCoordinator {
                 ac_common::Retryability::Retryable,
             )
         })
+    }
+
+    fn remember_paused(&self, job: QueuedMission) -> AcResult<()> {
+        let mut state = self.state.lock().map_err(|_| {
+            AcError::conflict("DAEMON-COORDINATOR_POISONED", "coordinator lock poisoned")
+        })?;
+        state.statuses.insert(
+            job.mission_id.to_string(),
+            MissionExecutionStatus {
+                mission_id: job.mission_id.clone(),
+                session_id: job.session_id.clone(),
+                state: "paused".to_string(),
+            },
+        );
+        state.paused.insert(job.mission_id.to_string(), job);
+        Ok(())
     }
 
     fn cancel(&self, mission_id: &str) -> AcResult<()> {
@@ -222,6 +319,67 @@ impl MissionCoordinator {
         }
         Ok(())
     }
+
+    fn stop(&self) -> AcResult<()> {
+        if let Ok(state) = self.state.lock() {
+            for token in state.cancellation.values() {
+                token.cancel();
+            }
+        }
+        let _ = self.tx.try_send(CoordinatorMessage::Shutdown);
+        let handle = self
+            .worker
+            .lock()
+            .map_err(|_| {
+                AcError::conflict(
+                    "DAEMON-COORDINATOR_POISONED",
+                    "coordinator worker lock poisoned",
+                )
+            })?
+            .take();
+        if let Some(handle) = handle {
+            handle.join().map_err(|_| {
+                AcError::conflict(
+                    "DAEMON-COORDINATOR_PANIC",
+                    "mission coordinator worker panicked",
+                )
+            })?;
+        }
+        Ok(())
+    }
+}
+
+fn prune_terminal_statuses(state: &mut CoordinatorState) {
+    const MAX_TERMINAL_STATUSES: usize = 256;
+    let active = state.active.as_ref().map(ToString::to_string);
+    let queued = state
+        .queued
+        .iter()
+        .map(|job| job.mission_id.to_string())
+        .collect::<Vec<_>>();
+    let paused = state.paused.keys().cloned().collect::<Vec<_>>();
+    let mut terminal = state
+        .statuses
+        .iter()
+        .filter(|(mission_id, status)| {
+            active.as_ref() != Some(mission_id)
+                && !queued.contains(mission_id)
+                && !paused.contains(mission_id)
+                && is_terminal_status(&status.state)
+        })
+        .map(|(mission_id, _)| mission_id.clone())
+        .collect::<Vec<_>>();
+    terminal.sort();
+    while terminal.len() > MAX_TERMINAL_STATUSES {
+        if let Some(mission_id) = terminal.first().cloned() {
+            state.statuses.remove(&mission_id);
+            terminal.remove(0);
+        }
+    }
+}
+
+fn is_terminal_status(state: &str) -> bool {
+    matches!(state, "completed" | "cancelled" | "failed") || state.starts_with("failed:")
 }
 
 fn execute_mission(
@@ -233,18 +391,35 @@ fn execute_mission(
 ) -> AcResult<String> {
     let db = ControlPlaneDb::open(db_path)?;
     db.update_session_state(&job.session_id, "running")?;
+    let persisted_session = db.get_session(&job.session_id)?;
+    let resume_graph = persisted_session
+        .map(|session| RuntimeHydrator::hydrate_session(&db, session))
+        .transpose()?
+        .and_then(|hydrated| {
+            let has_tasks = hydrated.graph.tasks().next().is_some();
+            has_tasks.then_some(hydrated.graph)
+        });
     let session =
         AgentSession::with_id_and_token(job.session_id.clone(), Worker::new(), cancellation);
     let worktree = workspace_root
         .join(".agentcode-worktrees")
         .join(job.session_id.as_str());
-    let mut agent = ac_agent::bound_workspace_agent(
+    let existing_worktree = db
+        .worktree_for_mission(&job.mission_id)?
+        .map(persisted_worktree_to_record)
+        .transpose()?;
+    let mut agent = ac_agent::bound_workspace_agent_with_durability(
         workspace_root.to_path_buf(),
         worktree,
         Arc::clone(&kernel),
         job.mission_id.clone(),
         session,
         backend_tool_policy(),
+        existing_worktree,
+        resume_graph,
+        Some(Box::new(SqliteAgentDurability {
+            db_path: db_path.to_path_buf(),
+        })),
     )?;
     let report = agent.run_goal(ac_agent::Goal::new(job.goal.clone())?)?;
     let evidence = agent.into_evidence();
@@ -271,6 +446,33 @@ fn execute_mission(
         _ => "failed",
     }
     .to_string())
+}
+
+fn persisted_worktree_to_record(row: PersistedWorktree) -> AcResult<WorktreeRecord> {
+    Ok(WorktreeRecord {
+        id: StableId::from_existing(&row.id)?,
+        repository_id: StableId::from_existing(&row.repository_id)?,
+        owner_mission_id: StableId::from_existing(&row.owner_mission_id)?,
+        owner_worker_id: StableId::from_existing(&row.owner_worker_id)?,
+        lease_epoch: row.lease_epoch,
+        path: PathBuf::from(row.path),
+        branch: row.branch,
+        base_commit: row.base_commit,
+        current_commit: row.current_commit,
+        status: match row.status.as_str() {
+            "Active" => WorktreeStatus::Active,
+            "Degraded" => WorktreeStatus::Degraded,
+            "Missing" => WorktreeStatus::Missing,
+            "Cleaned" => WorktreeStatus::Cleaned,
+            _ => {
+                return Err(AcError::validation(
+                    "DAEMON-WORKTREE_STATUS",
+                    "persisted worktree status is unknown",
+                ));
+            }
+        },
+        created_at: TimestampMillis::from_millis(row.created_at_ms as u128),
+    })
 }
 
 fn backend_tool_policy() -> ac_security::CapabilityPolicy {
@@ -464,15 +666,15 @@ impl DaemonService {
                     })?;
                 }
                 drop(kernel);
-                if !matches!(
-                    hydrated.session.state.as_str(),
-                    "paused" | "completed" | "cancelled" | "failed"
-                ) {
-                    self.coordinator.enqueue(QueuedMission {
-                        mission_id,
-                        session_id: StableId::from_existing(&hydrated.session.id)?,
-                        goal: mission.original_goal,
-                    })?;
+                let job = QueuedMission {
+                    mission_id,
+                    session_id: StableId::from_existing(&hydrated.session.id)?,
+                    goal: mission.original_goal,
+                };
+                match hydrated.session.state.as_str() {
+                    "paused" => self.coordinator.remember_paused(job)?,
+                    "completed" | "cancelled" | "failed" => {}
+                    _ => self.coordinator.enqueue(job)?,
                 }
             }
         }
@@ -489,6 +691,7 @@ impl DaemonService {
         }
         self.lifecycle = DaemonLifecycle::Stopping;
         self.kernel_lock()?.stop()?;
+        self.coordinator.stop()?;
         self.lock_file = None;
         let _ = fs::remove_file(&self.lock_path);
         self.lifecycle = DaemonLifecycle::Stopped;
@@ -569,6 +772,14 @@ impl DaemonService {
 
     pub fn persisted_mission_state(&self, mission_id: &str) -> AcResult<Option<String>> {
         let id = StableId::from_existing(mission_id)?;
+        if let Some(session) = self.db.session_for_mission(&id)? {
+            if matches!(
+                session.state.as_str(),
+                "paused" | "queued" | "running" | "cancelled" | "failed" | "completed"
+            ) {
+                return Ok(Some(session.state));
+            }
+        }
         Ok(self.db.get_mission(&id)?.map(|mission| mission.state))
     }
 
@@ -1041,7 +1252,11 @@ mod tests {
             matches!(active_state.as_str(), "queued" | "running"),
             "unexpected active recovery state: {active_state}"
         );
-        assert!(restarted.mission_status(paused_mission.as_str()).is_none());
+        let paused_state = restarted
+            .mission_status(paused_mission.as_str())
+            .unwrap()
+            .state;
+        assert_eq!(paused_state, "paused");
         assert!(restarted
             .mission_status(completed_mission.as_str())
             .is_none());

@@ -50,6 +50,28 @@ impl RuntimeHydrator {
             let acceptance_criteria = serde_json::from_str(&row.acceptance_criteria_json).unwrap_or_default();
             graph.tasks.insert(id.clone(), WorkerTask { id, mission_id, title: row.title, dependencies, state, assigned_worker: None, retry_count: row.retry_count, max_retries: row.max_retries, evidence_refs: Vec::new(), acceptance_criteria });
         }
+        for task in graph.tasks.values_mut() {
+            for attempt in db.task_attempts(task.id.as_str())? {
+                let evidence_refs = attempt
+                    .evidence_refs
+                    .split(',')
+                    .filter(|value| !value.is_empty())
+                    .map(StableId::from_existing)
+                    .collect::<AcResult<Vec<_>>>()?;
+                if attempt.outcome == "succeeded" {
+                    task.evidence_refs.extend(evidence_refs.iter().cloned());
+                }
+                graph.attempts.push(TaskAttempt {
+                    id: StableId::from_existing(&attempt.id)?,
+                    task_id: StableId::from_existing(&attempt.task_id)?,
+                    worker_id: StableId::from_existing(&attempt.worker_id)?,
+                    outcome: task_attempt_outcome(&attempt.outcome)?,
+                    evidence_refs,
+                    failure_class: attempt.failure_class,
+                    created_at: TimestampMillis::from_millis(attempt.created_at_ms as u128),
+                });
+            }
+        }
         graph.refresh_ready();
         for task in graph.tasks.values() {
             if reconciled_tasks.contains(&task.id) {
@@ -69,3 +91,14 @@ fn task_state(value: &str) -> AcResult<TaskState> {
     match value { "pending" => Ok(TaskState::Pending), "ready" => Ok(TaskState::Ready), "running" => Ok(TaskState::Running), "retryable" => Ok(TaskState::Retryable), "completed" => Ok(TaskState::Completed), "failed" => Ok(TaskState::Failed), "cancelled" => Ok(TaskState::Cancelled), _ => Err(AcError::validation("RUNTIME-HYDRATE_TASK_STATE", format!("unknown task state {value}"))) }
 }
 fn task_state_name(value: TaskState) -> &'static str { match value { TaskState::Pending => "pending", TaskState::Ready => "ready", TaskState::Running => "running", TaskState::Retryable => "retryable", TaskState::Completed => "completed", TaskState::Failed => "failed", TaskState::Cancelled => "cancelled" } }
+fn task_attempt_outcome(value: &str) -> AcResult<TaskAttemptOutcome> {
+    match value {
+        "succeeded" => Ok(TaskAttemptOutcome::Succeeded),
+        "failed" => Ok(TaskAttemptOutcome::Failed),
+        "cancelled" => Ok(TaskAttemptOutcome::Cancelled),
+        _ => Err(AcError::validation(
+            "RUNTIME-HYDRATE_TASK_ATTEMPT",
+            format!("unknown task attempt outcome {value}"),
+        )),
+    }
+}
