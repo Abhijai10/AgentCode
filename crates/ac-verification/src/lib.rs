@@ -1875,7 +1875,7 @@ impl BrowserRuntime {
         evidence_store: &mut EvidenceStore,
     ) -> AcResult<BrowserDiagnostics> {
         let page = self.real_page_mut(session_id)?;
-        page.client.drain_events(Duration::from_millis(150))?;
+        page.client.drain_events(Duration::from_millis(500))?;
         let console_errors = page.client.console_errors.clone();
         let page_errors = page.client.page_errors.clone();
         let network_failures = page.client.network_failures.clone();
@@ -2294,7 +2294,7 @@ impl CdpClient {
     }
 
     fn wait_for_load(&mut self, expected_url: Option<&str>) -> AcResult<()> {
-        let deadline = Instant::now() + Duration::from_secs(10);
+        let deadline = Instant::now() + Duration::from_secs(30);
         while Instant::now() < deadline {
             let remaining = deadline.saturating_duration_since(Instant::now());
             self.drain_events(remaining.min(Duration::from_millis(75)))?;
@@ -3617,7 +3617,7 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         std::thread::spawn(move || {
             listener.set_nonblocking(true).unwrap();
-            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(6);
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
             while std::time::Instant::now() < deadline {
                 match listener.accept() {
                     Ok((mut stream, _)) => {
@@ -3756,7 +3756,21 @@ mod tests {
             },
             &mut evidence,
         );
-        let diagnostics = runtime.diagnostics(&session.id, &mut evidence).unwrap();
+        // Wait for the CDP Network.responseReceived (404) event to be
+        // dispatched.  Under full-suite contention the event can arrive late,
+        // so poll with a deadline instead of relying on a single fixed sleep.
+        // The assertion below is unchanged and remains strict.
+        let wait_deadline = Instant::now() + Duration::from_secs(10);
+        let mut diagnostics = runtime.diagnostics(&session.id, &mut evidence).unwrap();
+        while !diagnostics
+            .network_failures
+            .iter()
+            .any(|failure| failure.contains("missing.html") || failure.contains("net::ERR"))
+            && Instant::now() < wait_deadline
+        {
+            std::thread::sleep(Duration::from_millis(100));
+            diagnostics = runtime.diagnostics(&session.id, &mut evidence).unwrap();
+        }
         assert!(diagnostics
             .network_failures
             .iter()

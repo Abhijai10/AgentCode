@@ -113,6 +113,13 @@ impl EvidenceStore {
         }
     }
 
+    /// Restore a persisted evidence record with its original ID.
+    /// Used during crash recovery to re-populate the in-memory store
+    /// from durable records so that lookups by ID succeed.
+    pub fn restore(&mut self, record: EvidenceRecord) {
+        self.records.entry(record.id.clone()).or_insert(record);
+    }
+
     pub fn replace(&mut self, _id: &StableId, _record: EvidenceRecord) -> AcResult<()> {
         Err(AcError::policy_denied(
             "EVIDENCE-APPEND_ONLY",

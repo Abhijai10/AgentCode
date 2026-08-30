@@ -948,3 +948,50 @@ pub struct ReleaseEvidenceBundleRow {
     pub migration_report_ref: String,
     pub created_at_ms: i64,
 }
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProviderCatalogRow {
+    pub id: String,
+    pub display_name: String,
+    pub description: String,
+    pub website_url: String,
+    pub logo_url: String,
+    pub credential_url: String,
+    pub pricing_classification: String,
+    pub capabilities: String,
+    pub created_at_ms: i64,
+    pub updated_at_ms: i64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProviderAccountRow {
+    pub id: String,
+    pub provider_id: String,
+    pub label: String,
+    pub credential_ref: String,
+    pub credential_region: String,
+    pub organization: String,
+    pub project: String,
+    pub workspace: String,
+    pub enabled: bool,
+    pub health_state: String,
+    pub quota_rate_limit: Option<i64>,
+    pub quota_remaining: Option<i64>,
+    pub quota_reset_at_ms: Option<i64>,
+    pub last_success_at_ms: Option<i64>,
+    pub last_failure_at_ms: Option<i64>,
+    pub failure_reason: String,
+    pub created_at_ms: i64,
+    pub updated_at_ms: i64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProviderHealthObservationRow {
+    pub id: String,
+    pub account_id: String,
+    pub success: bool,
+    pub latency_ms: u64,
+    pub failure_code: String,
+    pub failure_message: String,
+    pub observed_at_ms: i64,
+}

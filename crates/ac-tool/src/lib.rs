@@ -2399,7 +2399,7 @@ mod tests {
         );
         WorkspaceTools::with_required_isolation(
             root.clone(),
-            ac_sandbox::IsolationLevel::ProcessRestricted,
+            ac_sandbox::IsolationLevel::FilesystemIsolated,
         )
         .register_all(&mut broker)
         .unwrap();
@@ -2439,6 +2439,14 @@ mod tests {
             "{}",
             result.observation
         );
+        // Verify FilesystemIsolated was achieved, not just ProcessRestricted
+        assert!(
+            result
+                .observation
+                .contains("achieved_isolation:FilesystemIsolated"),
+            "standalone Trivy test must prove FilesystemIsolated, got: {}",
+            result.observation
+        );
         std::env::remove_var("AGENTCODE_SCANNER_DATA_DIR");
         let _ = fs::remove_dir_all(scanner_data);
         let _ = fs::remove_dir_all(root);
@@ -2462,7 +2470,7 @@ mod tests {
         );
         WorkspaceTools::with_required_isolation(
             root.clone(),
-            ac_sandbox::IsolationLevel::ProcessRestricted,
+            ac_sandbox::IsolationLevel::FilesystemIsolated,
         )
         .register_all(&mut broker)
         .unwrap();
@@ -2506,7 +2514,7 @@ mod tests {
         );
         WorkspaceTools::with_required_isolation(
             root.clone(),
-            ac_sandbox::IsolationLevel::ProcessRestricted,
+            ac_sandbox::IsolationLevel::FilesystemIsolated,
         )
         .register_all(&mut broker)
         .unwrap();

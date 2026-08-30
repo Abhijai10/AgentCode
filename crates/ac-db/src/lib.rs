@@ -29,4 +29,5 @@ include!("desktop_optimization.rs");
 include!("chaos_dogfood.rs");
 include!("security_release.rs");
 include!("git.rs");
+include!("provider.rs");
 include!("tests.rs");

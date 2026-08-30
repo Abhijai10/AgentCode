@@ -8,6 +8,15 @@ use reqwest::header::{HeaderMap, HeaderName, HeaderValue, AUTHORIZATION, CONTENT
 use reqwest::Url;
 use serde_json::{json, Value};
 
+pub mod catalog;
+pub mod discovery;
+
+pub use catalog::{
+    resolve_credential_ref, test_provider_account, DiscoveredModel, ProviderAccount,
+    ProviderAccountStatus, ProviderCatalogEntry, ProviderConnectionKind, ProviderConnectionTest,
+};
+pub use discovery::{discover_models, ModelDiscoveryKind};
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ProviderCapability {
     Chat,
@@ -837,7 +846,8 @@ impl HttpProviderAdapter {
             HttpProviderKind::OllamaChat => json!({
                 "model": self.model_name,
                 "messages": [{"role": "user", "content": request.prompt}],
-                "stream": true
+                "stream": true,
+                "format": "json"
             }),
         }
     }
@@ -2072,7 +2082,7 @@ fn extract_string_array(raw: &str, key: &str) -> AcResult<Vec<String>> {
         .collect())
 }
 
-fn map_reqwest_error(error: reqwest::Error) -> ProviderFailureClass {
+pub(crate) fn map_reqwest_error(error: reqwest::Error) -> ProviderFailureClass {
     if error.is_timeout() {
         ProviderFailureClass::Timeout
     } else if error.is_builder() {
@@ -2321,7 +2331,7 @@ fn provider_error_class(body: &str) -> Result<Vec<ProviderStreamEvent>, Provider
     Err(provider_error_class_from_value(&value).unwrap_or(ProviderFailureClass::MalformedResponse))
 }
 
-fn provider_error_class_from_value(value: &Value) -> Option<ProviderFailureClass> {
+pub(crate) fn provider_error_class_from_value(value: &Value) -> Option<ProviderFailureClass> {
     let error = value.get("error")?;
     let code = error
         .get("code")

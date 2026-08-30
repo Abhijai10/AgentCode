@@ -60,6 +60,7 @@ pub enum ErrorKind {
     PolicyDenied,
     Unavailable,
     Internal,
+    Cancelled,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -108,6 +109,15 @@ impl AcError {
             code,
             message,
             ErrorKind::PolicyDenied,
+            Retryability::NotRetryable,
+        )
+    }
+
+    pub fn cancelled(code: &'static str, message: impl Into<String>) -> Self {
+        Self::new(
+            code,
+            message,
+            ErrorKind::Cancelled,
             Retryability::NotRetryable,
         )
     }
