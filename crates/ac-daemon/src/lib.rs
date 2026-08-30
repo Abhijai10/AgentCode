@@ -33,6 +33,7 @@ struct QueuedMission {
     mission_id: StableId,
     session_id: StableId,
     goal: String,
+    workspace_root: PathBuf,
 }
 
 enum CoordinatorMessage {
@@ -124,11 +125,7 @@ struct MissionCoordinator {
 }
 
 impl MissionCoordinator {
-    fn new(
-        db_path: PathBuf,
-        workspace_root: PathBuf,
-        kernel: Arc<Mutex<Kernel<ProductionKernelPolicy>>>,
-    ) -> Self {
+    fn new(db_path: PathBuf, kernel: Arc<Mutex<Kernel<ProductionKernelPolicy>>>) -> Self {
         let (tx, rx) = mpsc::sync_channel::<CoordinatorMessage>(64);
         let state = Arc::new(Mutex::new(CoordinatorState::default()));
         let worker_state = Arc::clone(&state);
@@ -180,7 +177,13 @@ impl MissionCoordinator {
                                 state.cancellation.get(job.mission_id.as_str()).cloned()
                             })
                             .unwrap_or_default();
-                        execute_mission(&db_path, &workspace_root, Arc::clone(&kernel), &job, token)
+                        execute_mission(
+                            &db_path,
+                            &job.workspace_root,
+                            Arc::clone(&kernel),
+                            &job,
+                            token,
+                        )
                     }));
                     let terminal = match outcome {
                         Ok(Ok(state)) => state,
@@ -545,6 +548,66 @@ fn execute_mission(
     .to_string())
 }
 
+/// Resolve the authoritative workspace root for a mission.
+///
+/// A project-specific workspace supplied by the caller is authoritative: it is
+/// canonicalized, must exist and be a directory, must be absolute, must not be
+/// a filesystem root, and must not traverse/escape via `..` or symlinks.  No
+/// silent fallback to the daemon default is allowed when a project workspace
+/// was supplied — an invalid supplied path is rejected, never replaced.
+fn resolve_workspace_root(supplied: Option<&str>, daemon_default: &Path) -> AcResult<PathBuf> {
+    let raw = match supplied {
+        Some(raw) => raw,
+        None => {
+            // No project-specific workspace was supplied: fall back to the
+            // daemon-configured default, canonicalized so the persisted value
+            // is consistent with the submitted case.
+            return fs::canonicalize(daemon_default).map_err(|error| {
+                AcError::validation(
+                    "DAEMON-WORKSPACE_DEFAULT",
+                    format!("daemon workspace root is not accessible: {error}"),
+                )
+            });
+        }
+    };
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return Err(AcError::validation(
+            "DAEMON-WORKSPACE_EMPTY",
+            "workspace_root must not be empty",
+        ));
+    }
+    let candidate = Path::new(raw);
+    if !candidate.is_absolute() {
+        return Err(AcError::validation(
+            "DAEMON-WORKSPACE_NOT_ABSOLUTE",
+            "workspace_root must be an absolute path",
+        ));
+    }
+    let canonical = fs::canonicalize(candidate).map_err(|error| {
+        AcError::validation(
+            "DAEMON-WORKSPACE_UNAVAILABLE",
+            format!("workspace_root is not an accessible path: {error}"),
+        )
+    })?;
+    if !canonical.is_dir() {
+        return Err(AcError::validation(
+            "DAEMON-WORKSPACE_NOT_DIR",
+            "workspace_root must be a directory",
+        ));
+    }
+    // Reject a filesystem root: canonicalize() already resolved any `..` or
+    // symlink, so an accepted root here is a real directory.  A filesystem
+    // root would grant the sandbox authority over the entire host.
+    if canonical.parent().is_none() {
+        return Err(AcError::policy_denied(
+            "DAEMON-WORKSPACE_ROOT_DENIED",
+            "workspace_root must not be a filesystem root",
+        ));
+    }
+    Ok(canonical)
+}
+
 fn persisted_worktree_to_record(row: PersistedWorktree) -> AcResult<WorktreeRecord> {
     Ok(WorktreeRecord {
         id: StableId::from_existing(&row.id)?,
@@ -612,6 +675,7 @@ pub enum DaemonCommand {
     Health,
     CreateSession {
         goal: String,
+        workspace_root: Option<String>,
     },
     CheckpointSession {
         session_id: StableId,
@@ -677,6 +741,11 @@ pub struct DaemonService {
     recovered: Vec<PersistedSession>,
     hydrated: Vec<HydratedSession>,
     coordinator: MissionCoordinator,
+    /// Daemon-configured default workspace root (AGENTCODE_WORKSPACE_ROOT or
+    /// cwd).  Used ONLY when a submission carries no project-specific
+    /// workspace_root; a supplied project root always wins and is never
+    /// silently replaced by this default.
+    default_workspace_root: PathBuf,
 }
 
 /// Production daemon policy. Tool capability checks remain owned by ToolBroker;
@@ -713,11 +782,7 @@ impl DaemonService {
         Ok(Self {
             lifecycle: DaemonLifecycle::Created,
             db,
-            coordinator: MissionCoordinator::new(
-                db_path.clone(),
-                workspace_root.clone(),
-                Arc::clone(&kernel),
-            ),
+            coordinator: MissionCoordinator::new(db_path.clone(), Arc::clone(&kernel)),
             db_path,
             kernel,
             lock_path: lock_path.into(),
@@ -725,6 +790,7 @@ impl DaemonService {
             instance_id: StableId::new("daemon"),
             recovered: Vec::new(),
             hydrated: Vec::new(),
+            default_workspace_root: workspace_root,
         })
     }
 
@@ -766,10 +832,34 @@ impl DaemonService {
                     })?;
                 }
                 drop(kernel);
+                // Recovery must reuse the persisted project workspace rather
+                // than the daemon's current cwd/AGENTCODE_WORKSPACE_ROOT.  The
+                // persisted workspace was validated at submission time and is
+                // re-validated here so a stale or tampered value cannot cause
+                // the mission to resume in a different directory.
+                let workspace_root = match resolve_workspace_root(
+                    hydrated.session.workspace_root.as_deref(),
+                    &self.default_workspace_root,
+                ) {
+                    Ok(root) => root,
+                    Err(error) => {
+                        eprintln!(
+                            "MISSION-RECOVERY-WORKSPACE session={} error={}",
+                            hydrated.session.id,
+                            error.code()
+                        );
+                        let _ = self.db.update_session_state(
+                            &StableId::from_existing(&hydrated.session.id)?,
+                            "failed",
+                        );
+                        continue;
+                    }
+                };
                 let job = QueuedMission {
                     mission_id,
                     session_id: StableId::from_existing(&hydrated.session.id)?,
                     goal: mission.original_goal,
+                    workspace_root,
                 };
                 match hydrated.session.state.as_str() {
                     "paused" => self.coordinator.remember_paused(job)?,
@@ -889,6 +979,17 @@ impl DaemonService {
             .db
             .get_mission(&id)?
             .map(|mission| mission.original_goal))
+    }
+
+    /// The authoritative project workspace for a mission, read from the
+    /// persisted session.  This is the directory the daemon will execute in,
+    /// not the daemon's own cwd.
+    pub fn mission_workspace(&self, mission_id: &str) -> AcResult<Option<String>> {
+        let id = StableId::from_existing(mission_id)?;
+        Ok(self
+            .db
+            .session_for_mission(&id)?
+            .and_then(|session| session.workspace_root))
     }
 
     pub fn desktop_settings(&self) -> AcResult<ac_db::DesktopPreferenceRow> {
@@ -1051,6 +1152,49 @@ impl DaemonService {
         self.db.delete_provider_account(account_id)
     }
 
+    /// Toggle only the enabled flag of an account.  The credential reference is
+    /// never round-tripped through the UI so a masked value cannot overwrite it.
+    pub fn set_provider_account_enabled(&self, account_id: &str, enabled: bool) -> AcResult<()> {
+        let existing = self.db.provider_account(account_id)?.ok_or_else(|| {
+            AcError::validation(
+                "DAEMON-PROVIDER_ACCOUNT_NOT_FOUND",
+                "provider account not found",
+            )
+        })?;
+        let now = ac_common::TimestampMillis::now().as_millis() as i64;
+        let mut row = existing;
+        row.enabled = enabled;
+        row.updated_at_ms = now;
+        self.db.save_provider_account(&row)
+    }
+
+    /// Rotate an account's credential reference to a newly stored secret.  The
+    /// UI passes only the new `secret:NAME` reference (from StoreCredential),
+    /// never the raw key and never the old masked credential.
+    pub fn rotate_provider_account(&self, account_id: &str, credential_ref: &str) -> AcResult<()> {
+        if credential_ref.trim().is_empty() {
+            return Err(AcError::validation(
+                "DAEMON-PROVIDER_ROTATE_EMPTY",
+                "rotation requires a new credential reference",
+            ));
+        }
+        let existing = self.db.provider_account(account_id)?.ok_or_else(|| {
+            AcError::validation(
+                "DAEMON-PROVIDER_ACCOUNT_NOT_FOUND",
+                "provider account not found",
+            )
+        })?;
+        let now = ac_common::TimestampMillis::now().as_millis() as i64;
+        let mut row = existing;
+        row.credential_ref = credential_ref.to_string();
+        row.health_state = "ok".to_string();
+        row.last_failure_at_ms = None;
+        row.failure_reason = String::new();
+        row.last_success_at_ms = Some(now);
+        row.updated_at_ms = now;
+        self.db.save_provider_account(&row)
+    }
+
     pub fn test_provider_account(&self, account_id: &str) -> AcResult<ProviderAccountStatus> {
         let account = self.db.provider_account(account_id)?.ok_or_else(|| {
             AcError::validation(
@@ -1146,18 +1290,16 @@ impl DaemonService {
             )
         })?;
         let dir_path = std::path::Path::new(&dir);
-        std::fs::create_dir_all(dir_path).map_err(|error| {
-            AcError::validation("DAEMON-SECRET_DIR_CREATE", error.to_string())
-        })?;
+        std::fs::create_dir_all(dir_path)
+            .map_err(|error| AcError::validation("DAEMON-SECRET_DIR_CREATE", error.to_string()))?;
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
             let _ = std::fs::set_permissions(dir_path, std::fs::Permissions::from_mode(0o700));
         }
         let path = dir_path.join(sanitize_secret_name(name));
-        std::fs::write(&path, value.as_bytes()).map_err(|error| {
-            AcError::validation("DAEMON-SECRET_WRITE", error.to_string())
-        })?;
+        std::fs::write(&path, value.as_bytes())
+            .map_err(|error| AcError::validation("DAEMON-SECRET_WRITE", error.to_string()))?;
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -1175,9 +1317,8 @@ impl DaemonService {
         })?;
         let path = std::path::Path::new(&dir).join(sanitize_secret_name(name));
         if path.exists() {
-            std::fs::remove_file(&path).map_err(|error| {
-                AcError::validation("DAEMON-SECRET_REMOVE", error.to_string())
-            })?;
+            std::fs::remove_file(&path)
+                .map_err(|error| AcError::validation("DAEMON-SECRET_REMOVE", error.to_string()))?;
         }
         Ok(())
     }
@@ -1234,8 +1375,20 @@ impl DaemonService {
     pub fn handle(&mut self, command: DaemonCommand) -> AcResult<DaemonResponse> {
         match command {
             DaemonCommand::Health => Ok(DaemonResponse::Health(self.health())),
-            DaemonCommand::CreateSession { goal } => {
+            DaemonCommand::CreateSession {
+                goal,
+                workspace_root,
+            } => {
                 self.ensure_running()?;
+                // The supplied project workspace is authoritative and is
+                // validated independently of the frontend (canonicalized,
+                // must be a real directory, must not escape).  A missing value
+                // falls back to the daemon-configured default only because no
+                // project-specific workspace was supplied.
+                let workspace = resolve_workspace_root(
+                    workspace_root.as_deref(),
+                    &self.default_workspace_root,
+                )?;
                 let mut kernel = self.kernel_lock()?;
                 let mission_id = kernel.create_mission(goal.clone())?;
                 kernel.transition_mission(&mission_id, MissionState::Active, Vec::new())?;
@@ -1246,12 +1399,17 @@ impl DaemonService {
                     let _ = self.db.append_kernel_event(event);
                 }
                 let session = AgentSession::new(Worker::new());
-                self.db
-                    .save_session(session.id(), &mission_id, session_state(session.state()))?;
+                self.db.save_session(
+                    session.id(),
+                    &mission_id,
+                    session_state(session.state()),
+                    Some(workspace.to_string_lossy().as_ref()),
+                )?;
                 self.coordinator.enqueue(QueuedMission {
                     mission_id: mission_id.clone(),
                     session_id: session.id().clone(),
                     goal,
+                    workspace_root: workspace,
                 })?;
                 Ok(DaemonResponse::SessionCreated {
                     mission_id,
@@ -1734,6 +1892,96 @@ mod tests {
     }
 
     #[test]
+    fn provider_catalog_is_seeded_on_open() {
+        let (dir, db, lock) = temp_paths();
+        let daemon = DaemonService::open(&db, &lock).unwrap();
+        let catalog = daemon.provider_catalog().unwrap();
+        let ids = catalog
+            .iter()
+            .map(|entry| entry.id.to_string())
+            .collect::<Vec<_>>();
+        for expected in ["openai", "anthropic", "gemini", "ollama", "lm-studio"] {
+            assert!(
+                ids.contains(&expected.to_string()),
+                "catalog must contain {expected}, got {ids:?}"
+            );
+        }
+        // Seeding is idempotent: reopening does not duplicate.
+        drop(daemon);
+        let daemon = DaemonService::open(&db, &lock).unwrap();
+        assert_eq!(daemon.provider_catalog().unwrap().len(), 5);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn provider_accounts_persist_across_reopen() {
+        let (dir, db, lock) = temp_paths();
+        let daemon = DaemonService::open(&db, &lock).unwrap();
+        let account_id = daemon
+            .save_provider_account("ollama", "work", "secret:ollama-work", "", "", "", "", true)
+            .unwrap();
+        // Read back through a fresh daemon (simulates restart).
+        drop(daemon);
+        let daemon = DaemonService::open(&db, &lock).unwrap();
+        let accounts = daemon.list_provider_accounts("ollama").unwrap();
+        assert_eq!(accounts.len(), 1);
+        assert_eq!(accounts[0].id.to_string(), account_id.to_string());
+        assert_eq!(accounts[0].credential_ref, "secret:ollama-work");
+        assert!(accounts[0].enabled);
+        // Disable + rotate through the dedicated backend operations.
+        daemon
+            .set_provider_account_enabled(account_id.as_str(), false)
+            .unwrap();
+        let accounts = daemon.list_provider_accounts("ollama").unwrap();
+        assert!(!accounts[0].enabled);
+        daemon
+            .rotate_provider_account(account_id.as_str(), "secret:rotated")
+            .unwrap();
+        let accounts = daemon.list_provider_accounts("ollama").unwrap();
+        assert_eq!(accounts[0].credential_ref, "secret:rotated");
+        // Delete.
+        daemon.delete_provider_account(account_id.as_str()).unwrap();
+        assert!(daemon.list_provider_accounts("ollama").unwrap().is_empty());
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn store_credential_writes_only_masked_and_readable_ref() {
+        let (dir, db, lock) = temp_paths();
+        std::env::set_var("AGENTCODE_SECRET_DIR", dir.join("secrets"));
+        let daemon = DaemonService::open(&db, &lock).unwrap();
+        let reference = daemon
+            .store_credential("test-key", "sk-live-secret")
+            .unwrap();
+        assert_eq!(reference, "secret:test-key");
+        // The stored value is resolvable by the provider credential resolver.
+        let resolved = ac_provider::catalog::resolve_credential_ref(&reference).unwrap();
+        assert_eq!(resolved, "sk-live-secret");
+        // Delete removes the file.
+        daemon.delete_credential("test-key").unwrap();
+        assert!(ac_provider::catalog::resolve_credential_ref(&reference).is_err());
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn test_credential_returns_normalized_result_without_saving() {
+        let (dir, db, lock) = temp_paths();
+        std::env::set_var("AGENTCODE_SECRET_DIR", dir.join("secrets"));
+        let daemon = DaemonService::open(&db, &lock).unwrap();
+        // An unreachable endpoint must normalize to a non-ok status, not panic
+        // and not create an account.
+        let reference = daemon.store_credential("probe", "bad-key").unwrap();
+        let status = daemon
+            .test_credential("openai", &reference, "", "", "")
+            .unwrap();
+        assert!(!status.ok);
+        assert!(status.failure.is_some());
+        assert!(status.masked_credential.contains("****"));
+        assert!(daemon.list_provider_accounts("openai").unwrap().is_empty());
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
     fn daemon_starts_routes_ipc_and_stops() {
         let (dir, db, lock) = temp_paths();
         let mut daemon = DaemonService::open(&db, &lock).unwrap();
@@ -1742,6 +1990,7 @@ mod tests {
         let response = ipc
             .send(DaemonCommand::CreateSession {
                 goal: "Create README.md".to_string(),
+                workspace_root: None,
             })
             .unwrap();
         assert!(matches!(response, DaemonResponse::SessionCreated { .. }));
@@ -1767,6 +2016,7 @@ mod tests {
         let (mission_id, session_id) = match daemon
             .handle(DaemonCommand::CreateSession {
                 goal: "queued daemon execution".to_string(),
+                workspace_root: None,
             })
             .unwrap()
         {
@@ -1894,7 +2144,7 @@ mod tests {
                 created_at: TimestampMillis::now(),
             })
             .unwrap();
-            db.save_session(&session_id, &mission_id, "executing")
+            db.save_session(&session_id, &mission_id, "executing", None)
                 .unwrap();
             db.save_checkpoint(
                 &StableId::from_existing("checkpoint-restart-recover").unwrap(),
@@ -1937,18 +2187,21 @@ mod tests {
                 &StableId::from_existing("session-restart-active").unwrap(),
                 &active_mission,
                 "running",
+                None,
             )
             .unwrap();
             db.save_session(
                 &StableId::from_existing("session-restart-paused").unwrap(),
                 &paused_mission,
                 "paused",
+                None,
             )
             .unwrap();
             db.save_session(
                 &StableId::from_existing("session-restart-completed").unwrap(),
                 &completed_mission,
                 "completed",
+                None,
             )
             .unwrap();
         }
@@ -2228,6 +2481,7 @@ mod tests {
             let (mission_id, _) = match daemon
                 .handle(DaemonCommand::CreateSession {
                     goal: format!("bounded-state-{i}"),
+                    workspace_root: None,
                 })
                 .unwrap()
             {
@@ -2247,6 +2501,326 @@ mod tests {
             let status = daemon.mission_status(mid.as_str()).unwrap();
             assert_eq!(status.state, "cancelled");
         }
+        daemon.stop().unwrap();
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    // ── Workspace binding (project-to-daemon) ─────────────────────────────
+
+    #[test]
+    fn submitted_mission_persists_supplied_workspace() {
+        // TEST 1/2: Submit missions for Project A and Project B.  Each must
+        // persist its own workspace_root independently.
+        let (dir, db, lock) = temp_paths();
+        let proj_a = dir.join("proj_a");
+        let proj_b = dir.join("proj_b");
+        fs::create_dir_all(&proj_a).unwrap();
+        fs::create_dir_all(&proj_b).unwrap();
+        let canon_a = fs::canonicalize(&proj_a).unwrap();
+        let canon_b = fs::canonicalize(&proj_b).unwrap();
+        let mut daemon = DaemonService::open(&db, &lock).unwrap();
+        daemon.start().unwrap();
+        let resp_a = daemon
+            .handle(DaemonCommand::CreateSession {
+                goal: "task A".to_string(),
+                workspace_root: Some(proj_a.to_string_lossy().to_string()),
+            })
+            .unwrap();
+        let resp_b = daemon
+            .handle(DaemonCommand::CreateSession {
+                goal: "task B".to_string(),
+                workspace_root: Some(proj_b.to_string_lossy().to_string()),
+            })
+            .unwrap();
+        let (mid_a, _sid_a) = match resp_a {
+            DaemonResponse::SessionCreated {
+                mission_id,
+                session_id,
+            } => (mission_id, session_id),
+            _ => panic!("expected session"),
+        };
+        let (mid_b, _sid_b) = match resp_b {
+            DaemonResponse::SessionCreated {
+                mission_id,
+                session_id,
+            } => (mission_id, session_id),
+            _ => panic!("expected session"),
+        };
+        assert_eq!(
+            daemon.mission_workspace(mid_a.as_str()).unwrap().unwrap(),
+            canon_a.to_string_lossy(),
+            "Project A workspace must be persisted"
+        );
+        assert_eq!(
+            daemon.mission_workspace(mid_b.as_str()).unwrap().unwrap(),
+            canon_b.to_string_lossy(),
+            "Project B workspace must be persisted"
+        );
+        assert_ne!(
+            canon_a, canon_b,
+            "two different projects must have different workspaces"
+        );
+        daemon.stop().unwrap();
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn recovered_mission_uses_persisted_workspace() {
+        // TEST 3/8: A session whose workspace_root is persisted in the DB
+        // must be recovered with the SAME workspace identity after a daemon
+        // restart, even when the daemon's configured default differs.
+        let (dir, db_path, lock) = temp_paths();
+        let project = dir.join("recovery_project");
+        fs::create_dir_all(&project).unwrap();
+        let canon = fs::canonicalize(&project).unwrap();
+        let session_id = StableId::new("recovery-session");
+        let mission_id = StableId::new("recovery-mission");
+        {
+            let mut db = ControlPlaneDb::open(&db_path).unwrap();
+            db.migrate().unwrap();
+            db.put_mission(&ac_kernel::Mission {
+                id: mission_id.clone(),
+                original_goal: "recover me".to_string(),
+                state: MissionState::Active,
+                created_at: TimestampMillis::now(),
+            })
+            .unwrap();
+            db.save_session(
+                &session_id,
+                &mission_id,
+                "executing",
+                Some(canon.to_string_lossy().as_ref()),
+            )
+            .unwrap();
+        }
+        // Simulate daemon restart with the same runtime directory.
+        let mut restarted = DaemonService::open(&db_path, &lock).unwrap();
+        restarted.start().unwrap();
+        // The interrupted session must be recovered, and its workspace
+        // identity must come from the DB, not from the daemon default.
+        assert!(
+            !restarted.recovered_sessions().is_empty(),
+            "interrupted session must be recovered"
+        );
+        assert_eq!(
+            restarted
+                .mission_workspace(mission_id.as_str())
+                .unwrap()
+                .unwrap(),
+            canon.to_string_lossy(),
+            "recovered workspace must match the persisted project path"
+        );
+        restarted.stop().unwrap();
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn supplied_workspace_beats_daemon_default() {
+        // TEST 4: When a project-specific workspace is supplied, the daemon
+        // must use it even though its own configured default is a different
+        // directory.
+        let (dir, db, lock) = temp_paths();
+        let project = dir.join("my_explicit_project");
+        fs::create_dir_all(&project).unwrap();
+        let canon_project = fs::canonicalize(&project).unwrap();
+        // The daemon's default_workspace_root is the current dir (the
+        // AgentCode repo root).  The supplied project is different, so
+        // verify the persisted workspace is the project, not the default.
+        let mut daemon = DaemonService::open(&db, &lock).unwrap();
+        assert_ne!(
+            daemon.default_workspace_root, canon_project,
+            "test fixture: daemon default must differ from supplied project"
+        );
+        daemon.start().unwrap();
+        let response = daemon
+            .handle(DaemonCommand::CreateSession {
+                goal: "explicit project".to_string(),
+                workspace_root: Some(project.to_string_lossy().to_string()),
+            })
+            .unwrap();
+        let mid = match response {
+            DaemonResponse::SessionCreated { mission_id, .. } => mission_id,
+            _ => panic!("expected session"),
+        };
+        assert_eq!(
+            daemon.mission_workspace(mid.as_str()).unwrap().unwrap(),
+            canon_project.to_string_lossy(),
+            "supplied workspace must win over daemon default"
+        );
+        daemon.stop().unwrap();
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn invalid_workspace_path_is_rejected() {
+        // TEST 5: A non-existent or non-directory path must be rejected.
+        let (dir, db, lock) = temp_paths();
+        let mut daemon = DaemonService::open(&db, &lock).unwrap();
+        daemon.start().unwrap();
+        // Non-existent path
+        let missing = dir.join("does-not-exist");
+        let err = daemon
+            .handle(DaemonCommand::CreateSession {
+                goal: "missing".to_string(),
+                workspace_root: Some(missing.to_string_lossy().to_string()),
+            })
+            .unwrap_err();
+        assert_eq!(err.code(), "DAEMON-WORKSPACE_UNAVAILABLE");
+        // Non-directory path (a file)
+        let file = dir.join("some_file.txt");
+        fs::write(&file, "not a directory").unwrap();
+        let err = daemon
+            .handle(DaemonCommand::CreateSession {
+                goal: "file".to_string(),
+                workspace_root: Some(file.to_string_lossy().to_string()),
+            })
+            .unwrap_err();
+        assert_eq!(err.code(), "DAEMON-WORKSPACE_NOT_DIR");
+        daemon.stop().unwrap();
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn filesystem_root_workspace_is_rejected() {
+        // TEST 6: A workspace that resolves to a filesystem root must be
+        // rejected as outside the allowed boundary.
+        let (dir, db, lock) = temp_paths();
+        let mut daemon = DaemonService::open(&db, &lock).unwrap();
+        daemon.start().unwrap();
+        let err = daemon
+            .handle(DaemonCommand::CreateSession {
+                goal: "root escape".to_string(),
+                workspace_root: Some("/".to_string()),
+            })
+            .unwrap_err();
+        assert_eq!(
+            err.code(),
+            "DAEMON-WORKSPACE_ROOT_DENIED",
+            "filesystem root must be rejected by policy"
+        );
+        daemon.stop().unwrap();
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn two_projects_do_not_share_workspace() {
+        // TEST 7: Two missions for two different projects must have distinct
+        // persistent workspace roots and cannot accidentally share the same
+        // worktree space.
+        let (dir, db, lock) = temp_paths();
+        let alpha = dir.join("alpha");
+        let beta = dir.join("beta");
+        fs::create_dir_all(&alpha).unwrap();
+        fs::create_dir_all(&beta).unwrap();
+        let canon_alpha = fs::canonicalize(&alpha).unwrap();
+        let canon_beta = fs::canonicalize(&beta).unwrap();
+        let mut daemon = DaemonService::open(&db, &lock).unwrap();
+        daemon.start().unwrap();
+        let resp_a = daemon
+            .handle(DaemonCommand::CreateSession {
+                goal: "alpha".to_string(),
+                workspace_root: Some(alpha.to_string_lossy().to_string()),
+            })
+            .unwrap();
+        let resp_b = daemon
+            .handle(DaemonCommand::CreateSession {
+                goal: "beta".to_string(),
+                workspace_root: Some(beta.to_string_lossy().to_string()),
+            })
+            .unwrap();
+        let mid_a = match resp_a {
+            DaemonResponse::SessionCreated { mission_id, .. } => mission_id,
+            _ => panic!("expected session"),
+        };
+        let mid_b = match resp_b {
+            DaemonResponse::SessionCreated { mission_id, .. } => mission_id,
+            _ => panic!("expected session"),
+        };
+        let ws_a = daemon.mission_workspace(mid_a.as_str()).unwrap().unwrap();
+        let ws_b = daemon.mission_workspace(mid_b.as_str()).unwrap().unwrap();
+        assert_eq!(ws_a, canon_alpha.to_string_lossy());
+        assert_eq!(ws_b, canon_beta.to_string_lossy());
+        assert_ne!(
+            ws_a, ws_b,
+            "two different projects must not share workspace identity"
+        );
+        daemon.stop().unwrap();
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn frontend_cannot_silently_redirect_workspace() {
+        // TEST 9: The daemon validates workspace_root independently and
+        // rejects values that would redirect execution to a different
+        // directory than the user intended.  A relative / empty / invalid
+        // path must be rejected rather than silently used.
+        let (dir, db, lock) = temp_paths();
+        let mut daemon = DaemonService::open(&db, &lock).unwrap();
+        daemon.start().unwrap();
+        // Empty string must be rejected (not silently ignored).
+        let err = daemon
+            .handle(DaemonCommand::CreateSession {
+                goal: "empty workspace".to_string(),
+                workspace_root: Some("   ".to_string()),
+            })
+            .unwrap_err();
+        assert_eq!(err.code(), "DAEMON-WORKSPACE_EMPTY");
+        // Relative path must be rejected.
+        let err = daemon
+            .handle(DaemonCommand::CreateSession {
+                goal: "relative".to_string(),
+                workspace_root: Some("../somewhere".to_string()),
+            })
+            .unwrap_err();
+        assert_eq!(err.code(), "DAEMON-WORKSPACE_NOT_ABSOLUTE");
+        daemon.stop().unwrap();
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn workspace_root_default_fallback_does_not_leak_to_other_missions() {
+        // When no workspace_root is supplied (None), the daemon default
+        // is used.  That default is independent per-mission — it cannot
+        // cause one mission's workspace to contaminate another's.
+        let (dir, db, lock) = temp_paths();
+        let explicit_project = dir.join("explicit");
+        fs::create_dir_all(&explicit_project).unwrap();
+        let canon_explicit = fs::canonicalize(&explicit_project).unwrap();
+        let mut daemon = DaemonService::open(&db, &lock).unwrap();
+        daemon.start().unwrap();
+        // Mission A: no workspace → uses daemon default (cwd/repo-root)
+        let resp_a = daemon
+            .handle(DaemonCommand::CreateSession {
+                goal: "default".to_string(),
+                workspace_root: None,
+            })
+            .unwrap();
+        let mid_a = match resp_a {
+            DaemonResponse::SessionCreated { mission_id, .. } => mission_id,
+            _ => panic!("expected session"),
+        };
+        // Mission B: explicit workspace
+        let resp_b = daemon
+            .handle(DaemonCommand::CreateSession {
+                goal: "explicit".to_string(),
+                workspace_root: Some(explicit_project.to_string_lossy().to_string()),
+            })
+            .unwrap();
+        let mid_b = match resp_b {
+            DaemonResponse::SessionCreated { mission_id, .. } => mission_id,
+            _ => panic!("expected session"),
+        };
+        let ws_a = daemon.mission_workspace(mid_a.as_str()).unwrap().unwrap();
+        let ws_b = daemon.mission_workspace(mid_b.as_str()).unwrap().unwrap();
+        // The default workspace must be a real directory (the canonicalized
+        // daemon default).  The explicit workspace must match the supplied
+        // project.  They must differ.
+        assert!(!ws_a.is_empty(), "default workspace must resolve");
+        assert_eq!(ws_b, canon_explicit.to_string_lossy());
+        assert_ne!(
+            ws_a, ws_b,
+            "default and explicit workspaces must not leak across missions"
+        );
         daemon.stop().unwrap();
         let _ = fs::remove_dir_all(dir);
     }

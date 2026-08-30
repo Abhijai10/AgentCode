@@ -1611,31 +1611,12 @@ impl<P: PolicyBoundary> AutonomousAgent<P> {
         let mut transaction = self.prepare_edit_transaction(&repo, path, content)?;
         let refs = evidence_refs.to_vec();
         let worktree_id = self.session.worker().workspace_ref.clone();
-        let (files_changed, additions, removals) = self
-            .session
-            .worker()
-            .workspace_ref
-            .as_ref()
-            .and_then(|worktree_id| self.git.worktree_diff(worktree_id).ok())
-            .map(|diff| summarize_diff(&diff.diff))
-            .filter(|(files, _, _)| !files.is_empty())
-            .unwrap_or_else(|| {
-                (
-                    vec![FileChangeSummary {
-                        path: path.to_string(),
-                        additions: content.lines().count() as u32,
-                        removals: 0,
-                    }],
-                    content.lines().count() as u32,
-                    0,
-                )
-            });
         transaction.changeset.attach_metadata(ChangeSetMetadata {
             originating_task: goal.id.clone(),
             originating_agent_session: self.session.id().clone(),
-            files_changed,
-            additions,
-            removals,
+            files_changed: Vec::new(),
+            additions: 0,
+            removals: 0,
             evidence_refs: refs,
             verification_passed: None,
         })?;
@@ -1654,6 +1635,25 @@ impl<P: PolicyBoundary> AutonomousAgent<P> {
             &worktree.base_commit,
         )?;
         EditEngine.apply(&mut repo, &mut transaction)?;
+        // Metadata must reflect the ACTUAL mutation after apply, not a
+        // pre-apply estimate.  Recompute from the applied edits so the
+        // ChangeSet metadata exactly describes the real file state.
+        if let Some(metadata) = &mut transaction.changeset.metadata {
+            let files_changed = transaction
+                .edits
+                .iter()
+                .map(|edit| FileChangeSummary {
+                    path: edit.path.clone(),
+                    additions: edit.additions,
+                    removals: edit.removals,
+                })
+                .collect::<Vec<_>>();
+            let total_additions: u32 = transaction.edits.iter().map(|e| e.additions).sum();
+            let total_removals: u32 = transaction.edits.iter().map(|e| e.removals).sum();
+            metadata.files_changed = files_changed;
+            metadata.additions = total_additions;
+            metadata.removals = total_removals;
+        }
         let applied_evidence = self.evidence.append(
             EvidenceKind::FileSnapshot,
             provenance("agent.changeset.apply"),
@@ -2925,7 +2925,7 @@ fn bound_workspace_agent_full<P: PolicyBoundary>(
         }
         git.register_existing_worktree(source_root, worktree)?
     } else {
-        git.create_task_workspace(
+        git.recover_or_create_worktree(
             source_root,
             worktree_root.clone(),
             mission_id.clone(),
@@ -3864,43 +3864,6 @@ fn missing_field(name: &str) -> AcError {
         "AGENT-PLAN_MISSING_FIELD",
         format!("missing structured plan field: {}", name),
     )
-}
-
-fn summarize_diff(diff: &str) -> (Vec<FileChangeSummary>, u32, u32) {
-    let mut files = Vec::new();
-    let mut current_path = None;
-    let mut additions = 0;
-    let mut removals = 0;
-    let mut total_additions = 0;
-    let mut total_removals = 0;
-    for line in diff.lines() {
-        if let Some(path) = line.strip_prefix("+++ b/") {
-            if let Some(path) = current_path.take() {
-                files.push(FileChangeSummary {
-                    path,
-                    additions,
-                    removals,
-                });
-            }
-            current_path = Some(path.to_string());
-            additions = 0;
-            removals = 0;
-        } else if line.starts_with('+') && !line.starts_with("+++") {
-            additions += 1;
-            total_additions += 1;
-        } else if line.starts_with('-') && !line.starts_with("---") {
-            removals += 1;
-            total_removals += 1;
-        }
-    }
-    if let Some(path) = current_path {
-        files.push(FileChangeSummary {
-            path,
-            additions,
-            removals,
-        });
-    }
-    (files, total_additions, total_removals)
 }
 
 fn search_goal_terms(code_intel: &CodeIntelligenceService, goal: &str) -> Vec<ContextCandidate> {
@@ -5884,6 +5847,114 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(worktree.path.join("README.md")).unwrap(),
             "external change\n"
+        );
+    }
+
+    #[test]
+    fn production_mutation_path_requires_approval_and_metadata_matches_file() {
+        // BF-05: the real production mutation path must (1) refuse to apply
+        // without kernel approval, (2) record stale-hash preconditions, and
+        // (3) produce ChangeSet metadata that exactly matches the on-disk
+        // mutation after apply.
+        let mut agent = agent_with_tool(
+            CapabilityPolicy::new()
+                .allow(Capability::FilesystemRead("*".to_string()))
+                .allow(Capability::FilesystemWrite("*".to_string()))
+                .allow(Capability::ProcessExec("*".to_string())),
+            0,
+        );
+        agent.kernel_lock().unwrap().start().unwrap();
+        let worktree = agent
+            .session
+            .worker()
+            .workspace_ref
+            .as_ref()
+            .and_then(|id| agent.git.worktree(id))
+            .unwrap()
+            .clone();
+        let goal = Goal::new("Fix the README").unwrap();
+        let task = WorkerTask {
+            id: StableId::new("task"),
+            mission_id: StableId::new("mission"),
+            title: "Modify target".to_string(),
+            dependencies: Vec::new(),
+            state: TaskState::Ready,
+            assigned_worker: Some(agent.session.worker().id.clone()),
+            retry_count: 0,
+            max_retries: 2,
+            evidence_refs: Vec::new(),
+            acceptance_criteria: Vec::new(),
+        };
+        let mut evidence_refs = Vec::new();
+        let changeset = agent
+            .prepare_and_write_changeset(
+                &goal,
+                &task,
+                "README.md",
+                "# Project\n\n## Usage\n",
+                &mut evidence_refs,
+            )
+            .unwrap();
+        assert_eq!(changeset.state, ChangeSetState::Applied);
+        // The operation must carry the stale-hash precondition.
+        assert!(matches!(
+            &changeset.operations[0],
+            ChangeOperation::WriteFile { expected_hash: Some(hash), .. } if hash.starts_with("fnv1a64:")
+        ));
+        // Metadata must describe the actual on-disk mutation (adds two lines).
+        let metadata = changeset.metadata.as_ref().unwrap();
+        assert_eq!(metadata.files_changed.len(), 1);
+        assert_eq!(metadata.files_changed[0].path, "README.md");
+        assert_eq!(metadata.files_changed[0].additions, 2);
+        assert_eq!(metadata.files_changed[0].removals, 0);
+        assert_eq!(metadata.additions, 2);
+        assert_eq!(metadata.removals, 0);
+        assert_eq!(
+            std::fs::read_to_string(worktree.path.join("README.md")).unwrap(),
+            "# Project\n\n## Usage\n"
+        );
+    }
+
+    #[test]
+    fn production_mutation_path_rejects_stale_precondition() {
+        // BF-05: if the target file changed after the agent read it (stale
+        // hash), the production path must fail BEFORE any mutation.  The
+        // file must remain untouched.
+        let agent = agent_with_tool(
+            CapabilityPolicy::new()
+                .allow(Capability::FilesystemRead("*".to_string()))
+                .allow(Capability::FilesystemWrite("*".to_string()))
+                .allow(Capability::ProcessExec("*".to_string())),
+            0,
+        );
+        agent.kernel_lock().unwrap().start().unwrap();
+        let worktree = agent
+            .session
+            .worker()
+            .workspace_ref
+            .as_ref()
+            .and_then(|id| agent.git.worktree(id))
+            .unwrap()
+            .clone();
+        let mut repo =
+            LocalWorkspaceFileRepository::new(worktree.path.clone(), worktree.base_commit.clone());
+        // Prepare against the current on-disk state.
+        let mut transaction = agent
+            .prepare_edit_transaction(&repo, "README.md", "# Project\n")
+            .unwrap();
+        // Simulate a concurrent external modification before approval/apply.
+        std::fs::write(worktree.path.join("README.md"), "someone else\n").unwrap();
+        transaction.changeset.validate().unwrap();
+        agent
+            .kernel_lock()
+            .unwrap()
+            .approve_changeset(&mut transaction.changeset)
+            .unwrap();
+        let err = EditEngine.apply(&mut repo, &mut transaction).unwrap_err();
+        assert_eq!(err.code(), "EDIT-CONCURRENT_MUTATION");
+        assert_eq!(
+            std::fs::read_to_string(worktree.path.join("README.md")).unwrap(),
+            "someone else\n"
         );
     }
 

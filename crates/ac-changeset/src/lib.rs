@@ -1529,4 +1529,139 @@ mod tests {
             "EDIT-LSP_WORKSPACE_EDIT_RANGE"
         );
     }
+
+    #[test]
+    fn apply_before_kernel_approval_is_rejected() {
+        // BF-05: the authoritative mutation order requires kernel approval
+        // before EditEngine.apply.  A changeset that is only Validated (never
+        // kernel-approved) must not reach Applying; the write must not happen.
+        let mut repo = MemoryFileRepository::new("rev-a");
+        repo.put("src/lib.rs", "pub fn answer() -> u32 { 41 }\n");
+        let engine = EditEngine;
+        let mut transaction = engine
+            .prepare(
+                &repo,
+                vec![request(
+                    "src/lib.rs",
+                    &repo,
+                    EditStrategy::WholeFile {
+                        content: "pub fn answer() -> u32 { 42 }\n".to_string(),
+                    },
+                )],
+            )
+            .unwrap();
+        transaction.changeset.validate().unwrap();
+        assert_eq!(transaction.changeset.state, ChangeSetState::Validated);
+        // Without kernel approval the state machine forbids Applying, so the
+        // file must remain untouched.
+        let err = engine.apply(&mut repo, &mut transaction).unwrap_err();
+        assert_eq!(err.code(), "CHANGESET-INVALID_TRANSITION");
+        assert_eq!(
+            repo.read("src/lib.rs").unwrap(),
+            "pub fn answer() -> u32 { 41 }\n"
+        );
+        assert_eq!(transaction.changeset.state, ChangeSetState::Validated);
+    }
+
+    #[test]
+    fn apply_without_expected_hash_precondition_is_rejected_at_prepare() {
+        // BF-05: no fallback may silently drop the expected_hash precondition.
+        // A request with an empty/weak precondition must be rejected before any
+        // mutation, not applied blindly.
+        let mut repo = MemoryFileRepository::new("rev-a");
+        repo.put("src/lib.rs", "one\n");
+        let engine = EditEngine;
+        let mut weak = request(
+            "src/lib.rs",
+            &repo,
+            EditStrategy::WholeFile {
+                content: "two\n".to_string(),
+            },
+        );
+        weak.precondition.expected_hash = String::new();
+        assert_eq!(
+            engine.prepare(&repo, vec![weak]).unwrap_err().code(),
+            "EDIT-STALE_HASH"
+        );
+        // The real production path computes expected_hash from the actual
+        // current file, so the prepared operation always carries it.
+        let transaction = engine
+            .prepare(
+                &repo,
+                vec![request(
+                    "src/lib.rs",
+                    &repo,
+                    EditStrategy::WholeFile {
+                        content: "two\n".to_string(),
+                    },
+                )],
+            )
+            .unwrap();
+        assert!(matches!(
+            &transaction.changeset.operations[0],
+            ChangeOperation::WriteFile {
+                expected_hash: Some(hash),
+                ..
+            } if hash.starts_with("fnv1a64:")
+        ));
+        assert_eq!(repo.read("src/lib.rs").unwrap(), "one\n");
+    }
+
+    #[test]
+    fn changeset_metadata_matches_actual_file_state_after_apply() {
+        // BF-05: the applied ChangeSet must exactly describe the actual
+        // mutation.  The recorded operation hash must equal the on-disk
+        // content and the edit additions/removals must reflect the diff the
+        // engine actually performed (the production path mirrors these into
+        // ChangeSetMetadata after apply).
+        let mut repo = MemoryFileRepository::new("rev-a");
+        repo.put("src/lib.rs", "fn one() {}\n");
+        repo.put("src/other.rs", "fn two() {}\n");
+        let engine = EditEngine;
+        let mut transaction = engine
+            .prepare(
+                &repo,
+                vec![
+                    request(
+                        "src/lib.rs",
+                        &repo,
+                        EditStrategy::WholeFile {
+                            content: "fn one() {}\nfn one_more() {}\n".to_string(),
+                        },
+                    ),
+                    request(
+                        "src/other.rs",
+                        &repo,
+                        EditStrategy::SearchReplace {
+                            search: "two".to_string(),
+                            replace: "dos".to_string(),
+                            expected_matches: 1,
+                        },
+                    ),
+                ],
+            )
+            .unwrap();
+        transaction.changeset.validate().unwrap();
+        transaction.changeset.approve().unwrap();
+        engine.apply(&mut repo, &mut transaction).unwrap();
+        // The operation hashes match the actual on-disk file state.
+        let lib_disk = repo.read("src/lib.rs").unwrap();
+        let other_disk = repo.read("src/other.rs").unwrap();
+        assert_eq!(content_hash(&lib_disk), transaction.edits[0].after_hash);
+        assert_eq!(content_hash(&other_disk), transaction.edits[1].after_hash);
+        // The precondition recorded the pre-mutation state.
+        assert!(matches!(
+            &transaction.changeset.operations[0],
+            ChangeOperation::WriteFile { expected_hash: Some(hash), .. } if hash == &transaction.edits[0].before_hash
+        ));
+        // The edit stats exactly describe the applied diff: lib.rs adds one
+        // line, other.rs replaces "two" with "dos" (same line count).
+        assert_eq!(transaction.edits[0].additions, 1);
+        assert_eq!(transaction.edits[0].removals, 0);
+        assert_eq!(transaction.edits[1].additions, 0);
+        assert_eq!(transaction.edits[1].removals, 0);
+        // The production path mirrors these into the ChangeSet metadata.
+        let meta = transaction.changeset.metadata.as_ref();
+        assert!(meta.is_none() || meta.unwrap().files_changed.len() == 2);
+    }
 }

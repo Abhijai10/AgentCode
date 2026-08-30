@@ -466,6 +466,117 @@ impl GitCoordinator {
         )
     }
 
+    /// Create a task worktree at the deterministic session path, or safely
+    /// reattach to an existing one left behind by an interrupted daemon.
+    ///
+    /// After a daemon crash the deterministic worktree directory may already
+    /// exist with partial completed work.  Recreating it with `git worktree
+    /// add` would fail because the destination already exists.  Instead this
+    /// method verifies the existing directory is genuinely the expected
+    /// AgentCode worktree of the expected source repository, discovers the
+    /// branch/HEAD from git itself, and reconstructs the in-memory worktree
+    /// record without creating a second worktree and without touching the
+    /// source repository.  A mismatched or tampered directory fails closed.
+    pub fn recover_or_create_worktree(
+        &mut self,
+        source_root: PathBuf,
+        worktree_root: PathBuf,
+        owner_mission_id: StableId,
+        owner_worker_id: StableId,
+    ) -> AcResult<StableId> {
+        if !worktree_root.exists() {
+            return self.create_task_workspace(
+                source_root,
+                worktree_root,
+                owner_mission_id,
+                owner_worker_id,
+            );
+        }
+        if !worktree_root.is_dir() {
+            return Err(AcError::conflict(
+                "GIT-WORKTREE_REATTACH_NOT_DIR",
+                "expected worktree path exists but is not a directory",
+            ));
+        }
+        // The existing directory must be a git worktree whose top level is
+        // exactly the deterministic session path.
+        let expected_path = canonical_path(&worktree_root)?;
+        let actual_root = canonical_path(Path::new(
+            &git_output(&worktree_root, ["rev-parse", "--show-toplevel"]).map_err(|_error| {
+                AcError::conflict(
+                    "GIT-WORKTREE_REATTACH_PATH",
+                    "existing directory is not a git worktree",
+                )
+            })?,
+        ))?;
+        if actual_root != expected_path {
+            return Err(AcError::conflict(
+                "GIT-WORKTREE_REATTACH_PATH",
+                "existing directory is not the expected git worktree",
+            ));
+        }
+        // Repository identity: the worktree must belong to the same source
+        // repository the mission is bound to.
+        let source_common = canonical_path(&source_root.join(".git"))?;
+        let actual_common = canonical_path(&worktree_root.join(git_output(
+            &worktree_root,
+            ["rev-parse", "--git-common-dir"],
+        )?))?;
+        if actual_common != source_common {
+            return Err(AcError::conflict(
+                "GIT-WORKTREE_REATTACH_REPOSITORY",
+                "existing worktree belongs to a different source repository",
+            ));
+        }
+        // Ownership: only an AgentCode task branch may be resumed.
+        let branch = git_output(&worktree_root, ["branch", "--show-current"])?;
+        validate_branch(&branch)?;
+        if !branch.starts_with("agent/task-") {
+            return Err(AcError::conflict(
+                "GIT-WORKTREE_REATTACH_OWNERSHIP",
+                "existing worktree branch is not an AgentCode task branch",
+            ));
+        }
+        let current_commit = git_output(&worktree_root, ["rev-parse", "HEAD"])?;
+        let default_branch = git_output(&source_root, ["branch", "--show-current"])
+            .unwrap_or_else(|_| "main".to_string());
+        // Reconstruct the fork point as the base commit.  This is where the
+        // interrupted branch diverged from the source default branch; it is a
+        // valid object in the shared object database.
+        let base_commit = git_output(
+            &source_root,
+            ["merge-base", branch.as_str(), default_branch.as_str()],
+        )
+        .or_else(|_| git_output(&worktree_root, ["rev-list", "--max-parents=0", "HEAD"]))?;
+        let base_present = git_output(&worktree_root, ["cat-file", "-t", base_commit.as_str()])?;
+        if base_present != "commit" {
+            return Err(AcError::conflict(
+                "GIT-WORKTREE_REATTACH_BASE",
+                "reconstructed base commit is not present in the worktree",
+            ));
+        }
+        let repository_id =
+            self.register_repository(source_root, current_commit.clone(), default_branch)?;
+        let id = StableId::new("wt");
+        self.worktrees.insert(
+            id.clone(),
+            WorktreeRecord {
+                id: id.clone(),
+                repository_id,
+                owner_mission_id,
+                owner_worker_id,
+                lease_epoch: 1,
+                path: worktree_root,
+                branch,
+                current_commit: current_commit.clone(),
+                base_commit,
+                status: WorktreeStatus::Active,
+                created_at: TimestampMillis::now(),
+            },
+        );
+        Ok(id)
+    }
+
     pub fn worktree_status(&self, worktree_id: &StableId) -> AcResult<String> {
         let worktree = self
             .worktrees
@@ -1209,5 +1320,303 @@ mod tests {
         assert_eq!(err.code(), "GIT-DIRTY_BASE");
         let _ = fs::remove_dir_all(&source);
         let _ = fs::remove_dir_all(&worktree);
+    }
+
+    // ── BF-02: interrupted-worktree recovery ────────────────────────────────
+
+    /// Build a committed source repository plus a task worktree whose branch
+    /// contains a real committed checkpoint of partial completed work.
+    fn setup_interrupted_worktree() -> (PathBuf, PathBuf, StableId, StableId, String, String) {
+        let source =
+            std::env::temp_dir().join(format!("agentcode-rec-src-{}", StableId::new("tmp")));
+        let worktree =
+            std::env::temp_dir().join(format!("agentcode-rec-wt-{}", StableId::new("tmp")));
+        let _ = fs::remove_dir_all(&source);
+        let _ = fs::remove_dir_all(&worktree);
+        fs::create_dir_all(&source).unwrap();
+        fs::write(source.join("a.txt"), "base\n").unwrap();
+        run_git(&source, ["init"]);
+        run_git(&source, ["add", "."]);
+        run_git(
+            &source,
+            [
+                "-c",
+                "user.name=AgentCode Test",
+                "-c",
+                "user.email=agentcode@example.test",
+                "commit",
+                "-m",
+                "base",
+            ],
+        );
+        let mission = StableId::new("mission");
+        let worker = StableId::new("worker");
+        let mut git = GitCoordinator::new();
+        let worktree_id = git
+            .create_task_workspace(
+                source.clone(),
+                worktree.clone(),
+                mission.clone(),
+                worker.clone(),
+            )
+            .unwrap();
+        // Simulate completed partial work preserved in the worktree.
+        fs::write(worktree.join("a.txt"), "partial completed work\n").unwrap();
+        git.checkpoint_current(&worktree_id, "partial progress")
+            .unwrap();
+        let branch = git_output(&worktree, ["branch", "--show-current"]).unwrap();
+        let head = git_output(&worktree, ["rev-parse", "HEAD"]).unwrap();
+        (source, worktree, mission, worker, branch, head)
+    }
+
+    #[test]
+    fn interrupted_worktree_reattaches_after_restart_preserving_work() {
+        let (source, worktree, mission, worker, branch, _head) = setup_interrupted_worktree();
+        // Simulate a daemon restart: a fresh GitCoordinator has no in-memory
+        // state and must recover from the deterministic session path alone.
+        let mut restarted = GitCoordinator::new();
+        let id = restarted
+            .recover_or_create_worktree(
+                source.clone(),
+                worktree.clone(),
+                mission.clone(),
+                worker.clone(),
+            )
+            .unwrap();
+        let record = restarted.worktree(&id).unwrap().clone();
+        assert_eq!(record.path, worktree);
+        assert_eq!(record.branch, branch);
+        assert_eq!(record.owner_mission_id, mission);
+        assert_eq!(record.owner_worker_id, worker);
+        // Partial completed work must survive the restart.
+        assert_eq!(
+            fs::read_to_string(worktree.join("a.txt")).unwrap(),
+            "partial completed work\n"
+        );
+        // No second worktree may be created for the mission.
+        let list = git_output(&source, ["worktree", "list", "--porcelain"]).unwrap();
+        let count = list
+            .lines()
+            .filter(|line| line.starts_with("worktree "))
+            .count();
+        assert_eq!(count, 2, "source repo + one mission worktree only");
+        // Source repository must remain untouched.
+        assert_eq!(fs::read_to_string(source.join("a.txt")).unwrap(), "base\n");
+        assert_eq!(git_output(&source, ["status", "--porcelain"]).unwrap(), "");
+        restarted.cleanup_worktree(&id).unwrap();
+        let _ = fs::remove_dir_all(&source);
+    }
+
+    #[test]
+    fn interrupted_worktree_restart_reuses_same_git_worktree() {
+        let (source, worktree, mission, worker, _branch, head) = setup_interrupted_worktree();
+        let list_before = git_output(&source, ["worktree", "list", "--porcelain"]).unwrap();
+        let worktree_entries_before = list_before
+            .lines()
+            .filter(|line| line.starts_with("worktree "))
+            .count();
+        let mut restarted = GitCoordinator::new();
+        let id = restarted
+            .recover_or_create_worktree(
+                source.clone(),
+                worktree.clone(),
+                mission.clone(),
+                worker.clone(),
+            )
+            .unwrap();
+        assert_eq!(restarted.worktree(&id).unwrap().current_commit, head);
+        // The recovered record must describe the existing git worktree, and no
+        // duplicate worktree path may appear.
+        let list_after = git_output(&source, ["worktree", "list", "--porcelain"]).unwrap();
+        let worktree_entries_after = list_after
+            .lines()
+            .filter(|line| line.starts_with("worktree "))
+            .count();
+        assert_eq!(worktree_entries_before, worktree_entries_after);
+        let expected = format!(
+            "worktree {}",
+            worktree
+                .canonicalize()
+                .unwrap_or_else(|_| worktree.clone())
+                .display()
+        );
+        assert_eq!(
+            list_after
+                .lines()
+                .filter(|line| *line == expected.as_str())
+                .count(),
+            1,
+            "exactly one worktree entry for the deterministic path"
+        );
+        restarted.cleanup_worktree(&id).unwrap();
+        let _ = fs::remove_dir_all(&source);
+    }
+
+    #[test]
+    fn interrupted_worktree_rejects_mismatched_repository() {
+        let (source, worktree, mission, worker, _branch, _head) = setup_interrupted_worktree();
+        // A different repository must never be resumed against this worktree.
+        let other =
+            std::env::temp_dir().join(format!("agentcode-rec-other-{}", StableId::new("tmp")));
+        let _ = fs::remove_dir_all(&other);
+        fs::create_dir_all(&other).unwrap();
+        fs::write(other.join("x.txt"), "other\n").unwrap();
+        run_git(&other, ["init"]);
+        run_git(&other, ["add", "."]);
+        run_git(
+            &other,
+            [
+                "-c",
+                "user.name=AgentCode Test",
+                "-c",
+                "user.email=agentcode@example.test",
+                "commit",
+                "-m",
+                "other",
+            ],
+        );
+        let mut restarted = GitCoordinator::new();
+        let err = restarted
+            .recover_or_create_worktree(
+                other.clone(),
+                worktree.clone(),
+                mission.clone(),
+                worker.clone(),
+            )
+            .unwrap_err();
+        assert_eq!(err.code(), "GIT-WORKTREE_REATTACH_REPOSITORY");
+        // Mismatched recovery must leave the worktree untouched.
+        assert_eq!(
+            fs::read_to_string(worktree.join("a.txt")).unwrap(),
+            "partial completed work\n"
+        );
+        let _ = fs::remove_dir_all(&source);
+        let _ = fs::remove_dir_all(&other);
+    }
+
+    #[test]
+    fn interrupted_worktree_rejects_unexpected_directory() {
+        let source =
+            std::env::temp_dir().join(format!("agentcode-rec-src2-{}", StableId::new("tmp")));
+        let worktree =
+            std::env::temp_dir().join(format!("agentcode-rec-wt2-{}", StableId::new("tmp")));
+        let _ = fs::remove_dir_all(&source);
+        let _ = fs::remove_dir_all(&worktree);
+        fs::create_dir_all(&source).unwrap();
+        fs::write(source.join("a.txt"), "base\n").unwrap();
+        run_git(&source, ["init"]);
+        run_git(&source, ["add", "."]);
+        run_git(
+            &source,
+            [
+                "-c",
+                "user.name=AgentCode Test",
+                "-c",
+                "user.email=agentcode@example.test",
+                "commit",
+                "-m",
+                "base",
+            ],
+        );
+        // An unexpected directory at the deterministic path (not a git
+        // worktree) must fail closed and must never be deleted.
+        fs::create_dir_all(worktree.join("user-files")).unwrap();
+        fs::write(worktree.join("user-files/precious.txt"), "user data\n").unwrap();
+        let mut git = GitCoordinator::new();
+        let err = git
+            .recover_or_create_worktree(
+                source.clone(),
+                worktree.clone(),
+                StableId::new("mission"),
+                StableId::new("worker"),
+            )
+            .unwrap_err();
+        assert_eq!(err.code(), "GIT-WORKTREE_REATTACH_PATH");
+        assert_eq!(
+            fs::read_to_string(worktree.join("user-files/precious.txt")).unwrap(),
+            "user data\n"
+        );
+        let _ = fs::remove_dir_all(&source);
+        let _ = fs::remove_dir_all(&worktree);
+    }
+
+    #[test]
+    fn interrupted_worktree_rejects_non_directory_path() {
+        let source =
+            std::env::temp_dir().join(format!("agentcode-rec-src3-{}", StableId::new("tmp")));
+        let worktree =
+            std::env::temp_dir().join(format!("agentcode-rec-wt3-{}", StableId::new("tmp")));
+        let _ = fs::remove_dir_all(&source);
+        let _ = fs::remove_dir_all(&worktree);
+        fs::create_dir_all(&source).unwrap();
+        fs::write(source.join("a.txt"), "base\n").unwrap();
+        run_git(&source, ["init"]);
+        run_git(&source, ["add", "."]);
+        run_git(
+            &source,
+            [
+                "-c",
+                "user.name=AgentCode Test",
+                "-c",
+                "user.email=agentcode@example.test",
+                "commit",
+                "-m",
+                "base",
+            ],
+        );
+        // A regular file where the worktree directory is expected.
+        fs::write(&worktree, "not a directory\n").unwrap();
+        let mut git = GitCoordinator::new();
+        let err = git
+            .recover_or_create_worktree(
+                source.clone(),
+                worktree.clone(),
+                StableId::new("mission"),
+                StableId::new("worker"),
+            )
+            .unwrap_err();
+        assert_eq!(err.code(), "GIT-WORKTREE_REATTACH_NOT_DIR");
+        assert_eq!(fs::read_to_string(&worktree).unwrap(), "not a directory\n");
+        let _ = fs::remove_dir_all(&source);
+        let _ = fs::remove_dir_all(&worktree);
+    }
+
+    #[test]
+    fn recover_or_create_worktree_creates_freshly_when_path_is_absent() {
+        let source =
+            std::env::temp_dir().join(format!("agentcode-rec-src4-{}", StableId::new("tmp")));
+        let worktree =
+            std::env::temp_dir().join(format!("agentcode-rec-wt4-{}", StableId::new("tmp")));
+        let _ = fs::remove_dir_all(&source);
+        let _ = fs::remove_dir_all(&worktree);
+        fs::create_dir_all(&source).unwrap();
+        fs::write(source.join("a.txt"), "base\n").unwrap();
+        run_git(&source, ["init"]);
+        run_git(&source, ["add", "."]);
+        run_git(
+            &source,
+            [
+                "-c",
+                "user.name=AgentCode Test",
+                "-c",
+                "user.email=agentcode@example.test",
+                "commit",
+                "-m",
+                "base",
+            ],
+        );
+        let mut git = GitCoordinator::new();
+        let id = git
+            .recover_or_create_worktree(
+                source.clone(),
+                worktree.clone(),
+                StableId::new("mission"),
+                StableId::new("worker"),
+            )
+            .unwrap();
+        assert!(git.worktree(&id).is_some());
+        assert!(worktree.join("a.txt").exists());
+        git.cleanup_worktree(&id).unwrap();
+        let _ = fs::remove_dir_all(&source);
     }
 }

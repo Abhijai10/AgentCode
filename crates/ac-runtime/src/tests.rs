@@ -261,7 +261,8 @@ mod tests {
         {
             let mut db = ControlPlaneDb::open(&path).unwrap();
             db.migrate().unwrap();
-            db.save_session(&session_id, &mission, "running").unwrap();
+            db.save_session(&session_id, &mission, "running", None)
+                .unwrap();
             graph.persist(&db, &worker, &session_id).unwrap();
         }
         {
@@ -324,7 +325,8 @@ mod tests {
         {
             let mut db = ControlPlaneDb::open(&path).unwrap();
             db.migrate().unwrap();
-            db.save_session(&session_id, &mission, "running").unwrap();
+            db.save_session(&session_id, &mission, "running", None)
+                .unwrap();
             graph.persist(&db, &worker, &session_id).unwrap();
         }
         {
@@ -383,7 +385,8 @@ mod tests {
         {
             let mut db = ControlPlaneDb::open(&path).unwrap();
             db.migrate().unwrap();
-            db.save_session(&session_id, &mission, "running").unwrap();
+            db.save_session(&session_id, &mission, "running", None)
+                .unwrap();
             graph.persist(&db, &worker, &session_id).unwrap();
         }
         {
@@ -420,6 +423,117 @@ mod tests {
             evidence_refs: Vec::new(),
             acceptance_criteria: Vec::new(),
         }
+    }
+
+    #[test]
+    fn crash_before_mutation_resumes_cleanly_from_persisted_plan() {
+        let mission = StableId::new("mission");
+        let edit = StableId::from_existing("task-edit-not-started").unwrap();
+        let verify = StableId::from_existing("task-verify-pending").unwrap();
+        let plan = RuntimePlan {
+            id: StableId::new("plan"),
+            mission_id: mission.clone(),
+            revision: 1,
+            tasks: vec![
+                worker_task(edit.clone(), mission.clone(), "edit", Vec::new()),
+                worker_task(verify.clone(), mission.clone(), "verify", vec![edit.clone()]),
+            ],
+            proposals: Vec::new(),
+            supersedes: None,
+        };
+        let graph = TaskGraph::from_runtime_plan(&plan).unwrap();
+        let mut worker = Worker::new();
+        worker.assign(mission.clone()).unwrap();
+        worker.transition(WorkerState::Running).unwrap();
+        let path = std::env::temp_dir().join(format!(
+            "agentcode-runtime-crash-before-{}.sqlite",
+            StableId::new("db")
+        ));
+        let session_id = StableId::new("session");
+        {
+            let mut db = ControlPlaneDb::open(&path).unwrap();
+            db.migrate().unwrap();
+            db.save_session(&session_id, &mission, "running", None)
+                .unwrap();
+            // Crash before mutation: only the plan has been checkpointed,
+            // no task has started.
+            graph.persist(&db, &worker, &session_id).unwrap();
+        }
+        {
+            let db = ControlPlaneDb::open(&path).unwrap();
+            let session = db.get_session(&session_id).unwrap().unwrap();
+            let hydrated = RuntimeHydrator::hydrate_session(&db, session).unwrap();
+            let states = hydrated
+                .graph
+                .tasks()
+                .map(|task| (task.id.clone(), task.state))
+                .collect::<std::collections::BTreeMap<_, _>>();
+            // No mutation happened before the crash, so nothing is Completed.
+            assert_eq!(states[&edit], TaskState::Ready);
+            assert_eq!(states[&verify], TaskState::Pending);
+            assert!(hydrated.reconciled_tasks.is_empty());
+        }
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn crash_after_mutation_before_verification_starts_keeps_edit_completed() {
+        let mission = StableId::new("mission");
+        let edit = StableId::from_existing("task-edit-done").unwrap();
+        let verify = StableId::from_existing("task-verify-not-started").unwrap();
+        let plan = RuntimePlan {
+            id: StableId::new("plan"),
+            mission_id: mission.clone(),
+            revision: 1,
+            tasks: vec![
+                worker_task(edit.clone(), mission.clone(), "edit", Vec::new()),
+                worker_task(verify.clone(), mission.clone(), "verify", vec![edit.clone()]),
+            ],
+            proposals: Vec::new(),
+            supersedes: None,
+        };
+        let mut graph = TaskGraph::from_runtime_plan(&plan).unwrap();
+        let mut worker = Worker::new();
+        worker.assign(mission.clone()).unwrap();
+        worker.transition(WorkerState::Running).unwrap();
+        graph.start(&edit, &worker).unwrap();
+        graph
+            .finish(
+                &edit,
+                &worker,
+                TaskAttemptOutcome::Succeeded,
+                vec![StableId::new("mutation-evidence")],
+                None,
+            )
+            .unwrap();
+        let path = std::env::temp_dir().join(format!(
+            "agentcode-runtime-crash-after-edit-{}.sqlite",
+            StableId::new("db")
+        ));
+        let session_id = StableId::new("session");
+        {
+            let mut db = ControlPlaneDb::open(&path).unwrap();
+            db.migrate().unwrap();
+            db.save_session(&session_id, &mission, "running", None)
+                .unwrap();
+            // Crash after the mutation task completed but before the
+            // verification task started.
+            graph.persist(&db, &worker, &session_id).unwrap();
+        }
+        {
+            let db = ControlPlaneDb::open(&path).unwrap();
+            let session = db.get_session(&session_id).unwrap().unwrap();
+            let hydrated = RuntimeHydrator::hydrate_session(&db, session).unwrap();
+            let states = hydrated
+                .graph
+                .tasks()
+                .map(|task| (task.id.clone(), task.state))
+                .collect::<std::collections::BTreeMap<_, _>>();
+            assert_eq!(states[&edit], TaskState::Completed);
+            assert_eq!(states[&verify], TaskState::Ready);
+            assert!(hydrated.reconciled_tasks.is_empty());
+        }
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]

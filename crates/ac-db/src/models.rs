@@ -617,6 +617,7 @@ pub struct PersistedSession {
     pub id: String,
     pub mission_id: String,
     pub state: String,
+    pub workspace_root: Option<String>,
     pub updated_at_ms: i64,
 }
 

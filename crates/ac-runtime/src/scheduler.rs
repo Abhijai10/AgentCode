@@ -119,16 +119,17 @@ impl TaskGraph {
                 "worker is not assigned to a mission",
             )
         })?;
-        db.save_worker(&WorkerRecord {
+        let worker_record = WorkerRecord {
             id: worker.id.to_string(),
             mission_id: mission.to_string(),
             session_id: session_id.to_string(),
             state: format!("{:?}", worker.state).to_lowercase(),
             workspace_ref: worker.workspace_ref.as_ref().map(ToString::to_string),
             updated_at_ms: TimestampMillis::now().as_millis() as i64,
-        })?;
+        };
+        let mut task_records = Vec::with_capacity(self.tasks.len());
         for task in self.tasks.values() {
-            db.save_task(&TaskRecord {
+            task_records.push(TaskRecord {
                 id: task.id.to_string(),
                 mission_id: task.mission_id.to_string(),
                 title: task.title.clone(),
@@ -143,11 +144,19 @@ impl TaskGraph {
                 retry_count: task.retry_count,
                 max_retries: task.max_retries,
                 updated_at_ms: TimestampMillis::now().as_millis() as i64,
-                acceptance_criteria_json: serde_json::to_string(&task.acceptance_criteria).map_err(|error| AcError::validation("RUNTIME-TASK_CRITERIA_SERIALIZE", error.to_string()))?,
-            })?;
+                acceptance_criteria_json: serde_json::to_string(&task.acceptance_criteria)
+                    .map_err(|error| {
+                        AcError::validation(
+                            "RUNTIME-TASK_CRITERIA_SERIALIZE",
+                            error.to_string(),
+                        )
+                    })?,
+            });
         }
-        for attempt in &self.attempts {
-            db.save_task_attempt(&TaskAttemptRecord {
+        let attempt_records = self
+            .attempts
+            .iter()
+            .map(|attempt| TaskAttemptRecord {
                 id: attempt.id.to_string(),
                 task_id: attempt.task_id.to_string(),
                 worker_id: attempt.worker_id.to_string(),
@@ -160,9 +169,12 @@ impl TaskGraph {
                     .join(","),
                 failure_class: attempt.failure_class.clone(),
                 created_at_ms: attempt.created_at.as_millis() as i64,
-            })?;
-        }
-        Ok(())
+            })
+            .collect::<Vec<_>>();
+        // The worker, tasks, and attempts form one logical checkpoint.  Write
+        // them atomically so a crash cannot leave a partially-persisted graph
+        // (BF-03 requirement 11).
+        db.persist_graph_atomic(&worker_record, &task_records, &attempt_records)
     }
 
     fn add_task(

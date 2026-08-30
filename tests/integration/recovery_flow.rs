@@ -14,6 +14,7 @@ fn recovery_flow_reconstructs_interrupted_session_after_reload() {
         let response = daemon
             .handle(ac_daemon::DaemonCommand::CreateSession {
                 goal: "Recover integration task".to_string(),
+                workspace_root: None,
             })
             .unwrap();
         session_id = match response {

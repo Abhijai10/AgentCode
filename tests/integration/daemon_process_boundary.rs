@@ -229,6 +229,17 @@ fn real_daemon_binary_recovers_crash_after_mutation_without_replay() {
     let mut second = launch_daemon(&daemon, &runtime, &project);
     wait_for_socket(&socket, &mut second, &runtime);
     assert_socket_0600(&socket);
+
+    // While the recovered mission is re-running, ListActiveMissions must
+    // reflect the PERSISTED task graph from SQLite (not a loss of task state
+    // across the crash boundary).  This is checked before completion while the
+    // mission is still active.
+    let listed_tasks = poll_active_mission_tasks(&socket, &mission_id, &mut second, &runtime);
+    assert!(
+        listed_tasks >= 2,
+        "ListActiveMissions must reflect persisted tasks during recovery"
+    );
+
     let completed = poll_mission_completed(&socket, &mission_id, &mut second, &runtime);
     assert_eq!(
         completed["state"], "completed",
@@ -255,8 +266,246 @@ fn real_daemon_binary_recovers_crash_after_mutation_without_replay() {
                 .as_deref()
                 .is_some_and(|content| content.contains("achieved_isolation:FilesystemIsolated"))
     }));
+    let evidence_count_after_crash = db_after.evidence_records().unwrap().len();
+
+    // Verify the daemon restarted with the SAME mission/session identity and
+    // reports the PERSISTED task graph (not an in-memory reconstruction).
+    let same_mission = UnixIpcClient::new(&socket)
+        .request(json!({
+            "id": "identity-check",
+            "command": "GetMission",
+            "mission_id": mission_id
+        }))
+        .unwrap();
+    assert_eq!(same_mission["mission_id"], mission_id, "{same_mission}");
+    assert_eq!(same_mission["session_id"], session_id, "{same_mission}");
+    assert_eq!(same_mission["state"], "completed", "{same_mission}");
+    let persisted_tasks = same_mission["tasks"]
+        .as_array()
+        .map(|tasks| tasks.len())
+        .unwrap_or(0);
+    assert!(
+        persisted_tasks >= 2,
+        "persisted task graph must be visible over IPC, got {same_mission}"
+    );
+    // ListActiveMissions was already proven to reflect the persisted task
+    // graph above, while the recovered mission was still active.
 
     shutdown_daemon(&socket, &mut second, &runtime);
+
+    // Second restart: the terminal Completed state must survive and nothing
+    // may replay (no new mutation attempt, no duplicated evidence).
+    let mut third = launch_daemon(&daemon, &runtime, &project);
+    wait_for_socket(&socket, &mut third, &runtime);
+    assert_socket_0600(&socket);
+    let after_second_restart = UnixIpcClient::new(&socket)
+        .request(json!({
+            "id": "after-second-restart",
+            "command": "GetMission",
+            "mission_id": mission_id
+        }))
+        .unwrap();
+    assert_eq!(
+        after_second_restart["state"], "completed",
+        "second restart response: {after_second_restart}"
+    );
+    assert_eq!(
+        fs::read_to_string(&worktree_lib).unwrap(),
+        "pub fn fixture_answer() -> u32 {\n    42\n}"
+    );
+    assert_eq!(
+        count_occurrences(&fs::read_to_string(&worktree_lib).unwrap(), "42"),
+        1
+    );
+    let second_restart_db = ControlPlaneDb::open(&db_path).unwrap();
+    assert_eq!(
+        second_restart_db
+            .task_attempts(&modified_task)
+            .unwrap()
+            .len(),
+        modify_attempts_before,
+        "completed mutation task replayed after second restart"
+    );
+    assert_eq!(
+        second_restart_db.evidence_records().unwrap().len(),
+        evidence_count_after_crash,
+        "evidence duplicated after second restart"
+    );
+
+    shutdown_daemon(&socket, &mut third, &runtime);
+    let _ = fs::remove_dir_all(&runtime);
+    let _ = fs::remove_dir_all(&project);
+}
+
+#[test]
+#[ignore = "requires built ac-daemon binary and macOS production sandbox"]
+fn real_daemon_binary_binds_submitted_workspace_root_per_project() {
+    // Project-to-daemon workspace binding (TEST 1/2/7/9): the daemon must
+    // execute against the submitted workspace_root, never against its own
+    // AGENTCODE_WORKSPACE_ROOT or cwd, and two projects must stay isolated.
+    let runtime = short_temp_path("acwb");
+    let project_a = short_temp_path("acwba");
+    let project_b = short_temp_path("acwbb");
+    let _ = fs::remove_dir_all(&runtime);
+    let _ = fs::remove_dir_all(&project_a);
+    let _ = fs::remove_dir_all(&project_b);
+    fs::create_dir_all(&runtime).unwrap();
+    create_fixture_project(&project_a);
+    create_fixture_project(&project_b);
+    let daemon = daemon_binary();
+    assert!(
+        daemon.is_file(),
+        "build the daemon first: cargo build -p ac-daemon"
+    );
+    let socket = default_socket_path(&runtime);
+    let (db_path, _) = default_paths(&runtime);
+
+    // Launch with AGENTCODE_WORKSPACE_ROOT = project B so the daemon's
+    // configured default deliberately differs from the project we will submit.
+    let mut child = launch_daemon(&daemon, &runtime, &project_b);
+    wait_for_socket(&socket, &mut child, &runtime);
+
+    // Mission 1: submit with workspace_root = Project A.
+    let submit_a = UnixIpcClient::new(&socket)
+        .request(json!({
+            "id": "submit-a",
+            "command": "SubmitMission",
+            "goal": "Fix the bug in src/lib.rs",
+            "workspace_root": project_a.to_string_lossy().to_string()
+        }))
+        .unwrap();
+    assert_eq!(submit_a["ok"], true, "submit A response: {submit_a}");
+    let mission_a = submit_a["mission_id"].as_str().unwrap().to_string();
+    let completed_a = poll_mission_completed(&socket, &mission_a, &mut child, &runtime);
+    assert_eq!(completed_a["state"], "completed", "{completed_a}");
+    // Persisted workspace must be Project A, not the daemon default (B).
+    let db = ControlPlaneDb::open(&db_path).unwrap();
+    let session_a = db
+        .session_for_mission(&StableId::from_existing(&mission_a).unwrap())
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        session_a.workspace_root.as_deref(),
+        Some(fs::canonicalize(&project_a).unwrap().to_str().unwrap()),
+        "mission A must be bound to Project A"
+    );
+    // Mutation must appear in Project A's worktree, NOT in Project B.
+    let session_a_id = session_a.id.clone();
+    let worktree_a_lib = project_a
+        .join(".agentcode-worktrees")
+        .join(&session_a_id)
+        .join("src/lib.rs");
+    assert_eq!(
+        fs::read_to_string(&worktree_a_lib).unwrap(),
+        "pub fn fixture_answer() -> u32 {\n    42\n}",
+        "Project A worktree must contain the mutation"
+    );
+    assert_eq!(
+        fs::read_to_string(project_a.join("src/lib.rs")).unwrap(),
+        "pub fn fixture_answer() -> u32 {\n    41\n}\n",
+        "Project A source must remain unmodified by isolated work"
+    );
+    assert!(
+        !project_b.join(".agentcode-worktrees").exists(),
+        "Project B must not receive Project A's worktree"
+    );
+
+    // Mission 2: submit with workspace_root = Project B.
+    let submit_b = UnixIpcClient::new(&socket)
+        .request(json!({
+            "id": "submit-b",
+            "command": "SubmitMission",
+            "goal": "Fix the bug in src/lib.rs",
+            "workspace_root": project_b.to_string_lossy().to_string()
+        }))
+        .unwrap();
+    assert_eq!(submit_b["ok"], true, "submit B response: {submit_b}");
+    let mission_b = submit_b["mission_id"].as_str().unwrap().to_string();
+    let completed_b = poll_mission_completed(&socket, &mission_b, &mut child, &runtime);
+    assert_eq!(completed_b["state"], "completed", "{completed_b}");
+    let db = ControlPlaneDb::open(&db_path).unwrap();
+    let session_b = db
+        .session_for_mission(&StableId::from_existing(&mission_b).unwrap())
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        session_b.workspace_root.as_deref(),
+        Some(fs::canonicalize(&project_b).unwrap().to_str().unwrap()),
+        "mission B must be bound to Project B"
+    );
+    let worktree_b_lib = project_b
+        .join(".agentcode-worktrees")
+        .join(&session_b.id)
+        .join("src/lib.rs");
+    assert_eq!(
+        fs::read_to_string(&worktree_b_lib).unwrap(),
+        "pub fn fixture_answer() -> u32 {\n    42\n}",
+        "Project B worktree must contain the mutation"
+    );
+    // The two missions must never share a workspace identity.
+    assert_ne!(
+        session_a.workspace_root, session_b.workspace_root,
+        "two different projects must not share a workspace"
+    );
+    assert_ne!(
+        session_a.id, session_b.id,
+        "two missions must not share a session/worktree"
+    );
+
+    shutdown_daemon(&socket, &mut child, &runtime);
+    let _ = fs::remove_dir_all(&runtime);
+    let _ = fs::remove_dir_all(&project_a);
+    let _ = fs::remove_dir_all(&project_b);
+}
+
+#[test]
+#[ignore = "requires built ac-daemon binary and macOS production sandbox"]
+fn real_daemon_binary_rejects_invalid_workspace_root() {
+    // TEST 5/9: The daemon must independently reject an invalid, non-existent,
+    // or non-directory workspace_root from the frontend.
+    let runtime = short_temp_path("acwi");
+    let project = short_temp_path("acwip");
+    let _ = fs::remove_dir_all(&runtime);
+    let _ = fs::remove_dir_all(&project);
+    fs::create_dir_all(&runtime).unwrap();
+    create_fixture_project(&project);
+    let daemon = daemon_binary();
+    let socket = default_socket_path(&runtime);
+    let mut child = launch_daemon(&daemon, &runtime, &project);
+    wait_for_socket(&socket, &mut child, &runtime);
+
+    let missing = runtime.join("no-such-project");
+    let rejected = UnixIpcClient::new(&socket)
+        .request(json!({
+            "id": "submit-invalid",
+            "command": "SubmitMission",
+            "goal": "Fix the bug in src/lib.rs",
+            "workspace_root": missing.to_string_lossy().to_string()
+        }))
+        .unwrap();
+    assert_eq!(
+        rejected["ok"], false,
+        "invalid workspace_root must be rejected: {rejected}"
+    );
+    assert_eq!(rejected["error"]["code"], "DAEMON-WORKSPACE_UNAVAILABLE");
+
+    // A file is not a directory.
+    let file = runtime.join("not-a-dir.txt");
+    fs::write(&file, "x").unwrap();
+    let rejected_file = UnixIpcClient::new(&socket)
+        .request(json!({
+            "id": "submit-file",
+            "command": "SubmitMission",
+            "goal": "Fix the bug in src/lib.rs",
+            "workspace_root": file.to_string_lossy().to_string()
+        }))
+        .unwrap();
+    assert_eq!(
+        rejected_file["error"]["code"], "DAEMON-WORKSPACE_NOT_DIR",
+        "{rejected_file}"
+    );
+
+    shutdown_daemon(&socket, &mut child, &runtime);
     let _ = fs::remove_dir_all(&runtime);
     let _ = fs::remove_dir_all(&project);
 }
@@ -713,6 +962,41 @@ fn poll_mission_state(
     }
     panic!(
         "mission did not reach {expected}; last={last}\n{}",
+        daemon_log(runtime)
+    );
+}
+
+fn poll_active_mission_tasks(
+    socket: &Path,
+    mission_id: &str,
+    child: &mut Child,
+    runtime: &Path,
+) -> usize {
+    // The recovered mission must be visible as active over real IPC with its
+    // PERSISTED task graph.  Poll until the mission appears; the task_count
+    // comes from SQLite (daemon.active_missions -> tasks_for_mission).
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut last = json!(null);
+    while Instant::now() < deadline {
+        assert_process_running(child, runtime);
+        last = UnixIpcClient::new(socket)
+            .request(json!({"id": "poll-active", "command": "ListActiveMissions"}))
+            .unwrap();
+        if let Some(count) = last["missions"]
+            .as_array()
+            .and_then(|missions| {
+                missions
+                    .iter()
+                    .find(|mission| mission["mission_id"] == mission_id)
+            })
+            .and_then(|mission| mission["task_count"].as_u64())
+        {
+            return count as usize;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    panic!(
+        "recovered mission did not appear in ListActiveMissions; last={last}\n{}",
         daemon_log(runtime)
     );
 }

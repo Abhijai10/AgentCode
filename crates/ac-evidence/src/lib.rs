@@ -281,4 +281,55 @@ mod tests {
         assert!(summary.ends_with("\n[output truncated]"));
         assert!(!summary.contains("unicode-secret"));
     }
+
+    #[test]
+    fn bounded_summary_cjk_starting_exactly_at_limit_byte_is_excluded() {
+        // 4095 ASCII bytes + a 3-byte CJK char whose first byte lands exactly
+        // on the 4096th byte.  The char must be excluded whole and the slice
+        // must stay on a character boundary.
+        let value = format!("{}界x", "a".repeat(4095));
+        assert!(value.len() > 4096);
+        let summary = bounded_summary(&value);
+        assert!(summary.starts_with(&"a".repeat(4095)));
+        assert!(!summary.contains('界'));
+        assert!(summary.ends_with("\n[output truncated]"));
+    }
+
+    #[test]
+    fn bounded_summary_emoji_spanning_limit_byte_is_excluded_whole() {
+        // 4094 ASCII bytes + a 4-byte emoji that starts at byte 4094 and would
+        // straddle the 4096-byte boundary.  It must be excluded entirely.
+        let value = format!("{}😀", "a".repeat(4094));
+        assert!(value.len() > 4096);
+        let summary = bounded_summary(&value);
+        assert!(summary.starts_with(&"a".repeat(4094)));
+        assert!(!summary.contains('😀'));
+        assert!(summary.ends_with("\n[output truncated]"));
+    }
+
+    #[test]
+    fn bounded_summary_exact_boundary_ascii_keeps_full_limit() {
+        // Exactly LIMIT ASCII bytes must be retained in full even when more
+        // non-ASCII content follows the boundary.
+        let value = format!("{}漢字", "a".repeat(4096));
+        let summary = bounded_summary(&value);
+        assert!(summary.starts_with(&"a".repeat(4096)));
+        assert!(!summary.contains('漢'));
+        assert!(summary.ends_with("\n[output truncated]"));
+    }
+
+    #[test]
+    fn bounded_summary_multibyte_never_panics_across_all_boundary_offsets() {
+        // Walk every possible leading byte count around the 4096-byte limit
+        // with a 4-byte emoji to prove no slice can land inside a character.
+        for prefix in 4092..=4096 {
+            let value = format!("{}😀{}", "a".repeat(prefix), "b".repeat(3));
+            assert!(value.len() > 4096);
+            let summary = bounded_summary(&value);
+            assert!(summary.ends_with("\n[output truncated]"));
+            // The result must be valid UTF-8; String already guarantees this,
+            // and a panic here would fail the test.
+            assert!(summary.is_char_boundary(summary.len()));
+        }
+    }
 }

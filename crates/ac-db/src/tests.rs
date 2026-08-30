@@ -142,7 +142,7 @@ mod tests {
         {
             let mut db = ControlPlaneDb::open(&path).unwrap();
             db.migrate().unwrap();
-            db.save_session(&session_id, &mission_id, "executing")
+            db.save_session(&session_id, &mission_id, "executing", None)
                 .unwrap();
             db.save_checkpoint(&StableId::new("cp"), &session_id, 2, "executing")
                 .unwrap();
@@ -152,6 +152,84 @@ mod tests {
             let interrupted = db.interrupted_sessions().unwrap();
             assert_eq!(interrupted.len(), 1);
             assert_eq!(interrupted[0].id, session_id.to_string());
+        }
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn graph_persist_is_atomic_across_worker_tasks_and_attempts() {
+        let path = std::env::temp_dir().join(format!("agentcode-{}.sqlite", StableId::new("db")));
+        let mission_id = StableId::new("mission");
+        let worker = WorkerRecord {
+            id: StableId::new("worker").to_string(),
+            mission_id: mission_id.to_string(),
+            session_id: StableId::new("session").to_string(),
+            state: "running".to_string(),
+            workspace_ref: None,
+            updated_at_ms: millis(TimestampMillis::now()),
+        };
+        let tasks = vec![
+            TaskRecord {
+                id: StableId::new("task-a").to_string(),
+                mission_id: mission_id.to_string(),
+                title: "modify target".to_string(),
+                state: "completed".to_string(),
+                dependencies_json: String::new(),
+                assigned_worker_id: Some(worker.id.clone()),
+                retry_count: 0,
+                max_retries: 2,
+                updated_at_ms: millis(TimestampMillis::now()),
+                acceptance_criteria_json: "[]".to_string(),
+            },
+            TaskRecord {
+                id: StableId::new("task-b").to_string(),
+                mission_id: mission_id.to_string(),
+                title: "run verification".to_string(),
+                state: "ready".to_string(),
+                dependencies_json: format!("{}", StableId::new("task-a")),
+                assigned_worker_id: None,
+                retry_count: 0,
+                max_retries: 2,
+                updated_at_ms: millis(TimestampMillis::now()),
+                acceptance_criteria_json: "[]".to_string(),
+            },
+        ];
+        let attempts = vec![TaskAttemptRecord {
+            id: StableId::new("attempt").to_string(),
+            task_id: tasks[0].id.clone(),
+            worker_id: worker.id.clone(),
+            outcome: "succeeded".to_string(),
+            evidence_refs: StableId::new("ev").to_string(),
+            failure_class: None,
+            created_at_ms: millis(TimestampMillis::now()),
+        }];
+        {
+            let mut db = ControlPlaneDb::open(&path).unwrap();
+            db.migrate().unwrap();
+            db.persist_graph_atomic(&worker, &tasks, &attempts)
+                .unwrap();
+        }
+        // Reopening after a simulated process death must see the entire
+        // checkpoint: worker, both tasks, and the attempt together.
+        {
+            let db = ControlPlaneDb::open(&path).unwrap();
+            assert_eq!(
+                db.worker(&worker.id).unwrap().unwrap().state,
+                "running"
+            );
+            let persisted = db.tasks_for_mission(mission_id.as_str()).unwrap();
+            assert_eq!(persisted.len(), 2);
+            assert!(persisted
+                .iter()
+                .any(|task| task.title == "modify target" && task.state == "completed"));
+            assert!(persisted
+                .iter()
+                .any(|task| task.title == "run verification" && task.state == "ready"));
+            assert_eq!(db.task_attempts(&tasks[0].id).unwrap().len(), 1);
+            assert_eq!(
+                db.task_attempts(&tasks[0].id).unwrap()[0].id,
+                attempts[0].id
+            );
         }
         let _ = std::fs::remove_file(path);
     }
@@ -191,7 +269,7 @@ mod tests {
         {
             let mut db = ControlPlaneDb::open(&db_path).unwrap();
             db.migrate().unwrap();
-            db.save_session(&session_id, &mission_id, "executing")
+            db.save_session(&session_id, &mission_id, "executing", None)
                 .unwrap();
 
             let mut git = GitCoordinator::new();
@@ -289,7 +367,8 @@ mod tests {
         {
             let mut db = ControlPlaneDb::open(&path).unwrap();
             db.migrate().unwrap();
-            db.save_session(&session_id, &mission_id, "running").unwrap();
+            db.save_session(&session_id, &mission_id, "running", None)
+                .unwrap();
             let mut evidence = ac_evidence::EvidenceStore::new();
             evidence_id = evidence
                 .append_tool_output(

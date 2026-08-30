@@ -590,18 +590,6 @@ impl WorkspaceTools {
         )?;
         broker.register_tool(
             ToolDefinition {
-                id: "fs.create".to_string(),
-                version: "1".to_string(),
-                required_capabilities: vec![Capability::FilesystemWrite(
-                    self.root.display().to_string(),
-                )],
-            },
-            Box::new(CreateFileTool {
-                root: self.root.clone(),
-            }),
-        )?;
-        broker.register_tool(
-            ToolDefinition {
                 id: "fs.read".to_string(),
                 version: "1".to_string(),
                 required_capabilities: vec![Capability::FilesystemRead(
@@ -609,30 +597,6 @@ impl WorkspaceTools {
                 )],
             },
             Box::new(ReadFileTool {
-                root: self.root.clone(),
-            }),
-        )?;
-        broker.register_tool(
-            ToolDefinition {
-                id: "fs.delete".to_string(),
-                version: "1".to_string(),
-                required_capabilities: vec![Capability::FilesystemWrite(
-                    self.root.display().to_string(),
-                )],
-            },
-            Box::new(DeleteFileTool {
-                root: self.root.clone(),
-            }),
-        )?;
-        broker.register_tool(
-            ToolDefinition {
-                id: "fs.write".to_string(),
-                version: "1".to_string(),
-                required_capabilities: vec![Capability::FilesystemWrite(
-                    self.root.display().to_string(),
-                )],
-            },
-            Box::new(WriteFileTool {
                 root: self.root.clone(),
             }),
         )?;
@@ -753,71 +717,6 @@ impl ToolExecutor for ReadFileTool {
         let path = safe_join(&self.root, &request.payload)?;
         fs::read_to_string(path)
             .map_err(|err| AcError::validation("TOOL-FS_READ_FAILED", err.to_string()))
-    }
-}
-
-struct WriteFileTool {
-    root: PathBuf,
-}
-
-struct CreateFileTool {
-    root: PathBuf,
-}
-
-impl ToolExecutor for CreateFileTool {
-    fn execute(&self, request: &ToolRequest) -> AcResult<String> {
-        let path = safe_join(&self.root, &request.payload)?;
-        if path.exists() {
-            return Err(AcError::conflict(
-                "TOOL-FS_CREATE_EXISTS",
-                "refusing to overwrite an existing file",
-            ));
-        }
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)
-                .map_err(|error| AcError::validation("TOOL-FS_CREATE_FAILED", error.to_string()))?;
-        }
-        fs::File::create(&path)
-            .map_err(|error| AcError::validation("TOOL-FS_CREATE_FAILED", error.to_string()))?;
-        Ok(format!("created:{}", request.payload))
-    }
-}
-
-struct DeleteFileTool {
-    root: PathBuf,
-}
-
-impl ToolExecutor for DeleteFileTool {
-    fn execute(&self, request: &ToolRequest) -> AcResult<String> {
-        let path = safe_join(&self.root, &request.payload)?;
-        if path.is_dir() {
-            return Err(AcError::policy_denied(
-                "TOOL-FS_DELETE_DIRECTORY",
-                "directory deletion is not permitted",
-            ));
-        }
-        fs::remove_file(&path)
-            .map_err(|error| AcError::validation("TOOL-FS_DELETE_FAILED", error.to_string()))?;
-        Ok(format!("deleted:{}", request.payload))
-    }
-}
-
-impl ToolExecutor for WriteFileTool {
-    fn execute(&self, request: &ToolRequest) -> AcResult<String> {
-        let (relative_path, content) = request.payload.split_once('\n').ok_or_else(|| {
-            AcError::validation(
-                "TOOL-FS_WRITE_PAYLOAD",
-                "write payload must be '<relative-path>\\n<content>'",
-            )
-        })?;
-        let path = safe_join(&self.root, relative_path)?;
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)
-                .map_err(|err| AcError::validation("TOOL-FS_WRITE_FAILED", err.to_string()))?;
-        }
-        fs::write(&path, content)
-            .map_err(|err| AcError::validation("TOOL-FS_WRITE_FAILED", err.to_string()))?;
-        Ok(format!("wrote:{}:{}", relative_path, content.len()))
     }
 }
 
@@ -2022,6 +1921,11 @@ mod tests {
 
     struct EchoExecutor;
 
+    /// Returns >4096 bytes of non-ASCII output regardless of the request
+    /// payload, so the ToolBroker evidence path is exercised with content that
+    /// would panic any byte-slice truncation.
+    struct UnicodeEchoExecutor;
+
     fn run_git<const N: usize>(cwd: &Path, args: [&str; N]) {
         let output = Command::new("git")
             .args(args)
@@ -2038,6 +1942,12 @@ mod tests {
     impl ToolExecutor for EchoExecutor {
         fn execute(&self, request: &ToolRequest) -> AcResult<String> {
             Ok(request.payload.clone())
+        }
+    }
+
+    impl ToolExecutor for UnicodeEchoExecutor {
+        fn execute(&self, _request: &ToolRequest) -> AcResult<String> {
+            Ok(format!("{}漢字😀統合", "界".repeat(1400)))
         }
     }
 
@@ -2072,6 +1982,52 @@ mod tests {
     }
 
     #[test]
+    fn toolbroker_large_unicode_output_completes_without_panic_and_is_truncated() {
+        // Regression for BF-01: a ToolBroker/model-facing summary containing
+        // >4096 bytes of non-ASCII output must complete safely (no byte-slice
+        // panic) while raw evidence stays intact and the summary is truncated.
+        let mut broker = ToolBroker::new(
+            CapabilityPolicy::new()
+                .allow(Capability::ProcessExec("echo".to_string()))
+                .allow(Capability::SecretRead("echo".to_string())),
+        );
+        broker
+            .register_tool(
+                ToolDefinition {
+                    id: "echo".to_string(),
+                    version: "1".to_string(),
+                    required_capabilities: vec![Capability::ProcessExec("echo".to_string())],
+                },
+                Box::new(UnicodeEchoExecutor),
+            )
+            .unwrap();
+        let mut evidence = EvidenceStore::new();
+        let result = broker
+            .invoke(
+                ToolRequest {
+                    id: StableId::new("toolreq"),
+                    tool_id: "echo".to_string(),
+                    tool_version: "1".to_string(),
+                    payload: "ignored".to_string(),
+                    capabilities: Vec::new(),
+                },
+                &mut evidence,
+            )
+            .unwrap();
+        assert_eq!(result.status, ToolStatus::Succeeded);
+        let record = evidence.get(&result.evidence_ref).unwrap();
+        let raw = record.raw_content.as_ref().unwrap();
+        assert!(raw.len() > 4096, "fixture must exceed the truncation limit");
+        let summary = record.model_summary.as_ref().unwrap();
+        assert!(
+            summary.ends_with("\n[output truncated]"),
+            "summary must carry the truncation marker"
+        );
+        assert!(summary.len() < raw.len());
+        assert!(summary.is_char_boundary(summary.len()));
+    }
+
+    #[test]
     fn workspace_registers_browser_and_security_verification_tools() {
         let root = std::env::temp_dir().join(format!("agentcode-tool-reg-{}", StableId::new("t")));
         fs::create_dir_all(&root).unwrap();
@@ -2097,6 +2053,53 @@ mod tests {
         assert!(broker.definitions["security.verify"]
             .required_capabilities
             .contains(&Capability::SecurityScan));
+        // BF-05: the production broker must NOT expose raw write tools that
+        // mutate the workspace without ChangeSet authorization.
+        assert!(
+            !broker.definitions.contains_key("fs.write"),
+            "fs.write must not be registered on the production broker"
+        );
+        assert!(
+            !broker.definitions.contains_key("fs.create"),
+            "fs.create must not be registered on the production broker"
+        );
+        assert!(
+            !broker.definitions.contains_key("fs.delete"),
+            "fs.delete must not be registered on the production broker"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn raw_write_tool_is_not_invokable_through_production_broker() {
+        let root =
+            std::env::temp_dir().join(format!("agentcode-tool-nowrite-{}", StableId::new("t")));
+        fs::create_dir_all(&root).unwrap();
+        let mut broker = ToolBroker::new(
+            CapabilityPolicy::new()
+                .allow(Capability::FilesystemRead("*".to_string()))
+                .allow(Capability::FilesystemWrite("*".to_string())),
+        );
+        WorkspaceTools::new(root.clone())
+            .register_all(&mut broker)
+            .unwrap();
+        let mut evidence = EvidenceStore::new();
+        // A model cannot propose a raw write: the tool is not registered, so
+        // invocation must be rejected rather than silently writing the file.
+        let err = broker
+            .invoke(
+                ToolRequest {
+                    id: StableId::new("toolreq"),
+                    tool_id: "fs.write".to_string(),
+                    tool_version: "1".to_string(),
+                    payload: "target.txt\nunsanctioned\n".to_string(),
+                    capabilities: vec![Capability::FilesystemWrite("*".to_string())],
+                },
+                &mut evidence,
+            )
+            .unwrap_err();
+        assert_eq!(err.code(), "TOOL-UNKNOWN_TOOL");
+        assert!(!root.join("target.txt").exists());
         let _ = fs::remove_dir_all(root);
     }
 

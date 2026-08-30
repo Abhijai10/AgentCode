@@ -216,7 +216,13 @@ fn dispatch_request(request: &Value, daemon: &mut DaemonService) -> (Value, bool
     let response = match command {
         "Ping" | "Health" | "GetDaemonInfo" => json!({"id": correlation_id, "ok": true, "protocol_version": IPC_PROTOCOL_VERSION, "lifecycle": format!("{:?}", daemon.health().lifecycle), "recovered_sessions": daemon.health().recovered_sessions}),
         "SubmitMission" => match request.get("goal").and_then(Value::as_str) {
-            Some(goal) => match daemon.handle(DaemonCommand::CreateSession { goal: goal.to_string() }) {
+            Some(goal) => match daemon.handle(DaemonCommand::CreateSession {
+                goal: goal.to_string(),
+                workspace_root: request
+                    .get("workspace_root")
+                    .and_then(Value::as_str)
+                    .map(ToString::to_string),
+            }) {
                 Ok(DaemonResponse::SessionCreated { mission_id, session_id }) => json!({"id": correlation_id, "ok": true, "mission_id": mission_id.to_string(), "session_id": session_id.to_string()}),
                 Ok(_) => error_response(correlation_id, "DAEMON-IPC_PROTOCOL", "unexpected response".to_string()),
                 Err(error) => error_response(correlation_id, error.code(), error.to_string()),
@@ -236,7 +242,8 @@ fn dispatch_request(request: &Value, daemon: &mut DaemonService) -> (Value, bool
                         None => daemon.persisted_mission_state(mission_id).ok().flatten(),
                     };
                     let goal = daemon.mission_goal(mission_id).ok().flatten();
-                    json!({"id": correlation_id, "ok": true, "mission_id": mission_id, "session_id": status.as_ref().map(|status| status.session_id.to_string()), "state": state, "goal": goal, "tasks": tasks.into_iter().map(|(task_id, state)| json!({"task_id": task_id, "state": state})).collect::<Vec<_>>() })
+                    let workspace_root = daemon.mission_workspace(mission_id).ok().flatten();
+                    json!({"id": correlation_id, "ok": true, "mission_id": mission_id, "session_id": status.as_ref().map(|status| status.session_id.to_string()), "state": state, "goal": goal, "workspace_root": workspace_root, "tasks": tasks.into_iter().map(|(task_id, state)| json!({"task_id": task_id, "state": state})).collect::<Vec<_>>() })
                 },
                 Err(error) => error_response(correlation_id, error.code(), error.to_string()),
             },
@@ -305,6 +312,22 @@ fn dispatch_request(request: &Value, daemon: &mut DaemonService) -> (Value, bool
                 Err(error) => error_response(correlation_id, error.code(), error.to_string()),
             },
             None => error_response(correlation_id, "DAEMON-IPC_INVALID", "account_id is required".to_string()),
+        },
+        "SetProviderAccountEnabled" => {
+            let account_id = request.get("account_id").and_then(Value::as_str).unwrap_or("");
+            let enabled = request.get("enabled").and_then(Value::as_bool).unwrap_or(true);
+            match daemon.set_provider_account_enabled(account_id, enabled) {
+                Ok(()) => json!({"id": correlation_id, "ok": true, "account_id": account_id}),
+                Err(error) => error_response(correlation_id, error.code(), error.to_string()),
+            }
+        },
+        "RotateProviderAccount" => {
+            let account_id = request.get("account_id").and_then(Value::as_str).unwrap_or("");
+            let credential_ref = request.get("credential_ref").and_then(Value::as_str).unwrap_or("");
+            match daemon.rotate_provider_account(account_id, credential_ref) {
+                Ok(()) => json!({"id": correlation_id, "ok": true, "account_id": account_id}),
+                Err(error) => error_response(correlation_id, error.code(), error.to_string()),
+            }
         },
         "TestProviderAccount" => match request.get("account_id").and_then(Value::as_str) {
             Some(account_id) => match daemon.test_provider_account(account_id) {

@@ -4,16 +4,18 @@ impl ControlPlaneDb {
         session_id: &StableId,
         mission_id: &StableId,
         state: &str,
+        workspace_root: Option<&str>,
     ) -> AcResult<()> {
         self.connection
             .execute(
-                "INSERT INTO agent_sessions (id, mission_id, state, updated_at_ms)
-                 VALUES (?1, ?2, ?3, ?4)
-                 ON CONFLICT(id) DO UPDATE SET state = excluded.state, updated_at_ms = excluded.updated_at_ms",
+                "INSERT INTO agent_sessions (id, mission_id, state, workspace_root, updated_at_ms)
+                 VALUES (?1, ?2, ?3, ?4, ?5)
+                 ON CONFLICT(id) DO UPDATE SET state = excluded.state, workspace_root = excluded.workspace_root, updated_at_ms = excluded.updated_at_ms",
                 params![
                     session_id.as_str(),
                     mission_id.as_str(),
                     state,
+                    workspace_root,
                     millis(TimestampMillis::now())
                 ],
             )
@@ -67,7 +69,7 @@ impl ControlPlaneDb {
         let mut stmt = self
             .connection
             .prepare(
-                "SELECT id, mission_id, state, updated_at_ms
+                "SELECT id, mission_id, state, workspace_root, updated_at_ms
                  FROM agent_sessions
                  WHERE state NOT IN ('completed', 'cancelled', 'failed')",
             )
@@ -78,7 +80,8 @@ impl ControlPlaneDb {
                     id: row.get(0)?,
                     mission_id: row.get(1)?,
                     state: row.get(2)?,
-                    updated_at_ms: row.get(3)?,
+                    workspace_root: row.get(3)?,
+                    updated_at_ms: row.get(4)?,
                 })
             })
             .map_err(db_error)?;
@@ -87,9 +90,9 @@ impl ControlPlaneDb {
 
     pub fn active_sessions(&self) -> AcResult<Vec<PersistedSession>> {
         let mut stmt = self.connection.prepare(
-            "SELECT id, mission_id, state, updated_at_ms FROM agent_sessions WHERE state NOT IN ('completed', 'cancelled', 'failed') ORDER BY updated_at_ms DESC",
+            "SELECT id, mission_id, state, workspace_root, updated_at_ms FROM agent_sessions WHERE state NOT IN ('completed', 'cancelled', 'failed') ORDER BY updated_at_ms DESC",
         ).map_err(db_error)?;
-        let rows = stmt.query_map([], |row| Ok(PersistedSession { id: row.get(0)?, mission_id: row.get(1)?, state: row.get(2)?, updated_at_ms: row.get(3)? })).map_err(db_error)?;
+        let rows = stmt.query_map([], |row| Ok(PersistedSession { id: row.get(0)?, mission_id: row.get(1)?, state: row.get(2)?, workspace_root: row.get(3)?, updated_at_ms: row.get(4)? })).map_err(db_error)?;
         rows.collect::<Result<Vec<_>, _>>().map_err(db_error)
     }
 
@@ -97,7 +100,7 @@ impl ControlPlaneDb {
         let mut stmt = self
             .connection
             .prepare(
-                "SELECT id, mission_id, state, updated_at_ms FROM agent_sessions WHERE id = ?1",
+                "SELECT id, mission_id, state, workspace_root, updated_at_ms FROM agent_sessions WHERE id = ?1",
             )
             .map_err(db_error)?;
         let mut rows = stmt.query(params![session_id.as_str()]).map_err(db_error)?;
@@ -106,7 +109,8 @@ impl ControlPlaneDb {
                 id: row.get(0).map_err(db_error)?,
                 mission_id: row.get(1).map_err(db_error)?,
                 state: row.get(2).map_err(db_error)?,
-                updated_at_ms: row.get(3).map_err(db_error)?,
+                workspace_root: row.get(3).map_err(db_error)?,
+                updated_at_ms: row.get(4).map_err(db_error)?,
             }));
         }
         Ok(None)
@@ -116,7 +120,7 @@ impl ControlPlaneDb {
         let mut stmt = self
             .connection
             .prepare(
-                "SELECT id, mission_id, state, updated_at_ms
+                "SELECT id, mission_id, state, workspace_root, updated_at_ms
                  FROM agent_sessions
                  WHERE mission_id = ?1
                  ORDER BY updated_at_ms DESC
@@ -129,7 +133,8 @@ impl ControlPlaneDb {
                 id: row.get(0).map_err(db_error)?,
                 mission_id: row.get(1).map_err(db_error)?,
                 state: row.get(2).map_err(db_error)?,
-                updated_at_ms: row.get(3).map_err(db_error)?,
+                workspace_root: row.get(3).map_err(db_error)?,
+                updated_at_ms: row.get(4).map_err(db_error)?,
             }));
         }
         Ok(None)
@@ -163,13 +168,7 @@ impl ControlPlaneDb {
     }
 
     pub fn save_worker(&self, record: &WorkerRecord) -> AcResult<()> {
-        self.connection.execute(
-            "INSERT INTO workers (id, mission_id, session_id, state, workspace_ref, updated_at_ms)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
-             ON CONFLICT(id) DO UPDATE SET state = excluded.state, workspace_ref = excluded.workspace_ref, updated_at_ms = excluded.updated_at_ms",
-            params![record.id, record.mission_id, record.session_id, record.state, record.workspace_ref, record.updated_at_ms],
-        ).map_err(db_error)?;
-        Ok(())
+        save_worker_sql(&self.connection, record)
     }
 
     pub fn worker(&self, id: &str) -> AcResult<Option<WorkerRecord>> {
@@ -180,12 +179,28 @@ impl ControlPlaneDb {
     }
 
     pub fn save_task(&self, record: &TaskRecord) -> AcResult<()> {
-        self.connection.execute(
-                "INSERT INTO tasks (id, mission_id, title, state, dependencies_json, assigned_worker_id, retry_count, max_retries, updated_at_ms, acceptance_criteria_json)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
-                 ON CONFLICT(id) DO UPDATE SET state = excluded.state, assigned_worker_id = excluded.assigned_worker_id, retry_count = excluded.retry_count, updated_at_ms = excluded.updated_at_ms, acceptance_criteria_json = excluded.acceptance_criteria_json",
-            params![record.id, record.mission_id, record.title, record.state, record.dependencies_json, record.assigned_worker_id, record.retry_count, record.max_retries, record.updated_at_ms, record.acceptance_criteria_json],
-        ).map_err(db_error)?;
+        save_task_sql(&self.connection, record)
+    }
+
+    /// Persist the worker, all tasks, and all task attempts in a single
+    /// SQLite transaction.  A crash cannot leave a partially-written graph:
+    /// either the whole checkpoint lands or none of it does.  This is the
+    /// atomicity boundary for crash recovery (BF-03 requirement 11).
+    pub fn persist_graph_atomic(
+        &self,
+        worker: &WorkerRecord,
+        tasks: &[TaskRecord],
+        attempts: &[TaskAttemptRecord],
+    ) -> AcResult<()> {
+        let tx = self.connection.unchecked_transaction().map_err(db_error)?;
+        save_worker_sql(&tx, worker)?;
+        for task in tasks {
+            save_task_sql(&tx, task)?;
+        }
+        for attempt in attempts {
+            save_task_attempt_sql(&tx, attempt)?;
+        }
+        tx.commit().map_err(db_error)?;
         Ok(())
     }
 
@@ -211,16 +226,7 @@ impl ControlPlaneDb {
     }
 
     pub fn save_task_attempt(&self, record: &TaskAttemptRecord) -> AcResult<()> {
-        self.connection.execute(
-            "INSERT INTO task_attempts (id, task_id, worker_id, outcome, evidence_refs, failure_class, created_at_ms)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
-             ON CONFLICT(id) DO UPDATE SET
-                outcome=excluded.outcome,
-                evidence_refs=excluded.evidence_refs,
-                failure_class=excluded.failure_class",
-            params![record.id, record.task_id, record.worker_id, record.outcome, record.evidence_refs, record.failure_class, record.created_at_ms],
-        ).map_err(db_error)?;
-        Ok(())
+        save_task_attempt_sql(&self.connection, record)
     }
 
     pub fn task_attempts(&self, task_id: &str) -> AcResult<Vec<TaskAttemptRecord>> {
@@ -491,4 +497,66 @@ impl ControlPlaneDb {
             .map_err(db_error)?;
         rows.collect::<Result<Vec<_>, _>>().map_err(db_error)
     }
+}
+
+fn save_worker_sql(conn: &rusqlite::Connection, record: &WorkerRecord) -> AcResult<()> {
+    conn.execute(
+        "INSERT INTO workers (id, mission_id, session_id, state, workspace_ref, updated_at_ms)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+         ON CONFLICT(id) DO UPDATE SET state = excluded.state, workspace_ref = excluded.workspace_ref, updated_at_ms = excluded.updated_at_ms",
+        params![
+            record.id,
+            record.mission_id,
+            record.session_id,
+            record.state,
+            record.workspace_ref,
+            record.updated_at_ms
+        ],
+    )
+    .map_err(db_error)?;
+    Ok(())
+}
+
+fn save_task_sql(conn: &rusqlite::Connection, record: &TaskRecord) -> AcResult<()> {
+    conn.execute(
+        "INSERT INTO tasks (id, mission_id, title, state, dependencies_json, assigned_worker_id, retry_count, max_retries, updated_at_ms, acceptance_criteria_json)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+         ON CONFLICT(id) DO UPDATE SET state = excluded.state, assigned_worker_id = excluded.assigned_worker_id, retry_count = excluded.retry_count, updated_at_ms = excluded.updated_at_ms, acceptance_criteria_json = excluded.acceptance_criteria_json",
+        params![
+            record.id,
+            record.mission_id,
+            record.title,
+            record.state,
+            record.dependencies_json,
+            record.assigned_worker_id,
+            record.retry_count,
+            record.max_retries,
+            record.updated_at_ms,
+            record.acceptance_criteria_json
+        ],
+    )
+    .map_err(db_error)?;
+    Ok(())
+}
+
+fn save_task_attempt_sql(conn: &rusqlite::Connection, record: &TaskAttemptRecord) -> AcResult<()> {
+    conn.execute(
+        "INSERT INTO task_attempts (id, task_id, worker_id, outcome, evidence_refs, failure_class, created_at_ms)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+         ON CONFLICT(id) DO UPDATE SET
+            outcome=excluded.outcome,
+            evidence_refs=excluded.evidence_refs,
+            failure_class=excluded.failure_class",
+        params![
+            record.id,
+            record.task_id,
+            record.worker_id,
+            record.outcome,
+            record.evidence_refs,
+            record.failure_class,
+            record.created_at_ms
+        ],
+    )
+    .map_err(db_error)?;
+    Ok(())
 }
