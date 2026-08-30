@@ -84,6 +84,7 @@ dependencies = [
  "ac-provider",
  "ac-runtime",
  "ac-security",
+ "ac-verification",
  "serde",
  "serde_json",
  "tokio",

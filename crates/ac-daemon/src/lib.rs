@@ -20,6 +20,7 @@ use ac_runtime::{
     AgentSession, AgentSessionState, CancellationToken, HydratedSession, RuntimeHydrator,
     TaskGraph, Worker,
 };
+use serde_json::{json, Value};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MissionExecutionStatus {
@@ -645,6 +646,7 @@ fn backend_tool_policy() -> ac_security::CapabilityPolicy {
 }
 
 include!("release.rs");
+include!("observability.rs");
 include!("ipc.rs");
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

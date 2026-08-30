@@ -30,4 +30,5 @@ include!("chaos_dogfood.rs");
 include!("security_release.rs");
 include!("git.rs");
 include!("provider.rs");
+include!("observability.rs");
 include!("tests.rs");

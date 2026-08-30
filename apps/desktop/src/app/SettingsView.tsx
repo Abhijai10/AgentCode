@@ -527,28 +527,19 @@ export function SettingsView() {
             <div className="neo-raised p-8 rounded-2xl">
               <h3 className="font-semibold text-lg text-on-surface mb-4">Autonomy Defaults</h3>
               <div className="space-y-6">
-                <div>
-                  <label className="block text-sm text-on-surface-variant mb-2">Default Model Routing</label>
-                  <select
-                    value={settings?.routing_profile ?? "free_first"}
-                    onChange={(e) => updateSettings({ routing_profile: e.target.value as SettingsState["routing_profile"] })}
-                    className="neo-input w-full py-3 px-4 rounded-xl text-sm text-on-surface"
-                  >
-                    <option value="free_first">Free First</option>
-                    <option value="local_first">Local First</option>
-                    <option value="quality_first">Quality First</option>
-                    <option value="paid_allowed">Paid Allowed</option>
-                    <option value="offline">Offline</option>
-                  </select>
+                <div className="neo-pressed rounded-xl p-4">
+                  <p className="text-sm font-medium text-on-surface mb-1">Default Model Routing</p>
+                  <p className="text-sm text-on-surface-variant">
+                    Not available in this build — the daemon IPC does not expose a routing-profile override.
+                    Routing is determined by the daemon's own provider configuration.
+                  </p>
                 </div>
-                <div>
-                  <label className="block text-sm text-on-surface-variant mb-2">Preferred Model (optional)</label>
-                  <input
-                    className="neo-input w-full py-3 px-4 rounded-xl text-sm text-on-surface"
-                    placeholder="e.g., gpt-4-turbo"
-                    value={settings?.preferred_model ?? ""}
-                    onChange={(e) => updateSettings({ preferred_model: e.target.value || undefined })}
-                  />
+                <div className="neo-pressed rounded-xl p-4">
+                  <p className="text-sm font-medium text-on-surface mb-1">Preferred Model</p>
+                  <p className="text-sm text-on-surface-variant">
+                    Not available in this build — the daemon IPC does not expose a preferred-model override.
+                    The daemon selects its model from its provider configuration (e.g. the Ollama default).
+                  </p>
                 </div>
                 <div>
                   <label className="block text-sm text-on-surface-variant mb-2">Budget Limit (micros, optional)</label>

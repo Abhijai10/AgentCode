@@ -4,12 +4,9 @@ import { daemon } from "./daemon";
 import type { DiscussMessage, DiscussSession } from "./types";
 
 export function DiscussView({ project, branch }: { project: string; branch: string }) {
-  const [input, setInput] = useState("");
-  const [busy, setBusy] = useState(false);
   const [sessions, setSessions] = useState<DiscussSession[]>([]);
   const [activeSession, setActiveSession] = useState<string | null>(null);
   const [messages, setMessages] = useState<DiscussMessage[]>([]);
-  const [error, setError] = useState<string | null>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
@@ -48,28 +45,6 @@ export function DiscussView({ project, branch }: { project: string; branch: stri
     };
   }, [activeSession]);
 
-  const send = async () => {
-    const content = input.trim();
-    if (!content || busy) return;
-    setInput("");
-    setBusy(true);
-    setError(null);
-    if (!activeSession) {
-      setError("No discussion session is open yet. Start one from the session list.");
-      setBusy(false);
-      return;
-    }
-    const result = await daemon.discussSendMessage(activeSession, content);
-    if (result) {
-      const m = await daemon.discussGetMessages(activeSession);
-      setMessages(m);
-    } else {
-      setError("The daemon could not record the message. The discuss session is not available on this backend yet.");
-      setInput(content);
-    }
-    setBusy(false);
-  };
-
   return (
     <main className="flex-1 flex flex-col relative px-6 md:px-8 py-6 max-w-5xl mx-auto w-full overflow-hidden">
       <div className="flex-1 neo-raised p-6 flex flex-col mb-6 overflow-hidden min-h-0">
@@ -83,10 +58,15 @@ export function DiscussView({ project, branch }: { project: string; branch: stri
           </div>
         </div>
 
+        <div className="neo-pressed rounded-xl p-4 mb-4 text-sm text-on-surface-variant flex items-center gap-2">
+          <Icon name="info" size={16} className="text-primary" />
+          Not available in this build — the daemon IPC does not expose a Discuss session contract.
+        </div>
+
         <div ref={scrollRef} className="flex-1 overflow-y-auto pr-4 flex flex-col gap-4">
           {sessions.length === 0 && (
             <div className="text-center text-on-surface-variant text-sm py-10">
-              No discussion sessions yet. The daemon owns discussion state; sessions appear here once the backend records them.
+              No discussion sessions recorded. Discuss mode is not wired to the backend in this build.
             </div>
           )}
           {sessions.length > 0 && messages.length === 0 && (
@@ -117,40 +97,21 @@ export function DiscussView({ project, branch }: { project: string; branch: stri
               </div>
             </div>
           ))}
-          {busy && (
-            <div className="flex items-center gap-2 text-sm text-on-surface-variant py-4">
-              <Icon name="autorenew" size={16} className="animate-spin" />
-              Submitting to daemon...
-            </div>
-          )}
-          {error && (
-            <div className="flex items-center gap-2 text-sm text-red-600 dark:text-red-400 py-2">
-              <Icon name="error" size={16} fill />
-              {error}
-            </div>
-          )}
         </div>
 
         <div className="mt-4 relative">
           <div className="relative flex items-center">
             <input
-              className="neo-input w-full py-4 pl-14 pr-16 text-sm"
-              placeholder="Ask a question or request a change..."
-              value={input}
-              onChange={(e) => setInput(e.target.value)}
-              onKeyDown={(e) => {
-                if (e.key === "Enter" && !e.shiftKey) {
-                  e.preventDefault();
-                  send();
-                }
-              }}
+              className="neo-input w-full py-4 pl-14 pr-16 text-sm disabled:opacity-60"
+              placeholder="Discuss mode is not available in this build"
+              disabled
             />
-            <button onClick={send} className="absolute right-3 w-10 h-10 rounded-full neo-button flex items-center justify-center text-primary">
+            <button disabled className="absolute right-3 w-10 h-10 rounded-full neo-button flex items-center justify-center text-on-surface-variant opacity-50">
               <Icon name="send" size={20} fill />
             </button>
           </div>
           <div className="flex justify-between mt-2 px-2">
-            <span className="text-xs text-on-surface-variant">Press Enter to submit</span>
+            <span className="text-xs text-on-surface-variant">Not available in this build — submit a coding mission from Home instead.</span>
           </div>
         </div>
       </div>

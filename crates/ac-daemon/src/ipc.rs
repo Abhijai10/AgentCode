@@ -3,7 +3,6 @@ use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::sync::atomic::AtomicUsize;
 use std::time::Duration;
-use serde_json::{json, Value};
 
 const MAX_FRAME_BYTES: usize = 1024 * 1024;
 const MAX_CLIENTS: usize = 8;
@@ -249,6 +248,38 @@ fn dispatch_request(request: &Value, daemon: &mut DaemonService) -> (Value, bool
             },
             None => error_response(correlation_id, "DAEMON-IPC_INVALID", "mission_id is required".to_string()),
         },
+        "GetMissionDetails" | "GetTaskDetails" | "GetMissionEvents" | "GetChangeSetSummary"
+        | "GetEvidenceSummary" | "GetVerificationSummary" => {
+            match request.get("mission_id").and_then(Value::as_str) {
+                Some(mission_id) => {
+                    let result = match command {
+                        "GetMissionDetails" => daemon.mission_details(mission_id),
+                        "GetTaskDetails" => daemon.task_details(mission_id),
+                        "GetMissionEvents" => daemon.mission_events(
+                            mission_id,
+                            request.get("limit").and_then(Value::as_u64).map(|n| n as usize),
+                        ),
+                        "GetChangeSetSummary" => daemon.changeset_summary(mission_id),
+                        "GetEvidenceSummary" => daemon.evidence_summary(mission_id),
+                        _ => daemon.verification_summary(mission_id),
+                    };
+                    match result {
+                        Ok(mut payload) => {
+                            payload["id"] = json!(correlation_id);
+                            payload["ok"] = json!(true);
+                            payload["mission_id"] = json!(mission_id);
+                            payload
+                        }
+                        Err(error) => error_response(correlation_id, error.code(), error.to_string()),
+                    }
+                }
+                None => error_response(
+                    correlation_id,
+                    "DAEMON-IPC_INVALID",
+                    "mission_id is required".to_string(),
+                ),
+            }
+        }
         "PauseMission" | "ResumeMission" | "CancelMission" => match request.get("mission_id").and_then(Value::as_str) {
             Some(mission_id) => {
                 let result = match command { "PauseMission" => daemon.pause_mission(mission_id), "ResumeMission" => daemon.resume_mission(mission_id), _ => daemon.cancel_mission(mission_id) };
@@ -691,5 +722,618 @@ mod ipc_tests {
             thread.is_finished(),
             "IPC request did not complete within the pump budget"
         );
+    }
+
+    /// Seed a deterministic mission with real persisted rows so the
+    /// observability IPC commands can be exercised against authoritative
+    /// SQLite data through the real daemon + Unix socket boundary.
+    struct SeededMission {
+        mission_id: String,
+        evidence_ids: Vec<String>,
+    }
+
+    fn seed_observability_mission(db: &ControlPlaneDb, completed: bool) -> SeededMission {
+        use ac_changeset::{
+            EditEngine, EditPrecondition, EditRequest, EditStrategy, MemoryFileRepository,
+        };
+        use ac_evidence::{EvidenceKind, EvidenceStore, Provenance};
+        use ac_kernel::{AllowAllPolicy, Kernel, MissionState};
+        use ac_verification::{
+            FinalAuditInput, GateStatus, ProjectCapabilities, VerificationEngine,
+            VerificationRisk,
+        };
+
+        let mut kernel = Kernel::new(AllowAllPolicy);
+        kernel.start().unwrap();
+        let mission_id = kernel
+            .create_mission("observability test mission")
+            .unwrap();
+        kernel
+            .transition_mission(&mission_id, MissionState::Active, Vec::new())
+            .unwrap();
+        if completed {
+            kernel
+                .transition_mission(&mission_id, MissionState::Completed, Vec::new())
+                .unwrap();
+        }
+        db.put_mission(kernel.mission(&mission_id).unwrap()).unwrap();
+        for event in kernel.events() {
+            db.append_kernel_event(event).unwrap();
+        }
+
+        let session_id = StableId::new("session");
+        db.save_session(
+            &session_id,
+            &mission_id,
+            if completed { "completed" } else { "running" },
+            Some("/tmp/observability-workspace"),
+        )
+        .unwrap();
+
+        let worker = ac_db::WorkerRecord {
+            id: StableId::new("worker").to_string(),
+            mission_id: mission_id.to_string(),
+            session_id: session_id.to_string(),
+            state: "running".to_string(),
+            workspace_ref: Some("/tmp/observability-workspace".to_string()),
+            updated_at_ms: 1_700_000_000_000,
+        };
+        let task_a = ac_db::TaskRecord {
+            id: StableId::new("task-a").to_string(),
+            mission_id: mission_id.to_string(),
+            title: "Implement the feature".to_string(),
+            state: if completed { "completed" } else { "running" }.to_string(),
+            dependencies_json: String::new(),
+            assigned_worker_id: Some(worker.id.clone()),
+            retry_count: 1,
+            max_retries: 3,
+            updated_at_ms: 1_700_000_001_000,
+            acceptance_criteria_json: r#"[{"id":"ac-1","description":"works","required":true}]"#
+                .to_string(),
+        };
+        let task_b = ac_db::TaskRecord {
+            id: StableId::new("task-b").to_string(),
+            mission_id: mission_id.to_string(),
+            title: "Verify the feature".to_string(),
+            state: if completed { "completed" } else { "ready" }.to_string(),
+            dependencies_json: task_a.id.clone(),
+            assigned_worker_id: Some(worker.id.clone()),
+            retry_count: 0,
+            max_retries: 3,
+            updated_at_ms: 1_700_000_002_000,
+            acceptance_criteria_json: "[]".to_string(),
+        };
+
+        let mut evidence_store = EvidenceStore::new();
+        let ev_a = evidence_store
+            .append(
+                EvidenceKind::CommandOutput,
+                Provenance {
+                    source: "agent.observation".to_string(),
+                    commit: Some("abc".to_string()),
+                    worktree: Some("/tmp/observability-workspace".to_string()),
+                    tool: Some("fs.read".to_string()),
+                },
+                "mem://observability/a",
+                "fnv1a64:abc123",
+            )
+            .unwrap();
+        let ev_b = evidence_store
+            .append(
+                EvidenceKind::TestReport,
+                Provenance {
+                    source: "dev.test".to_string(),
+                    commit: Some("abc".to_string()),
+                    worktree: Some("/tmp/observability-workspace".to_string()),
+                    tool: Some("cargo".to_string()),
+                },
+                "mem://observability/b",
+                "fnv1a64:def456",
+            )
+            .unwrap();
+        // A sensitive record with a redacted summary — its raw content must
+        // never appear in IPC responses.
+        let ev_sensitive = evidence_store
+            .append_tool_output(
+                Provenance {
+                    source: "tool.execution".to_string(),
+                    commit: Some("abc".to_string()),
+                    worktree: Some("/tmp/observability-workspace".to_string()),
+                    tool: Some("run".to_string()),
+                },
+                "mem://observability/sensitive",
+                "token=sk-observability-secret\noutput line",
+                &["sk-observability-secret".to_string()],
+            )
+            .unwrap();
+        let evidence_ids = vec![
+            ev_a.to_string(),
+            ev_b.to_string(),
+            ev_sensitive.to_string(),
+        ];
+
+        let attempts = vec![ac_db::TaskAttemptRecord {
+            id: StableId::new("attempt-1").to_string(),
+            task_id: task_a.id.clone(),
+            worker_id: worker.id.clone(),
+            outcome: "succeeded".to_string(),
+            evidence_refs: format!("{ev_a},{ev_b},{ev_sensitive}"),
+            failure_class: None,
+            created_at_ms: 1_700_000_003_000,
+        }];
+        db.persist_graph_atomic(&worker, &[task_a.clone(), task_b.clone()], &attempts)
+            .unwrap();
+        for record in evidence_store.records() {
+            db.append_evidence(record).unwrap();
+        }
+
+        // ChangeSet through the authoritative edit-engine path.
+        let mut repo = MemoryFileRepository::new("rev-obs");
+        repo.put("src/lib.rs", "pub fn answer() -> u32 { 41 }\n");
+        let request = EditRequest {
+            path: "src/lib.rs".to_string(),
+            precondition: EditPrecondition {
+                path: "src/lib.rs".to_string(),
+                expected_hash: Some(repo.hash("src/lib.rs").unwrap()),
+                base_revision: "rev-obs".to_string(),
+                symbol_fingerprint: None,
+            },
+            strategy: EditStrategy::SearchReplace {
+                search: "41".to_string(),
+                replace: "42".to_string(),
+                expected_matches: 1,
+            },
+        };
+        let mut transaction = EditEngine.prepare(&repo, vec![request]).unwrap();
+        EditEngine.apply(&mut repo, &mut transaction).unwrap();
+        // Persist both the changeset row (changesets table) and its edit
+        // transaction (edit_transactions/edit_operations), mirroring the real
+        // durability path so the observability join can find it.
+        db.save_changeset(&transaction.changeset).unwrap();
+        db.save_changeset_transaction(
+            &transaction,
+            Some(task_a.id.as_str()),
+            None,
+            "rev-obs",
+            "rust",
+        )
+        .unwrap();
+
+        // Verification run + final audit.
+        let engine = VerificationEngine::new(ac_security::CapabilityPolicy::new());
+        let profile = engine.derive_profile(
+            StableId::new("task"),
+            VerificationRisk::High,
+            &ProjectCapabilities {
+                cargo: true,
+                makefile: false,
+                package_json: false,
+                python: false,
+                go: false,
+                browser: false,
+                security: false,
+            },
+        );
+        let mut manifest_evidence = EvidenceStore::new();
+        let requirement_id = StableId::new("req");
+        let manifest = engine
+            .record_evidence_manifest(
+                "commit-obs",
+                "/tmp/observability-workspace",
+                "cargo test --workspace",
+                GateStatus::Passed,
+                vec![requirement_id.clone()],
+                vec!["src/lib.rs".to_string()],
+                &mut manifest_evidence,
+            )
+            .unwrap();
+        db.save_verification_manifest(
+            &manifest,
+            Some(profile.id.as_str()),
+            Some(task_b.id.as_str()),
+        )
+        .unwrap();
+        if completed {
+            let audit = engine
+                .final_audit(
+                    FinalAuditInput {
+                        original_goal: "observability test mission".to_string(),
+                        requirements: vec!["feature works".to_string()],
+                        required_requirement_ids: vec![requirement_id.clone()],
+                        verified_requirement_ids: vec![requirement_id.clone()],
+                        evidence_refs: vec![manifest.evidence_ref.clone()],
+                        worker_completion_text: "done".to_string(),
+                        unresolved_limitations: Vec::new(),
+                    },
+                    &mut manifest_evidence,
+                )
+                .unwrap();
+            db.save_final_audit(
+                mission_id.as_str(),
+                "observability test mission",
+                &["feature works".to_string()],
+                &audit,
+                true,
+            )
+            .unwrap();
+        }
+
+        SeededMission {
+            mission_id: mission_id.to_string(),
+            evidence_ids,
+        }
+    }
+
+    fn request_via_ipc(
+        server: &UnixIpcServer,
+        listener: &UnixListener,
+        daemon: &mut DaemonService,
+        payload: Value,
+    ) -> Value {
+        let client = std::thread::spawn({
+            let socket = server.path().to_path_buf();
+            move || UnixIpcClient::new(socket).request(payload).unwrap()
+        });
+        pump_until(server, listener, daemon, &client);
+        client.join().unwrap()
+    }
+
+    #[test]
+    fn observability_mission_details_surfaces_full_snapshot() {
+        let (dir, db_path, lock, socket) = temp_paths("obs-details");
+        let seeded_mission_id;
+        {
+            let mut db = ControlPlaneDb::open(&db_path).unwrap();
+            db.migrate().unwrap();
+            let seeded = seed_observability_mission(&db, false);
+            seeded_mission_id = seeded.mission_id;
+        }
+        // Daemon open without start() to avoid coordinator re-execution
+        // of the non-terminal mission.
+        let mut daemon = DaemonService::open(&db_path, &lock).unwrap();
+        let Some((server, listener)) = bind_or_skip(&socket, None) else {
+            daemon.shutdown().unwrap();
+            let _ = fs::remove_dir_all(dir);
+            return;
+        };
+        let response = request_via_ipc(
+            &server,
+            &listener,
+            &mut daemon,
+            json!({"id":"obs","command":"GetMissionDetails","mission_id": seeded_mission_id}),
+        );
+        assert_eq!(response["ok"], true, "details response: {response}");
+        assert_eq!(response["mission_id"], seeded_mission_id);
+        assert_eq!(response["state"], "running");
+        assert_eq!(response["goal"], "observability test mission");
+        assert_eq!(response["workspace_root"], "/tmp/observability-workspace");
+        assert_eq!(response["task_count"], 2);
+        assert_eq!(response["completed_task_count"], 0);
+        let current_task = response["current_task"].as_str().unwrap();
+        assert!(
+            current_task.starts_with("task-a-"),
+            "current_task should be the running task, got {current_task}"
+        );
+        assert!(response["created_at_ms"].is_u64() || response["created_at_ms"].is_i64());
+        assert!(response["updated_at_ms"].is_u64() || response["updated_at_ms"].is_i64());
+        assert_eq!(response["terminal"], false);
+        assert!(response["progress"].is_number());
+        assert!(response["state_counts"].is_object());
+        server.cleanup();
+        daemon.shutdown().unwrap();
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn observability_task_details_include_attempts_and_dependencies() {
+        let (dir, db_path, lock, socket) = temp_paths("obs-tasks");
+        let seeded_mission_id;
+        {
+            let mut db = ControlPlaneDb::open(&db_path).unwrap();
+            db.migrate().unwrap();
+            let seeded = seed_observability_mission(&db, false);
+            seeded_mission_id = seeded.mission_id;
+        }
+        let mut daemon = DaemonService::open(&db_path, &lock).unwrap();
+        let Some((server, listener)) = bind_or_skip(&socket, None) else {
+            daemon.shutdown().unwrap();
+            let _ = fs::remove_dir_all(dir);
+            return;
+        };
+        let response = request_via_ipc(
+            &server,
+            &listener,
+            &mut daemon,
+            json!({"id":"obs","command":"GetTaskDetails","mission_id": seeded_mission_id}),
+        );
+        assert_eq!(response["ok"], true, "tasks response: {response}");
+        let tasks = response["tasks"].as_array().unwrap();
+        assert_eq!(tasks.len(), 2);
+        let task_a = tasks
+            .iter()
+            .find(|task| task["title"] == "Implement the feature")
+            .unwrap();
+        assert_eq!(task_a["state"], "running");
+        assert_eq!(task_a["retry_count"], 1);
+        assert_eq!(task_a["max_retries"], 3);
+        assert_eq!(task_a["attempts"].as_array().unwrap().len(), 1);
+        assert_eq!(task_a["attempts"][0]["outcome"], "succeeded");
+        let task_b = tasks
+            .iter()
+            .find(|task| task["title"] == "Verify the feature")
+            .unwrap();
+        assert_eq!(task_b["dependencies"].as_array().unwrap().len(), 1);
+        server.cleanup();
+        daemon.shutdown().unwrap();
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn observability_activity_events_are_bounded_and_real() {
+        let (dir, db_path, lock, socket) = temp_paths("obs-events");
+        let seeded_mission_id;
+        {
+            let mut db = ControlPlaneDb::open(&db_path).unwrap();
+            db.migrate().unwrap();
+            let seeded = seed_observability_mission(&db, true);
+            seeded_mission_id = seeded.mission_id;
+        }
+        let mut daemon = DaemonService::open(&db_path, &lock).unwrap();
+        let Some((server, listener)) = bind_or_skip(&socket, None) else {
+            daemon.shutdown().unwrap();
+            let _ = fs::remove_dir_all(dir);
+            return;
+        };
+        let response = request_via_ipc(
+            &server,
+            &listener,
+            &mut daemon,
+            json!({"id":"obs","command":"GetMissionEvents","mission_id": seeded_mission_id, "limit": 3}),
+        );
+        assert_eq!(response["ok"], true, "events response: {response}");
+        let events = response["events"].as_array().unwrap();
+        assert!(events.len() <= 3, "events must be bounded, got {events:?}");
+        assert!(!events.is_empty(), "seeded mission must produce events");
+        for event in events {
+            assert!(event["kind"].as_str().is_some(), "event: {event}");
+            assert!(event["created_at_ms"].is_u64() || event["created_at_ms"].is_i64());
+        }
+        server.cleanup();
+        daemon.shutdown().unwrap();
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn observability_changeset_summary_lists_files_read_only() {
+        let (dir, db_path, lock, socket) = temp_paths("obs-changeset");
+        let seeded_mission_id;
+        {
+            let mut db = ControlPlaneDb::open(&db_path).unwrap();
+            db.migrate().unwrap();
+            let seeded = seed_observability_mission(&db, true);
+            seeded_mission_id = seeded.mission_id;
+        }
+        let mut daemon = DaemonService::open(&db_path, &lock).unwrap();
+        let Some((server, listener)) = bind_or_skip(&socket, None) else {
+            daemon.shutdown().unwrap();
+            let _ = fs::remove_dir_all(dir);
+            return;
+        };
+        let response = request_via_ipc(
+            &server,
+            &listener,
+            &mut daemon,
+            json!({"id":"obs","command":"GetChangeSetSummary","mission_id": seeded_mission_id}),
+        );
+        assert_eq!(response["ok"], true, "changeset response: {response}");
+        let changesets = response["changesets"].as_array().unwrap();
+        assert!(!changesets.is_empty());
+        let first = &changesets[0];
+        assert!(first["changeset_id"].as_str().is_some());
+        assert!(first["state"].as_str().is_some());
+        let files = first["files"].as_array().unwrap();
+        assert!(!files.is_empty(), "changeset files must be exposed");
+        assert_eq!(files[0]["path"], "src/lib.rs");
+        assert_eq!(files[0]["strategy"], "SearchReplace");
+        server.cleanup();
+        daemon.shutdown().unwrap();
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn observability_evidence_summary_never_leaks_raw_or_secret_content() {
+        let (dir, db_path, lock, socket) = temp_paths("obs-evidence");
+        let seeded_mission_id;
+        let seeded_evidence;
+        {
+            let mut db = ControlPlaneDb::open(&db_path).unwrap();
+            db.migrate().unwrap();
+            let seeded = seed_observability_mission(&db, false);
+            seeded_mission_id = seeded.mission_id;
+            seeded_evidence = seeded.evidence_ids;
+        }
+        let mut daemon = DaemonService::open(&db_path, &lock).unwrap();
+        let Some((server, listener)) = bind_or_skip(&socket, None) else {
+            daemon.shutdown().unwrap();
+            let _ = fs::remove_dir_all(dir);
+            return;
+        };
+        let response = request_via_ipc(
+            &server,
+            &listener,
+            &mut daemon,
+            json!({"id":"obs","command":"GetEvidenceSummary","mission_id": seeded_mission_id}),
+        );
+        assert_eq!(response["ok"], true, "evidence response: {response}");
+        let evidence = response["evidence"].as_array().unwrap();
+        assert!(!evidence.is_empty());
+        let serialized = format!("{response}");
+        // The raw secret value must never appear anywhere in the response.
+        assert!(
+            !serialized.contains("sk-observability-secret"),
+            "raw secret leaked into evidence summary: {serialized}"
+        );
+        // A redacted summary is expected and safe: it must contain the
+        // redaction marker, proving the evidence layer's redaction ran.
+        assert!(
+            serialized.contains("[REDACTED]"),
+            "sensitive evidence summary must be redacted: {serialized}"
+        );
+        for item in evidence {
+            assert!(item["evidence_id"].as_str().is_some());
+            assert!(item["kind"].as_str().is_some());
+            assert!(item["content_hash"].as_str().is_some());
+            assert!(item["sensitive"].is_boolean());
+            assert!(item.get("raw_content").is_none(), "raw_content exposed: {item}");
+        }
+        for id in &seeded_evidence {
+            assert!(
+                evidence
+                    .iter()
+                    .any(|item| item["evidence_id"] == json!(id)),
+                "evidence {id} missing from summary: {response}"
+            );
+        }
+        server.cleanup();
+        daemon.shutdown().unwrap();
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn observability_verification_summary_returns_results_without_raw_artifact() {
+        let (dir, db_path, lock, socket) = temp_paths("obs-verification");
+        let seeded_mission_id;
+        {
+            let mut db = ControlPlaneDb::open(&db_path).unwrap();
+            db.migrate().unwrap();
+            let seeded = seed_observability_mission(&db, true);
+            seeded_mission_id = seeded.mission_id;
+        }
+        let mut daemon = DaemonService::open(&db_path, &lock).unwrap();
+        let Some((server, listener)) = bind_or_skip(&socket, None) else {
+            daemon.shutdown().unwrap();
+            let _ = fs::remove_dir_all(dir);
+            return;
+        };
+        let response = request_via_ipc(
+            &server,
+            &listener,
+            &mut daemon,
+            json!({"id":"obs","command":"GetVerificationSummary","mission_id": seeded_mission_id}),
+        );
+        assert_eq!(response["ok"], true, "verification response: {response}");
+        let verifications = response["verifications"].as_array().unwrap();
+        assert!(!verifications.is_empty());
+        for run in verifications {
+            assert!(run["verification_id"].as_str().is_some());
+            assert!(run["status"].as_str().is_some());
+            assert!(run["passed"].is_boolean());
+            assert!(run.get("raw_artifact").is_none(), "raw_artifact exposed: {run}");
+            assert!(run["command"].as_str().is_some());
+        }
+        let audits = response["final_audits"].as_array().unwrap();
+        assert!(!audits.is_empty());
+        assert_eq!(audits[0]["completion_allowed"], true);
+        server.cleanup();
+        daemon.shutdown().unwrap();
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn observability_invalid_mission_id_returns_typed_error() {
+        let (dir, db_path, lock, socket) = temp_paths("obs-invalid");
+        let mut daemon = DaemonService::open(&db_path, &lock).unwrap();
+        let Some((server, listener)) = bind_or_skip(&socket, None) else {
+            daemon.shutdown().unwrap();
+            let _ = fs::remove_dir_all(dir);
+            return;
+        };
+        for command in [
+            "GetMissionDetails",
+            "GetTaskDetails",
+            "GetMissionEvents",
+            "GetChangeSetSummary",
+            "GetEvidenceSummary",
+            "GetVerificationSummary",
+        ] {
+            let response = request_via_ipc(
+                &server,
+                &listener,
+                &mut daemon,
+                json!({"id":"obs","command": command, "mission_id": "mission-does-not-exist"}),
+            );
+            assert_eq!(response["ok"], false, "{command} must reject unknown mission: {response}");
+            assert_eq!(
+                response["error"]["code"], "DAEMON-MISSION_NOT_FOUND",
+                "{command} error: {response}"
+            );
+        }
+        let response = request_via_ipc(
+            &server,
+            &listener,
+            &mut daemon,
+            json!({"id":"obs","command":"GetMissionDetails"}),
+        );
+        assert_eq!(response["ok"], false);
+        assert_eq!(response["error"]["code"], "DAEMON-IPC_INVALID");
+        server.cleanup();
+        daemon.shutdown().unwrap();
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn observability_completed_mission_remains_completed_across_restart() {
+        let (dir, db_path, lock, socket) = temp_paths("obs-restart");
+        let seeded_mission_id;
+        {
+            let mut db = ControlPlaneDb::open(&db_path).unwrap();
+            db.migrate().unwrap();
+            let seeded = seed_observability_mission(&db, true);
+            seeded_mission_id = seeded.mission_id;
+        }
+        // First cycle: open + start (safe because session is terminal).
+        {
+            let mut daemon = DaemonService::open(&db_path, &lock).unwrap();
+            daemon.start().unwrap();
+            let Some((server, listener)) = bind_or_skip(&socket, None) else {
+                daemon.stop().unwrap();
+                let _ = fs::remove_dir_all(dir);
+                return;
+            };
+            let response = request_via_ipc(
+                &server,
+                &listener,
+                &mut daemon,
+                json!({"id":"obs","command":"GetMissionDetails","mission_id": seeded_mission_id}),
+            );
+            assert_eq!(response["state"], "completed");
+            assert_eq!(response["terminal"], true);
+            assert_eq!(response["completion"]["completion_allowed"], true);
+            server.cleanup();
+            daemon.stop().unwrap();
+        }
+        // Second cycle: restart with same SQLite, state must still be
+        // completed and the final audit must still be reachable.
+        {
+            let mut daemon = DaemonService::open(&db_path, &lock).unwrap();
+            daemon.start().unwrap();
+            let Some((server, listener)) = bind_or_skip(&socket, None) else {
+                daemon.stop().unwrap();
+                let _ = fs::remove_dir_all(dir);
+                return;
+            };
+            let response = request_via_ipc(
+                &server,
+                &listener,
+                &mut daemon,
+                json!({"id":"obs","command":"GetMissionDetails","mission_id": seeded_mission_id}),
+            );
+            assert_eq!(response["state"], "completed");
+            assert_eq!(response["terminal"], true);
+            assert_eq!(response["completion"]["completion_allowed"], true);
+            server.cleanup();
+            daemon.stop().unwrap();
+        }
+        let _ = fs::remove_dir_all(dir);
     }
 }

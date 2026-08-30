@@ -16,6 +16,12 @@ import type {
   MemoryInfo,
   SecurityFinding,
   ChangeSet,
+  MissionDetails,
+  TaskDetail,
+  MissionActivityEvent,
+  ChangeSetSummary,
+  EvidenceSummaryItem,
+  VerificationSummary,
 } from "./types";
 
 function toDaemonStatus(h: DaemonHealth): DaemonStatus {
@@ -305,6 +311,61 @@ export const daemon = {
   async getChangeset(missionId: string): Promise<ChangeSet | null> {
     try {
       return await invoke<ChangeSet>("daemon_get_changeset", { missionId });
+    } catch {
+      return null;
+    }
+  },
+
+  async getMissionDetails(missionId: string): Promise<MissionDetails | null> {
+    try {
+      return await invoke<MissionDetails>("daemon_get_mission_details", { missionId });
+    } catch {
+      return null;
+    }
+  },
+
+  async getTaskDetails(missionId: string): Promise<TaskDetail[] | null> {
+    try {
+      const res = await invoke<{ tasks: TaskDetail[] }>("daemon_get_task_details", { missionId });
+      return res.tasks ?? null;
+    } catch {
+      return null;
+    }
+  },
+
+  async getMissionEvents(missionId: string, limit?: number): Promise<MissionActivityEvent[] | null> {
+    try {
+      const res = await invoke<{ events: MissionActivityEvent[] }>("daemon_get_mission_events", {
+        missionId,
+        limit: limit ?? undefined,
+      });
+      return res.events ?? null;
+    } catch {
+      return null;
+    }
+  },
+
+  async getEvidenceSummary(missionId: string): Promise<EvidenceSummaryItem[] | null> {
+    try {
+      const res = await invoke<{ evidence: EvidenceSummaryItem[] }>("daemon_get_evidence_summary", { missionId });
+      return res.evidence ?? null;
+    } catch {
+      return null;
+    }
+  },
+
+  async getVerificationSummary(missionId: string): Promise<VerificationSummary | null> {
+    try {
+      return await invoke<VerificationSummary>("daemon_get_verification_summary", { missionId });
+    } catch {
+      return null;
+    }
+  },
+
+  async getChangeSetSummary(missionId: string): Promise<ChangeSetSummary[] | null> {
+    try {
+      const res = await invoke<{ changesets: ChangeSetSummary[] }>("daemon_get_changeset", { missionId });
+      return res.changesets ?? null;
     } catch {
       return null;
     }

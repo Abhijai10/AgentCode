@@ -11,12 +11,14 @@ export function HomeView({
 }: {
   project: Project | null;
   onOpenProject(): void;
-  onSubmit(goal: string): void;
+  onSubmit(goal: string): Promise<boolean>;
   onConfigureProviders(): void;
 }) {
   const [goal, setGoal] = useState("");
   const [hasUsableRoute, setHasUsableRoute] = useState(true);
   const [routeCheckDone, setRouteCheckDone] = useState(false);
+  const [submitting, setSubmitting] = useState(false);
+  const [submitError, setSubmitError] = useState<string | null>(null);
 
   useEffect(() => {
     if (!project) return;
@@ -85,10 +87,18 @@ export function HomeView({
     );
   }
 
-  const send = () => {
+  const send = async () => {
     const trimmed = goal.trim();
-    if (!trimmed) return;
-    onSubmit(trimmed);
+    if (!trimmed || submitting) return;
+    setSubmitting(true);
+    setSubmitError(null);
+    const ok = await onSubmit(trimmed);
+    if (ok) {
+      setGoal("");
+    } else {
+      setSubmitError("Mission submission failed. Check the daemon and provider configuration.");
+    }
+    setSubmitting(false);
   };
 
   return (
@@ -100,6 +110,7 @@ export function HomeView({
           </div>
           <h2 className="text-4xl font-semibold text-on-surface tracking-tight">What do you want to build?</h2>
           <p className="text-on-surface-variant text-lg max-w-xl mx-auto">Working in <span className="font-semibold text-primary">{project.name}</span>. Describe your vision — the agent will orchestrate design, logic, and infrastructure to bring it to life.</p>
+          <p className="text-xs text-on-surface-variant font-mono max-w-xl mx-auto truncate">{project.path}</p>
         </div>
 
         {routeCheckDone && !hasUsableRoute && (
@@ -128,20 +139,26 @@ export function HomeView({
           </div>
         )}
 
-        <div className="neo-raised rounded-[24px] p-2 flex flex-col relative">
+        {submitError && (
+  <div className="flex items-center gap-2 text-sm text-red-600 dark:text-red-400 font-medium px-2">
+    <Icon name="error" size={16} fill /> {submitError}
+  </div>
+)}
+<div className="neo-raised rounded-[24px] p-2 flex flex-col relative">
           <div className="neo-pressed rounded-[20px] p-6 min-h-[160px] flex flex-col">
-            <textarea
-              className="w-full bg-transparent border-none outline-none resize-none text-on-surface placeholder:text-on-surface-variant/50 text-lg flex-1 focus:ring-0 p-0"
-              placeholder={`e.g., Build a real-time dashboard in ${project.name} for monitoring satellite telemetry data...`}
-              value={goal}
-              onChange={(e) => setGoal(e.target.value)}
-              onKeyDown={(e) => {
-                if (e.key === "Enter" && !e.shiftKey) {
-                  e.preventDefault();
-                  send();
-                }
-              }}
-            />
+<textarea
+                className="w-full bg-transparent border-none outline-none resize-none text-on-surface placeholder:text-on-surface-variant/50 text-lg flex-1 focus:ring-0 p-0 disabled:opacity-50"
+                placeholder={`e.g., Build a real-time dashboard in ${project.name} for monitoring satellite telemetry data...`}
+                value={goal}
+                disabled={submitting}
+                onChange={(e) => setGoal(e.target.value)}
+                onKeyDown={async (e) => {
+                  if (e.key === "Enter" && !e.shiftKey) {
+                    e.preventDefault();
+                    await send();
+                  }
+                }}
+              />
             <div className="flex justify-between items-center mt-4 pt-4 border-t border-outline-variant/40 dark:border-white/5">
               <div className="flex gap-2">
                 <button className="w-9 h-9 rounded-full neo-button flex items-center justify-center text-on-surface-variant hover:text-primary transition-all duration-150">
@@ -152,10 +169,11 @@ export function HomeView({
                 </button>
               </div>
               <button
-                onClick={send}
-                className="w-12 h-12 rounded-full bg-surface shadow-neo-raised-primary flex items-center justify-center text-primary hover:text-primary-container transition-all duration-150 active:shadow-neo-pressed"
+                onClick={() => send()}
+                disabled={submitting || !goal.trim()}
+                className="w-12 h-12 rounded-full bg-surface shadow-neo-raised-primary flex items-center justify-center text-primary hover:text-primary-container transition-all duration-150 active:shadow-neo-pressed disabled:opacity-50"
               >
-                <Icon name="send" size={24} fill />
+                <Icon name={submitting ? "autorenew" : "send"} size={24} fill className={submitting ? "animate-spin" : ""} />
               </button>
             </div>
           </div>

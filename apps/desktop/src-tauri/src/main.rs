@@ -358,9 +358,20 @@ fn daemon_get_mission(
         "GetMission",
         json!({ "mission_id": mission_id }),
     )?;
+    // Enrich each task with the real backend task details (title, state,
+    // dependencies, attempts) so the plan view reflects authoritative state.
+    let task_details = request(
+        &state.0,
+        "ui",
+        "GetTaskDetails",
+        json!({ "mission_id": mission_id }),
+    )
+    .ok()
+    .and_then(|r| r.get("tasks").and_then(Value::as_array).cloned())
+    .unwrap_or_default();
     Ok(json!({
         "state": response.get("state").cloned().unwrap_or(Value::Null),
-        "tasks": response.get("tasks").cloned().unwrap_or(json!([])),
+        "tasks": task_details,
         "workspace_root": response.get("workspace_root").cloned().unwrap_or(Value::Null),
     }))
 }
@@ -708,6 +719,12 @@ fn daemon_refresh_ollama(state: tauri::State<DaemonClient>) -> Result<Value, Str
 
 #[tauri::command]
 fn daemon_get_settings(state: tauri::State<DaemonClient>) -> Result<Value, String> {
+    // Desktop-appearance and notification settings are backed by the daemon's
+    // SetDesktopSettings/GetDesktopSettings IPC.  Model routing and preferred
+    // model are NOT exposed by the backend IPC in this build — the daemon
+    // determines routing from its own provider config and per-provider env
+    // vars (OLLAMA_MODEL, OPENAI_MODEL, etc.).  Return them as null rather
+    // than inventing a local preference the daemon silently ignores.
     let response = request(&state.0, "ui", "GetDesktopSettings", json!({}))?;
     Ok(json!({
         "appearance": response.get("appearance").and_then(Value::as_str).unwrap_or("light"),
@@ -715,8 +732,8 @@ fn daemon_get_settings(state: tauri::State<DaemonClient>) -> Result<Value, Strin
         "completion_sound": response.get("completion_sound_enabled").and_then(Value::as_bool).unwrap_or(true),
         "reduced_motion": response.get("reduced_motion").and_then(Value::as_bool).unwrap_or(false),
         "budget_limit_micros": response.get("budget_limit_micros").and_then(Value::as_u64),
-        "routing_profile": std::env::var("AGENTCODE_ROUTING_PROFILE").unwrap_or_else(|_| "free_first".to_string()),
-        "preferred_model": std::env::var("AGENTCODE_PREFERRED_MODEL").ok(),
+        "routing_profile": null,
+        "preferred_model": null,
     }))
 }
 
@@ -752,9 +769,6 @@ fn daemon_set_settings(state: tauri::State<DaemonClient>, settings: Value) -> Re
             "budget_limit_micros": budget,
         }),
     )?;
-    if let Some(profile) = settings.get("routing_profile").and_then(Value::as_str) {
-        std::env::set_var("AGENTCODE_ROUTING_PROFILE", profile);
-    }
     Ok(())
 }
 
@@ -763,10 +777,12 @@ fn daemon_mission_progress(
     state: tauri::State<DaemonClient>,
     mission_id: String,
 ) -> Result<Value, String> {
+    // Use the real mission snapshot so progress/counts/current task come from
+    // authoritative backend state rather than frontend derivation.
     let response = request(
         &state.0,
         "ui",
-        "GetMission",
+        "GetMissionDetails",
         json!({ "mission_id": mission_id }),
     )?;
     let state_val = response
@@ -774,23 +790,16 @@ fn daemon_mission_progress(
         .and_then(Value::as_str)
         .unwrap_or("unknown")
         .to_string();
-    let tasks = response
-        .get("tasks")
-        .and_then(Value::as_array)
-        .cloned()
-        .unwrap_or_default();
-    let task_count = tasks.len();
-    let done = tasks
-        .iter()
-        .filter(|t| {
-            t.get("state")
-                .and_then(Value::as_str)
-                .map(|s| matches!(s, "done" | "completed" | "succeeded"))
-                .unwrap_or(false)
-        })
-        .count();
+    let task_count = response
+        .get("task_count")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let progress = response
+        .get("progress")
+        .and_then(Value::as_f64)
+        .unwrap_or(0.0);
     let progress_pct = if task_count > 0 {
-        (done as f64 / task_count as f64 * 100.0).round() as u32
+        (progress * 100.0).round() as u32
     } else {
         0
     };
@@ -799,9 +808,9 @@ fn daemon_mission_progress(
         "goal": response.get("goal").cloned().unwrap_or_default(),
         "state": state_val,
         "progress_pct": progress_pct,
-        "active_task": tasks.iter().find(|t| {
-            t.get("state").and_then(Value::as_str).map(|s| matches!(s, "in_progress" | "running" | "working" | "verifying")).unwrap_or(false)
-        }).and_then(|t| t.get("task_id")).cloned(),
+        "active_task": response.get("current_task").cloned(),
+        "terminal": response.get("terminal").cloned().unwrap_or(json!(false)),
+        "failure_code": response.get("failure_code").cloned(),
     }))
 }
 
@@ -810,25 +819,78 @@ fn daemon_get_changeset(
     state: tauri::State<DaemonClient>,
     mission_id: String,
 ) -> Result<Value, String> {
-    // The daemon IPC does not yet expose a per-mission ChangeSet contract.
-    // Return the real mission state only; never fabricate a safe verdict or
-    // file list.
     let response = request(
         &state.0,
         "ui",
-        "GetMission",
+        "GetChangeSetSummary",
         json!({ "mission_id": mission_id }),
     )?;
-    let state_val = response
-        .get("state")
-        .and_then(Value::as_str)
-        .unwrap_or("unknown")
-        .to_string();
-    Ok(json!({
-        "mission_id": mission_id,
-        "available": false,
-        "verification_state": if state_val == "completed" { "Completed".to_string() } else { format!("Mission {state_val}") },
-    }))
+    Ok(response)
+}
+
+#[tauri::command]
+fn daemon_get_mission_details(
+    state: tauri::State<DaemonClient>,
+    mission_id: String,
+) -> Result<Value, String> {
+    request(
+        &state.0,
+        "ui",
+        "GetMissionDetails",
+        json!({ "mission_id": mission_id }),
+    )
+}
+
+#[tauri::command]
+fn daemon_get_task_details(
+    state: tauri::State<DaemonClient>,
+    mission_id: String,
+) -> Result<Value, String> {
+    request(
+        &state.0,
+        "ui",
+        "GetTaskDetails",
+        json!({ "mission_id": mission_id }),
+    )
+}
+
+#[tauri::command]
+fn daemon_get_mission_events(
+    state: tauri::State<DaemonClient>,
+    mission_id: String,
+    limit: Option<u64>,
+) -> Result<Value, String> {
+    let mut payload = json!({ "mission_id": mission_id });
+    if let Some(l) = limit {
+        payload["limit"] = json!(l);
+    }
+    request(&state.0, "ui", "GetMissionEvents", payload)
+}
+
+#[tauri::command]
+fn daemon_get_evidence_summary(
+    state: tauri::State<DaemonClient>,
+    mission_id: String,
+) -> Result<Value, String> {
+    request(
+        &state.0,
+        "ui",
+        "GetEvidenceSummary",
+        json!({ "mission_id": mission_id }),
+    )
+}
+
+#[tauri::command]
+fn daemon_get_verification_summary(
+    state: tauri::State<DaemonClient>,
+    mission_id: String,
+) -> Result<Value, String> {
+    request(
+        &state.0,
+        "ui",
+        "GetVerificationSummary",
+        json!({ "mission_id": mission_id }),
+    )
 }
 
 #[tauri::command]
@@ -929,6 +991,11 @@ fn main() {
             daemon_set_settings,
             daemon_mission_progress,
             daemon_get_changeset,
+            daemon_get_mission_details,
+            daemon_get_task_details,
+            daemon_get_mission_events,
+            daemon_get_evidence_summary,
+            daemon_get_verification_summary,
             daemon_list_tools,
             daemon_list_scanners,
             daemon_list_memory,

@@ -103,8 +103,10 @@ export interface SettingsState {
   notifications_enabled: boolean;
   completion_sound: boolean;
   reduced_motion: boolean;
-  routing_profile: "free_first" | "local_first" | "quality_first" | "paid_allowed" | "offline";
-  preferred_model?: string;
+  /** Always null in this build: the daemon IPC does not expose routing profile. */
+  routing_profile: "free_first" | "local_first" | "quality_first" | "paid_allowed" | "offline" | null;
+  /** Always null in this build: the daemon IPC does not expose preferred model. */
+  preferred_model?: string | null;
   budget_limit_micros?: number;
 }
 
@@ -184,4 +186,110 @@ export interface ChangeSet {
   summary?: string[];
   safe?: boolean;
   verification_state: string;
+}
+
+// ── Real backend observability contract (ac-daemon H1 IPC) ──────────────
+
+export interface MissionDetails {
+  mission_id: string;
+  session_id?: string | null;
+  state: string;
+  goal?: string;
+  workspace_root?: string | null;
+  created_at_ms?: number;
+  updated_at_ms?: number;
+  terminal: boolean;
+  failure_code?: string | null;
+  task_count: number;
+  completed_task_count: number;
+  failed_task_count: number;
+  current_task?: string | null;
+  progress?: number | null;
+  state_counts: Record<string, number>;
+  completion?: {
+    passed: boolean;
+    completion_allowed: boolean;
+    created_at_ms: number;
+  } | null;
+}
+
+export interface TaskAttempt {
+  attempt_id: string;
+  outcome: string;
+  failure_class?: string | null;
+  evidence_refs: string;
+  created_at_ms: number;
+}
+
+export interface TaskDetail {
+  task_id: string;
+  title: string;
+  state: string;
+  dependencies: string[];
+  retry_count: number;
+  max_retries: number;
+  assigned_worker_id?: string | null;
+  updated_at_ms: number;
+  attempts: TaskAttempt[];
+  current_attempt_outcome?: string | null;
+  current_attempt_age_ms?: number | null;
+}
+
+export interface MissionActivityEvent {
+  id: string;
+  kind: string;
+  subject_id: string;
+  created_at_ms: number;
+  detail: string;
+}
+
+export interface ChangeSetFile {
+  path: string;
+  strategy: string;
+  additions: number;
+  removals: number;
+}
+
+export interface ChangeSetSummary {
+  changeset_id: string;
+  state: string;
+  created_at_ms: number;
+  applied: boolean;
+  files: ChangeSetFile[];
+}
+
+export interface EvidenceSummaryItem {
+  evidence_id: string;
+  kind: string;
+  created_at_ms: number;
+  content_hash: string;
+  sensitive: boolean;
+  summary?: string | null;
+  provenance_source: string;
+  provenance_tool?: string | null;
+}
+
+export interface VerificationRun {
+  verification_id: string;
+  task_id?: string | null;
+  commit_ref: string;
+  environment: string;
+  command: string;
+  tool_version: string;
+  status: string;
+  passed: boolean;
+  evidence_ref: string;
+  created_at_ms: number;
+}
+
+export interface FinalAuditInfo {
+  audit_id: string;
+  passed: boolean;
+  completion_allowed: boolean;
+  created_at_ms: number;
+}
+
+export interface VerificationSummary {
+  verifications: VerificationRun[];
+  final_audits: FinalAuditInfo[];
 }

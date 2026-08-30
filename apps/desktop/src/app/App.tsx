@@ -25,7 +25,6 @@ function AppShell() {
   const [notice, setNotice] = useState<string | null>(null);
   const [projectModal, setProjectModal] = useState<null | "open" | "new" | "choose">(null);
   const [projectAlert, setProjectAlert] = useState(false);
-  const [routingProfile, setRoutingProfile] = useState("free_first");
   const { project, openProject } = useProject();
 
   const requestView = useCallback(
@@ -41,13 +40,19 @@ function AppShell() {
 
   useEffect(() => {
     let cancelled = false;
+    // Use a ref for activeMission so the poll loop is created once and never
+    // recreated when the active mission changes (single bounded interval).
+    const activeRef = { current: activeMission };
+    activeRef.current = activeMission;
     const refresh = async () => {
-      const [d, m, s] = await Promise.all([daemon.health(), daemon.listActiveMissions(), daemon.getSettings()]);
+      const [d, m] = await Promise.all([daemon.health(), daemon.listActiveMissions()]);
       if (cancelled) return;
       setDaemonStatus(d);
       setMissions(m);
-      setRoutingProfile(s?.routing_profile ?? "free_first");
-      if (!activeMission && m.length > 0) setActiveMission(m[0].mission_id);
+      if (!activeRef.current && m.length > 0) setActiveMission(m[0].mission_id);
+      if (activeRef.current && !m.some((mi) => mi.mission_id === activeRef.current)) {
+        setActiveMission(null);
+      }
     };
     refresh();
     const timer = setInterval(refresh, 4000);
@@ -55,7 +60,7 @@ function AppShell() {
       cancelled = true;
       clearInterval(timer);
     };
-  }, [activeMission]);
+  }, []);
 
   const handleOpenedProject = (p: Project) => {
     openProject(p.path, p.name);
@@ -66,10 +71,10 @@ function AppShell() {
     setTimeout(() => setNotice(null), 4000);
   };
 
-  const handleNewMission = (goal: string) => {
+  const handleNewMission = async (goal: string): Promise<boolean> => {
     if (!project) {
       setProjectModal("choose");
-      return;
+      return false;
     }
     const doSubmit = async () => {
       const created = await daemon.submitMission(goal, project?.path);
@@ -80,14 +85,16 @@ function AppShell() {
         setMissions(m);
         setNotice("Mission submitted to the AgentCode daemon.");
         setTimeout(() => setNotice(null), 4000);
+        return true;
       } else {
         // Surface the real backend error (e.g. a rejected workspace_root)
         // instead of a fabricated success or a generic failure message.
         setNotice(created.error || "Daemon is not connected — could not submit mission.");
         setTimeout(() => setNotice(null), 6000);
+        return false;
       }
     };
-    doSubmit();
+    return doSubmit();
   };
 
   const daemonConnected = daemonStatus?.state === "running";
@@ -130,7 +137,7 @@ function AppShell() {
           {view === "settings" && <SettingsView />}
           <Footer
             daemonConnected={daemonConnected}
-            modelLabel={`Routing: ${routingProfile.replace(/_/g, " ")}`}
+            modelLabel="Model: daemon-managed"
             tasks={`Tasks: ${missions.length}`}
           />
         </div>

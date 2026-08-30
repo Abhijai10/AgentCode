@@ -612,6 +612,21 @@ pub struct PersistedMission {
     pub created_at_ms: i64,
 }
 
+/// A single, already-persisted activity event surfaced to the desktop.
+/// `kind` is a stable event class (mission_*, task_*, attempt_*,
+/// changeset_*, verification_*, evidence_*, final_audit_*).  `detail` is a
+/// short safe summary derived from the persisted row — never raw command
+/// output and never a secret.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MissionActivityRow {
+    pub id: String,
+    pub kind: String,
+    pub mission_id: String,
+    pub subject_id: String,
+    pub created_at_ms: i64,
+    pub detail: String,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PersistedSession {
     pub id: String,
