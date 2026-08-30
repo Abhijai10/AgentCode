@@ -1,0 +1,196 @@
+import { useState, useEffect } from "react";
+import { Icon } from "./Icon";
+import { daemon } from "./daemon";
+import type { Project } from "./ProjectContext";
+
+export function HomeView({
+  project,
+  onOpenProject,
+  onSubmit,
+  onConfigureProviders,
+}: {
+  project: Project | null;
+  onOpenProject(): void;
+  onSubmit(goal: string): void;
+  onConfigureProviders(): void;
+}) {
+  const [goal, setGoal] = useState("");
+  const [hasUsableRoute, setHasUsableRoute] = useState(true);
+  const [routeCheckDone, setRouteCheckDone] = useState(false);
+
+  useEffect(() => {
+    if (!project) return;
+    let cancelled = false;
+    (async () => {
+      const [providers, o] = await Promise.all([daemon.listProviders(), daemon.discoverOllama()]);
+      if (cancelled) return;
+      const hasAny = providers.some((p) => p.connected_accounts > 0 && p.health === "healthy");
+      setHasUsableRoute(hasAny || o.running);
+      setRouteCheckDone(true);
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [project]);
+
+  if (!project) {
+    return (
+      <main className="flex-1 overflow-y-auto p-8 relative flex items-center justify-center">
+        <div className="max-w-2xl mx-auto flex flex-col gap-8 w-full">
+          <div className="text-center space-y-4">
+            <div className="inline-flex items-center justify-center w-16 h-16 rounded-2xl neo-raised mb-4 text-primary">
+              <Icon name="smart_toy" size={32} fill />
+            </div>
+            <h2 className="text-4xl font-semibold text-on-surface tracking-tight">Welcome to AgentCode</h2>
+            <p className="text-on-surface-variant text-lg max-w-xl mx-auto">Open an existing project or start a new one from scratch to begin building.</p>
+          </div>
+
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+            <button
+              onClick={() => {
+                onOpenProject();
+              }}
+              className="neo-raised rounded-3xl p-8 flex flex-col gap-5 text-left hover:text-primary transition-all duration-200 active:scale-[0.98]"
+            >
+              <div className="w-14 h-14 rounded-full neo-pressed flex items-center justify-center text-primary">
+                <Icon name="create_new_folder" size={28} />
+              </div>
+              <div>
+                <h3 className="font-semibold text-on-surface text-lg mb-1">Start a New Project</h3>
+                <p className="text-sm text-on-surface-variant leading-relaxed">Create a fresh project. Choose where it lives on your machine and give it a name.</p>
+              </div>
+            </button>
+            <button
+              onClick={() => {
+                onOpenProject();
+              }}
+              className="neo-raised rounded-3xl p-8 flex flex-col gap-5 text-left hover:text-primary transition-all duration-200 active:scale-[0.98]"
+            >
+              <div className="w-14 h-14 rounded-full neo-pressed flex items-center justify-center text-primary">
+                <Icon name="folder_open" size={28} />
+              </div>
+              <div>
+                <h3 className="font-semibold text-on-surface text-lg mb-1">Open a Project</h3>
+                <p className="text-sm text-on-surface-variant leading-relaxed">Browse to an existing folder on your computer and start working on it.</p>
+              </div>
+            </button>
+          </div>
+
+          <div className="flex items-center justify-center gap-2 text-xs text-on-surface-variant mt-2">
+            <Icon name="info" size={14} />
+            Both options open a folder picker to select the project location.
+          </div>
+        </div>
+      </main>
+    );
+  }
+
+  const send = () => {
+    const trimmed = goal.trim();
+    if (!trimmed) return;
+    onSubmit(trimmed);
+  };
+
+  return (
+    <main className="flex-1 overflow-y-auto p-8 relative">
+      <div className="max-w-3xl mx-auto flex flex-col gap-8 h-full justify-center pb-20">
+        <div className="text-center space-y-4 mb-8">
+          <div className="inline-flex items-center justify-center w-16 h-16 rounded-2xl neo-raised mb-4 text-primary">
+            <Icon name="smart_toy" size={32} fill />
+          </div>
+          <h2 className="text-4xl font-semibold text-on-surface tracking-tight">What do you want to build?</h2>
+          <p className="text-on-surface-variant text-lg max-w-xl mx-auto">Working in <span className="font-semibold text-primary">{project.name}</span>. Describe your vision — the agent will orchestrate design, logic, and infrastructure to bring it to life.</p>
+        </div>
+
+        {routeCheckDone && !hasUsableRoute && (
+          <div className="neo-raised p-6 rounded-2xl text-center">
+            <div className="w-12 h-12 rounded-full neo-pressed mx-auto mb-3 flex items-center justify-center text-primary">
+              <Icon name="route" size={24} />
+            </div>
+            <h4 className="font-semibold text-on-surface">No model routes configured</h4>
+            <p className="text-sm text-on-surface-variant mt-2 max-w-lg mx-auto">
+              AgentCode needs at least one usable model route. Connect a provider account or start a local model to begin.
+            </p>
+            <div className="flex justify-center gap-3 mt-5">
+              <button
+                onClick={onConfigureProviders}
+                className="px-6 py-3 rounded-xl bg-primary text-on-primary text-sm font-medium hover:brightness-110 transition-all"
+              >
+                Configure Provider
+              </button>
+              <button
+                onClick={onConfigureProviders}
+                className="px-6 py-3 rounded-xl neo-button text-sm text-primary font-medium"
+              >
+                Use Local Model
+              </button>
+            </div>
+          </div>
+        )}
+
+        <div className="neo-raised rounded-[24px] p-2 flex flex-col relative">
+          <div className="neo-pressed rounded-[20px] p-6 min-h-[160px] flex flex-col">
+            <textarea
+              className="w-full bg-transparent border-none outline-none resize-none text-on-surface placeholder:text-on-surface-variant/50 text-lg flex-1 focus:ring-0 p-0"
+              placeholder={`e.g., Build a real-time dashboard in ${project.name} for monitoring satellite telemetry data...`}
+              value={goal}
+              onChange={(e) => setGoal(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === "Enter" && !e.shiftKey) {
+                  e.preventDefault();
+                  send();
+                }
+              }}
+            />
+            <div className="flex justify-between items-center mt-4 pt-4 border-t border-outline-variant/40 dark:border-white/5">
+              <div className="flex gap-2">
+                <button className="w-9 h-9 rounded-full neo-button flex items-center justify-center text-on-surface-variant hover:text-primary transition-all duration-150">
+                  <Icon name="attach_file" size={18} />
+                </button>
+                <button className="w-9 h-9 rounded-full neo-button flex items-center justify-center text-on-surface-variant hover:text-primary transition-all duration-150">
+                  <Icon name="mic" size={18} />
+                </button>
+              </div>
+              <button
+                onClick={send}
+                className="w-12 h-12 rounded-full bg-surface shadow-neo-raised-primary flex items-center justify-center text-primary hover:text-primary-container transition-all duration-150 active:shadow-neo-pressed"
+              >
+                <Icon name="send" size={24} fill />
+              </button>
+            </div>
+          </div>
+        </div>
+
+        <div className="grid grid-cols-1 md:grid-cols-3 gap-6 mt-4">
+          <button className="neo-raised p-5 rounded-2xl flex flex-col gap-3 text-left hover:text-primary transition-colors duration-200 active:scale-[0.98]">
+            <div className="w-10 h-10 rounded-full neo-pressed flex items-center justify-center text-primary">
+              <Icon name="architecture" size={20} />
+            </div>
+            <div>
+              <h3 className="font-semibold text-on-surface text-sm mb-1">Design System</h3>
+              <p className="text-xs text-on-surface-variant">Configure visual language</p>
+            </div>
+          </button>
+          <button className="neo-raised p-5 rounded-2xl flex flex-col gap-3 text-left hover:text-primary transition-colors duration-200 active:scale-[0.98]">
+            <div className="w-10 h-10 rounded-full neo-pressed flex items-center justify-center text-tertiary">
+              <Icon name="database" size={20} />
+            </div>
+            <div>
+              <h3 className="font-semibold text-on-surface text-sm mb-1">Data Models</h3>
+              <p className="text-xs text-on-surface-variant">Define schema & rules</p>
+            </div>
+          </button>
+          <button className="neo-raised p-5 rounded-2xl flex flex-col gap-3 text-left hover:text-primary transition-colors duration-200 active:scale-[0.98]">
+            <div className="w-10 h-10 rounded-full neo-pressed flex items-center justify-center text-primary">
+              <Icon name="api" size={20} />
+            </div>
+            <div>
+              <h3 className="font-semibold text-on-surface text-sm mb-1">Integrations</h3>
+              <p className="text-xs text-on-surface-variant">Connect external services</p>
+            </div>
+          </button>
+        </div>
+      </div>
+    </main>
+  );
+}

@@ -1,16 +1,196 @@
-import { useEffect, useState } from "react";
-import { changes, checks, context, daemon, evidence, memory, projects, session, tasks, terminal } from "../mocks/demo";
-import type { SessionMode } from "../types/domain";
-type View = "home" | "session" | "settings"; type Tool = "Changes" | "Plan" | "Terminal" | "Verification" | "Context" | "Browser" | "Security" | "Memory" | "Evidence";
-const recents = ["Fix authentication flow", "Refactor provider router", "Design memory system", "Add retry to tool calls", "Improve error handling", "Optimize context loading", "Add tests for task engine"];
-const Logo = () => <div className="logo"><span>✦</span><strong>AgentCode</strong></div>;
-function Sidebar({ view, setView, collapsed, setCollapsed }: { view: View; setView(v: View): void; collapsed: boolean; setCollapsed(v: boolean): void }) { return <aside className={`sidebar ${collapsed ? "collapsed" : ""}`}><Logo/><button className="new-task" onClick={() => setView("home")}>＋<span>New Task</span><kbd>⌘ N</kbd></button><nav><p>Projects</p>{projects.map((p,i) => <button className={`nav-item ${i===0 ? "selected" : ""}`} key={p.id}><b>{p.color}</b><span>{p.name}</span>{i===0 && <i>⌄</i>}</button>)}<button className="add">＋ <span>Add Project</span></button><p>Recent</p>{recents.map((x,i) => <button className={`recent ${i===0 && view === "session" ? "selected" : ""}`} onClick={() => setView("session")} key={x}>▱ <span>{x}</span></button>)}</nav><div className="sidebar-foot"><button className={`nav-item ${view==="settings" ? "selected" : ""}`} onClick={() => setView("settings")}>⚙ <span>Settings</span></button><div className="daemon"><span className="pulse"/><span>Agent Daemon</span><small>Running</small></div><button className="collapse" onClick={() => setCollapsed(!collapsed)} aria-label="Toggle sidebar">‹</button></div></aside>; }
-function Composer({ home, send }: { home?: boolean; send(): void }) { const [value,setValue]=useState(""); return <div className={`composer ${home ? "home-composer" : ""}`}><textarea aria-label="Message the agent" placeholder={home?"Describe your task...":"Ask the agent anything..."} value={value} onChange={e=>setValue(e.target.value)}/><div className="composer-bar">{home ? <><button>▣ AgentCode⌄</button><div className="mode-mini"><span>Agent</span><span>Discuss</span><span>Design</span></div></> : <><button>@ Context</button><button>＋ Add</button></>}<span className="grow"/><button>Auto⌄</button><button className="send" aria-label="Send message" onClick={send}>↑</button></div></div>; }
-function Home({ send }: { send(): void }) { return <main className="home"><div className="home-center"><div className="hero-mark">✦</div><h1>What would you like to build?</h1><p>Turn your ideas into working code with AgentCode.</p><Composer home send={send}/><div className="suggestions">{["Fix authentication flow","Refactor provider router","Design a memory system","Add tests for retry logic"].map(x=><button key={x}>{x}</button>)}</div></div></main>; }
-function Conversation({ mode }: { mode: SessionMode }) { if(mode==="discuss") return <div className="conversation"><article className="message user"><div className="avatar">A</div><div><b>You</b><p>Can you explain how the provider router works?</p></div></article><article className="message agent"><div className="agent-mark">✦</div><div><b>Agent</b><p>The provider router chooses a healthy route by capability and policy, keeping vendor details behind one boundary.</p><button className="file-chip">▣ src/router/provider.ts</button></div></article></div>; if(mode==="design") return <div className="conversation"><article className="message user"><div className="avatar">A</div><div><b>You</b><p>I want to design a better memory system for this project.</p></div></article><article className="message agent"><div className="agent-mark">✦</div><div><b>Agent</b><p>Let’s start with retrieval boundaries, freshness, and source traceability.</p><div className="design-artifact"><b>Memory System Architecture</b><p>Requirements · Architecture · Key decisions · Affected files</p><div className="diagram">Application → Memory Manager → Short-term · Long-term · Knowledge graph</div></div><div className="decision"><b>Decision summary</b><p>Use typed facts with freshness and evidence links, keeping generated context non-authoritative.</p></div></div></article></div>; return <div className="conversation"><article className="message user"><div className="avatar">A</div><div><b>You</b><p>Users are getting logged out randomly. Investigate and fix.</p></div><time>10:42 AM</time></article><article className="message agent"><div className="agent-mark">✦</div><div className="message-body"><div className="message-head"><b>Agent</b><span className="status working">● Working</span></div><p>I’ll investigate the auth flow and session handling to find the root cause.</p><ol className="activity">{tasks.map(t=><li className={t.state} key={t.id}><span>{t.state==="done"?"✓":t.state==="in_progress"?"◉":"○"}</span><div>{t.title}{t.detail&&<small>↳ {t.detail}</small>}</div></li>)}</ol><details className="tool" open><summary><span>✦</span> Tool Call: Read <em>src/middleware/auth.ts</em><i>✓</i></summary><pre>{`import { verifyToken, refresh } from '@/lib/auth';\nimport { NextResponse } from 'next/server';\n\nexport async function middleware(req: NextRequest) {\n  const token = req.cookies.get('session')?.value;\n  if (!token) return NextResponse.redirect('/login');\n}`}</pre></details><div className="decision"><b>Decision summary</b><p>Session refresh appears to fail when the refresh token expires.</p></div></div><time>10:42 AM</time></article></div>; }
-function Panel({ tool, setTool, visible }: { tool: Tool; setTool(t:Tool):void; visible:boolean }) { if(!visible)return null; const tabs:Tool[]=["Changes","Plan","Terminal","Verification","Context"], more:Tool[]=["Browser","Security","Memory","Evidence"]; const body=tool==="Changes"?<><div className="panel-summary"><b>3 files changed</b><span><strong>+241</strong> <i>−38</i></span></div>{changes.files.map((f,i)=><div className="changed-file" key={f.path}><div><b>▣ {f.path}</b><span><strong>+{f.additions}</strong> <i>−{f.deletions}</i></span></div>{i===0&&<pre className="diff">{f.diff}</pre>}</div>)}<div className="panel-note"><b>Summary</b>{changes.summary.map(x=><p key={x}>{x}</p>)}<strong className="safe">◉ Safe change</strong></div></>:tool==="Plan"?<ol className="panel-plan">{tasks.map(t=><li className={t.state} key={t.id}>{t.state==="done"?"✓":t.state==="in_progress"?"◉":"○"} {t.title}</li>)}</ol>:tool==="Terminal"?<><p className="muted">Mock terminal output · no command has been executed.</p><pre className="terminal">{terminal.join("\n")}</pre></>:tool==="Verification"?<div className="verify">{checks.map(c=><div key={c.name}><span>✓</span><b>{c.name}</b><small>{c.detail}</small></div>)}</div>:tool==="Context"?<div className="context">{context.map(c=><div key={c.label}><small>{c.label}</small><b>{c.value}</b></div>)}</div>:tool==="Memory"?<><input className="search" placeholder="Search memory..."/>{memory.map(m=><div className="memory" key={m.id}><b>{m.statement}</b><p>{m.type} · {m.freshness}</p><small>{m.source} · {m.date}</small></div>)}</>:tool==="Evidence"?<div className="evidence">{evidence.map(e=><div key={e.id}><span>▱</span><b>{e.label}</b><small>{e.count}</small></div>)}</div>:tool==="Security"?<><p className="muted">Mock display only — scanner adapters are not connected.</p>{["Gitleaks — Passed","Semgrep — Available","Trivy — Available","OSV — Available","Checkov — Unavailable","ZAP — Available"].map(x=><div className="scanner" key={x}>{x}</div>)}</>:<div className="browser"><b>Browser evidence</b><p>Backend-generated evidence will appear here when connected.</p><label>URL</label><input value="http://localhost:3000/login" readOnly/><p>Console issues · Network failures · Accessibility checks</p></div>; return <aside className="right-panel"><div className="tool-tabs">{tabs.map(x=><button className={tool===x?"active":""} onClick={()=>setTool(x)} key={x}>{x}</button>)}<button className={more.includes(tool)?"active":""} onClick={()=>setTool("Memory")}>More⌄</button></div>{more.includes(tool)&&<div className="tool-subtabs">{more.map(x=><button className={tool===x?"active":""} onClick={()=>setTool(x)} key={x}>{x}</button>)}</div>}<section className="panel-content">{body}</section></aside>; }
-function Workspace({ settings }: { settings():void }) { const [mode,setMode]=useState<SessionMode>("agent"),[tool,setTool]=useState<Tool>("Changes"),[open,setOpen]=useState(true); return <main className="workspace"><header className="topbar"><div><h2>{session.title}</h2><span className="branch">⌘ main</span></div><div className="mode-tabs" role="tablist">{(["agent","discuss","design"] as SessionMode[]).map(x=><button className={mode===x?"active":""} role="tab" aria-selected={mode===x} onClick={()=>setMode(x)} key={x}>{x[0].toUpperCase()+x.slice(1)}</button>)}</div><div className="top-actions"><button>Auto⌄</button><span className="online">●</span><button onClick={()=>setOpen(!open)} aria-label="Toggle context panel">⇥</button><button onClick={settings} aria-label="Open Settings">⚙</button></div></header><div className={`workspace-body ${open?"with-panel":""}`}><section className="session"><Conversation mode={mode}/><Composer send={()=>undefined}/></section><Panel tool={tool} setTool={setTool} visible={open}/></div></main>; }
-const nav=["Providers & Models","Tools","Security Scanners","Memory","Daemon","Autonomy Defaults","Appearance"]; const Rows=({rows}:{rows:[string,string,string][]})=><div className="setting-list">{rows.map(([a,b,c])=><div className="setting-row" key={a}><b>{a}</b><span className={`setting-state ${c}`}>{b}</span></div>)}</div>; const Select=({label,value}:{label:string;value:string})=><label className="setting-select">{label}<select defaultValue={value}><option>{value}</option></select></label>;
-function Settings(){const[active,setActive]=useState(nav[0]); const body=active==="Providers & Models"?<><Select label="Model Routing" value="Auto"/><Select label="Preferred model" value="GPT-5.1 (Latest)"/><Select label="Backup model" value="Auto fallback"/><h4>Provider priority</h4><Rows rows={[["OpenAI","Connected","good"],["Anthropic","Connected","good"],["Google / Gemini","Disconnected","quiet"],["Ollama","Unavailable","quiet"],["LM Studio","Unavailable","quiet"]]}/></>:active==="Tools"?<><p className="muted">Capability availability will be populated by the daemon.</p><Rows rows={[["Git","Available","good"],["Sandbox","Available","good"],["Tree-sitter","Available","good"],["LSP","Available","good"],["Browser","Available","good"],["Terminal","Available","good"]]}/></>:active==="Security Scanners"?<><p className="muted">Status only. No scanner is started from this UI.</p><Rows rows={[["Gitleaks","Available · Required","good"],["OSV Scanner","Available · Required","good"],["Trivy","Available · Optional","quiet"],["Semgrep","Available · Optional","quiet"],["Checkov","Unavailable · Optional","quiet"],["ZAP","Available · Optional","quiet"]]}/></>:active==="Memory"?<><Rows rows={[["Embedding model","all-MiniLM-L6-v2","quiet"],["Dimension","384","quiet"],["Status","Ready","good"],["Indexed chunks","12,486","quiet"],["Last indexed","2 minutes ago","quiet"]]}/><button className="secondary">Reindex placeholder</button></>:active==="Daemon"?<><Rows rows={[["Status","Running","good"],["Instance ID",daemon.instanceId,"quiet"],["Uptime",daemon.uptime,"quiet"],["Socket",daemon.socket,"quiet"],["Database",daemon.database,"quiet"],["Recovery state","Healthy","good"]]}/><button className="secondary">Reconnect</button><button className="secondary">Restart daemon</button></>:active==="Autonomy Defaults"?<><Select label="Default model routing" value="Auto"/><Select label="Reasoning effort" value="Medium"/><Select label="Verification profile" value="Standard"/><Rows rows={[["Auto-prioritize","Enabled","good"],["Require approval for risky work","Enabled","good"],["Maximum concurrent tasks","3","quiet"]]}/></>:<><Rows rows={[["Theme","Dark","good"],["Accent","Indigo","quiet"],["Sidebar","Expanded","quiet"],["Reduced motion","System setting","quiet"]]}/><p className="muted">Light-theme tokens are prepared; dark is the V1 default.</p></>;return <main className="settings"><header><h2>Settings</h2><input className="search" placeholder="Search settings..."/></header><div className="settings-body"><nav>{nav.map(x=><button className={active===x?"active":""} onClick={()=>setActive(x)} key={x}>{x}</button>)}</nav><section className="settings-content"><h3>{active}</h3>{body}</section></div></main>}
-function Palette({open,close}:{open:boolean;close():void}){return open?<div className="palette-backdrop" onMouseDown={close}><div className="palette" onMouseDown={e=>e.stopPropagation()}><input autoFocus placeholder="Search commands..."/>{["New Task","Open recent session","Switch project","Agent mode","Discuss mode","Design mode","Open Changes","Open Terminal","Open Verification","Open Settings"].map(x=><p key={x}>{x}</p>)}</div></div>:null}
-export function App(){const[view,setView]=useState<View>("home"),[collapsed,setCollapsed]=useState(false),[palette,setPalette]=useState(false);useEffect(()=>{const key=(e:KeyboardEvent)=>{if(e.metaKey&&e.key.toLowerCase()==="k"){e.preventDefault();setPalette(true)}if(e.metaKey&&e.key.toLowerCase()==="n"){e.preventDefault();setView("home")}if(e.metaKey&&e.key.toLowerCase()==="b"){e.preventDefault();setCollapsed(x=>!x)}if(e.metaKey&&e.key===","){e.preventDefault();setView("settings")}};window.addEventListener("keydown",key);return()=>window.removeEventListener("keydown",key)},[]);return <div className="app-shell"><Sidebar view={view} setView={setView} collapsed={collapsed} setCollapsed={setCollapsed}/>{view==="home"?<Home send={()=>setView("session")}/>:view==="settings"?<Settings/>:<Workspace settings={()=>setView("settings")}/>}<Palette open={palette} close={()=>setPalette(false)}/></div>}
+import { useEffect, useState, useCallback } from "react";
+import { ThemeProvider } from "./ThemeContext";
+import { ProjectProvider, useProject, type Project } from "./ProjectContext";
+import { Sidebar } from "./Sidebar";
+import { TopBar } from "./TopBar";
+import { Footer } from "./Footer";
+import { HomeView } from "./HomeView";
+import { MissionView } from "./MissionView";
+import { DiscussView } from "./DiscussView";
+import { DesignView } from "./DesignView";
+import { SecurityView } from "./SecurityView";
+import { SettingsView } from "./SettingsView";
+import { ProjectModal } from "./ProjectModal";
+import { Icon } from "./Icon";
+import { daemon } from "./daemon";
+import type { View, MissionSummary, DaemonStatus } from "./types";
+
+const PROJECT_REQUIRED_VIEWS: View[] = ["mission", "discuss", "design", "security"];
+
+function AppShell() {
+  const [view, setView] = useState<View>("home");
+  const [daemonStatus, setDaemonStatus] = useState<DaemonStatus | null>(null);
+  const [missions, setMissions] = useState<MissionSummary[]>([]);
+  const [activeMission, setActiveMission] = useState<string | null>(null);
+  const [notice, setNotice] = useState<string | null>(null);
+  const [projectModal, setProjectModal] = useState<null | "open" | "new" | "choose">(null);
+  const [projectAlert, setProjectAlert] = useState(false);
+  const [routingProfile, setRoutingProfile] = useState("free_first");
+  const { project, openProject } = useProject();
+
+  const requestView = useCallback(
+    (target: View) => {
+      if (!project && PROJECT_REQUIRED_VIEWS.includes(target)) {
+        setProjectAlert(true);
+        return;
+      }
+      setView(target);
+    },
+    [project]
+  );
+
+  useEffect(() => {
+    let cancelled = false;
+    const refresh = async () => {
+      const [d, m, s] = await Promise.all([daemon.health(), daemon.listActiveMissions(), daemon.getSettings()]);
+      if (cancelled) return;
+      setDaemonStatus(d);
+      setMissions(m);
+      setRoutingProfile(s?.routing_profile ?? "free_first");
+      if (!activeMission && m.length > 0) setActiveMission(m[0].mission_id);
+    };
+    refresh();
+    const timer = setInterval(refresh, 4000);
+    return () => {
+      cancelled = true;
+      clearInterval(timer);
+    };
+  }, [activeMission]);
+
+  const handleOpenedProject = (p: Project) => {
+    openProject(p.path, p.name);
+    setProjectModal(null);
+    setProjectAlert(false);
+    setView("home");
+    setNotice(`Project "${p.name}" opened.`);
+    setTimeout(() => setNotice(null), 4000);
+  };
+
+  const handleNewMission = (goal: string) => {
+    if (!project) {
+      setProjectModal("choose");
+      return;
+    }
+    const doSubmit = async () => {
+      const created = await daemon.submitMission(goal);
+      if (created) {
+        setActiveMission(created.mission_id);
+        setView("mission");
+        const m = await daemon.listActiveMissions();
+        setMissions(m);
+        setNotice("Mission submitted to the AgentCode daemon.");
+        setTimeout(() => setNotice(null), 4000);
+      } else {
+        setNotice("Daemon is not connected — could not submit mission.");
+        setTimeout(() => setNotice(null), 4000);
+      }
+    };
+    doSubmit();
+  };
+
+  const daemonConnected = daemonStatus?.state === "running";
+
+  return (
+    <div className="h-screen w-screen flex flex-col bg-background text-on-surface overflow-hidden font-body antialiased dark:bg-background dark:text-on-surface">
+      <div className="flex flex-1 overflow-hidden">
+        <Sidebar
+          view={view}
+          setView={requestView}
+          daemonConnected={daemonConnected}
+          project={project}
+          onOpenProject={() => setProjectModal(project ? "open" : "choose")}
+        />
+        <div className="flex-1 flex flex-col overflow-hidden">
+          <TopBar
+            project={project ? `Project: ${project.name}` : "No Project Open"}
+            branch={project ? "main" : "—"}
+            onOpenProject={() => setProjectModal(project ? "open" : "choose")}
+            onNewMission={() => {
+              if (project) {
+                setView("home");
+              } else {
+                setProjectModal("choose");
+              }
+            }}
+          />
+          {view === "home" && (
+            <HomeView
+              project={project}
+              onOpenProject={() => setProjectModal("choose")}
+              onSubmit={handleNewMission}
+              onConfigureProviders={() => setView("settings")}
+            />
+          )}
+          {view === "mission" && <MissionView missionId={activeMission} onOpenSettings={() => setView("settings")} />}
+          {view === "discuss" && <DiscussView project={project?.name ?? "AgentCode"} branch="main" />}
+          {view === "design" && <DesignView />}
+          {view === "security" && <SecurityView />}
+          {view === "settings" && <SettingsView />}
+          <Footer
+            daemonConnected={daemonConnected}
+            modelLabel={`Routing: ${routingProfile.replace(/_/g, " ")}`}
+            tasks={`Tasks: ${missions.length}`}
+          />
+        </div>
+      </div>
+
+      {projectModal && (
+        <ProjectModal
+          mode={projectModal}
+          onClose={() => setProjectModal(null)}
+          onOpened={handleOpenedProject}
+        />
+      )}
+
+      {projectAlert && (
+        <div className="fixed inset-0 bg-black/40 flex items-center justify-center z-50" onClick={() => setProjectAlert(false)}>
+          <div
+            className="bg-surface rounded-2xl p-8 max-w-sm w-full mx-4 neo-raised"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="flex flex-col items-center text-center gap-4">
+              <div className="w-12 h-12 rounded-full neo-pressed flex items-center justify-center text-primary">
+                <Icon name="folder_open" size={24} />
+              </div>
+              <h3 className="text-lg font-semibold text-on-surface">Open a Project First</h3>
+              <p className="text-sm text-on-surface-variant">Please open a project to start working. You can open an existing one or create a new one.</p>
+              <div className="flex gap-3 mt-2">
+                <button
+                  onClick={() => {
+                    setProjectAlert(false);
+                    setProjectModal("choose");
+                  }}
+                  className="neo-button px-5 py-3 rounded-xl text-sm text-primary font-medium"
+                >
+                  Open Project
+                </button>
+                <button
+                  onClick={() => setProjectAlert(false)}
+                  className="neo-button px-5 py-3 rounded-xl text-sm text-on-surface-variant font-medium"
+                >
+                  Dismiss
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {notice && (
+        <div className="fixed bottom-10 left-1/2 -translate-x-1/2 z-50 neo-raised rounded-xl px-5 py-3 text-sm font-medium text-on-surface">
+          {notice}
+        </div>
+      )}
+    </div>
+  );
+}
+
+export function App() {
+  return (
+    <ThemeProvider>
+      <ProjectProvider>
+        <AppShell />
+      </ProjectProvider>
+    </ThemeProvider>
+  );
+}
