@@ -894,7 +894,7 @@ mod tests {
             path: "src/lib.rs".to_string(),
             precondition: ac_changeset::EditPrecondition {
                 path: "src/lib.rs".to_string(),
-                expected_hash: repo.hash("src/lib.rs").unwrap(),
+                expected_hash: Some(repo.hash("src/lib.rs").unwrap()),
                 base_revision: "rev-p13".to_string(),
                 symbol_fingerprint: None,
             },

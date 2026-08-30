@@ -202,7 +202,7 @@ impl ChangeSet {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct EditPrecondition {
     pub path: String,
-    pub expected_hash: String,
+    pub expected_hash: Option<String>,
     pub base_revision: String,
     pub symbol_fingerprint: Option<String>,
 }
@@ -277,6 +277,7 @@ pub struct PreparedEdit {
     pub symbol_fingerprint: Option<String>,
     pub additions: u32,
     pub removals: u32,
+    pub create: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -339,6 +340,7 @@ pub struct EditQualityMetrics {
 pub trait FileRepository {
     fn read(&self, path: &str) -> AcResult<String>;
     fn write(&mut self, path: &str, content: &str) -> AcResult<()>;
+    fn remove(&mut self, path: &str) -> AcResult<()>;
     fn base_revision(&self) -> AcResult<String>;
 }
 
@@ -367,7 +369,12 @@ impl EditEngine {
                     "one transaction may edit a path only once",
                 ));
             }
-            let current = repo.read(&request.path)?;
+            let create = request.precondition.expected_hash.is_none();
+            let current = if create {
+                String::new()
+            } else {
+                repo.read(&request.path)?
+            };
             validate_precondition(repo, &request, &current)?;
             let after = apply_strategy(&request.path, &current, &request.strategy)?;
             let before_hash = content_hash(&current);
@@ -383,13 +390,18 @@ impl EditEngine {
                 symbol_fingerprint: request.precondition.symbol_fingerprint,
                 additions,
                 removals,
+                create,
             });
         }
         let operations = edits
             .iter()
             .map(|edit| ChangeOperation::WriteFile {
                 path: edit.path.clone(),
-                expected_hash: Some(edit.before_hash.clone()),
+                expected_hash: if edit.create {
+                    None
+                } else {
+                    Some(edit.before_hash.clone())
+                },
                 new_hash: edit.after_hash.clone(),
             })
             .collect();
@@ -445,19 +457,46 @@ impl EditEngine {
         transaction.changeset.mark_applying()?;
         let mut applied = Vec::new();
         for edit in &transaction.edits {
-            match repo.read(&edit.path) {
-                Ok(current) if content_hash(&current) == edit.before_hash => {}
-                Ok(_) => {
-                    transaction.changeset.mark_rolling_back()?;
-                    rollback_applied(repo, &transaction.edits, &mut transaction.journal, &applied)?;
-                    transaction.changeset.mark_rolled_back()?;
-                    transaction.metrics.first_apply_success = false;
-                    return Err(AcError::conflict(
-                        "EDIT-CONCURRENT_MUTATION",
-                        "file changed after preparation and before apply",
-                    ));
+            if edit.create {
+                match repo.read(&edit.path) {
+                    Err(error) if error.code() == "EDIT-FILE_NOT_FOUND" => {}
+                    Ok(_) => {
+                        transaction.changeset.mark_rolling_back()?;
+                        rollback_applied(
+                            repo,
+                            &transaction.edits,
+                            &mut transaction.journal,
+                            &applied,
+                        )?;
+                        transaction.changeset.mark_rolled_back()?;
+                        transaction.metrics.first_apply_success = false;
+                        return Err(AcError::conflict(
+                            "EDIT-CONCURRENT_MUTATION",
+                            "file appeared after preparation and before apply",
+                        ));
+                    }
+                    Err(error) => return Err(error),
                 }
-                Err(error) => return Err(error),
+            } else {
+                match repo.read(&edit.path) {
+                    Ok(current) if content_hash(&current) == edit.before_hash => {}
+                    Ok(_) => {
+                        transaction.changeset.mark_rolling_back()?;
+                        rollback_applied(
+                            repo,
+                            &transaction.edits,
+                            &mut transaction.journal,
+                            &applied,
+                        )?;
+                        transaction.changeset.mark_rolled_back()?;
+                        transaction.metrics.first_apply_success = false;
+                        return Err(AcError::conflict(
+                            "EDIT-CONCURRENT_MUTATION",
+                            "file changed after preparation and before apply",
+                        ));
+                    }
+                    Err(error) => return Err(error),
+                }
             }
             if let Err(error) = repo.write(&edit.path, &edit.after_content) {
                 transaction.changeset.mark_rolling_back()?;
@@ -501,6 +540,24 @@ impl EditEngine {
         let mut after = 0;
         let mut unknown = 0;
         for edit in &transaction.edits {
+            if edit.create {
+                match repo.read(&edit.path) {
+                    Err(error) if error.code() == "EDIT-FILE_NOT_FOUND" => {
+                        before += 1;
+                        continue;
+                    }
+                    Err(error) => return Err(error),
+                    Ok(current) => {
+                        let current_hash = content_hash(&current);
+                        if current_hash == edit.after_hash {
+                            after += 1;
+                        } else {
+                            unknown += 1;
+                        }
+                        continue;
+                    }
+                }
+            }
             let current = repo.read(&edit.path)?;
             let current_hash = content_hash(&current);
             if current_hash == edit.before_hash {
@@ -571,6 +628,12 @@ impl FileRepository for MemoryFileRepository {
         Ok(())
     }
 
+    fn remove(&mut self, path: &str) -> AcResult<()> {
+        self.files.remove(path).map(|_| ()).ok_or_else(|| {
+            AcError::validation("EDIT-FILE_NOT_FOUND", format!("file not found: {path}"))
+        })
+    }
+
     fn base_revision(&self) -> AcResult<String> {
         Ok(self.base_revision.clone())
     }
@@ -597,8 +660,15 @@ impl LocalWorkspaceFileRepository {
 
 impl FileRepository for LocalWorkspaceFileRepository {
     fn read(&self, path: &str) -> AcResult<String> {
-        std::fs::read_to_string(self.resolve(path)?)
-            .map_err(|error| AcError::validation("EDIT-FS_READ_FAILED", error.to_string()))
+        let path = self.resolve(path)?;
+        std::fs::read_to_string(&path).map_err(|error| {
+            let code = if error.kind() == std::io::ErrorKind::NotFound {
+                "EDIT-FILE_NOT_FOUND"
+            } else {
+                "EDIT-FS_READ_FAILED"
+            };
+            AcError::validation(code, error.to_string())
+        })
     }
 
     fn write(&mut self, path: &str, content: &str) -> AcResult<()> {
@@ -607,8 +677,20 @@ impl FileRepository for LocalWorkspaceFileRepository {
             std::fs::create_dir_all(parent)
                 .map_err(|error| AcError::validation("EDIT-FS_WRITE_FAILED", error.to_string()))?;
         }
-        std::fs::write(path, content)
+        std::fs::write(&path, content)
             .map_err(|error| AcError::validation("EDIT-FS_WRITE_FAILED", error.to_string()))
+    }
+
+    fn remove(&mut self, path: &str) -> AcResult<()> {
+        let path = self.resolve(path)?;
+        std::fs::remove_file(&path).map_err(|error| {
+            let code = if error.kind() == std::io::ErrorKind::NotFound {
+                "EDIT-FILE_NOT_FOUND"
+            } else {
+                "EDIT-FS_REMOVE_FAILED"
+            };
+            AcError::validation(code, error.to_string())
+        })
     }
 
     fn base_revision(&self) -> AcResult<String> {
@@ -643,12 +725,28 @@ fn validate_precondition<R: FileRepository>(
             "precondition path must match request path",
         ));
     }
-    let actual_hash = content_hash(current);
-    if actual_hash != request.precondition.expected_hash {
-        return Err(AcError::conflict(
-            "EDIT-STALE_HASH",
-            "current file hash does not match edit precondition",
-        ));
+    match &request.precondition.expected_hash {
+        Some(expected) => {
+            let actual_hash = content_hash(current);
+            if actual_hash != *expected {
+                return Err(AcError::conflict(
+                    "EDIT-STALE_HASH",
+                    "current file hash does not match edit precondition",
+                ));
+            }
+        }
+        None => {
+            // A `None` expected_hash means "create new file": the file must
+            // NOT already exist.  `EditEngine.prepare` verifies absence by
+            // reading (a not-found read is expected and acceptable here);
+            // if a file is present, creation is rejected before mutation.
+            if repo_exists(repo, &request.path)? {
+                return Err(AcError::conflict(
+                    "EDIT-FILE_ALREADY_EXISTS",
+                    format!("cannot create existing file: {}", request.path),
+                ));
+            }
+        }
     }
     let base_revision = repo.base_revision()?;
     if base_revision != request.precondition.base_revision {
@@ -675,6 +773,16 @@ fn validate_precondition<R: FileRepository>(
         }
     }
     Ok(())
+}
+
+/// True if a path exists in the repository without treating read failures as
+/// absence.  Absence is only declared for the explicit not-found error.
+fn repo_exists<R: FileRepository>(repo: &R, path: &str) -> AcResult<bool> {
+    match repo.read(path) {
+        Ok(_) => Ok(true),
+        Err(error) if error.code() == "EDIT-FILE_NOT_FOUND" => Ok(false),
+        Err(error) => Err(error),
+    }
 }
 
 fn apply_strategy(path: &str, content: &str, strategy: &EditStrategy) -> AcResult<String> {
@@ -983,6 +1091,33 @@ fn rollback_applied<R: FileRepository>(
             .cloned();
         if let Some(entry) = entry {
             mark_journal(journal, path, ChangeSetState::RollingBack);
+            let edit = edits
+                .iter()
+                .find(|edit| &edit.path == path)
+                .ok_or_else(|| {
+                    AcError::conflict(
+                        "EDIT-ROLLBACK_MISSING_EDIT",
+                        "rollback journal has no prepared edit for path",
+                    )
+                })?;
+            if edit.create {
+                // A created file is removed entirely, not restored to an
+                // empty pre-state.
+                repo.remove(path)?;
+                match repo.read(path) {
+                    Err(error) if error.code() == "EDIT-FILE_NOT_FOUND" => {}
+                    Ok(_) => {
+                        mark_journal(journal, path, ChangeSetState::UnknownEffect);
+                        return Err(AcError::conflict(
+                            "EDIT-ROLLBACK_CORRUPTION",
+                            "rollback did not remove created file",
+                        ));
+                    }
+                    Err(error) => return Err(error),
+                }
+                mark_journal(journal, path, ChangeSetState::RolledBack);
+                continue;
+            }
             let before_content = edits
                 .iter()
                 .find(|edit| &edit.path == path)
@@ -1106,7 +1241,7 @@ mod tests {
             path: path.to_string(),
             precondition: EditPrecondition {
                 path: path.to_string(),
-                expected_hash: repo.hash(path).unwrap(),
+                expected_hash: Some(repo.hash(path).unwrap()),
                 base_revision: repo.base_revision().unwrap(),
                 symbol_fingerprint: match &strategy {
                     EditStrategy::StructuredSymbol { symbol, .. }
@@ -1183,7 +1318,7 @@ mod tests {
                 expected_matches: 1,
             },
         );
-        stale.precondition.expected_hash = "fnv1a64:stale".to_string();
+        stale.precondition.expected_hash = Some("fnv1a64:stale".to_string());
         assert_eq!(
             engine.prepare(&repo, vec![stale]).unwrap_err().code(),
             "EDIT-STALE_HASH"
@@ -1578,7 +1713,7 @@ mod tests {
                 content: "two\n".to_string(),
             },
         );
-        weak.precondition.expected_hash = String::new();
+        weak.precondition.expected_hash = Some(String::new());
         assert_eq!(
             engine.prepare(&repo, vec![weak]).unwrap_err().code(),
             "EDIT-STALE_HASH"
@@ -1605,6 +1740,69 @@ mod tests {
             } if hash.starts_with("fnv1a64:")
         ));
         assert_eq!(repo.read("src/lib.rs").unwrap(), "one\n");
+    }
+
+    #[test]
+    fn create_new_file_through_edit_engine() {
+        let mut repo = MemoryFileRepository::new("rev-a");
+        let engine = EditEngine;
+        let mut transaction = engine
+            .prepare(
+                &repo,
+                vec![EditRequest {
+                    path: "new_file.txt".to_string(),
+                    precondition: EditPrecondition {
+                        path: "new_file.txt".to_string(),
+                        expected_hash: None,
+                        base_revision: "rev-a".to_string(),
+                        symbol_fingerprint: None,
+                    },
+                    strategy: EditStrategy::WholeFile {
+                        content: "created content\n".to_string(),
+                    },
+                }],
+            )
+            .unwrap();
+        // The operation must record expected_hash: None (create).
+        assert!(matches!(
+            &transaction.changeset.operations[0],
+            ChangeOperation::WriteFile {
+                expected_hash: None,
+                ..
+            }
+        ));
+        assert!(transaction.edits[0].create);
+        transaction.changeset.validate().unwrap();
+        transaction.changeset.approve().unwrap();
+        engine.apply(&mut repo, &mut transaction).unwrap();
+        assert_eq!(transaction.changeset.state, ChangeSetState::Applied);
+        assert_eq!(repo.read("new_file.txt").unwrap(), "created content\n");
+    }
+
+    #[test]
+    fn create_new_file_rejects_existing_file() {
+        let mut repo = MemoryFileRepository::new("rev-a");
+        repo.put("existing.txt", "content\n".to_string());
+        let engine = EditEngine;
+        let err = engine
+            .prepare(
+                &repo,
+                vec![EditRequest {
+                    path: "existing.txt".to_string(),
+                    precondition: EditPrecondition {
+                        path: "existing.txt".to_string(),
+                        expected_hash: None,
+                        base_revision: "rev-a".to_string(),
+                        symbol_fingerprint: None,
+                    },
+                    strategy: EditStrategy::WholeFile {
+                        content: "new\n".to_string(),
+                    },
+                }],
+            )
+            .unwrap_err();
+        assert_eq!(err.code(), "EDIT-FILE_ALREADY_EXISTS");
+        assert_eq!(repo.read("existing.txt").unwrap(), "content\n");
     }
 
     #[test]

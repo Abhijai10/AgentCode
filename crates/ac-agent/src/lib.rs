@@ -1864,14 +1864,18 @@ impl<P: PolicyBoundary> AutonomousAgent<P> {
         path: &str,
         content: &str,
     ) -> AcResult<ChangeSetTransaction> {
-        let current = repo.read(path)?;
+        let expected_hash = match repo.read(path) {
+            Ok(current) => Some(content_hash(&current)),
+            Err(error) if error.code() == "EDIT-FILE_NOT_FOUND" => None,
+            Err(error) => return Err(error),
+        };
         EditEngine.prepare(
             repo,
             vec![EditRequest {
                 path: path.to_string(),
                 precondition: EditPrecondition {
                     path: path.to_string(),
-                    expected_hash: content_hash(&current),
+                    expected_hash,
                     base_revision: repo.base_revision()?,
                     symbol_fingerprint: None,
                 },
@@ -3088,19 +3092,32 @@ Valid planner JSON (reuse this exact structure; task_kind one of: Investigate, R
   "tasks": [
     {
       "id": "task-1",
-      "title": "Short title",
+      "title": "Apply the requested change",
       "objective": "What this task achieves",
       "rationale": "Why this task is needed",
       "dependencies": [],
+      "task_kind": "ModifyCode",
+      "required_context": ["target/file.txt"],
+      "preferred_capabilities": ["FilesystemWrite"],
+      "expected_outputs": ["changeset prepared"],
+      "verification_requirements": ["diff exists"],
+      "risk": "medium"
+    },
+    {
+      "id": "task-2",
+      "title": "Verify the change",
+      "objective": "Run verification for the change.",
+      "rationale": "Completion requires independent verification evidence.",
+      "dependencies": ["task-1"],
       "task_kind": "RunTests",
-      "required_context": ["src/lib.rs"],
+      "required_context": ["target/file.txt"],
       "preferred_capabilities": ["ProcessExec"],
       "expected_outputs": ["tests pass"],
       "verification_requirements": ["status:0"],
-      "risk": "low"
+      "risk": "medium"
     }
   ],
-  "stopping_conditions": ["condition that ends the mission"],
+  "stopping_conditions": ["changeset prepared with verification evidence"],
   "uncertainties": [],
   "questions_or_blockers": []
 }
@@ -3115,6 +3132,9 @@ const ACTION_PROPOSAL_MAX_REPAIR_ATTEMPTS: usize = 2;
 
 /// Compact schema example for action proposals (one per ready task).
 /// The task_id MUST match the task_id or task_title provided above.
+/// The canonical coding workflow is: inspect (ReadFile) → mutate (PrepareEdit)
+/// → verify (RunVerification).  Showing the mutation step explicitly makes the
+/// real coding path reliable with small local models (Ollama qwen/gemma etc.).
 const ACTION_SCHEMA_EXAMPLE: &str = r#"
 Valid action JSON (reuse this exact structure; action type one of: ReadFile, SearchCode, PrepareEdit, ExecuteTool, RunVerification, RequestAdditionalContext, FinishTask, RequestReplan, DeclareBlocked):
 {
@@ -3123,10 +3143,11 @@ Valid action JSON (reuse this exact structure; action type one of: ReadFile, Sea
   "task_title": "use the exact task_title from the instruction above",
   "reasoning_summary": "brief reasoning",
   "actions": [
+    {"type": "PrepareEdit", "path": "target/path/file.txt", "content": "exact file content to write"},
     {"type": "RunVerification", "tool_id": "dev.test", "plan_name": "agent-dynamic-validation"}
   ],
-  "expected_observations": ["observable outcome"],
-  "success_criteria": ["condition for success"],
+  "expected_observations": ["file updated", "tests pass"],
+  "success_criteria": ["change applied through Tool Broker", "status:0"],
   "uncertainty": null,
   "requires_replan": false
 }
@@ -6068,6 +6089,68 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(worktree.path.join("README.md")).unwrap(),
             "someone else\n"
+        );
+    }
+
+    #[test]
+    fn production_mutation_path_creates_new_file_with_exact_content() {
+        let mut agent = agent_with_tool(
+            CapabilityPolicy::new()
+                .allow(Capability::FilesystemRead("*".to_string()))
+                .allow(Capability::FilesystemWrite("*".to_string()))
+                .allow(Capability::ProcessExec("*".to_string())),
+            0,
+        );
+        agent.kernel_lock().unwrap().start().unwrap();
+        let worktree = agent
+            .session
+            .worker()
+            .workspace_ref
+            .as_ref()
+            .and_then(|id| agent.git.worktree(id))
+            .unwrap()
+            .clone();
+        let goal = Goal::new("Create smoke file").unwrap();
+        let task = WorkerTask {
+            id: StableId::new("task"),
+            mission_id: StableId::new("mission"),
+            title: "Modify target".to_string(),
+            dependencies: Vec::new(),
+            state: TaskState::Ready,
+            assigned_worker: Some(agent.session.worker().id.clone()),
+            retry_count: 0,
+            max_retries: 2,
+            evidence_refs: Vec::new(),
+            acceptance_criteria: Vec::new(),
+        };
+        let mut evidence_refs = Vec::new();
+        let changeset = agent
+            .prepare_and_write_changeset(
+                &goal,
+                &task,
+                "agentcode_smoke.txt",
+                "AgentCode operational smoke test",
+                &mut evidence_refs,
+            )
+            .unwrap();
+        assert_eq!(changeset.state, ChangeSetState::Applied);
+        // The operation must carry expected_hash: None (create).
+        assert!(matches!(
+            &changeset.operations[0],
+            ChangeOperation::WriteFile {
+                expected_hash: None,
+                ..
+            }
+        ));
+        // Metadata must describe the actual on-disk mutation (adds one line).
+        let metadata = changeset.metadata.as_ref().unwrap();
+        assert_eq!(metadata.files_changed.len(), 1);
+        assert_eq!(metadata.files_changed[0].path, "agentcode_smoke.txt");
+        assert_eq!(metadata.files_changed[0].additions, 1);
+        assert_eq!(metadata.files_changed[0].removals, 0);
+        assert_eq!(
+            std::fs::read_to_string(worktree.path.join("agentcode_smoke.txt")).unwrap(),
+            "AgentCode operational smoke test"
         );
     }
 

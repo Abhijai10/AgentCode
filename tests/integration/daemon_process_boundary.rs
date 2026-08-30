@@ -744,6 +744,126 @@ fn real_provider_daemon_path_smoke_proof() {
     let _ = fs::remove_dir_all(&project);
 }
 
+#[test]
+#[ignore = "requires Ollama or LM Studio running locally with a loaded model"]
+fn real_provider_daemon_path_creates_smoke_file_with_exact_content() {
+    let ollama_base =
+        std::env::var("OLLAMA_BASE_URL").unwrap_or_else(|_| "http://127.0.0.1:11434".to_string());
+    let connect_addr = ollama_connect_addr(&ollama_base);
+    if std::net::TcpStream::connect(&connect_addr).is_err() {
+        eprintln!("SKIP: Ollama not reachable at {ollama_base}; cannot run real provider test");
+        return;
+    }
+    let ollama_chat = if ollama_base.ends_with("/api/chat") {
+        ollama_base.clone()
+    } else if ollama_base.ends_with('/') {
+        format!("{ollama_base}api/chat")
+    } else {
+        format!("{ollama_base}/api/chat")
+    };
+    let ollama_model =
+        std::env::var("OLLAMA_MODEL").unwrap_or_else(|_| "qwen2.5-coder:7b".to_string());
+
+    let runtime = short_temp_path("acrp");
+    let project = short_temp_path("acrpp");
+    let _ = fs::remove_dir_all(&runtime);
+    let _ = fs::remove_dir_all(&project);
+    fs::create_dir_all(&runtime).unwrap();
+    create_smoke_fixture_project(&project);
+    let daemon = daemon_binary();
+    assert!(
+        daemon.is_file(),
+        "build the daemon first: cargo build -p ac-daemon"
+    );
+    let socket = default_socket_path(&runtime);
+    let (db_path, _) = default_paths(&runtime);
+
+    let mut child = Command::new(&daemon)
+        .env("AGENTCODE_RUNTIME_DIR", &runtime)
+        .env("AGENTCODE_WORKSPACE_ROOT", &project)
+        .env("OLLAMA_BASE_URL", &ollama_chat)
+        .env("OLLAMA_MODEL", &ollama_model)
+        .stdout(Stdio::from(
+            File::create(runtime.join("daemon.log")).unwrap(),
+        ))
+        .stderr(Stdio::from(
+            File::options()
+                .create(true)
+                .append(true)
+                .open(runtime.join("daemon.log"))
+                .unwrap(),
+        ))
+        .spawn()
+        .unwrap();
+    wait_for_socket(&socket, &mut child, &runtime);
+
+    let submit = UnixIpcClient::new(&socket)
+        .request(json!({
+            "id": "submit-smoke",
+            "command": "SubmitMission",
+            "goal": "Create a file named agentcode_smoke.txt containing exactly: AgentCode operational smoke test"
+        }))
+        .unwrap();
+    assert_eq!(submit["ok"], true, "submit response: {submit}");
+    let mission_id = submit["mission_id"].as_str().unwrap().to_string();
+    let session_id = submit["session_id"].as_str().unwrap().to_string();
+
+    let completed = poll_mission_completed(&socket, &mission_id, &mut child, &runtime);
+    assert_eq!(
+        completed["state"], "completed",
+        "real provider smoke mission: {completed}"
+    );
+
+    // Verify the file was created with exact content in the worktree.
+    // Small local models may place it at the root or inside tests/; the
+    // backend must create the file with the exact content in one of them.
+    let worktree_dir = project.join(".agentcode-worktrees").join(&session_id);
+    let candidates = [
+        worktree_dir.join("agentcode_smoke.txt"),
+        worktree_dir.join("tests/agentcode_smoke.txt"),
+    ];
+    let found = candidates.iter().find(|path| path.exists());
+    assert!(
+        found.is_some(),
+        "agentcode_smoke.txt must exist in the worktree after mission completion"
+    );
+    let content = fs::read_to_string(found.unwrap()).unwrap();
+    assert_eq!(
+        content.trim(),
+        "AgentCode operational smoke test",
+        "file content must match exactly"
+    );
+
+    // Verify real provider evidence exists.
+    let mission_stable = StableId::from_existing(&mission_id).unwrap();
+    let db = ControlPlaneDb::open(&db_path).unwrap();
+    assert_eq!(
+        db.get_mission(&mission_stable).unwrap().unwrap().state,
+        "completed"
+    );
+    let evidence = db.evidence_records().unwrap();
+    assert!(
+        evidence.iter().any(|record| {
+            record.provenance.source == "agent.completion-request"
+                || record.artifact_uri.contains("completion")
+        }),
+        "real provider must produce completion evidence"
+    );
+    let real_provider_evidence = evidence.iter().any(|record| {
+        record.provenance.source == "agent.provider.planner"
+            && !record.artifact_uri.contains("mock")
+            && !record.artifact_uri.contains("scripted")
+    });
+    assert!(
+        real_provider_evidence,
+        "real provider must produce planner evidence from a real provider, not mock or scripted"
+    );
+
+    shutdown_daemon(&socket, &mut child, &runtime);
+    let _ = fs::remove_dir_all(&runtime);
+    let _ = fs::remove_dir_all(&project);
+}
+
 fn short_temp_path(prefix: &str) -> PathBuf {
     PathBuf::from(format!("/tmp/{prefix}-{}", std::process::id()))
 }
@@ -854,6 +974,69 @@ fn create_slow_fixture_project(root: &Path) {
             "commit",
             "-m",
             "slow test",
+        ],
+    );
+}
+
+/// A fixture with a smoke test that reads agentcode_smoke.txt and asserts
+/// exact content.  The test initially FAILS (file does not exist), so the
+/// model must create the file with the correct content before verification
+/// can pass.  This is a genuine coding task that exercises the real provider
+/// path with real file mutation, ChangeSet, and verification.
+fn create_smoke_fixture_project(root: &Path) {
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::create_dir_all(root.join("tests")).unwrap();
+    fs::write(
+        root.join("Cargo.toml"),
+        "[package]\nname = \"agentcode_daemon_fixture\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    )
+    .unwrap();
+    fs::write(
+        root.join("src/lib.rs"),
+        "pub fn fixture_answer() -> u32 {\n    42\n}\n",
+    )
+    .unwrap();
+    // The fixture test always passes.
+    fs::write(
+        root.join("tests/fixture.rs"),
+        "use agentcode_daemon_fixture::fixture_answer;\n\n#[test]\nfn fixture_answer_is_correct() {\n    assert_eq!(fixture_answer(), 42);\n}\n",
+    )
+    .unwrap();
+    // The smoke test will FAIL initially (file missing) and PASS after the
+    // model creates the file with the exact content.  Small local models may
+    // place the file at the repository root or inside tests/; both are
+    // accepted so the test proves the BACKEND can create a file with exact
+    // content, independent of the model's path choice.
+    fs::write(
+        root.join("tests/smoke.rs"),
+        r#"#[test]
+fn smoke_file_exists() {
+    let manifest = env!("CARGO_MANIFEST_DIR");
+    let candidates = [
+        format!("{manifest}/agentcode_smoke.txt"),
+        format!("{manifest}/tests/agentcode_smoke.txt"),
+    ];
+    let content = candidates
+        .iter()
+        .find_map(|path| std::fs::read_to_string(path).ok())
+        .unwrap_or_default();
+    assert_eq!(content.trim(), "AgentCode operational smoke test");
+}
+"#,
+    )
+    .unwrap();
+    run_git(root, ["init"]);
+    run_git(root, ["add", "."]);
+    run_git(
+        root,
+        [
+            "-c",
+            "user.name=AgentCode Test",
+            "-c",
+            "user.email=agentcode@example.test",
+            "commit",
+            "-m",
+            "initial",
         ],
     );
 }
