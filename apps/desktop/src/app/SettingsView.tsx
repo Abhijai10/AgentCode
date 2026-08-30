@@ -465,7 +465,7 @@ export function SettingsView() {
                   </div>
                 ))}
               </div>
-              <button className="neo-button px-6 py-2 rounded-lg text-sm text-primary font-medium">Reconnect</button>
+              <button onClick={() => (async () => { const h = await daemon.health(); setDaemonStatus(h); })()} className="neo-button px-6 py-2 rounded-lg text-sm text-primary font-medium">Reconnect</button>
             </div>
           )}
 

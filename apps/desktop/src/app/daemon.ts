@@ -70,13 +70,26 @@ export const daemon = {
     }
   },
 
-  async submitMission(goal: string): Promise<{ mission_id: string; session_id: string } | null> {
+  async submitMission(
+    goal: string,
+    workspaceRoot?: string
+  ): Promise<
+    | { ok: true; mission_id: string; session_id: string }
+    | { ok: false; error: string }
+  > {
     try {
-      return await invoke<{ mission_id: string; session_id: string }>("daemon_submit_mission", {
-        goal,
-      });
-    } catch {
-      return null;
+      const result = await invoke<{ mission_id: string; session_id: string }>(
+        "daemon_submit_mission",
+        {
+          goal,
+          workspaceRoot: workspaceRoot ?? null,
+        }
+      );
+      return { ok: true, mission_id: result.mission_id, session_id: result.session_id };
+    } catch (e: unknown) {
+      const message = e instanceof Error ? e.message : String(e);
+      const cleaned = message.replace(/^[A-Z0-9_-]+:\s*/, "");
+      return { ok: false, error: cleaned || message };
     }
   },
 

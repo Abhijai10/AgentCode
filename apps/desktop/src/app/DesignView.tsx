@@ -1,9 +1,11 @@
 import { useEffect, useState } from "react";
 import { Icon } from "./Icon";
 import { daemon } from "./daemon";
+import { useProject } from "./ProjectContext";
 import type { DesignSession } from "./types";
 
 export function DesignView() {
+  const { project } = useProject();
   const [prompt, setPrompt] = useState("");
   const [sessions, setSessions] = useState<DesignSession[]>([]);
   const [activeSession, setActiveSession] = useState<DesignSession | null>(null);
@@ -44,12 +46,12 @@ export function DesignView() {
     // The design backend contract is not yet available through the daemon IPC.
     // Design sessions are owned by the backend; submitting a mission is the
     // real daemon path for goal-driven work.
-    const mission = await daemon.submitMission(trimmed);
-    if (mission) {
+    const mission = await daemon.submitMission(trimmed, project?.path);
+    if (mission.ok) {
       const s = await daemon.designListSessions();
       setSessions(s);
     } else {
-      setError("The daemon is not available. Design sessions require the backend design mode.");
+      setError(mission.error || "The daemon is not available. Design sessions require the backend design mode.");
     }
     setBusy(false);
   };

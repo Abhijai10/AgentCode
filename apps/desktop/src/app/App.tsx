@@ -72,8 +72,8 @@ function AppShell() {
       return;
     }
     const doSubmit = async () => {
-      const created = await daemon.submitMission(goal);
-      if (created) {
+      const created = await daemon.submitMission(goal, project?.path);
+      if (created.ok) {
         setActiveMission(created.mission_id);
         setView("mission");
         const m = await daemon.listActiveMissions();
@@ -81,8 +81,10 @@ function AppShell() {
         setNotice("Mission submitted to the AgentCode daemon.");
         setTimeout(() => setNotice(null), 4000);
       } else {
-        setNotice("Daemon is not connected — could not submit mission.");
-        setTimeout(() => setNotice(null), 4000);
+        // Surface the real backend error (e.g. a rejected workspace_root)
+        // instead of a fabricated success or a generic failure message.
+        setNotice(created.error || "Daemon is not connected — could not submit mission.");
+        setTimeout(() => setNotice(null), 6000);
       }
     };
     doSubmit();
