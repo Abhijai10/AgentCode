@@ -642,10 +642,7 @@ fn real_daemon_binary_pauses_queued_mission_across_restart_then_resumes() {
 fn real_provider_daemon_path_smoke_proof() {
     let ollama_base =
         std::env::var("OLLAMA_BASE_URL").unwrap_or_else(|_| "http://127.0.0.1:11434".to_string());
-    let host = ollama_base
-        .strip_prefix("http://")
-        .unwrap_or(&ollama_base)
-        .trim_end_matches('/');
+    let connect_addr = ollama_connect_addr(&ollama_base);
     let ollama_chat = if ollama_base.ends_with("/api/chat") {
         ollama_base.clone()
     } else if ollama_base.ends_with('/') {
@@ -655,7 +652,8 @@ fn real_provider_daemon_path_smoke_proof() {
     };
     let ollama_model = std::env::var("OLLAMA_MODEL").unwrap_or_else(|_| "qwen3:4b".to_string());
     // Quick connectivity check — skip (not fail) if Ollama is unreachable.
-    if std::net::TcpStream::connect(host).is_err() {
+    // Uses host:port only (never the URL path) so TcpStream::connect works.
+    if std::net::TcpStream::connect(&connect_addr).is_err() {
         eprintln!("SKIP: Ollama not reachable at {ollama_base}; cannot run real provider test");
         return;
     }
@@ -748,6 +746,18 @@ fn real_provider_daemon_path_smoke_proof() {
 
 fn short_temp_path(prefix: &str) -> PathBuf {
     PathBuf::from(format!("/tmp/{prefix}-{}", std::process::id()))
+}
+
+/// Extract the `host:port` TCP connect address from an Ollama base URL.  The
+/// URL may carry a path (e.g. `/api/chat`); `TcpStream::connect` must never
+/// receive the path — only the authority.
+fn ollama_connect_addr(base: &str) -> String {
+    let parsed = url::Url::parse(base).expect("OLLAMA_BASE_URL must be a valid URL");
+    let host = parsed.host_str().expect("OLLAMA_BASE_URL must have a host");
+    let port = parsed
+        .port_or_known_default()
+        .expect("OLLAMA_BASE_URL must resolve to a port");
+    format!("{host}:{port}")
 }
 
 fn create_fixture_project(root: &Path) {
@@ -1089,4 +1099,38 @@ fn run_git<const N: usize>(cwd: &Path, args: [&str; N]) {
 
 fn count_occurrences(haystack: &str, needle: &str) -> usize {
     haystack.match_indices(needle).count()
+}
+
+#[cfg(test)]
+mod url_parsing_tests {
+    use super::ollama_connect_addr;
+
+    #[test]
+    fn ollama_connect_addr_strips_path_from_api_chat_url() {
+        assert_eq!(
+            ollama_connect_addr("http://127.0.0.1:11434/api/chat"),
+            "127.0.0.1:11434"
+        );
+    }
+
+    #[test]
+    fn ollama_connect_addr_handles_base_url_with_trailing_slash() {
+        assert_eq!(
+            ollama_connect_addr("http://127.0.0.1:11434/"),
+            "127.0.0.1:11434"
+        );
+    }
+
+    #[test]
+    fn ollama_connect_addr_handles_plain_base_url() {
+        assert_eq!(
+            ollama_connect_addr("http://127.0.0.1:11434"),
+            "127.0.0.1:11434"
+        );
+    }
+
+    #[test]
+    fn ollama_connect_addr_uses_known_default_port_when_absent() {
+        assert_eq!(ollama_connect_addr("http://localhost"), "localhost:80");
+    }
 }

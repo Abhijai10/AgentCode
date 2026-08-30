@@ -862,8 +862,9 @@ impl HttpProviderAdapter {
                 HeaderValue::from_str(value).map_err(|_| ProviderFailureClass::InvalidRequest)?,
             );
         }
-        if let Some(env_name) = &self.credential_env {
-            let key = std::env::var(env_name).map_err(|_| ProviderFailureClass::Auth)?;
+        if let Some(credential) = &self.credential_env {
+            let key =
+                resolve_adapter_credential(credential).map_err(|_| ProviderFailureClass::Auth)?;
             match self.provider_kind {
                 HttpProviderKind::AnthropicMessages => {
                     headers.insert(
@@ -2091,6 +2092,25 @@ pub(crate) fn map_reqwest_error(error: reqwest::Error) -> ProviderFailureClass {
         ProviderFailureClass::Network
     } else {
         ProviderFailureClass::ServerError
+    }
+}
+
+/// Resolve a credential configuration value to its secret, using the single
+/// canonical backend resolver.  Full references (`env:NAME`, `secret:NAME`)
+/// are resolved through `resolve_credential_ref` so a persisted `secret:NAME`
+/// account reference is honored on the real request path.  Bare environment
+/// variable names (the legacy adapter configuration shape) are read directly
+/// from the environment so those configurations keep working.
+fn resolve_adapter_credential(credential: &str) -> AcResult<String> {
+    if credential.starts_with("env:") || credential.starts_with("secret:") {
+        catalog::resolve_credential_ref(credential)
+    } else {
+        std::env::var(credential).map_err(|_| {
+            AcError::validation(
+                "PROVIDER-CREDENTIAL_UNAVAILABLE",
+                format!("environment credential {credential} is not set"),
+            )
+        })
     }
 }
 
@@ -3393,5 +3413,61 @@ data: [DONE]\n\n";
             let _ = registry.start_attempt(&request).unwrap();
         }
         assert_eq!(registry.attempts().len(), MAX_PROVIDER_HISTORY);
+    }
+
+    #[test]
+    fn http_provider_adapter_resolves_secret_reference_for_auth() {
+        let tmp = std::env::temp_dir().join(format!("ac-secret-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        let secret_path = tmp.join("test-secret");
+        std::fs::write(&secret_path, b"sk-live-secret-value").unwrap();
+        std::env::set_var("AGENTCODE_SECRET_DIR", tmp.as_os_str());
+
+        let adapter = HttpProviderAdapter::new(
+            "http://127.0.0.1:1/v1/chat",
+            Some("secret:test-secret".to_string()),
+            "fixture-model",
+            1000,
+        )
+        .unwrap();
+        let headers = adapter.auth_headers().unwrap();
+        let auth = headers.get(AUTHORIZATION).unwrap().to_str().unwrap();
+        assert_eq!(auth, "Bearer sk-live-secret-value");
+
+        // Also prove the full stream() path sends the correct header
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = format!("http://{}/v1/chat", listener.local_addr().unwrap());
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut buf = [0_u8; 4096];
+            let n = stream.read(&mut buf).unwrap_or(0);
+            let request = String::from_utf8_lossy(&buf[..n]).to_string();
+            tx.send(request).unwrap();
+            let body = "{\"choices\":[{\"message\":{\"content\":\"ok\"},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1}}";
+            let response = format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body);
+            let _ = stream.write_all(response.as_bytes());
+        });
+
+        let adapter = HttpProviderAdapter::new(
+            endpoint,
+            Some("secret:test-secret".to_string()),
+            "fixture-model",
+            5000,
+        )
+        .unwrap();
+        let request = request();
+        let events = adapter.stream(&request, &|| false).unwrap();
+        let wire = rx.recv_timeout(StdDuration::from_secs(2)).unwrap();
+        assert!(
+            wire.to_ascii_lowercase()
+                .contains("authorization: bearer sk-live-secret-value"),
+            "authenticated request must carry the resolved secret"
+        );
+        assert!(matches!(events.last(), Some(ProviderStreamEvent::Finished)));
+
+        std::env::remove_var("AGENTCODE_SECRET_DIR");
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 }

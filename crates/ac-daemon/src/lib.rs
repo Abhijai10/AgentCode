@@ -1884,6 +1884,13 @@ mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
 
+    static DAEMON_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn with_daemon_env_lock<T>(f: impl FnOnce() -> T) -> T {
+        let _guard = DAEMON_ENV_LOCK.lock().unwrap();
+        f()
+    }
+
     fn temp_paths() -> (PathBuf, PathBuf, PathBuf) {
         let dir = std::env::temp_dir().join(format!("agentcode-daemon-{}", StableId::new("tmp")));
         fs::create_dir_all(&dir).unwrap();
@@ -1947,38 +1954,134 @@ mod tests {
 
     #[test]
     fn store_credential_writes_only_masked_and_readable_ref() {
-        let (dir, db, lock) = temp_paths();
-        std::env::set_var("AGENTCODE_SECRET_DIR", dir.join("secrets"));
-        let daemon = DaemonService::open(&db, &lock).unwrap();
-        let reference = daemon
-            .store_credential("test-key", "sk-live-secret")
-            .unwrap();
-        assert_eq!(reference, "secret:test-key");
-        // The stored value is resolvable by the provider credential resolver.
-        let resolved = ac_provider::catalog::resolve_credential_ref(&reference).unwrap();
-        assert_eq!(resolved, "sk-live-secret");
-        // Delete removes the file.
-        daemon.delete_credential("test-key").unwrap();
-        assert!(ac_provider::catalog::resolve_credential_ref(&reference).is_err());
-        let _ = fs::remove_dir_all(dir);
+        with_daemon_env_lock(|| {
+            let (dir, db, lock) = temp_paths();
+            std::env::set_var("AGENTCODE_SECRET_DIR", dir.join("secrets"));
+            let daemon = DaemonService::open(&db, &lock).unwrap();
+            let reference = daemon
+                .store_credential("test-key", "sk-live-secret")
+                .unwrap();
+            assert_eq!(reference, "secret:test-key");
+            // The stored value is resolvable by the provider credential resolver.
+            let resolved = ac_provider::catalog::resolve_credential_ref(&reference).unwrap();
+            assert_eq!(resolved, "sk-live-secret");
+            // Delete removes the file.
+            daemon.delete_credential("test-key").unwrap();
+            assert!(ac_provider::catalog::resolve_credential_ref(&reference).is_err());
+            let _ = fs::remove_dir_all(dir);
+        });
     }
 
     #[test]
     fn test_credential_returns_normalized_result_without_saving() {
-        let (dir, db, lock) = temp_paths();
-        std::env::set_var("AGENTCODE_SECRET_DIR", dir.join("secrets"));
-        let daemon = DaemonService::open(&db, &lock).unwrap();
-        // An unreachable endpoint must normalize to a non-ok status, not panic
-        // and not create an account.
-        let reference = daemon.store_credential("probe", "bad-key").unwrap();
-        let status = daemon
-            .test_credential("openai", &reference, "", "", "")
-            .unwrap();
-        assert!(!status.ok);
-        assert!(status.failure.is_some());
-        assert!(status.masked_credential.contains("****"));
-        assert!(daemon.list_provider_accounts("openai").unwrap().is_empty());
-        let _ = fs::remove_dir_all(dir);
+        with_daemon_env_lock(|| {
+            let (dir, db, lock) = temp_paths();
+            std::env::set_var("AGENTCODE_SECRET_DIR", dir.join("secrets"));
+            let daemon = DaemonService::open(&db, &lock).unwrap();
+            // An unreachable endpoint must normalize to a non-ok status, not panic
+            // and not create an account.
+            let reference = daemon.store_credential("probe", "bad-key").unwrap();
+            let status = daemon
+                .test_credential("openai", &reference, "", "", "")
+                .unwrap();
+            assert!(!status.ok);
+            assert!(status.failure.is_some());
+            assert!(status.masked_credential.contains("****"));
+            assert!(daemon.list_provider_accounts("openai").unwrap().is_empty());
+            let _ = fs::remove_dir_all(dir);
+        });
+    }
+
+    #[test]
+    fn saved_secret_account_reaches_real_authenticated_request() {
+        with_daemon_env_lock(|| {
+            use std::io::{Read, Write};
+            use std::net::TcpListener;
+            use std::sync::mpsc;
+            use std::time::Duration as StdDuration;
+
+            let (dir, db, lock) = temp_paths();
+            let secrets = dir.join("secrets");
+            std::env::set_var("AGENTCODE_SECRET_DIR", &secrets);
+
+            // Local HTTP server that captures the Authorization header so the test
+            // proves the real request path without exposing the credential.
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let endpoint = format!(
+                "http://{}/v1/chat/completions",
+                listener.local_addr().unwrap()
+            );
+            let (tx, rx) = mpsc::channel();
+            std::thread::spawn(move || {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut buf = [0_u8; 8192];
+                let n = stream.read(&mut buf).unwrap_or(0);
+                let request = String::from_utf8_lossy(&buf[..n]).to_string();
+                tx.send(request).unwrap();
+                let body = "{\"choices\":[{\"message\":{\"content\":\"plan=ok\"},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":4,\"completion_tokens\":6}}";
+                let response = format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body);
+                let _ = stream.write_all(response.as_bytes());
+            });
+
+            std::env::set_var("OPENAI_BASE_URL", &endpoint);
+            let had_openai_key = std::env::var("OPENAI_API_KEY").ok();
+            std::env::remove_var("OPENAI_API_KEY");
+
+            // 1. Store a credential through the backend secret store.
+            let daemon = DaemonService::open(&db, &lock).unwrap();
+            let reference = daemon
+                .store_credential("live-key", "sk-live-secret")
+                .unwrap();
+            assert_eq!(reference, "secret:live-key");
+
+            // 2. Create a provider account that references the stored secret.
+            let account_id = daemon
+                .save_provider_account("openai", "live-account", &reference, "", "", "", "", true)
+                .unwrap();
+
+            // 3. Re-open/reload the provider registry from durable state.
+            drop(daemon);
+            let daemon = DaemonService::open(&db, &lock).unwrap();
+            let accounts = daemon.list_provider_accounts("openai").unwrap();
+            assert_eq!(accounts.len(), 1);
+            assert_eq!(accounts[0].credential_ref, "secret:live-key");
+            assert_eq!(accounts[0].id.to_string(), account_id.to_string());
+
+            // 4. Build the actual provider registry (the runtime request path).
+            let mut registry = daemon.build_provider_registry().unwrap();
+
+            // 5. Perform an actual authenticated provider request through the
+            //    daemon-built registry.  This exercises the full runtime path:
+            //    registry -> adapter -> auth_headers -> secret resolution -> HTTP.
+            let profile = ac_provider::TaskProfile::coding(
+                StableId::new("task"),
+                ac_provider::RoutingProfile::FreeFirst,
+            );
+            let execution = registry
+                .request_model(&profile, "plan this", 128, &|| false)
+                .expect("authenticated provider request must succeed");
+            assert!(execution
+                .events
+                .iter()
+                .any(|event| { matches!(event, ac_provider::ProviderStreamEvent::Finished) }));
+            assert!(execution.decision.selected.is_some());
+
+            let wire = rx.recv_timeout(StdDuration::from_secs(2)).unwrap();
+            assert!(
+                wire.to_ascii_lowercase()
+                    .contains("authorization: bearer sk-live-secret"),
+                "daemon registry must send the resolved secret on the wire"
+            );
+            // The raw credential never leaks into the account response.
+            assert!(!format!("{accounts:?}").contains("sk-live-secret"));
+
+            std::env::remove_var("OPENAI_BASE_URL");
+            std::env::remove_var("AGENTCODE_SECRET_DIR");
+            if let Some(key) = had_openai_key {
+                std::env::set_var("OPENAI_API_KEY", key);
+            }
+            let _ = fs::remove_dir_all(dir);
+        });
     }
 
     #[test]

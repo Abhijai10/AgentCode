@@ -1036,6 +1036,7 @@ impl<P: PolicyBoundary> AutonomousAgent<P> {
             match self.execute_task_actions(
                 &goal,
                 &task,
+                &task_context,
                 &action_reasoning,
                 &mut evidence_refs,
                 &mut changeset,
@@ -1310,6 +1311,65 @@ impl<P: PolicyBoundary> AutonomousAgent<P> {
         }
     }
 
+    /// Parse an implementer action proposal with a bounded repair path.
+    ///
+    /// Flow: direct parse → bundle fallback → bounded repair re-prompts →
+    /// deterministic AGENT-ACTION_PARSE_FAILED.  A repair re-prompt feeds the
+    /// previous error plus the schema example back to the provider.  The final
+    /// proposal still must satisfy the full ActionProposal schema; invalid
+    /// output is never silently reinterpreted as a valid action.
+    fn parse_action_proposal_with_repair(
+        &mut self,
+        goal: &Goal,
+        task: &WorkerTask,
+        context: &ContextPack,
+        reasoning: &ProviderReasoning,
+    ) -> AcResult<ActionProposal> {
+        let direct = ActionProposal::parse(&reasoning.text);
+        if direct.is_ok() {
+            return direct;
+        }
+        if let Ok(proposal) = action_proposal_from_bundle(&reasoning.text, task) {
+            return Ok(proposal);
+        }
+        let first = direct.unwrap_err();
+        let mut last_error = first;
+        for _ in 0..ACTION_PROPOSAL_MAX_REPAIR_ATTEMPTS {
+            let mut prompt =
+                build_provider_prompt("implementer", goal, context, Some(task), &self.observations);
+            prompt.push_str(&format!(
+                "\nREPAIR: previous action proposal was rejected. previous_error:{last_error}; return ActionProposal JSON schema_version 1 only\n{ACTION_SCHEMA_EXAMPLE}"
+            ));
+            let mut profile = TaskProfile::coding(goal.id.clone(), RoutingProfile::FreeFirst);
+            profile.required_context = context.budget;
+            let repair = self
+                .providers
+                .request_model(&profile, prompt, 8192, &|| self.session.is_cancelled())
+                .map_err(provider_error)?;
+            let text = provider_events_text(&repair.events);
+            match ActionProposal::parse(&text) {
+                Ok(proposal) => return Ok(proposal),
+                Err(error) => {
+                    if let Ok(proposal) = action_proposal_from_bundle(&text, task) {
+                        return Ok(proposal);
+                    }
+                    last_error = error;
+                }
+            }
+        }
+        Err(AcError::new(
+            "AGENT-ACTION_PARSE_FAILED",
+            format!(
+                "action parse failed after {} repair attempts; direct={}; text={}",
+                ACTION_PROPOSAL_MAX_REPAIR_ATTEMPTS,
+                truncate_for_log(&last_error.to_string(), 600),
+                truncate_for_log(&reasoning.text, 1200)
+            ),
+            ac_common::ErrorKind::Validation,
+            ac_common::Retryability::NotRetryable,
+        ))
+    }
+
     fn build_task_context(
         &mut self,
         goal: &Goal,
@@ -1369,28 +1429,18 @@ impl<P: PolicyBoundary> AutonomousAgent<P> {
         Ok(ProviderReasoning { text, events })
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn execute_task_actions(
         &mut self,
         goal: &Goal,
         task: &WorkerTask,
+        context: &ContextPack,
         reasoning: &ProviderReasoning,
         evidence_refs: &mut Vec<StableId>,
         changeset: &mut Option<ChangeSet>,
         validation: &mut Option<ValidationRunReport>,
     ) -> AcResult<TaskProgress> {
-        let proposal = ActionProposal::parse(&reasoning.text).or_else(|parse_error| {
-            action_proposal_from_bundle(&reasoning.text, task).map_err(|bundle_error| {
-                AcError::new(
-                    "AGENT-ACTION_PARSE_FAILED",
-                    format!(
-                        "action parse failed; direct={parse_error}; bundle={bundle_error}; text={}",
-                        truncate_for_log(&reasoning.text, 1200)
-                    ),
-                    ac_common::ErrorKind::Validation,
-                    ac_common::Retryability::NotRetryable,
-                )
-            })
-        })?;
+        let proposal = self.parse_action_proposal_with_repair(goal, task, context, reasoning)?;
         if proposal.task_id != task.id.to_string()
             && proposal.task_id != task.title
             && !task.id.to_string().starts_with(&proposal.task_id)
@@ -3056,6 +3106,12 @@ Valid planner JSON (reuse this exact structure; task_kind one of: Investigate, R
 }
 Output the JSON object only; no markdown, no prose, no code fences.
 "#;
+
+/// Bounded number of repair re-prompts before an action proposal is declared
+/// unparsable.  Mirrors the planner's single bounded repair but allows two
+/// attempts so a noisy small local model gets a fair chance without unbounded
+/// retries.
+const ACTION_PROPOSAL_MAX_REPAIR_ATTEMPTS: usize = 2;
 
 /// Compact schema example for action proposals (one per ready task).
 /// The task_id MUST match the task_id or task_title provided above.
@@ -5141,6 +5197,63 @@ mod tests {
             .unwrap();
         assert_eq!(report.state, AutonomousState::Completed);
         assert_eq!(report.runtime_plan.unwrap().tasks.len(), 1);
+    }
+
+    #[test]
+    fn implementer_action_proposal_uses_bounded_repair_and_still_validates() {
+        // Planner output is valid on the first call; the implementer's first
+        // action proposal is garbage (not JSON), so the bounded repair path
+        // must re-prompt the provider and accept the second, valid proposal.
+        // A mission that never produces a valid proposal must still FAIL rather
+        // than being silently accepted.
+        let responses = VecDeque::from([
+            planner_plan_only(
+                "src/lib.rs",
+                &[("verify", "Finish repaired task", "RunTests", &[][..])],
+            ),
+            "not-json implementer garbage".to_string(),
+            action_proposal_json(
+                "Finish repaired task",
+                "repaired action proposal",
+                r#"[{ "type": "RunVerification", "tool_id": "dev.test", "plan_name": "agent-dynamic-validation" }]"#,
+                false,
+            ),
+        ]);
+        let mut repaired = agent_with_provider(
+            CapabilityPolicy::new().allow(Capability::ProcessExec("*".to_string())),
+            Box::new(SequencedProvider {
+                responses: Mutex::new(responses),
+            }),
+        );
+        let report = repaired
+            .run_goal(Goal::new("Repair malformed action proposal").unwrap())
+            .unwrap();
+        assert_eq!(report.state, AutonomousState::Completed);
+        assert!(report.validation.is_some());
+
+        // Exhaustion: implementer always returns garbage, so even the bounded
+        // repair attempts fail and the mission must FAIL with the explicit
+        // AGENT-ACTION_PARSE_FAILED class — never a silent success.
+        let responses = VecDeque::from([
+            planner_plan_only(
+                "src/lib.rs",
+                &[("verify", "Finish repaired task", "RunTests", &[][..])],
+            ),
+            "garbage-one".to_string(),
+            "garbage-two".to_string(),
+            "garbage-three".to_string(),
+        ]);
+        let mut exhausted = agent_with_provider(
+            CapabilityPolicy::new().allow(Capability::ProcessExec("*".to_string())),
+            Box::new(SequencedProvider {
+                responses: Mutex::new(responses),
+            }),
+        );
+        let report = exhausted
+            .run_goal(Goal::new("Exhaust action repair attempts").unwrap())
+            .unwrap();
+        assert_eq!(report.state, AutonomousState::Failed);
+        assert!(report.completion_request.is_none());
     }
 
     #[test]
