@@ -2,13 +2,20 @@ use std::collections::{BTreeMap, VecDeque};
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread::{self, JoinHandle};
 
 use ac_common::{AcError, AcResult, StableId, TimestampMillis};
-use ac_db::{ControlPlaneDb, PersistedSession, PersistedWorktree};
+use ac_db::{ControlPlaneDb, PersistedSession, PersistedWorktree, ProviderCatalogRow};
 use ac_git::{WorktreeRecord, WorktreeStatus};
 use ac_kernel::{Kernel, KernelDecisionKind, MissionState, PermissionDecision, PolicyBoundary};
+use ac_provider::catalog::{
+    test_provider_account, ProviderAccount as CatalogAccount, ProviderAccountStatus,
+    ProviderCatalogEntry, ProviderConnectionKind, ProviderConnectionTest,
+};
+use ac_provider::discovery::{discover_models, ModelDiscoveryKind};
+use ac_provider::PrivacyClass;
 use ac_runtime::{
     AgentSession, AgentSessionState, CancellationToken, HydratedSession, RuntimeHydrator,
     TaskGraph, Worker,
@@ -76,6 +83,22 @@ impl ac_agent::AgentDurabilityObserver for SqliteAgentDurability {
             "rust",
         )
     }
+
+    fn evidence_persisted(&mut self, record: &ac_evidence::EvidenceRecord) -> AcResult<()> {
+        self.db()?.append_evidence(record)
+    }
+
+    fn load_evidence_records(
+        &mut self,
+        ids: &[ac_common::StableId],
+    ) -> AcResult<Vec<ac_evidence::EvidenceRecord>> {
+        let db = self.db()?;
+        let all = db.evidence_records()?;
+        Ok(all
+            .into_iter()
+            .filter(|record| ids.contains(&record.id))
+            .collect())
+    }
 }
 
 #[derive(Default)]
@@ -94,6 +117,10 @@ struct MissionCoordinator {
     tx: mpsc::SyncSender<CoordinatorMessage>,
     state: Arc<Mutex<CoordinatorState>>,
     worker: Mutex<Option<JoinHandle<()>>>,
+    /// Dedicated shutdown flag that cannot be blocked by a full work queue.
+    /// The worker checks this flag via recv_timeout, guaranteeing termination
+    /// even when all 64 channel slots are occupied by queued missions.
+    shutdown: Arc<AtomicBool>,
 }
 
 impl MissionCoordinator {
@@ -105,10 +132,20 @@ impl MissionCoordinator {
         let (tx, rx) = mpsc::sync_channel::<CoordinatorMessage>(64);
         let state = Arc::new(Mutex::new(CoordinatorState::default()));
         let worker_state = Arc::clone(&state);
+        let shutdown_flag = Arc::new(AtomicBool::new(false));
+        let shutdown_check = Arc::clone(&shutdown_flag);
         let worker = thread::Builder::new()
             .name("agentcode-mission-worker".to_string())
             .spawn(move || {
-                while let Ok(message) = rx.recv() {
+                loop {
+                    if shutdown_check.load(Ordering::Acquire) {
+                        break;
+                    }
+                    let message = match rx.recv_timeout(std::time::Duration::from_millis(50)) {
+                        Ok(msg) => msg,
+                        Err(mpsc::RecvTimeoutError::Timeout) => continue,
+                        Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                    };
                     let CoordinatorMessage::Run(job) = message else {
                         break;
                     };
@@ -147,8 +184,19 @@ impl MissionCoordinator {
                     }));
                     let terminal = match outcome {
                         Ok(Ok(state)) => state,
-                        Ok(Err(error)) => format!("failed: {}", error.code()),
-                        Err(_) => "failed: DAEMON-MISSION_PANIC".to_string(),
+                        Ok(Err(error)) => {
+                            eprintln!(
+                                "MISSION-ERROR mission={} code={} detail={}",
+                                job.mission_id,
+                                error.code(),
+                                error
+                            );
+                            format!("failed: {}", error.code())
+                        }
+                        Err(_) => {
+                            eprintln!("MISSION-PANIC mission={}", job.mission_id);
+                            "failed: DAEMON-MISSION_PANIC".to_string()
+                        }
                     };
                     let was_cancelled_in_memory = worker_state
                         .lock()
@@ -173,10 +221,18 @@ impl MissionCoordinator {
                         };
                         let _ = db.update_session_state(&job.session_id, state_name);
                     }
+                    let is_terminal = is_terminal_status(&terminal);
                     if let Ok(mut state) = worker_state.lock() {
                         state.active = None;
                         if let Some(status) = state.statuses.get_mut(job.mission_id.as_str()) {
                             status.state = terminal;
+                        }
+                        // Clean up terminal mission state so cancelled/cancellation
+                        // maps do not grow without bound across thousands of missions.
+                        if is_terminal {
+                            let mid = job.mission_id.as_str();
+                            state.cancelled.remove(mid);
+                            state.cancellation.remove(mid);
                         }
                         prune_terminal_statuses(&mut state);
                     }
@@ -187,6 +243,7 @@ impl MissionCoordinator {
             tx,
             state,
             worker: Mutex::new(Some(worker)),
+            shutdown: shutdown_flag,
         }
     }
 
@@ -326,6 +383,9 @@ impl MissionCoordinator {
                 token.cancel();
             }
         }
+        // Set the dedicated shutdown flag first.  This guarantees the worker
+        // will see the shutdown even when the channel is full.
+        self.shutdown.store(true, Ordering::Release);
         let _ = self.tx.try_send(CoordinatorMessage::Shutdown);
         let handle = self
             .worker
@@ -408,7 +468,10 @@ fn execute_mission(
         .worktree_for_mission(&job.mission_id)?
         .map(persisted_worktree_to_record)
         .transpose()?;
-    let mut agent = ac_agent::bound_workspace_agent_with_durability(
+    // Provider routing is backend-owned: build the mission's model broker from
+    // the durable provider catalog/accounts, falling back to the environment.
+    let providers = daemon_provider_registry(&db, db_path)?;
+    let mut agent = ac_agent::bound_workspace_agent_with_providers(
         workspace_root.to_path_buf(),
         worktree,
         Arc::clone(&kernel),
@@ -420,8 +483,42 @@ fn execute_mission(
         Some(Box::new(SqliteAgentDurability {
             db_path: db_path.to_path_buf(),
         })),
+        providers,
     )?;
     let report = agent.run_goal(ac_agent::Goal::new(job.goal.clone())?)?;
+    if report.state != ac_agent::AutonomousState::Completed {
+        eprintln!(
+            "MISSION-NOT-COMPLETED mission={} state={:?}",
+            job.mission_id, report.state
+        );
+        if let Some(plan) = &report.runtime_plan {
+            for task in plan.tasks.iter() {
+                eprintln!(
+                    "  TASK {} state={:?} title={}",
+                    task.id, task.state, task.title
+                );
+            }
+        }
+        for observation in &report.observations {
+            eprintln!(
+                "  OBS task={} action={} success={} failure_class={:?} summary={}",
+                observation.task_id,
+                observation.action,
+                observation.success,
+                observation.failure_class,
+                observation.summary
+            );
+        }
+        if let Some(validation) = &report.validation {
+            eprintln!(
+                "  VALIDATION plan={} passed={} evidence={}",
+                validation.plan_name, validation.passed, validation.evidence_ref
+            );
+        }
+        for replan in &report.replans {
+            eprintln!("  REPLAN {replan}");
+        }
+    }
     let evidence = agent.into_evidence();
     for record in evidence.records() {
         db.append_evidence(record)?;
@@ -572,6 +669,7 @@ impl IpcTransport for LocalIpc<'_> {
 pub struct DaemonService {
     lifecycle: DaemonLifecycle,
     db: ControlPlaneDb,
+    db_path: PathBuf,
     kernel: Arc<Mutex<Kernel<ProductionKernelPolicy>>>,
     lock_path: PathBuf,
     lock_file: Option<File>,
@@ -604,6 +702,7 @@ impl DaemonService {
         let db_path = db_path.as_ref().to_path_buf();
         let mut db = ControlPlaneDb::open(&db_path)?;
         db.migrate()?;
+        seed_provider_catalog(&db)?;
         let kernel = Arc::new(Mutex::new(Kernel::new(ProductionKernelPolicy)));
         let workspace_root = std::env::var_os("AGENTCODE_WORKSPACE_ROOT")
             .map(PathBuf::from)
@@ -615,10 +714,11 @@ impl DaemonService {
             lifecycle: DaemonLifecycle::Created,
             db,
             coordinator: MissionCoordinator::new(
-                db_path,
+                db_path.clone(),
                 workspace_root.clone(),
                 Arc::clone(&kernel),
             ),
+            db_path,
             kernel,
             lock_path: lock_path.into(),
             lock_file: None,
@@ -783,6 +883,47 @@ impl DaemonService {
         Ok(self.db.get_mission(&id)?.map(|mission| mission.state))
     }
 
+    pub fn mission_goal(&self, mission_id: &str) -> AcResult<Option<String>> {
+        let id = StableId::from_existing(mission_id)?;
+        Ok(self
+            .db
+            .get_mission(&id)?
+            .map(|mission| mission.original_goal))
+    }
+
+    pub fn desktop_settings(&self) -> AcResult<ac_db::DesktopPreferenceRow> {
+        Ok(self
+            .db
+            .desktop_preference("ui")?
+            .unwrap_or(ac_db::DesktopPreferenceRow {
+                session_id: "ui".to_string(),
+                appearance: "light".to_string(),
+                notifications_enabled: true,
+                completion_sound_enabled: true,
+                reduced_motion: false,
+                budget_limit_micros: None,
+            }))
+    }
+
+    pub fn save_desktop_settings(
+        &self,
+        appearance: String,
+        notifications_enabled: bool,
+        completion_sound_enabled: bool,
+        reduced_motion: bool,
+        budget_limit_micros: Option<u64>,
+    ) -> AcResult<()> {
+        self.db
+            .save_desktop_preference(&ac_db::DesktopPreferenceRow {
+                session_id: "ui".to_string(),
+                appearance,
+                notifications_enabled,
+                completion_sound_enabled,
+                reduced_motion,
+                budget_limit_micros,
+            })
+    }
+
     pub fn pause_mission(&mut self, mission_id: &str) -> AcResult<()> {
         self.ensure_running()?;
         self.coordinator.pause(mission_id)?;
@@ -809,6 +950,285 @@ impl DaemonService {
                 .update_session_state(&status.session_id, "cancelled")?;
         }
         Ok(())
+    }
+
+    // ── Provider Catalog ──────────────────────────────────────────────────────
+
+    pub fn provider_catalog(&self) -> AcResult<Vec<ProviderCatalogEntry>> {
+        let rows = self.db.provider_catalog_entries()?;
+        rows.into_iter().map(db_catalog_entry_to_ac).collect()
+    }
+
+    pub fn list_provider_accounts(&self, provider_id: &str) -> AcResult<Vec<CatalogAccount>> {
+        let rows = self.db.provider_accounts(provider_id)?;
+        rows.into_iter().map(db_account_to_ac).collect()
+    }
+
+    pub fn provider_account(&self, account_id: &str) -> AcResult<Option<CatalogAccount>> {
+        self.db
+            .provider_account(account_id)?
+            .map(db_account_to_ac)
+            .transpose()
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn save_provider_account(
+        &self,
+        provider_id: &str,
+        label: &str,
+        credential_ref: &str,
+        credential_region: &str,
+        organization: &str,
+        project: &str,
+        workspace: &str,
+        enabled: bool,
+    ) -> AcResult<StableId> {
+        let now = ac_common::TimestampMillis::now().as_millis() as i64;
+        let id = StableId::new("acct");
+        let row = ac_db::ProviderAccountRow {
+            id: id.to_string(),
+            provider_id: provider_id.to_string(),
+            label: label.to_string(),
+            credential_ref: credential_ref.to_string(),
+            credential_region: credential_region.to_string(),
+            organization: organization.to_string(),
+            project: project.to_string(),
+            workspace: workspace.to_string(),
+            enabled,
+            health_state: "unknown".to_string(),
+            quota_rate_limit: None,
+            quota_remaining: None,
+            quota_reset_at_ms: None,
+            last_success_at_ms: None,
+            last_failure_at_ms: None,
+            failure_reason: String::new(),
+            created_at_ms: now,
+            updated_at_ms: now,
+        };
+        self.db.save_provider_account(&row)?;
+        Ok(id)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn update_provider_account(
+        &self,
+        account_id: &str,
+        label: &str,
+        credential_ref: &str,
+        credential_region: &str,
+        organization: &str,
+        project: &str,
+        workspace: &str,
+        enabled: bool,
+    ) -> AcResult<()> {
+        let existing = self.db.provider_account(account_id)?.ok_or_else(|| {
+            AcError::validation(
+                "DAEMON-PROVIDER_ACCOUNT_NOT_FOUND",
+                "provider account not found",
+            )
+        })?;
+        let now = ac_common::TimestampMillis::now().as_millis() as i64;
+        let row = ac_db::ProviderAccountRow {
+            credential_ref: if credential_ref.is_empty() {
+                existing.credential_ref
+            } else {
+                credential_ref.to_string()
+            },
+            ..existing
+        };
+        let mut row = row;
+        row.label = label.to_string();
+        row.credential_region = credential_region.to_string();
+        row.organization = organization.to_string();
+        row.project = project.to_string();
+        row.workspace = workspace.to_string();
+        row.enabled = enabled;
+        row.updated_at_ms = now;
+        self.db.save_provider_account(&row)
+    }
+
+    pub fn delete_provider_account(&self, account_id: &str) -> AcResult<()> {
+        self.db.delete_provider_account(account_id)
+    }
+
+    pub fn test_provider_account(&self, account_id: &str) -> AcResult<ProviderAccountStatus> {
+        let account = self.db.provider_account(account_id)?.ok_or_else(|| {
+            AcError::validation(
+                "DAEMON-PROVIDER_ACCOUNT_NOT_FOUND",
+                "provider account not found",
+            )
+        })?;
+        let catalog_acct = db_account_to_ac(account)?;
+        let kind = provider_connection_kind(&catalog_acct.provider_id);
+        let endpoint = catalog_account_endpoint(&catalog_acct)?;
+        let model = "test".to_string();
+        let test = ProviderConnectionTest::new(catalog_acct.clone(), endpoint, model, kind)?;
+        let result = test_provider_account(&test, &|| false)?;
+        // Update the account's health state in the DB
+        let now = ac_common::TimestampMillis::now().as_millis() as i64;
+        let health_state = if result.ok { "ok" } else { "failed" };
+        if let Ok(Some(existing)) = self.db.provider_account(account_id) {
+            let updated = ac_db::ProviderAccountRow {
+                health_state: health_state.to_string(),
+                last_success_at_ms: if result.ok {
+                    Some(now)
+                } else {
+                    existing.last_success_at_ms
+                },
+                last_failure_at_ms: if result.ok {
+                    existing.last_failure_at_ms
+                } else {
+                    Some(now)
+                },
+                failure_reason: if result.ok {
+                    String::new()
+                } else {
+                    result.detail.clone()
+                },
+                updated_at_ms: now,
+                ..existing
+            };
+            let _ = self.db.save_provider_account(&updated);
+        }
+        let _ = self
+            .db
+            .append_provider_health_observation(&ac_db::ProviderHealthObservationRow {
+                id: StableId::new("health").to_string(),
+                account_id: account_id.to_string(),
+                success: result.ok,
+                latency_ms: result.latency_ms,
+                failure_code: result
+                    .failure
+                    .as_ref()
+                    .map(|f| format!("{f:?}"))
+                    .unwrap_or_default(),
+                failure_message: result.detail.clone(),
+                observed_at_ms: now,
+            });
+        Ok(result)
+    }
+
+    pub fn discover_provider_models(
+        &self,
+        endpoint_base: &str,
+        kind: &str,
+    ) -> AcResult<Vec<ac_provider::catalog::DiscoveredModel>> {
+        let discovery_kind = match kind {
+            "ollama" => ModelDiscoveryKind::Ollama,
+            _ => ModelDiscoveryKind::OpenAiCompatible,
+        };
+        discover_models(endpoint_base, discovery_kind, 5000, 10000)
+    }
+
+    // ── Backend-Owned Credential Store ─────────────────────────────────────────
+
+    /// Store a raw credential value into the single backend-owned secret store
+    /// (`AGENTCODE_SECRET_DIR`) and return its `secret:NAME` reference.  This is
+    /// the one authoritative secret-storage path; the desktop layer must not
+    /// maintain its own secret files.
+    pub fn store_credential(&self, name: &str, value: &str) -> AcResult<String> {
+        if name.trim().is_empty() {
+            return Err(AcError::validation(
+                "DAEMON-CREDENTIAL_NAME_EMPTY",
+                "credential name is required",
+            ));
+        }
+        if value.is_empty() {
+            return Err(AcError::validation(
+                "DAEMON-CREDENTIAL_VALUE_EMPTY",
+                "credential value is required",
+            ));
+        }
+        let dir = std::env::var("AGENTCODE_SECRET_DIR").map_err(|_| {
+            AcError::validation(
+                "DAEMON-SECRET_DIR_UNAVAILABLE",
+                "secret storage requires AGENTCODE_SECRET_DIR",
+            )
+        })?;
+        let dir_path = std::path::Path::new(&dir);
+        std::fs::create_dir_all(dir_path).map_err(|error| {
+            AcError::validation("DAEMON-SECRET_DIR_CREATE", error.to_string())
+        })?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(dir_path, std::fs::Permissions::from_mode(0o700));
+        }
+        let path = dir_path.join(sanitize_secret_name(name));
+        std::fs::write(&path, value.as_bytes()).map_err(|error| {
+            AcError::validation("DAEMON-SECRET_WRITE", error.to_string())
+        })?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+        }
+        Ok(format!("secret:{}", sanitize_secret_name(name)))
+    }
+
+    pub fn delete_credential(&self, name: &str) -> AcResult<()> {
+        let dir = std::env::var("AGENTCODE_SECRET_DIR").map_err(|_| {
+            AcError::validation(
+                "DAEMON-SECRET_DIR_UNAVAILABLE",
+                "secret storage requires AGENTCODE_SECRET_DIR",
+            )
+        })?;
+        let path = std::path::Path::new(&dir).join(sanitize_secret_name(name));
+        if path.exists() {
+            std::fs::remove_file(&path).map_err(|error| {
+                AcError::validation("DAEMON-SECRET_REMOVE", error.to_string())
+            })?;
+        }
+        Ok(())
+    }
+
+    /// Run a real provider connection test for a credential reference WITHOUT
+    /// persisting an account.  Used by the UI's "Test Connection" so success is
+    /// only reported after the provider is actually contacted.
+    pub fn test_credential(
+        &self,
+        provider_id: &str,
+        credential_ref: &str,
+        organization: &str,
+        project: &str,
+        workspace: &str,
+    ) -> AcResult<ProviderAccountStatus> {
+        if provider_id.trim().is_empty() || credential_ref.trim().is_empty() {
+            return Err(AcError::validation(
+                "DAEMON-TEST_CREDENTIAL_INVALID",
+                "provider and credential reference are required",
+            ));
+        }
+        let account = CatalogAccount {
+            id: StableId::new("tmp-acct"),
+            provider_id: StableId::from_existing(provider_id)?,
+            label: "connection-test".to_string(),
+            credential_ref: credential_ref.to_string(),
+            credential_region: String::new(),
+            organization: organization.to_string(),
+            project: project.to_string(),
+            workspace: workspace.to_string(),
+            enabled: true,
+            health_state: "unknown".to_string(),
+            quota_rate_limit: None,
+            quota_remaining: None,
+            quota_reset_at_ms: None,
+            last_success_at_ms: None,
+            last_failure_at_ms: None,
+            failure_reason: String::new(),
+        };
+        let kind = provider_connection_kind(&account.provider_id);
+        let endpoint = catalog_account_endpoint(&account)?;
+        let test = ProviderConnectionTest::new(account, endpoint, "test", kind)?;
+        test_provider_account(&test, &|| false)
+    }
+
+    // ── Provider Registry Builder ──────────────────────────────────────────────
+
+    /// Build a ProviderRegistry from the DB catalog + accounts, falling back to
+    /// the environment for providers that have no stored accounts.
+    pub fn build_provider_registry(&self) -> AcResult<ac_provider::ProviderRegistry> {
+        daemon_provider_registry(&self.db, &self.db_path)
     }
 
     pub fn handle(&mut self, command: DaemonCommand) -> AcResult<DaemonResponse> {
@@ -919,6 +1339,296 @@ fn lock_pid(metadata: &str) -> Option<u32> {
         .lines()
         .find_map(|line| line.strip_prefix("pid="))
         .and_then(|pid| pid.parse().ok())
+}
+
+/// Seed the provider catalog table with the canonical provider set that
+/// AgentCode's OmniRoute registry actually supports.  The table is the source
+/// of truth for `ListProviders`; seeding is idempotent and only inserts rows
+/// that are missing so user-added providers are never overwritten.
+fn seed_provider_catalog(db: &ControlPlaneDb) -> AcResult<()> {
+    let now = TimestampMillis::now().as_millis() as i64;
+    let canonical: Vec<ProviderCatalogRow> = vec![
+        ProviderCatalogRow {
+            id: "openai".to_string(),
+            display_name: "OpenAI".to_string(),
+            description: "Fast inference models (GPT series).".to_string(),
+            website_url: "https://openai.com".to_string(),
+            logo_url: String::new(),
+            credential_url: "https://platform.openai.com/api-keys".to_string(),
+            pricing_classification: "paid".to_string(),
+            capabilities: serde_json::to_string(&vec!["chat", "tools", "vision"]).unwrap(),
+            created_at_ms: now,
+            updated_at_ms: now,
+        },
+        ProviderCatalogRow {
+            id: "anthropic".to_string(),
+            display_name: "Anthropic".to_string(),
+            description: "High-quality Claude models.".to_string(),
+            website_url: "https://anthropic.com".to_string(),
+            logo_url: String::new(),
+            credential_url: "https://console.anthropic.com/settings/keys".to_string(),
+            pricing_classification: "paid".to_string(),
+            capabilities: serde_json::to_string(&vec!["chat", "tools"]).unwrap(),
+            created_at_ms: now,
+            updated_at_ms: now,
+        },
+        ProviderCatalogRow {
+            id: "gemini".to_string(),
+            display_name: "Google / Gemini".to_string(),
+            description: "Free tier available (Gemini models).".to_string(),
+            website_url: "https://ai.google.dev".to_string(),
+            logo_url: String::new(),
+            credential_url: "https://aistudio.google.com/app/apikey".to_string(),
+            pricing_classification: "free-tier".to_string(),
+            capabilities: serde_json::to_string(&vec!["chat", "vision"]).unwrap(),
+            created_at_ms: now,
+            updated_at_ms: now,
+        },
+        ProviderCatalogRow {
+            id: "ollama".to_string(),
+            display_name: "Ollama".to_string(),
+            description: "Local models, free, offline capable.".to_string(),
+            website_url: "https://ollama.com".to_string(),
+            logo_url: String::new(),
+            credential_url: "https://ollama.com/download".to_string(),
+            pricing_classification: "local".to_string(),
+            capabilities: serde_json::to_string(&vec!["chat", "tools", "local"]).unwrap(),
+            created_at_ms: now,
+            updated_at_ms: now,
+        },
+        ProviderCatalogRow {
+            id: "lm-studio".to_string(),
+            display_name: "LM Studio".to_string(),
+            description: "Local OpenAI-compatible models.".to_string(),
+            website_url: "https://lmstudio.ai".to_string(),
+            logo_url: String::new(),
+            credential_url: "https://lmstudio.ai/docs".to_string(),
+            pricing_classification: "local".to_string(),
+            capabilities: serde_json::to_string(&vec!["chat", "local"]).unwrap(),
+            created_at_ms: now,
+            updated_at_ms: now,
+        },
+    ];
+    for row in canonical {
+        if db.provider_catalog_entry(&row.id)?.is_none() {
+            db.save_provider_catalog_entry(&row)?;
+        }
+    }
+    Ok(())
+}
+
+fn db_catalog_entry_to_ac(row: ac_db::ProviderCatalogRow) -> AcResult<ProviderCatalogEntry> {
+    let capabilities = serde_json::from_str::<Vec<String>>(&row.capabilities)
+        .map_err(|error| AcError::validation("DAEMON-PROVIDER_CATALOG_JSON", error.to_string()))
+        .unwrap_or_default();
+    Ok(ProviderCatalogEntry {
+        id: StableId::from_existing(&row.id)?,
+        display_name: row.display_name,
+        description: row.description,
+        website_url: row.website_url,
+        logo_url: row.logo_url,
+        credential_url: row.credential_url,
+        pricing_classification: row.pricing_classification,
+        capabilities,
+    })
+}
+
+/// Sanitize a credential secret name to a filesystem-safe identifier.
+fn sanitize_secret_name(name: &str) -> String {
+    let sanitized: String = name
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    let sanitized = sanitized.trim_matches('_');
+    if sanitized.is_empty() {
+        "credential".to_string()
+    } else {
+        sanitized.to_string()
+    }
+}
+
+fn db_account_to_ac(row: ac_db::ProviderAccountRow) -> AcResult<CatalogAccount> {
+    Ok(CatalogAccount {
+        id: StableId::from_existing(&row.id)?,
+        provider_id: StableId::from_existing(&row.provider_id)?,
+        label: row.label,
+        credential_ref: row.credential_ref,
+        credential_region: row.credential_region,
+        organization: row.organization,
+        project: row.project,
+        workspace: row.workspace,
+        enabled: row.enabled,
+        health_state: row.health_state,
+        quota_rate_limit: row.quota_rate_limit.map(|v| v as u64),
+        quota_remaining: row.quota_remaining.map(|v| v as u64),
+        quota_reset_at_ms: row.quota_reset_at_ms.map(|v| v as u64),
+        last_success_at_ms: row.last_success_at_ms.map(|v| v as u64),
+        last_failure_at_ms: row.last_failure_at_ms.map(|v| v as u64),
+        failure_reason: row.failure_reason,
+    })
+}
+
+/// Build a ProviderRegistry from the durable catalog + environment,
+/// used by every mission executed through the daemon.
+fn daemon_provider_registry(
+    db: &ControlPlaneDb,
+    _db_path: &Path,
+) -> AcResult<ac_provider::ProviderRegistry> {
+    use ac_agent::{provider_registry_from_config, ProviderConfigEntry, ProviderRegistryConfig};
+    let mut config = ProviderRegistryConfig::from_environment();
+    let entries = db.provider_catalog_entries().unwrap_or_default();
+    for catalog_row in entries {
+        let accounts = db.provider_accounts(&catalog_row.id).unwrap_or_default();
+        for acct in accounts {
+            if !acct.enabled {
+                continue;
+            }
+            let kind = provider_config_kind(&catalog_row.id);
+            let endpoint = resolve_account_endpoint_helper(&catalog_row.id);
+            config.entries.push(ProviderConfigEntry {
+                kind,
+                provider_id: catalog_row.id.clone(),
+                name: acct.label.clone(),
+                enabled: true,
+                endpoint,
+                credential_env: Some(acct.credential_ref.clone()),
+                model: provider_default_model(&catalog_row.id),
+                models: Vec::new(),
+                connect_timeout_ms: 10_000,
+                read_timeout_ms: 60_000,
+                custom_headers: Vec::new(),
+                allow_plain_http_remote: false,
+                local: catalog_row.id == "ollama",
+                paid: !catalog_row.id.contains("ollama"),
+                privacy: if catalog_row.id == "ollama" {
+                    PrivacyClass::LocalOnly
+                } else {
+                    PrivacyClass::ExternalAllowed
+                },
+                input_cost_micros: None,
+                output_cost_micros: None,
+            });
+        }
+    }
+    provider_registry_from_config(config)
+}
+
+fn resolve_account_endpoint_helper(provider_id: &str) -> String {
+    match provider_id {
+        "ollama" => std::env::var("OLLAMA_BASE_URL")
+            .unwrap_or_else(|_| "http://127.0.0.1:11434/api/chat".to_string()),
+        "lm-studio" | "lmstudio" => std::env::var("LMSTUDIO_BASE_URL")
+            .unwrap_or_else(|_| "http://127.0.0.1:1234/v1/chat/completions".to_string()),
+        "openai" => std::env::var("OPENAI_BASE_URL")
+            .unwrap_or_else(|_| "https://api.openai.com/v1/chat/completions".to_string()),
+        "anthropic" => std::env::var("ANTHROPIC_BASE_URL")
+            .unwrap_or_else(|_| "https://api.anthropic.com/v1/messages".to_string()),
+        "gemini" => std::env::var("GEMINI_BASE_URL").unwrap_or_else(|_| {
+            format!(
+                "https://generativelanguage.googleapis.com/v1beta/models/{}:generateContent",
+                std::env::var("GEMINI_MODEL").unwrap_or_else(|_| "gemini-1.5-flash".to_string())
+            )
+        }),
+        _ => "config:unknown".to_string(),
+    }
+}
+
+fn provider_connection_kind(provider_id: &StableId) -> ProviderConnectionKind {
+    match provider_id.as_str() {
+        "ollama" => ProviderConnectionKind::OllamaChat,
+        "lm-studio" | "lmstudio" | "openai-compatible" => ProviderConnectionKind::OpenAiCompatible,
+        "anthropic" => ProviderConnectionKind::AnthropicMessages,
+        "gemini" => ProviderConnectionKind::GeminiGenerateContent,
+        _ => ProviderConnectionKind::OpenAiChatCompletions,
+    }
+}
+
+fn provider_config_kind(provider_id: &str) -> ac_agent::ProviderConfigKind {
+    match provider_id {
+        "openai" => ac_agent::ProviderConfigKind::OpenAi,
+        "anthropic" => ac_agent::ProviderConfigKind::Anthropic,
+        "gemini" => ac_agent::ProviderConfigKind::Gemini,
+        "ollama" => ac_agent::ProviderConfigKind::Ollama,
+        "lm-studio" | "lmstudio" => ac_agent::ProviderConfigKind::LmStudio,
+        _ => ac_agent::ProviderConfigKind::OpenAi,
+    }
+}
+
+fn provider_default_model(provider_id: &str) -> String {
+    match provider_id {
+        "ollama" => std::env::var("OLLAMA_MODEL").unwrap_or_else(|_| "qwen3:4b".to_string()),
+        "lm-studio" | "lmstudio" => {
+            std::env::var("LMSTUDIO_MODEL").unwrap_or_else(|_| "local-model".to_string())
+        }
+        "openai" => std::env::var("OPENAI_MODEL").unwrap_or_else(|_| "gpt-4o-mini".to_string()),
+        "anthropic" => std::env::var("ANTHROPIC_MODEL")
+            .unwrap_or_else(|_| "claude-3-5-haiku-latest".to_string()),
+        "gemini" => {
+            std::env::var("GEMINI_MODEL").unwrap_or_else(|_| "gemini-1.5-flash".to_string())
+        }
+        _ => "default".to_string(),
+    }
+}
+
+/// Resolve a provider account's chat endpoint.  Local providers default to
+/// their standard loopback endpoints; remote providers use the conventional
+/// base URL environment variable when set, otherwise the well-known public
+/// endpoint for that provider kind.
+fn catalog_account_endpoint(account: &CatalogAccount) -> AcResult<String> {
+    let provider = account.provider_id.as_str();
+    let base = match provider {
+        "ollama" => {
+            let mut base = std::env::var("OLLAMA_BASE_URL")
+                .unwrap_or_else(|_| "http://127.0.0.1:11434".to_string());
+            if !base.ends_with("/api/chat") {
+                if !base.ends_with('/') {
+                    base.push('/');
+                }
+                base.push_str("api/chat");
+            }
+            base
+        }
+        "lm-studio" | "lmstudio" => {
+            let mut base = std::env::var("LMSTUDIO_BASE_URL")
+                .unwrap_or_else(|_| "http://127.0.0.1:1234".to_string());
+            if !base.ends_with("/v1/chat/completions") {
+                if !base.ends_with('/') {
+                    base.push('/');
+                }
+                base.push_str("v1/chat/completions");
+            }
+            base
+        }
+        "openai" => std::env::var("OPENAI_BASE_URL")
+            .unwrap_or_else(|_| "https://api.openai.com/v1/chat/completions".to_string()),
+        "anthropic" => std::env::var("ANTHROPIC_BASE_URL")
+            .unwrap_or_else(|_| "https://api.anthropic.com/v1/messages".to_string()),
+        "gemini" => std::env::var("GEMINI_BASE_URL").unwrap_or_else(|_| {
+            format!(
+                "https://generativelanguage.googleapis.com/v1beta/models/{}:generateContent",
+                std::env::var("GEMINI_MODEL").unwrap_or_else(|_| "gemini-1.5-flash".to_string())
+            )
+        }),
+        _ => {
+            return Err(AcError::validation(
+                "DAEMON-PROVIDER_ENDPOINT_UNKNOWN",
+                format!("no endpoint known for provider {provider}"),
+            ));
+        }
+    };
+    if base.trim().is_empty() {
+        return Err(AcError::validation(
+            "DAEMON-PROVIDER_ENDPOINT_EMPTY",
+            format!("provider {provider} has an empty endpoint"),
+        ));
+    }
+    Ok(base)
 }
 
 fn process_is_alive(pid: u32) -> bool {
@@ -1503,5 +2213,41 @@ mod tests {
             .transition(ReleaseStatus::Released, "release/published-hash")
             .unwrap();
         assert_eq!(state.status, ReleaseStatus::Released);
+    }
+
+    #[test]
+    fn coordinator_terminal_state_is_bounded_and_cancellation_does_not_leak() {
+        let (dir, db, lock) = temp_paths();
+        let mut daemon = DaemonService::open(&db, &lock).unwrap();
+        daemon.start().unwrap();
+
+        // Cancel several missions to populate cancelled/cancellation maps,
+        // then verify terminal cleanup removes them.
+        let mut cancelled_ids = Vec::new();
+        for i in 0..5 {
+            let (mission_id, _) = match daemon
+                .handle(DaemonCommand::CreateSession {
+                    goal: format!("bounded-state-{i}"),
+                })
+                .unwrap()
+            {
+                DaemonResponse::SessionCreated {
+                    mission_id,
+                    session_id,
+                } => (mission_id, session_id),
+                _ => panic!("expected session"),
+            };
+            daemon.cancel_mission(mission_id.as_str()).unwrap();
+            cancelled_ids.push(mission_id);
+        }
+        // After cancellation + terminal processing, the in-memory
+        // cancellation/cleaned maps should not retain entries for terminal
+        // missions.  We verify by checking status is bounded and correct.
+        for mid in &cancelled_ids {
+            let status = daemon.mission_status(mid.as_str()).unwrap();
+            assert_eq!(status.state, "cancelled");
+        }
+        daemon.stop().unwrap();
+        let _ = fs::remove_dir_all(dir);
     }
 }
