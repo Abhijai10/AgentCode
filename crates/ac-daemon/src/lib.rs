@@ -1720,7 +1720,9 @@ fn provider_config_kind(provider_id: &str) -> ac_agent::ProviderConfigKind {
 
 fn provider_default_model(provider_id: &str) -> String {
     match provider_id {
-        "ollama" => std::env::var("OLLAMA_MODEL").unwrap_or_else(|_| "qwen3:4b".to_string()),
+        "ollama" => {
+            std::env::var("OLLAMA_MODEL").unwrap_or_else(|_| "qwen2.5-coder:3b".to_string())
+        }
         "lm-studio" | "lmstudio" => {
             std::env::var("LMSTUDIO_MODEL").unwrap_or_else(|_| "local-model".to_string())
         }
@@ -1879,15 +1881,20 @@ fn _timestamp_for_observability() -> TimestampMillis {
     TimestampMillis::now()
 }
 
+/// Crate-wide mutex serializing tests that mutate process environment
+/// variables (AGENTCODE_SECRET_DIR, provider base URLs).  Both the lib test
+/// module and the IPC test module share this so parallel tests cannot race on
+/// process-global env state.
+#[cfg(test)]
+pub(crate) static TEST_ENV_LOCK: Mutex<()> = Mutex::new(());
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
 
-    static DAEMON_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
     fn with_daemon_env_lock<T>(f: impl FnOnce() -> T) -> T {
-        let _guard = DAEMON_ENV_LOCK.lock().unwrap();
+        let _guard = TEST_ENV_LOCK.lock().unwrap();
         f()
     }
 
@@ -2080,6 +2087,115 @@ mod tests {
             if let Some(key) = had_openai_key {
                 std::env::set_var("OPENAI_API_KEY", key);
             }
+            let _ = fs::remove_dir_all(dir);
+        });
+    }
+
+    #[test]
+    fn provider_account_credentials_remain_isolated_between_accounts() {
+        with_daemon_env_lock(|| {
+            let (dir, db, lock) = temp_paths();
+            let secrets = dir.join("secrets");
+            std::env::set_var("AGENTCODE_SECRET_DIR", &secrets);
+
+            let daemon = DaemonService::open(&db, &lock).unwrap();
+            let ref_a = daemon
+                .store_credential("acct-a-key", "sk-secret-a")
+                .unwrap();
+            let ref_b = daemon
+                .store_credential("acct-b-key", "sk-secret-b")
+                .unwrap();
+            assert_ne!(ref_a, ref_b);
+
+            let account_a = daemon
+                .save_provider_account("openai", "account-a", &ref_a, "", "", "", "", true)
+                .unwrap();
+            let account_b = daemon
+                .save_provider_account("openai", "account-b", &ref_b, "", "", "", "", true)
+                .unwrap();
+
+            // Each account stores only its own reference; neither holds the
+            // other's secret value or reference.
+            let accounts = daemon.list_provider_accounts("openai").unwrap();
+            assert_eq!(accounts.len(), 2);
+            let a = accounts
+                .iter()
+                .find(|account| account.id == account_a)
+                .unwrap();
+            let b = accounts
+                .iter()
+                .find(|account| account.id == account_b)
+                .unwrap();
+            assert_eq!(a.credential_ref, "secret:acct-a-key");
+            assert_eq!(b.credential_ref, "secret:acct-b-key");
+            assert!(a.masked_credential().contains("****"));
+            assert!(b.masked_credential().contains("****"));
+
+            // The secrets resolve independently through the canonical resolver.
+            assert_eq!(
+                ac_provider::catalog::resolve_credential_ref(&ref_a).unwrap(),
+                "sk-secret-a"
+            );
+            assert_eq!(
+                ac_provider::catalog::resolve_credential_ref(&ref_b).unwrap(),
+                "sk-secret-b"
+            );
+
+            // Deleting account A must not disturb account B.
+            daemon.delete_provider_account(account_a.as_str()).unwrap();
+            let remaining = daemon.list_provider_accounts("openai").unwrap();
+            assert_eq!(remaining.len(), 1);
+            assert_eq!(remaining[0].id, account_b);
+
+            // Rotating B must not resurrect A's reference.
+            daemon
+                .rotate_provider_account(account_b.as_str(), "secret:acct-b-key")
+                .unwrap();
+            let remaining = daemon.list_provider_accounts("openai").unwrap();
+            assert_eq!(remaining.len(), 1);
+            assert_eq!(remaining[0].credential_ref, "secret:acct-b-key");
+
+            std::env::remove_var("AGENTCODE_SECRET_DIR");
+            let _ = fs::remove_dir_all(dir);
+        });
+    }
+
+    #[test]
+    fn missing_secret_reference_fails_account_operation_honestly() {
+        with_daemon_env_lock(|| {
+            let (dir, db, lock) = temp_paths();
+            let secrets = dir.join("secrets");
+            std::env::set_var("AGENTCODE_SECRET_DIR", &secrets);
+
+            let daemon = DaemonService::open(&db, &lock).unwrap();
+            // A reference to a secret file that was never stored must resolve
+            // to an honest error, not a placeholder value.
+            let err =
+                ac_provider::catalog::resolve_credential_ref("secret:never-stored").unwrap_err();
+            assert_eq!(err.code(), "PROVIDER-CREDENTIAL_UNAVAILABLE");
+
+            // Account creation still stores the reference (lazy resolution at
+            // the request boundary), but a real request must then fail.
+            let account_id = daemon
+                .save_provider_account(
+                    "openai",
+                    "broken",
+                    "secret:never-stored",
+                    "",
+                    "",
+                    "",
+                    "",
+                    true,
+                )
+                .unwrap();
+            let account_ref = account_id.to_string();
+            drop(daemon);
+            let daemon = DaemonService::open(&db, &lock).unwrap();
+            let accounts = daemon.list_provider_accounts("openai").unwrap();
+            assert_eq!(accounts[0].credential_ref, "secret:never-stored");
+            assert_eq!(accounts[0].id.to_string(), account_ref);
+
+            std::env::remove_var("AGENTCODE_SECRET_DIR");
             let _ = fs::remove_dir_all(dir);
         });
     }

@@ -650,7 +650,10 @@ fn real_provider_daemon_path_smoke_proof() {
     } else {
         format!("{ollama_base}/api/chat")
     };
-    let ollama_model = std::env::var("OLLAMA_MODEL").unwrap_or_else(|_| "qwen3:4b".to_string());
+    // Small-model constraint: this machine has 8 GB RAM, so the default is a
+    // <=4B coding model, never a 7B/8B model.
+    let ollama_model =
+        std::env::var("OLLAMA_MODEL").unwrap_or_else(|_| "qwen2.5-coder:3b".to_string());
     // Quick connectivity check — skip (not fail) if Ollama is unreachable.
     // Uses host:port only (never the URL path) so TcpStream::connect works.
     if std::net::TcpStream::connect(&connect_addr).is_err() {
@@ -761,8 +764,10 @@ fn real_provider_daemon_path_creates_smoke_file_with_exact_content() {
     } else {
         format!("{ollama_base}/api/chat")
     };
+    // Small-model constraint: <=4B only (8 GB RAM host).  Never default to a
+    // 7B/8B model.
     let ollama_model =
-        std::env::var("OLLAMA_MODEL").unwrap_or_else(|_| "qwen2.5-coder:7b".to_string());
+        std::env::var("OLLAMA_MODEL").unwrap_or_else(|_| "qwen2.5-coder:3b".to_string());
 
     let runtime = short_temp_path("acrp");
     let project = short_temp_path("acrpp");

@@ -536,6 +536,110 @@ mod ipc_tests {
         daemon.stop().unwrap();
         let _ = fs::remove_dir_all(dir);
     }
+    #[test]
+    fn provider_account_ipc_responses_never_expose_raw_secret() {
+        // Full IPC round trip: StoreCredential + CreateProviderAccount + list
+        // and get account responses must never contain the raw secret value or
+        // the unmasked reference.  This proves the no-leak requirement at the
+        // exact boundary React consumes.
+        let _env_lock = crate::TEST_ENV_LOCK.lock().unwrap();
+        let (dir, db, lock, socket) = temp_paths("secret-leak");
+        std::env::set_var("AGENTCODE_SECRET_DIR", dir.join("secrets"));
+        let mut daemon = DaemonService::open(&db, &lock).unwrap();
+        daemon.start().unwrap();
+        let Some((server, listener)) = bind_or_skip(&socket, None) else {
+            daemon.stop().unwrap();
+            std::env::remove_var("AGENTCODE_SECRET_DIR");
+            let _ = fs::remove_dir_all(dir);
+            return;
+        };
+
+        let store = std::thread::spawn({
+            let socket = socket.clone();
+            move || {
+                UnixIpcClient::new(socket)
+                    .request(json!({
+                        "id": "store",
+                        "command": "StoreCredential",
+                        "name": "ui-saved-key",
+                        "value": "sk-ui-saved-RAW-SECRET"
+                    }))
+                    .unwrap()
+            }
+        });
+        pump_until(&server, &listener, &mut daemon, &store);
+        let store = store.join().unwrap();
+        assert_eq!(store["ok"], true, "store response: {store}");
+        let credential_ref = store["credential_ref"].as_str().unwrap().to_string();
+        assert_eq!(credential_ref, "secret:ui-saved-key");
+
+        let create = std::thread::spawn({
+            let socket = socket.clone();
+            let credential_ref = credential_ref.clone();
+            move || {
+                UnixIpcClient::new(socket)
+                    .request(json!({
+                        "id": "create",
+                        "command": "CreateProviderAccount",
+                        "provider_id": "openai",
+                        "label": "ui-account",
+                        "credential_ref": credential_ref
+                    }))
+                    .unwrap()
+            }
+        });
+        pump_until(&server, &listener, &mut daemon, &create);
+        let create = create.join().unwrap();
+        assert_eq!(create["ok"], true, "create response: {create}");
+        let account_id = create["account_id"].as_str().unwrap().to_string();
+
+        let list = std::thread::spawn({
+            let socket = socket.clone();
+            move || {
+                UnixIpcClient::new(socket)
+                    .request(json!({"id": "list", "command": "ListProviderAccounts", "provider_id": "openai"}))
+                    .unwrap()
+            }
+        });
+        pump_until(&server, &listener, &mut daemon, &list);
+        let list = list.join().unwrap();
+        let get = std::thread::spawn({
+            let socket = socket.clone();
+            let account_id = account_id.clone();
+            move || {
+                UnixIpcClient::new(socket)
+                    .request(json!({"id": "get", "command": "GetProviderAccount", "account_id": account_id}))
+                    .unwrap()
+            }
+        });
+        pump_until(&server, &listener, &mut daemon, &get);
+        let get = get.join().unwrap();
+
+        // The raw secret value must appear nowhere in any IPC response.
+        let serialized = format!("{store}{create}{list}{get}");
+        assert!(
+            !serialized.contains("sk-ui-saved-RAW-SECRET"),
+            "raw secret leaked into IPC responses: {serialized}"
+        );
+        // Account list/get responses must carry only the masked form, never
+        // the unmasked `secret:NAME` reference.  (The StoreCredential response
+        // itself returns the reference because the UI needs that handle to
+        // create the account; that is the documented contract.)
+        assert!(
+            !format!("{list}{get}").contains("secret:ui-saved-key"),
+            "unmasked credential reference leaked into account responses: {serialized}"
+        );
+        assert!(serialized.contains("****"), "masked credential must be present");
+        // Account is durable and reachable after restart with the same ref.
+        drop(server);
+        daemon.stop().unwrap();
+        let daemon = DaemonService::open(&db, &lock).unwrap();
+        let accounts = daemon.list_provider_accounts("openai").unwrap();
+        assert_eq!(accounts[0].credential_ref, "secret:ui-saved-key");
+
+        std::env::remove_var("AGENTCODE_SECRET_DIR");
+        let _ = fs::remove_dir_all(dir);
+    }
 
     #[test]
     fn stalled_client_does_not_block_healthy_client() {
@@ -570,5 +674,22 @@ mod ipc_tests {
         server.cleanup();
         daemon.stop().unwrap();
         let _ = fs::remove_dir_all(dir);
+    }
+
+    fn pump_until(
+        server: &UnixIpcServer,
+        listener: &UnixListener,
+        daemon: &mut DaemonService,
+        thread: &std::thread::JoinHandle<Value>,
+    ) {
+        let start = Instant::now();
+        while !thread.is_finished() && start.elapsed() < Duration::from_secs(15) {
+            server.serve_once(listener, daemon).unwrap();
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(
+            thread.is_finished(),
+            "IPC request did not complete within the pump budget"
+        );
     }
 }

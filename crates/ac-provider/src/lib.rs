@@ -863,6 +863,12 @@ impl HttpProviderAdapter {
             );
         }
         if let Some(credential) = &self.credential_env {
+            if credential.trim().is_empty() {
+                // An explicitly empty credential means "no authentication" (the
+                // Ollama/no-auth account case).  Skip header construction so an
+                // account saved without a secret still reaches the provider.
+                return Ok(headers);
+            }
             let key =
                 resolve_adapter_credential(credential).map_err(|_| ProviderFailureClass::Auth)?;
             match self.provider_kind {
@@ -2456,6 +2462,13 @@ fn provider_finished(value: &Value, provider_kind: HttpProviderKind) -> bool {
     }
 }
 
+/// Crate-wide mutex serializing provider tests that mutate process environment
+/// variables (AGENTCODE_SECRET_DIR, provider test keys).  Both the lib test
+/// module and the catalog test module share this so parallel tests cannot race
+/// on process-global env state.
+#[cfg(test)]
+pub(crate) static PROVIDER_TEST_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2465,6 +2478,11 @@ mod tests {
     use std::sync::Mutex;
     use std::thread;
     use std::time::Duration as StdDuration;
+
+    fn with_test_env_lock<T>(f: impl FnOnce() -> T) -> T {
+        let _guard = crate::PROVIDER_TEST_ENV_LOCK.lock().unwrap();
+        f()
+    }
 
     struct RetryProvider {
         responses: Mutex<VecDeque<Result<Vec<ProviderStreamEvent>, ProviderFailureClass>>>,
@@ -3417,57 +3435,146 @@ data: [DONE]\n\n";
 
     #[test]
     fn http_provider_adapter_resolves_secret_reference_for_auth() {
-        let tmp = std::env::temp_dir().join(format!("ac-secret-test-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&tmp);
-        std::fs::create_dir_all(&tmp).unwrap();
-        let secret_path = tmp.join("test-secret");
-        std::fs::write(&secret_path, b"sk-live-secret-value").unwrap();
-        std::env::set_var("AGENTCODE_SECRET_DIR", tmp.as_os_str());
+        with_test_env_lock(|| {
+            let tmp = std::env::temp_dir().join(format!("ac-secret-test-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&tmp);
+            std::fs::create_dir_all(&tmp).unwrap();
+            let secret_path = tmp.join("test-secret");
+            std::fs::write(&secret_path, b"sk-live-secret-value").unwrap();
+            std::env::set_var("AGENTCODE_SECRET_DIR", tmp.as_os_str());
 
+            let adapter = HttpProviderAdapter::new(
+                "http://127.0.0.1:1/v1/chat",
+                Some("secret:test-secret".to_string()),
+                "fixture-model",
+                1000,
+            )
+            .unwrap();
+            let headers = adapter.auth_headers().unwrap();
+            let auth = headers.get(AUTHORIZATION).unwrap().to_str().unwrap();
+            assert_eq!(auth, "Bearer sk-live-secret-value");
+
+            // Also prove the full stream() path sends the correct header
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let endpoint = format!("http://{}/v1/chat", listener.local_addr().unwrap());
+            let (tx, rx) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut buf = [0_u8; 4096];
+                let n = stream.read(&mut buf).unwrap_or(0);
+                let request = String::from_utf8_lossy(&buf[..n]).to_string();
+                tx.send(request).unwrap();
+                let body = "{\"choices\":[{\"message\":{\"content\":\"ok\"},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1}}";
+                let response = format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body);
+                let _ = stream.write_all(response.as_bytes());
+            });
+
+            let adapter = HttpProviderAdapter::new(
+                endpoint,
+                Some("secret:test-secret".to_string()),
+                "fixture-model",
+                5000,
+            )
+            .unwrap();
+            let request = request();
+            let events = adapter.stream(&request, &|| false).unwrap();
+            let wire = rx.recv_timeout(StdDuration::from_secs(2)).unwrap();
+            assert!(
+                wire.to_ascii_lowercase()
+                    .contains("authorization: bearer sk-live-secret-value"),
+                "authenticated request must carry the resolved secret"
+            );
+            assert!(matches!(events.last(), Some(ProviderStreamEvent::Finished)));
+
+            std::env::remove_var("AGENTCODE_SECRET_DIR");
+            let _ = std::fs::remove_dir_all(&tmp);
+        });
+    }
+
+    #[test]
+    fn http_provider_adapter_empty_credential_skips_auth_headers() {
+        // A provider account saved without a credential (the local Ollama
+        // case) must reach the provider without an Authorization header.
+        // An empty credential_env is NOT an auth failure.
         let adapter = HttpProviderAdapter::new(
             "http://127.0.0.1:1/v1/chat",
-            Some("secret:test-secret".to_string()),
+            Some(String::new()),
             "fixture-model",
             1000,
         )
         .unwrap();
         let headers = adapter.auth_headers().unwrap();
-        let auth = headers.get(AUTHORIZATION).unwrap().to_str().unwrap();
-        assert_eq!(auth, "Bearer sk-live-secret-value");
-
-        // Also prove the full stream() path sends the correct header
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let endpoint = format!("http://{}/v1/chat", listener.local_addr().unwrap());
-        let (tx, rx) = std::sync::mpsc::channel();
-        std::thread::spawn(move || {
-            let (mut stream, _) = listener.accept().unwrap();
-            let mut buf = [0_u8; 4096];
-            let n = stream.read(&mut buf).unwrap_or(0);
-            let request = String::from_utf8_lossy(&buf[..n]).to_string();
-            tx.send(request).unwrap();
-            let body = "{\"choices\":[{\"message\":{\"content\":\"ok\"},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1}}";
-            let response = format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body);
-            let _ = stream.write_all(response.as_bytes());
-        });
-
-        let adapter = HttpProviderAdapter::new(
-            endpoint,
-            Some("secret:test-secret".to_string()),
-            "fixture-model",
-            5000,
-        )
-        .unwrap();
-        let request = request();
-        let events = adapter.stream(&request, &|| false).unwrap();
-        let wire = rx.recv_timeout(StdDuration::from_secs(2)).unwrap();
         assert!(
-            wire.to_ascii_lowercase()
-                .contains("authorization: bearer sk-live-secret-value"),
-            "authenticated request must carry the resolved secret"
+            headers.get(AUTHORIZATION).is_none(),
+            "empty credential must not produce an Authorization header"
         );
-        assert!(matches!(events.last(), Some(ProviderStreamEvent::Finished)));
+        assert_eq!(
+            headers.get(CONTENT_TYPE).unwrap().to_str().unwrap(),
+            "application/json"
+        );
+    }
 
-        std::env::remove_var("AGENTCODE_SECRET_DIR");
-        let _ = std::fs::remove_dir_all(&tmp);
+    #[test]
+    fn http_provider_adapter_missing_secret_fails_auth_honestly() {
+        // A secret reference that cannot be resolved must be a real Auth
+        // failure, never a silent success or a permissive fallback.
+        with_test_env_lock(|| {
+            let tmp =
+                std::env::temp_dir().join(format!("ac-secret-missing-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&tmp);
+            std::fs::create_dir_all(&tmp).unwrap();
+            std::env::set_var("AGENTCODE_SECRET_DIR", tmp.as_os_str());
+
+            let adapter = HttpProviderAdapter::new(
+                "http://127.0.0.1:1/v1/chat",
+                Some("secret:does-not-exist".to_string()),
+                "fixture-model",
+                1000,
+            )
+            .unwrap();
+            let err = adapter.auth_headers().unwrap_err();
+            assert_eq!(err, ProviderFailureClass::Auth);
+
+            std::env::remove_var("AGENTCODE_SECRET_DIR");
+            let _ = std::fs::remove_dir_all(&tmp);
+        });
+    }
+
+    #[test]
+    fn http_provider_adapter_env_reference_still_works() {
+        // Full `env:NAME` references and legacy bare variable names both keep
+        // working through the adapter auth path.
+        with_test_env_lock(|| {
+            std::env::set_var("AC_ADAPTER_ENV_REF", "env-secret-value");
+            let adapter = HttpProviderAdapter::new(
+                "http://127.0.0.1:1/v1/chat",
+                Some("env:AC_ADAPTER_ENV_REF".to_string()),
+                "fixture-model",
+                1000,
+            )
+            .unwrap();
+            let headers = adapter.auth_headers().unwrap();
+            assert_eq!(
+                headers.get(AUTHORIZATION).unwrap().to_str().unwrap(),
+                "Bearer env-secret-value"
+            );
+
+            std::env::set_var("AC_ADAPTER_BARE_REF", "bare-secret-value");
+            let adapter = HttpProviderAdapter::new(
+                "http://127.0.0.1:1/v1/chat",
+                Some("AC_ADAPTER_BARE_REF".to_string()),
+                "fixture-model",
+                1000,
+            )
+            .unwrap();
+            let headers = adapter.auth_headers().unwrap();
+            assert_eq!(
+                headers.get(AUTHORIZATION).unwrap().to_str().unwrap(),
+                "Bearer bare-secret-value"
+            );
+
+            std::env::remove_var("AC_ADAPTER_ENV_REF");
+            std::env::remove_var("AC_ADAPTER_BARE_REF");
+        });
     }
 }

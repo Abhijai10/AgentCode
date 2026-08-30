@@ -431,6 +431,11 @@ mod tests {
     use std::thread;
     use std::time::Duration as StdDuration;
 
+    fn with_credential_env_lock<T>(f: impl FnOnce() -> T) -> T {
+        let _guard = crate::PROVIDER_TEST_ENV_LOCK.lock().unwrap();
+        f()
+    }
+
     fn test_account() -> ProviderAccount {
         ProviderAccount {
             id: StableId::new("acct"),
@@ -471,10 +476,12 @@ mod tests {
 
     #[test]
     fn resolve_credential_env_works() {
-        std::env::set_var("AGENTCODE_TEST_CRED", "test-secret-value");
-        let result = resolve_credential_ref("env:AGENTCODE_TEST_CRED").unwrap();
-        assert_eq!(result, "test-secret-value");
-        std::env::remove_var("AGENTCODE_TEST_CRED");
+        with_credential_env_lock(|| {
+            std::env::set_var("AGENTCODE_TEST_CRED", "test-secret-value");
+            let result = resolve_credential_ref("env:AGENTCODE_TEST_CRED").unwrap();
+            assert_eq!(result, "test-secret-value");
+            std::env::remove_var("AGENTCODE_TEST_CRED");
+        });
     }
 
     #[test]
@@ -487,6 +494,37 @@ mod tests {
     fn resolve_credential_unset_env_is_error() {
         let err = resolve_credential_ref("env:UNSET_VAR_XYZ").unwrap_err();
         assert_eq!(err.code(), "PROVIDER-CREDENTIAL_UNAVAILABLE");
+    }
+
+    #[test]
+    fn resolve_credential_secret_round_trip() {
+        with_credential_env_lock(|| {
+            let tmp =
+                std::env::temp_dir().join(format!("ac-catalog-secret-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&tmp);
+            std::fs::create_dir_all(&tmp).unwrap();
+            std::env::set_var("AGENTCODE_SECRET_DIR", &tmp);
+            std::fs::write(tmp.join("live-key"), "sk-live-value\n").unwrap();
+            let resolved = resolve_credential_ref("secret:live-key").unwrap();
+            assert_eq!(resolved, "sk-live-value");
+            std::env::remove_var("AGENTCODE_SECRET_DIR");
+            let _ = std::fs::remove_dir_all(tmp);
+        });
+    }
+
+    #[test]
+    fn resolve_credential_missing_secret_file_is_honest_error() {
+        with_credential_env_lock(|| {
+            let tmp =
+                std::env::temp_dir().join(format!("ac-catalog-missing-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&tmp);
+            std::fs::create_dir_all(&tmp).unwrap();
+            std::env::set_var("AGENTCODE_SECRET_DIR", &tmp);
+            let err = resolve_credential_ref("secret:no-such-secret").unwrap_err();
+            assert_eq!(err.code(), "PROVIDER-CREDENTIAL_UNAVAILABLE");
+            std::env::remove_var("AGENTCODE_SECRET_DIR");
+            let _ = std::fs::remove_dir_all(tmp);
+        });
     }
 
     #[test]
@@ -518,22 +556,24 @@ mod tests {
 
     #[test]
     fn test_provider_account_returns_auth_failure_for_unreachable_endpoint() {
-        std::env::set_var("TEST_PROVIDER_KEY", "test-key");
-        let mut account = test_account();
-        account.credential_ref = "env:TEST_PROVIDER_KEY".to_string();
-        let test = ProviderConnectionTest::new(
-            account.clone(),
-            "http://127.0.0.1:1/nonexistent",
-            "test",
-            ProviderConnectionKind::OpenAiChatCompletions,
-        )
-        .unwrap();
-        let status = test_provider_account(&test, &|| false).unwrap();
-        // Connection failure should be a non-ok status, not a crash
-        assert!(!status.ok);
-        assert!(status.failure.is_some());
-        assert!(status.masked_credential.contains("****"));
-        std::env::remove_var("TEST_PROVIDER_KEY");
+        with_credential_env_lock(|| {
+            std::env::set_var("TEST_PROVIDER_KEY", "test-key");
+            let mut account = test_account();
+            account.credential_ref = "env:TEST_PROVIDER_KEY".to_string();
+            let test = ProviderConnectionTest::new(
+                account.clone(),
+                "http://127.0.0.1:1/nonexistent",
+                "test",
+                ProviderConnectionKind::OpenAiChatCompletions,
+            )
+            .unwrap();
+            let status = test_provider_account(&test, &|| false).unwrap();
+            // Connection failure should be a non-ok status, not a crash
+            assert!(!status.ok);
+            assert!(status.failure.is_some());
+            assert!(status.masked_credential.contains("****"));
+            std::env::remove_var("TEST_PROVIDER_KEY");
+        });
     }
 
     #[test]

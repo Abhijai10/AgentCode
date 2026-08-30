@@ -3121,6 +3121,11 @@ Valid planner JSON (reuse this exact structure; task_kind one of: Investigate, R
   "uncertainties": [],
   "questions_or_blockers": []
 }
+PLANNING RULES (strict):
+- For a small, single change, produce exactly TWO tasks: ModifyCode (or ModifyConfig) then RunTests. Do not invent extra tasks.
+- Only use task_kind values from the allowed list. Use ModifyCode for file edits, RunTests for verification, ReadCode for inspecting a file before editing.
+- required_context and preferred_capabilities must be non-empty arrays. Do not put prose or schema placeholders inside content/path values.
+- Do not modify test fixtures or example files unless the mission explicitly asks.
 Output the JSON object only; no markdown, no prose, no code fences.
 "#;
 
@@ -3151,6 +3156,12 @@ Valid action JSON (reuse this exact structure; action type one of: ReadFile, Sea
   "uncertainty": null,
   "requires_replan": false
 }
+ACTION RULES (strict):
+- For a code-modification task produce exactly TWO actions: PrepareEdit (with the exact path and content) then RunVerification. Do not add extra actions.
+- Do not modify test fixtures or example files. Create or modify only the file the mission identifies.
+- The "content" field must be the EXACT file content to write. Do not put schema examples, placeholders, or prose instructions inside it.
+- The "path" field must be the file path relative to the repository root. Do not use placeholder paths like "target/file.txt" literally.
+- task_id must match the task_id provided in the instruction above exactly.
 Output the JSON object only; no markdown, no prose, no code fences.
 "#;
 
