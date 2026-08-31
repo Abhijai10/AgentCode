@@ -40,19 +40,28 @@ function AppShell() {
 
   useEffect(() => {
     let cancelled = false;
+    // Restore the last-selected mission so that after a daemon restart the UI
+    // reconnects to the same mission's authoritative state instead of showing
+    // an empty shell.  A stale id simply resolves to daemon_unavailable /
+    // no_mission through MissionView's real health check.
+    const storedMission = window.localStorage.getItem("agentcode-active-mission");
+    if (storedMission) setActiveMission(storedMission);
     // Use a ref for activeMission so the poll loop is created once and never
     // recreated when the active mission changes (single bounded interval).
-    const activeRef = { current: activeMission };
-    activeRef.current = activeMission;
+    // Initialize it from the restored mission so the first poll does not
+    // treat a persisted terminal mission as "nothing selected".
+    const activeRef = { current: storedMission ?? activeMission };
     const refresh = async () => {
       const [d, m] = await Promise.all([daemon.health(), daemon.listActiveMissions()]);
       if (cancelled) return;
       setDaemonStatus(d);
       setMissions(m);
+      // Select the first active mission only when nothing is selected yet.
       if (!activeRef.current && m.length > 0) setActiveMission(m[0].mission_id);
-      if (activeRef.current && !m.some((mi) => mi.mission_id === activeRef.current)) {
-        setActiveMission(null);
-      }
+      // Intentionally DO NOT clear activeMission when it leaves the active
+      // list: a terminal (completed/failed/cancelled) mission is still
+      // retrievable from the daemon and must stay visible so the user sees
+      // its real terminal state rather than a fabricated "no mission".
     };
     refresh();
     const timer = setInterval(refresh, 4000);
@@ -61,6 +70,16 @@ function AppShell() {
       clearInterval(timer);
     };
   }, []);
+
+  // Persist the last-selected mission id (never any secret/state) so a
+  // daemon restart can reconnect to it.
+  useEffect(() => {
+    if (activeMission) {
+      window.localStorage.setItem("agentcode-active-mission", activeMission);
+    } else {
+      window.localStorage.removeItem("agentcode-active-mission");
+    }
+  }, [activeMission]);
 
   const handleOpenedProject = (p: Project) => {
     openProject(p.path, p.name);
@@ -71,10 +90,12 @@ function AppShell() {
     setTimeout(() => setNotice(null), 4000);
   };
 
-  const handleNewMission = async (goal: string): Promise<boolean> => {
+  const handleNewMission = async (
+    goal: string
+  ): Promise<{ ok: boolean; error?: string }> => {
     if (!project) {
       setProjectModal("choose");
-      return false;
+      return { ok: false, error: "Open a project first." };
     }
     const doSubmit = async () => {
       const created = await daemon.submitMission(goal, project?.path);
@@ -85,13 +106,14 @@ function AppShell() {
         setMissions(m);
         setNotice("Mission submitted to the AgentCode daemon.");
         setTimeout(() => setNotice(null), 4000);
-        return true;
+        return { ok: true };
       } else {
         // Surface the real backend error (e.g. a rejected workspace_root)
         // instead of a fabricated success or a generic failure message.
-        setNotice(created.error || "Daemon is not connected — could not submit mission.");
+        const error = created.error || "Daemon is not connected — could not submit mission.";
+        setNotice(error);
         setTimeout(() => setNotice(null), 6000);
-        return false;
+        return { ok: false, error };
       }
     };
     return doSubmit();
@@ -106,6 +128,7 @@ function AppShell() {
           view={view}
           setView={requestView}
           daemonConnected={daemonConnected}
+          recoveredSessions={daemonStatus?.recovered_sessions ?? 0}
           project={project}
           onOpenProject={() => setProjectModal(project ? "open" : "choose")}
         />
@@ -139,6 +162,7 @@ function AppShell() {
             daemonConnected={daemonConnected}
             modelLabel="Model: daemon-managed"
             tasks={`Tasks: ${missions.length}`}
+            recoveredSessions={daemonStatus?.recovered_sessions ?? 0}
           />
         </div>
       </div>

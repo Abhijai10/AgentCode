@@ -106,7 +106,6 @@ export function MissionView({ missionId, onOpenSettings }: { missionId: string |
   const [controlBusy, setControlBusy] = useState<"pause" | "resume" | "cancel" | null>(null);
   const [controlError, setControlError] = useState<string | null>(null);
   const [expanded, setExpanded] = useState<Set<string>>(new Set());
-  const [daemonSeen, setDaemonSeen] = useState(false);
   const timerRef = useRef<number | null>(null);
 
   const stopPolling = useCallback(() => {
@@ -138,11 +137,15 @@ export function MissionView({ missionId, onOpenSettings }: { missionId: string |
       if (cancelled) return;
       if (d) {
         setDetails(d);
-        setDaemonSeen(true);
         setStatus("loaded");
       } else {
-        // Mission id may be unknown (rejected) or the daemon may be down.
-        setStatus(daemonSeen ? "no_mission" : "daemon_unavailable");
+        // Distinguish a daemon outage from a genuinely missing mission by
+        // checking the real daemon health signal rather than guessing from
+        // local history.  This ensures a stopped daemon shows "Daemon
+        // unavailable" instead of a misleading "No mission selected".
+        const health = await daemon.health();
+        if (cancelled) return;
+        setStatus(health.state === "running" ? "no_mission" : "daemon_unavailable");
       }
       if (t) setTasks(t);
       if (e) setEvents(e);
@@ -178,14 +181,16 @@ export function MissionView({ missionId, onOpenSettings }: { missionId: string |
     if (!missionId || controlBusy) return;
     setControlBusy(action);
     setControlError(null);
-    const ok =
+    const result =
       action === "pause"
         ? await daemon.pauseMission(missionId)
         : action === "resume"
           ? await daemon.resumeMission(missionId)
           : await daemon.cancelMission(missionId);
-    if (!ok) {
-      setControlError(`The daemon rejected ${action}. The mission state may have changed.`);
+    if (!result.ok) {
+      // Surface the real backend error (e.g. an already-terminal mission)
+      // instead of a generic message.
+      setControlError(result.error || `The daemon rejected ${action}.`);
     }
     setControlBusy(null);
     // Refresh authoritative state immediately after the backend responds.

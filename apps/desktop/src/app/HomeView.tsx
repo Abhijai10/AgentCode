@@ -11,7 +11,7 @@ export function HomeView({
 }: {
   project: Project | null;
   onOpenProject(): void;
-  onSubmit(goal: string): Promise<boolean>;
+  onSubmit(goal: string): Promise<{ ok: boolean; error?: string }>;
   onConfigureProviders(): void;
 }) {
   const [goal, setGoal] = useState("");
@@ -92,11 +92,13 @@ export function HomeView({
     if (!trimmed || submitting) return;
     setSubmitting(true);
     setSubmitError(null);
-    const ok = await onSubmit(trimmed);
-    if (ok) {
+    const result = await onSubmit(trimmed);
+    if (result.ok) {
       setGoal("");
     } else {
-      setSubmitError("Mission submission failed. Check the daemon and provider configuration.");
+      // Surface the real backend error (e.g. a rejected workspace_root or a
+      // provider/down-daemon failure) instead of a generic placeholder.
+      setSubmitError(result.error || "Mission submission failed.");
     }
     setSubmitting(false);
   };

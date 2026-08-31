@@ -14,12 +14,14 @@ export function Sidebar({
   view,
   setView,
   daemonConnected,
+  recoveredSessions,
   project,
   onOpenProject,
 }: {
   view: View;
   setView(v: View): void;
   daemonConnected: boolean;
+  recoveredSessions: number;
   project: Project | null;
   onOpenProject(): void;
 }) {
@@ -87,6 +89,12 @@ export function Sidebar({
           <span className={`w-2 h-2 rounded-full ${daemonConnected ? "bg-emerald-500 shadow-[0_0_8px_rgba(16,185,129,0.5)]" : "bg-red-500 shadow-[0_0_8px_rgba(239,68,68,0.5)]"}`} />
           {daemonConnected ? "Daemon Connected" : "Daemon Disconnected"}
         </div>
+        {daemonConnected && recoveredSessions > 0 && (
+          <div className="mx-3 mb-3 py-2 px-3 rounded-xl flex items-center gap-2 text-xs text-amber-600 dark:text-amber-400">
+            <Icon name="restart_alt" size={14} />
+            Recovered {recoveredSessions} interrupted session{recoveredSessions !== 1 ? "s" : ""} from last run
+          </div>
+        )}
       </div>
     </aside>
   );

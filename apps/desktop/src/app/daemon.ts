@@ -117,30 +117,36 @@ export const daemon = {
     }
   },
 
-  async pauseMission(missionId: string): Promise<boolean> {
+  async pauseMission(missionId: string): Promise<{ ok: boolean; error?: string }> {
     try {
       await invoke("daemon_pause_mission", { missionId });
-      return true;
-    } catch {
-      return false;
+      return { ok: true };
+    } catch (e: unknown) {
+      const message = e instanceof Error ? e.message : String(e);
+      const cleaned = message.replace(/^[A-Z0-9_-]+:\s*/, "");
+      return { ok: false, error: cleaned || message };
     }
   },
 
-  async resumeMission(missionId: string): Promise<boolean> {
+  async resumeMission(missionId: string): Promise<{ ok: boolean; error?: string }> {
     try {
       await invoke("daemon_resume_mission", { missionId });
-      return true;
-    } catch {
-      return false;
+      return { ok: true };
+    } catch (e: unknown) {
+      const message = e instanceof Error ? e.message : String(e);
+      const cleaned = message.replace(/^[A-Z0-9_-]+:\s*/, "");
+      return { ok: false, error: cleaned || message };
     }
   },
 
-  async cancelMission(missionId: string): Promise<boolean> {
+  async cancelMission(missionId: string): Promise<{ ok: boolean; error?: string }> {
     try {
       await invoke("daemon_cancel_mission", { missionId });
-      return true;
-    } catch {
-      return false;
+      return { ok: true };
+    } catch (e: unknown) {
+      const message = e instanceof Error ? e.message : String(e);
+      const cleaned = message.replace(/^[A-Z0-9_-]+:\s*/, "");
+      return { ok: false, error: cleaned || message };
     }
   },
 
