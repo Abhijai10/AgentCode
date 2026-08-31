@@ -18,6 +18,7 @@ pub enum MissionState {
     Active,
     Completed,
     Cancelled,
+    Failed,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -34,6 +35,7 @@ pub enum KernelDecisionKind {
     ActivateMission,
     CompleteMission,
     CancelMission,
+    FailMission,
     ApproveChangeSet,
 }
 
@@ -71,7 +73,16 @@ pub struct Kernel<P: PolicyBoundary> {
     policy: P,
     missions: BTreeMap<StableId, Mission>,
     events: Vec<KernelEvent>,
+    max_events: usize,
 }
+
+/// Upper bound on the in-memory kernel event log.  The SQLite `kernel_events`
+/// table remains the authoritative, unbounded audit store; the in-memory
+/// `events` vector is a bounded convenience projection used by the daemon to
+/// flush new events to the DB between missions.  Once the bound is reached the
+/// oldest already-persisted events are dropped from memory so a long-lived
+/// daemon does not accumulate unbounded memory across thousands of missions.
+const DEFAULT_MAX_EVENTS: usize = 10_000;
 
 impl<P: PolicyBoundary> Kernel<P> {
     pub fn new(policy: P) -> Self {
@@ -80,6 +91,7 @@ impl<P: PolicyBoundary> Kernel<P> {
             policy,
             missions: BTreeMap::new(),
             events: Vec::new(),
+            max_events: DEFAULT_MAX_EVENTS,
         }
     }
 
@@ -162,6 +174,7 @@ impl<P: PolicyBoundary> Kernel<P> {
             MissionState::Active => KernelDecisionKind::ActivateMission,
             MissionState::Completed => KernelDecisionKind::CompleteMission,
             MissionState::Cancelled => KernelDecisionKind::CancelMission,
+            MissionState::Failed => KernelDecisionKind::FailMission,
             MissionState::Created => {
                 return Err(AcError::conflict(
                     "KERNEL-INVALID_MISSION_TRANSITION",
@@ -178,6 +191,7 @@ impl<P: PolicyBoundary> Kernel<P> {
             (MissionState::Created, MissionState::Active)
                 | (MissionState::Active, MissionState::Completed)
                 | (MissionState::Active, MissionState::Cancelled)
+                | (MissionState::Active, MissionState::Failed)
         );
         if !allowed {
             return Err(AcError::conflict(
@@ -257,6 +271,14 @@ impl<P: PolicyBoundary> Kernel<P> {
             evidence_refs,
             created_at: TimestampMillis::now(),
         });
+        // Bounded in-memory retention: the SQLite kernel_events table is the
+        // authoritative audit store, so dropping the oldest already-flushed
+        // events from memory cannot lose state.  This prevents unbounded
+        // growth across a long-lived daemon.
+        if self.events.len() > self.max_events {
+            let overflow = self.events.len() - self.max_events;
+            self.events.drain(0..overflow);
+        }
     }
 }
 
@@ -288,6 +310,66 @@ mod tests {
             MissionState::Completed
         );
         assert_eq!(kernel.events().len(), 3);
+    }
+
+    #[test]
+    fn failed_mission_transition_is_terminal_and_cannot_become_completed() {
+        let mut kernel = Kernel::new(AllowAllPolicy);
+        kernel.start().unwrap();
+        let mission_id = kernel.create_mission("will fail").unwrap();
+        kernel
+            .transition_mission(&mission_id, MissionState::Active, Vec::new())
+            .unwrap();
+        kernel
+            .transition_mission(&mission_id, MissionState::Failed, Vec::new())
+            .unwrap();
+        assert_eq!(
+            kernel.mission(&mission_id).unwrap().state,
+            MissionState::Failed
+        );
+        // A Failed mission must be terminal: it can never move to Completed.
+        let err = kernel
+            .transition_mission(&mission_id, MissionState::Completed, Vec::new())
+            .unwrap_err();
+        assert_eq!(err.code(), "KERNEL-INVALID_MISSION_TRANSITION");
+        // Nor can it go back to Active.
+        let err = kernel
+            .transition_mission(&mission_id, MissionState::Active, Vec::new())
+            .unwrap_err();
+        assert_eq!(err.code(), "KERNEL-INVALID_MISSION_TRANSITION");
+        // And a completed mission cannot be flipped to failed.
+        let completed = kernel.create_mission("already done").unwrap();
+        kernel
+            .transition_mission(&completed, MissionState::Active, Vec::new())
+            .unwrap();
+        kernel
+            .transition_mission(&completed, MissionState::Completed, Vec::new())
+            .unwrap();
+        let err = kernel
+            .transition_mission(&completed, MissionState::Failed, Vec::new())
+            .unwrap_err();
+        assert_eq!(err.code(), "KERNEL-INVALID_MISSION_TRANSITION");
+    }
+
+    #[test]
+    fn kernel_event_log_is_bounded_in_memory() {
+        let mut kernel = Kernel::new(AllowAllPolicy);
+        kernel.start().unwrap();
+        kernel.max_events = 8;
+        for _ in 0..25 {
+            let mission_id = kernel.create_mission("spin").unwrap();
+            kernel
+                .transition_mission(&mission_id, MissionState::Active, Vec::new())
+                .unwrap();
+            kernel
+                .transition_mission(&mission_id, MissionState::Completed, Vec::new())
+                .unwrap();
+        }
+        assert!(
+            kernel.events().len() <= 8,
+            "in-memory event log must respect its bound, got {}",
+            kernel.events().len()
+        );
     }
 
     #[test]

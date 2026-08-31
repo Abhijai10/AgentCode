@@ -37,6 +37,7 @@ fn mission_state(state: MissionState) -> &'static str {
         MissionState::Active => "active",
         MissionState::Completed => "completed",
         MissionState::Cancelled => "cancelled",
+        MissionState::Failed => "failed",
     }
 }
 
@@ -46,6 +47,7 @@ fn decision_kind(kind: KernelDecisionKind) -> &'static str {
         KernelDecisionKind::ActivateMission => "activate_mission",
         KernelDecisionKind::CompleteMission => "complete_mission",
         KernelDecisionKind::CancelMission => "cancel_mission",
+        KernelDecisionKind::FailMission => "fail_mission",
         KernelDecisionKind::ApproveChangeSet => "approve_changeset",
     }
 }

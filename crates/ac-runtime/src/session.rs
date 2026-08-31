@@ -1,3 +1,9 @@
+/// Upper bound on the in-memory session event log.  Session events are
+/// observability-only and are never consumed by the daemon or agent for
+/// correctness; bounding them prevents unbounded memory growth within a
+/// long-running mission.
+const MAX_SESSION_EVENTS: usize = 10_000;
+
 pub struct AgentSession {
     id: StableId,
     worker: Worker,
@@ -239,5 +245,9 @@ impl AgentSession {
             kind,
             created_at: TimestampMillis::now(),
         });
+        if self.events.len() > MAX_SESSION_EVENTS {
+            let overflow = self.events.len() - MAX_SESSION_EVENTS;
+            self.events.drain(0..overflow);
+        }
     }
 }

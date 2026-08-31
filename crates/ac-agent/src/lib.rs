@@ -2,6 +2,7 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fs;
 use std::path::Path;
 use std::path::PathBuf;
+use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 
 use ac_changeset::{
@@ -1017,7 +1018,7 @@ impl<P: PolicyBoundary> AutonomousAgent<P> {
                 {
                     break;
                 }
-                self.state = AutonomousState::Failed;
+                self.fail_or_cancel_mission(&mission_id, &evidence_refs)?;
                 return Ok(self.report(
                     goal.id,
                     changeset,
@@ -1064,7 +1065,7 @@ impl<P: PolicyBoundary> AutonomousAgent<P> {
                     )?;
                     self.persist_graph(&graph)?;
                     if self.replans.len() >= self.max_replans {
-                        self.state = AutonomousState::Failed;
+                        self.fail_or_cancel_mission(&mission_id, &evidence_refs)?;
                         return Ok(self.report(
                             goal.id,
                             changeset,
@@ -1093,7 +1094,7 @@ impl<P: PolicyBoundary> AutonomousAgent<P> {
                         Some(reason),
                     )?;
                     self.persist_graph(&graph)?;
-                    self.state = AutonomousState::Failed;
+                    self.fail_or_cancel_mission(&mission_id, &evidence_refs)?;
                     return Ok(self.report(
                         goal.id,
                         changeset,
@@ -1111,7 +1112,7 @@ impl<P: PolicyBoundary> AutonomousAgent<P> {
                         Some(err.code().to_string()),
                     )?;
                     self.persist_graph(&graph)?;
-                    self.state = AutonomousState::Failed;
+                    self.fail_or_cancel_mission(&mission_id, &evidence_refs)?;
                     return Ok(self.report(
                         goal.id,
                         changeset,
@@ -1122,7 +1123,6 @@ impl<P: PolicyBoundary> AutonomousAgent<P> {
                 }
             }
         }
-
         self.state = AutonomousState::Completed;
         // When resuming a mission where all tasks were already completed
         // (e.g. after a daemon crash), validation may be None because no
@@ -1183,7 +1183,7 @@ impl<P: PolicyBoundary> AutonomousAgent<P> {
             )
             .is_err()
         {
-            self.state = AutonomousState::Failed;
+            self.fail_or_cancel_mission(&mission_id, &evidence_refs)?;
         }
         Ok(self.report(
             goal.id,
@@ -1852,6 +1852,12 @@ impl<P: PolicyBoundary> AutonomousAgent<P> {
                 return Ok(result);
             }
             last = Some(result);
+            // A cancelled command must not be retried: the token is already
+            // set, so any retry would immediately be killed again and would
+            // waste process spawns.  Surface the cancelled result directly.
+            if cancelled.load(Ordering::Relaxed) {
+                break;
+            }
             self.session.enqueue("retry-after-tool-failure")?;
             self.session.run_until_idle()?;
         }
@@ -1894,6 +1900,37 @@ impl<P: PolicyBoundary> AutonomousAgent<P> {
             state: self.state.clone(),
             created_at: TimestampMillis::now(),
         }
+    }
+
+    /// Transition the kernel mission to a terminal state (Failed or Cancelled)
+    /// when the agent run cannot complete normally.  During in-flight tool
+    /// cancellation, the agent's task-execution error path reaches this method
+    /// rather than the clean loop-top cancellation check, so we detect whether
+    /// the session was cancelled and produce the correct terminal state.
+    fn fail_or_cancel_mission(
+        &mut self,
+        mission_id: &StableId,
+        evidence_refs: &[StableId],
+    ) -> AcResult<()> {
+        let cancelled =
+            self.session.is_cancelled() || self.session.state() == AgentSessionState::Cancelling;
+        self.state = if cancelled {
+            AutonomousState::Cancelled
+        } else {
+            AutonomousState::Failed
+        };
+        let target = if cancelled {
+            MissionState::Cancelled
+        } else {
+            MissionState::Failed
+        };
+        let mut kernel = self.kernel_lock()?;
+        if let Some(mission) = kernel.mission(mission_id) {
+            if mission.state == MissionState::Active {
+                kernel.transition_mission(mission_id, target, evidence_refs.to_vec())?;
+            }
+        }
+        Ok(())
     }
 
     fn report(
@@ -4043,6 +4080,8 @@ mod tests {
     use ac_kernel::AllowAllPolicy;
     use ac_runtime::Worker;
     use ac_tool::{ToolDefinition, ToolExecutor};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
     use std::sync::Mutex;
 
     static PROVIDER_ENV_LOCK: Mutex<()> = Mutex::new(());
@@ -6532,5 +6571,260 @@ mod tests {
             ac_sandbox::IsolationLevel::FilesystemIsolated
         );
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    struct BlockingCancelTool;
+    impl ToolExecutor for BlockingCancelTool {
+        fn execute(&self, _request: &ToolRequest) -> AcResult<String> {
+            Err(AcError::new(
+                "TOOL-NOT_IMPLEMENTED",
+                "blocking tool requires execute_with_cancellation",
+                ac_common::ErrorKind::Internal,
+                ac_common::Retryability::NotRetryable,
+            ))
+        }
+        fn execute_with_cancellation(
+            &self,
+            _request: &ToolRequest,
+            cancelled: &AtomicBool,
+        ) -> AcResult<String> {
+            // Simulate an in-flight subprocess that is killed by cancellation:
+            // set the shared token flag (the same AtomicBool the daemon's
+            // ProcessManager polls), then report the cancellation failure just
+            // like run_with_cancellation does after terminate_process_tree.
+            cancelled.store(true, Ordering::Relaxed);
+            Err(AcError::new(
+                "TOOL-COMMAND_CANCELLED",
+                "command was cancelled and was killed",
+                ac_common::ErrorKind::Cancelled,
+                ac_common::Retryability::NotRetryable,
+            ))
+        }
+    }
+
+    #[test]
+    fn in_flight_cancellation_during_tool_execution_produces_cancelled_not_failed() {
+        let mut tools = ToolBroker::new(
+            CapabilityPolicy::new().allow(Capability::ProcessExec("*".to_string())),
+        );
+        tools
+            .register_tool(
+                ToolDefinition {
+                    id: "dev.test".to_string(),
+                    version: "1".to_string(),
+                    required_capabilities: Vec::new(),
+                },
+                Box::new(BlockingCancelTool),
+            )
+            .unwrap();
+        for id in ["fs.read", "repo.diff"] {
+            tools
+                .register_tool(
+                    ToolDefinition {
+                        id: id.to_string(),
+                        version: "1".to_string(),
+                        required_capabilities: Vec::new(),
+                    },
+                    Box::new(EchoTool),
+                )
+                .unwrap();
+        }
+        let responses = VecDeque::from([
+            planner_plan_only(
+                "src/lib.rs",
+                &[("task-a", "run blocking tool", "ReadCode", &[][..])],
+            ),
+            action_proposal_json(
+                "run blocking tool",
+                "run blocking tool",
+                r#"[{ "type": "ExecuteTool", "tool_id": "dev.test", "payload": "block" }]"#,
+                false,
+            ),
+        ]);
+        let mut agent = AutonomousAgent::new(
+            ac_kernel::Kernel::new(AllowAllPolicy),
+            AgentSession::new(Worker::new()),
+            provider_registry_with(
+                "test-provider",
+                Box::new(SequencedProvider {
+                    responses: Mutex::new(responses),
+                }),
+            ),
+            tools,
+            EvidenceStore::new(),
+            MemoryService::new(),
+            GitCoordinator::new(),
+            VerificationEngine::new(CapabilityPolicy::new()),
+        );
+        bind_unit_test_workspace(&mut agent);
+        let report = agent
+            .run_goal(Goal::new("in-flight cancel test").unwrap())
+            .unwrap();
+        assert_eq!(
+            report.state,
+            AutonomousState::Cancelled,
+            "in-flight cancellation during tool execution must produce Cancelled, not Failed"
+        );
+    }
+
+    #[test]
+    fn scripted_provider_failure_produces_agent_provider_failure_not_unproven() {
+        let mut tools = ToolBroker::new(CapabilityPolicy::new());
+        for id in ["fs.read", "fs.write", "repo.diff", "dev.test"] {
+            tools
+                .register_tool(
+                    ToolDefinition {
+                        id: id.to_string(),
+                        version: "1".to_string(),
+                        required_capabilities: Vec::new(),
+                    },
+                    Box::new(EchoTool),
+                )
+                .unwrap();
+        }
+        let mut agent = AutonomousAgent::new(
+            ac_kernel::Kernel::new(AllowAllPolicy),
+            AgentSession::new(Worker::new()),
+            provider_registry_with(
+                "failing-provider",
+                Box::new(ScriptedProvider::new(vec![Err(
+                    ac_provider::ProviderFailureClass::Network,
+                )])),
+            ),
+            tools,
+            EvidenceStore::new(),
+            MemoryService::new(),
+            GitCoordinator::new(),
+            VerificationEngine::new(CapabilityPolicy::new()),
+        );
+        bind_unit_test_workspace(&mut agent);
+        let err = agent
+            .run_goal(Goal::new("provider failure test").unwrap())
+            .unwrap_err();
+        assert_eq!(
+            err.code(),
+            "AGENT-PROVIDER_FAILURE",
+            "provider connection failure must produce AGENT-PROVIDER_FAILURE, got: {}",
+            err.code()
+        );
+    }
+
+    #[test]
+    fn scripted_provider_model_unavailable_fails_mission() {
+        let mut tools = ToolBroker::new(CapabilityPolicy::new());
+        for id in ["fs.read", "fs.write", "repo.diff", "dev.test"] {
+            tools
+                .register_tool(
+                    ToolDefinition {
+                        id: id.to_string(),
+                        version: "1".to_string(),
+                        required_capabilities: Vec::new(),
+                    },
+                    Box::new(EchoTool),
+                )
+                .unwrap();
+        }
+        let mut agent = AutonomousAgent::new(
+            ac_kernel::Kernel::new(AllowAllPolicy),
+            AgentSession::new(Worker::new()),
+            provider_registry_with(
+                "failing-provider",
+                Box::new(ScriptedProvider::new(vec![Err(
+                    ac_provider::ProviderFailureClass::ModelUnavailable,
+                )])),
+            ),
+            tools,
+            EvidenceStore::new(),
+            MemoryService::new(),
+            GitCoordinator::new(),
+            VerificationEngine::new(CapabilityPolicy::new()),
+        );
+        bind_unit_test_workspace(&mut agent);
+        let err = agent
+            .run_goal(Goal::new("model unavailable test").unwrap())
+            .unwrap_err();
+        assert_eq!(
+            err.code(),
+            "AGENT-PROVIDER_FAILURE",
+            "model unavailability must produce AGENT-PROVIDER_FAILURE"
+        );
+    }
+
+    #[test]
+    fn failed_mission_persists_kernel_state_as_failed() {
+        let mut tools = ToolBroker::new(CapabilityPolicy::new());
+        for id in ["fs.read", "fs.write", "repo.diff", "dev.test"] {
+            tools
+                .register_tool(
+                    ToolDefinition {
+                        id: id.to_string(),
+                        version: "1".to_string(),
+                        required_capabilities: Vec::new(),
+                    },
+                    Box::new(EchoTool),
+                )
+                .unwrap();
+        }
+        let kernel = Arc::new(Mutex::new(ac_kernel::Kernel::new(AllowAllPolicy)));
+        let mission_id = {
+            let mut guard = kernel.lock().unwrap();
+            guard.start().unwrap();
+            let id = guard.create_mission("provider-failure-mission").unwrap();
+            guard
+                .transition_mission(&id, MissionState::Active, Vec::new())
+                .unwrap();
+            id
+        };
+        // Planner succeeds; the implementer declares blocked, so run_goal
+        // returns a Failed report through the Blocked path which must
+        // transition the kernel mission to Failed.
+        let responses = VecDeque::from([
+            planner_plan_only(
+                "src/lib.rs",
+                &[("task-a", "block this task", "ReadCode", &[][..])],
+            ),
+            action_proposal_json(
+                "block this task",
+                "cannot proceed",
+                r#"[{ "type": "DeclareBlocked", "reason": "unable to proceed" }]"#,
+                false,
+            ),
+        ]);
+        let mut agent = AutonomousAgent::new(
+            ac_kernel::Kernel::new(AllowAllPolicy),
+            AgentSession::new(Worker::new()),
+            provider_registry_with(
+                "test-provider",
+                Box::new(SequencedProvider {
+                    responses: Mutex::new(responses),
+                }),
+            ),
+            tools,
+            EvidenceStore::new(),
+            MemoryService::new(),
+            GitCoordinator::new(),
+            VerificationEngine::new(CapabilityPolicy::new()),
+        );
+        bind_unit_test_workspace(&mut agent);
+        agent.kernel = Arc::clone(&kernel);
+        agent.bound_mission_id = Some(mission_id.clone());
+        let report = agent
+            .run_goal(Goal::new("blocked mission").unwrap())
+            .unwrap();
+        assert_eq!(report.state, AutonomousState::Failed);
+        let guard = kernel.lock().unwrap();
+        assert!(
+            guard
+                .mission(&mission_id)
+                .is_some_and(|mission| mission.state == MissionState::Failed),
+            "a failed mission must leave the kernel mission in Failed, not Active"
+        );
+        assert!(
+            guard
+                .events()
+                .iter()
+                .any(|e| e.decision == ac_kernel::KernelDecisionKind::FailMission),
+            "a failed mission must produce a FailMission kernel event"
+        );
     }
 }

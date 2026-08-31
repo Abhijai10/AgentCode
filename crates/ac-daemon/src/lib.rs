@@ -489,7 +489,33 @@ fn execute_mission(
         })),
         providers,
     )?;
-    let report = agent.run_goal(ac_agent::Goal::new(job.goal.clone())?)?;
+    let report = match agent.run_goal(ac_agent::Goal::new(job.goal.clone())?) {
+        Ok(report) => report,
+        Err(error) => {
+            // Even when the agent run itself fails to produce a report,
+            // the kernel mission must be transitioned to a terminal state
+            // so it does not incorrectly remain Active.
+            if let Ok(mut kernel) = kernel.lock() {
+                let is_active = kernel
+                    .mission(&job.mission_id)
+                    .is_some_and(|m| m.state == ac_kernel::MissionState::Active);
+                if is_active {
+                    let _ = kernel.transition_mission(
+                        &job.mission_id,
+                        ac_kernel::MissionState::Failed,
+                        Vec::new(),
+                    );
+                }
+                if let Some(mission) = kernel.mission(&job.mission_id) {
+                    let _ = db.put_mission(mission);
+                }
+                for event in kernel.events() {
+                    let _ = db.append_kernel_event(event);
+                }
+            }
+            return Err(error);
+        }
+    };
     if report.state != ac_agent::AutonomousState::Completed {
         eprintln!(
             "MISSION-NOT-COMPLETED mission={} state={:?}",
@@ -528,12 +554,28 @@ fn execute_mission(
         db.append_evidence(record)?;
     }
     {
-        let kernel = kernel.lock().map_err(|_| {
+        let mut kernel = kernel.lock().map_err(|_| {
             AcError::conflict(
                 "DAEMON-KERNEL_POISONED",
                 "kernel lock poisoned after mission",
             )
         })?;
+        // If the run finished in a failed (non-completed, non-cancelled) state
+        // the agent leaves the kernel mission Active.  Transition it to a
+        // terminal Failed state here so the persisted mission never
+        // incorrectly reports Active for a genuinely failed run.
+        if report.state == ac_agent::AutonomousState::Failed {
+            let is_active = kernel
+                .mission(&job.mission_id)
+                .is_some_and(|m| m.state == ac_kernel::MissionState::Active);
+            if is_active {
+                let _ = kernel.transition_mission(
+                    &job.mission_id,
+                    ac_kernel::MissionState::Failed,
+                    Vec::new(),
+                );
+            }
+        }
         if let Some(mission) = kernel.mission(&job.mission_id) {
             db.put_mission(mission)?;
         }
@@ -762,6 +804,7 @@ impl PolicyBoundary for ProductionKernelPolicy {
             KernelDecisionKind::CreateMission
             | KernelDecisionKind::ActivateMission
             | KernelDecisionKind::CancelMission
+            | KernelDecisionKind::FailMission
             | KernelDecisionKind::ApproveChangeSet
             | KernelDecisionKind::CompleteMission => PermissionDecision::Allow,
         }
@@ -822,6 +865,7 @@ impl DaemonService {
                     "active" => MissionState::Active,
                     "completed" => MissionState::Completed,
                     "cancelled" => MissionState::Cancelled,
+                    "failed" => MissionState::Failed,
                     _ => continue,
                 };
                 let mut kernel = self.kernel_lock()?;
@@ -3043,6 +3087,170 @@ mod tests {
             "default and explicit workspaces must not leak across missions"
         );
         daemon.stop().unwrap();
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn multiple_restarts_keep_terminal_missions_terminal() {
+        let (dir, db_path, lock) = temp_paths();
+        let mission_id = StableId::from_existing("mission-multi-restart").unwrap();
+        let session_id = StableId::from_existing("session-multi-restart").unwrap();
+        {
+            let mut db = ControlPlaneDb::open(&db_path).unwrap();
+            db.migrate().unwrap();
+            db.put_mission(&ac_kernel::Mission {
+                id: mission_id.clone(),
+                original_goal: "terminal stability".to_string(),
+                state: MissionState::Completed,
+                created_at: TimestampMillis::now(),
+            })
+            .unwrap();
+            db.save_session(&session_id, &mission_id, "completed", None)
+                .unwrap();
+        }
+        // Restart three times; the completed mission must stay terminal
+        // and never be re-enqueued.
+        for cycle in 0..3 {
+            let mut daemon = DaemonService::open(&db_path, &lock).unwrap();
+            daemon.start().unwrap();
+            let status = daemon.mission_status(mission_id.as_str());
+            // A completed mission should not have a coordinator status
+            // (it is not queued, running, or paused).
+            assert!(
+                status.is_none(),
+                "cycle {cycle}: completed mission must not be in coordinator status"
+            );
+            let state = daemon.persisted_mission_state(mission_id.as_str()).unwrap();
+            assert_eq!(
+                state.as_deref(),
+                Some("completed"),
+                "cycle {cycle}: completed mission must stay completed, got {state:?}"
+            );
+            daemon.stop().unwrap();
+        }
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn multiple_restarts_keep_cancelled_session_terminal() {
+        let (dir, db_path, lock) = temp_paths();
+        let mission_id = StableId::from_existing("mission-cancelled-restart").unwrap();
+        let session_id = StableId::from_existing("session-cancelled-restart").unwrap();
+        {
+            let mut db = ControlPlaneDb::open(&db_path).unwrap();
+            db.migrate().unwrap();
+            db.put_mission(&ac_kernel::Mission {
+                id: mission_id.clone(),
+                original_goal: "cancelled stability".to_string(),
+                state: MissionState::Cancelled,
+                created_at: TimestampMillis::now(),
+            })
+            .unwrap();
+            db.save_session(&session_id, &mission_id, "cancelled", None)
+                .unwrap();
+        }
+        for cycle in 0..3 {
+            let mut daemon = DaemonService::open(&db_path, &lock).unwrap();
+            daemon.start().unwrap();
+            let state = daemon.persisted_mission_state(mission_id.as_str()).unwrap();
+            assert_eq!(
+                state.as_deref(),
+                Some("cancelled"),
+                "cycle {cycle}: cancelled mission must stay cancelled, got {state:?}"
+            );
+            daemon.stop().unwrap();
+        }
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn multiple_restarts_keep_failed_session_terminal() {
+        let (dir, db_path, lock) = temp_paths();
+        let mission_id = StableId::from_existing("mission-failed-restart").unwrap();
+        let session_id = StableId::from_existing("session-failed-restart").unwrap();
+        {
+            let mut db = ControlPlaneDb::open(&db_path).unwrap();
+            db.migrate().unwrap();
+            db.put_mission(&ac_kernel::Mission {
+                id: mission_id.clone(),
+                original_goal: "failed stability".to_string(),
+                state: MissionState::Failed,
+                created_at: TimestampMillis::now(),
+            })
+            .unwrap();
+            db.save_session(&session_id, &mission_id, "failed", None)
+                .unwrap();
+        }
+        for cycle in 0..3 {
+            let mut daemon = DaemonService::open(&db_path, &lock).unwrap();
+            daemon.start().unwrap();
+            let status = daemon.mission_status(mission_id.as_str());
+            assert!(
+                status.is_none(),
+                "cycle {cycle}: failed mission must not be in coordinator status"
+            );
+            let state = daemon.persisted_mission_state(mission_id.as_str()).unwrap();
+            assert_eq!(
+                state.as_deref(),
+                Some("failed"),
+                "cycle {cycle}: failed mission must stay failed, got {state:?}"
+            );
+            daemon.stop().unwrap();
+        }
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn restart_does_not_duplicate_evidence() {
+        let (dir, db_path, lock) = temp_paths();
+        let mission_id = StableId::from_existing("mission-evidence-stable").unwrap();
+        let session_id = StableId::from_existing("session-evidence-stable").unwrap();
+        let evidence_id = StableId::from_existing("ev-evidence-stable").unwrap();
+        {
+            let mut db = ControlPlaneDb::open(&db_path).unwrap();
+            db.migrate().unwrap();
+            db.put_mission(&ac_kernel::Mission {
+                id: mission_id.clone(),
+                original_goal: "evidence stability".to_string(),
+                state: MissionState::Completed,
+                created_at: TimestampMillis::now(),
+            })
+            .unwrap();
+            db.save_session(&session_id, &mission_id, "completed", None)
+                .unwrap();
+            db.append_evidence(&ac_evidence::EvidenceRecord {
+                id: evidence_id.clone(),
+                kind: ac_evidence::EvidenceKind::DerivedContext,
+                provenance: ac_evidence::Provenance {
+                    source: "test".to_string(),
+                    commit: None,
+                    worktree: None,
+                    tool: None,
+                },
+                artifact_uri: "mem://test/stable".to_string(),
+                content_hash: "hash".to_string(),
+                raw_content: None,
+                model_summary: None,
+                sensitive: false,
+                created_at: TimestampMillis::now(),
+            })
+            .unwrap();
+        }
+        let evidence_count_before = {
+            let db = ControlPlaneDb::open(&db_path).unwrap();
+            db.evidence_records().unwrap().len()
+        };
+        for cycle in 0..3 {
+            let mut daemon = DaemonService::open(&db_path, &lock).unwrap();
+            daemon.start().unwrap();
+            daemon.stop().unwrap();
+            let db = ControlPlaneDb::open(&db_path).unwrap();
+            assert_eq!(
+                db.evidence_records().unwrap().len(),
+                evidence_count_before,
+                "cycle {cycle}: evidence count must not change across restarts"
+            );
+        }
         let _ = fs::remove_dir_all(dir);
     }
 }

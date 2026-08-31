@@ -15,6 +15,29 @@ mod tests {
     }
 
     #[test]
+    fn session_event_log_is_bounded_in_memory() {
+        let mut session = AgentSession::new(Worker::new());
+        session.record(RuntimeEventKind::SessionStarted);
+        let cap = MAX_SESSION_EVENTS;
+        for i in 0..(cap + 500) {
+            session.record(RuntimeEventKind::WorkItemProcessed(format!("item-{i}")));
+        }
+        assert!(
+            session.events().len() <= cap,
+            "session event log must respect its bound, got {}",
+            session.events().len()
+        );
+        // The most recent events must be retained (oldest dropped).
+        let events = session.events();
+        let last = events.last().unwrap();
+        assert!(
+            matches!(&last.kind, RuntimeEventKind::WorkItemProcessed(item) if item.contains(&(cap + 499).to_string())),
+            "the last event must be the newest item, got: {:?}",
+            last
+        );
+    }
+
+    #[test]
     fn cancellation_stops_at_session_boundary() {
         let mut session = AgentSession::new(Worker::new());
         session.enqueue("first").unwrap();

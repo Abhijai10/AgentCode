@@ -284,12 +284,13 @@ impl DesktopExperience {
                 MissionState::Active => "running",
                 MissionState::Completed => "completed",
                 MissionState::Cancelled => "cancelled",
+                MissionState::Failed => "failed",
             }
             .to_string(),
             active_task,
             waiting_reason,
             required_approval,
-            no_action_required: matches!(kernel_state, MissionState::Active | MissionState::Completed),
+            no_action_required: matches!(kernel_state, MissionState::Completed),
         }
     }
 
