@@ -109,6 +109,10 @@ struct CoordinatorState {
     active: Option<StableId>,
     statuses: BTreeMap<String, MissionExecutionStatus>,
     paused: BTreeMap<String, QueuedMission>,
+    /// Per-mission pause flags for ACTIVE missions.  Pausing a running mission
+    /// sets its flag; the agent's run loop blocks on it (via the session) so no
+    /// forward work occurs while paused, and resume clears it.
+    pause_flags: BTreeMap<String, Arc<AtomicBool>>,
     cancelled: BTreeMap<String, ()>,
     cancellation: BTreeMap<String, CancellationToken>,
 }
@@ -156,6 +160,17 @@ impl MissionCoordinator {
                             .queued
                             .retain(|queued| queued.mission_id != job.mission_id);
                         if state.cancelled.contains_key(job.mission_id.as_str()) {
+                            // A queued mission cancelled before execution: its
+                            // Run message is still in the channel.  This branch
+                            // is the only place it is ever seen, so clean up the
+                            // per-mission maps here — otherwise cancelled/cancellation/
+                            // pause_flags/statuses would leak for every queued
+                            // mission cancelled before it executed.
+                            let mid = job.mission_id.as_str();
+                            state.cancelled.remove(mid);
+                            state.cancellation.remove(mid);
+                            state.pause_flags.remove(mid);
+                            prune_terminal_statuses(&mut state);
                             continue;
                         }
                         if state.paused.contains_key(job.mission_id.as_str()) {
@@ -171,19 +186,29 @@ impl MissionCoordinator {
                         continue;
                     }
                     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        let token = worker_state
-                            .lock()
-                            .ok()
-                            .and_then(|state| {
-                                state.cancellation.get(job.mission_id.as_str()).cloned()
-                            })
-                            .unwrap_or_default();
+                        let (token, pause) = {
+                            let state = worker_state.lock().ok();
+                            (
+                                state
+                                    .as_ref()
+                                    .and_then(|state| {
+                                        state.cancellation.get(job.mission_id.as_str()).cloned()
+                                    })
+                                    .unwrap_or_default(),
+                                state
+                                    .and_then(|state| {
+                                        state.pause_flags.get(job.mission_id.as_str()).cloned()
+                                    })
+                                    .unwrap_or_else(|| Arc::new(AtomicBool::new(false))),
+                            )
+                        };
                         execute_mission(
                             &db_path,
                             &job.workspace_root,
                             Arc::clone(&kernel),
                             &job,
                             token,
+                            pause,
                         )
                     }));
                     let terminal = match outcome {
@@ -237,6 +262,7 @@ impl MissionCoordinator {
                             let mid = job.mission_id.as_str();
                             state.cancelled.remove(mid);
                             state.cancellation.remove(mid);
+                            state.pause_flags.remove(mid);
                         }
                         prune_terminal_statuses(&mut state);
                     }
@@ -267,6 +293,9 @@ impl MissionCoordinator {
             state
                 .cancellation
                 .insert(job.mission_id.to_string(), CancellationToken::new());
+            state
+                .pause_flags
+                .insert(job.mission_id.to_string(), Arc::new(AtomicBool::new(false)));
             state.queued.push_back(job.clone());
         }
         if self
@@ -280,6 +309,7 @@ impl MissionCoordinator {
                     .retain(|queued| queued.mission_id != job.mission_id);
                 state.statuses.remove(job.mission_id.as_str());
                 state.cancellation.remove(job.mission_id.as_str());
+                state.pause_flags.remove(job.mission_id.as_str());
             }
             return Err(AcError::new(
                 "DAEMON-QUEUE_FULL",
@@ -299,64 +329,108 @@ impl MissionCoordinator {
         let mut state = self.state.lock().map_err(|_| {
             AcError::conflict("DAEMON-COORDINATOR_POISONED", "coordinator lock poisoned")
         })?;
-        let job = state
+        // Pause a queued mission: move it to the paused map so the worker
+        // skips it on dequeue and it never executes until resumed.
+        if let Some(job) = state
             .queued
             .iter()
             .find(|job| job.mission_id.as_str() == mission_id)
             .cloned()
-            .ok_or_else(|| {
-                AcError::conflict(
-                    "DAEMON-MISSION_NOT_PAUSABLE",
-                    "mission is already running or terminal",
-                )
-            })?;
-        state.paused.insert(mission_id.to_string(), job);
-        if let Some(status) = state.statuses.get_mut(mission_id) {
-            status.state = "paused".to_string();
+        {
+            state.paused.insert(mission_id.to_string(), job);
+            if let Some(status) = state.statuses.get_mut(mission_id) {
+                status.state = "paused".to_string();
+            }
+            return Ok(());
         }
-        Ok(())
+        // Pause an active (running) mission: set the shared pause flag so the
+        // agent's run loop blocks at the next safe point.
+        if state
+            .active
+            .as_ref()
+            .is_some_and(|id| id.as_str() == mission_id)
+            || state
+                .statuses
+                .get(mission_id)
+                .is_some_and(|s| s.state == "running")
+        {
+            if let Some(sig) = state.pause_flags.get(mission_id) {
+                sig.store(true, Ordering::SeqCst);
+            }
+            if let Some(status) = state.statuses.get_mut(mission_id) {
+                status.state = "paused".to_string();
+            }
+            return Ok(());
+        }
+        Err(AcError::conflict(
+            "DAEMON-MISSION_NOT_PAUSABLE",
+            "mission is terminal or not found",
+        ))
     }
 
     fn resume(&self, mission_id: &str) -> AcResult<()> {
+        // Resume a queued-paused mission: requeue it.
         let job = {
             let mut state = self.state.lock().map_err(|_| {
                 AcError::conflict("DAEMON-COORDINATOR_POISONED", "coordinator lock poisoned")
             })?;
-            let job = state.paused.remove(mission_id).ok_or_else(|| {
-                AcError::conflict("DAEMON-MISSION_NOT_PAUSED", "mission is not paused")
-            })?;
-            state.queued.push_back(job.clone());
-            if let Some(status) = state.statuses.get_mut(mission_id) {
-                status.state = "queued".to_string();
+            if let Some(job) = state.paused.remove(mission_id) {
+                state.queued.push_back(job.clone());
+                if let Some(status) = state.statuses.get_mut(mission_id) {
+                    status.state = "queued".to_string();
+                }
+                Some(job)
+            } else {
+                // Resume an active-paused mission: clear the pause flag so the
+                // agent's run loop continues.
+                if let Some(sig) = state.pause_flags.get(mission_id) {
+                    if sig.load(Ordering::SeqCst) {
+                        sig.store(false, Ordering::SeqCst);
+                        if let Some(status) = state.statuses.get_mut(mission_id) {
+                            status.state = "running".to_string();
+                        }
+                        return Ok(());
+                    }
+                }
+                None
             }
-            job
         };
-        self.tx.try_send(CoordinatorMessage::Run(job)).map_err(|_| {
-            AcError::new(
-                "DAEMON-QUEUE_FULL",
-                "mission queue is full",
-                ac_common::ErrorKind::Unavailable,
-                ac_common::Retryability::Retryable,
-            )
-        })
+        match job {
+            Some(job) => self.tx.try_send(CoordinatorMessage::Run(job)).map_err(|_| {
+                AcError::new(
+                    "DAEMON-QUEUE_FULL",
+                    "mission queue is full",
+                    ac_common::ErrorKind::Unavailable,
+                    ac_common::Retryability::Retryable,
+                )
+            }),
+            None => Err(AcError::conflict(
+                "DAEMON-MISSION_NOT_PAUSED",
+                "mission is not paused",
+            )),
+        }
     }
 
     fn remember_paused(&self, job: QueuedMission) -> AcResult<()> {
         let mut state = self.state.lock().map_err(|_| {
             AcError::conflict("DAEMON-COORDINATOR_POISONED", "coordinator lock poisoned")
         })?;
+        let mission_key = job.mission_id.to_string();
         state.statuses.insert(
-            job.mission_id.to_string(),
+            mission_key.clone(),
             MissionExecutionStatus {
                 mission_id: job.mission_id.clone(),
                 session_id: job.session_id.clone(),
                 state: "paused".to_string(),
             },
         );
-        state.paused.insert(job.mission_id.to_string(), job);
+        state.paused.insert(mission_key.clone(), job);
+        state
+            .pause_flags
+            .entry(mission_key)
+            .or_insert_with(|| Arc::new(AtomicBool::new(false)));
         Ok(())
     }
-
     fn cancel(&self, mission_id: &str) -> AcResult<()> {
         let mut state = self.state.lock().map_err(|_| {
             AcError::conflict("DAEMON-COORDINATOR_POISONED", "coordinator lock poisoned")
@@ -372,6 +446,10 @@ impl MissionCoordinator {
         }
         state.cancelled.insert(mission_id.to_string(), ());
         state.paused.remove(mission_id);
+        if let Some(sig) = state.pause_flags.get(mission_id) {
+            sig.store(false, Ordering::SeqCst);
+        }
+        state.pause_flags.remove(mission_id);
         state
             .queued
             .retain(|job| job.mission_id.as_str() != mission_id);
@@ -410,6 +488,22 @@ impl MissionCoordinator {
             })?;
         }
         Ok(())
+    }
+
+    /// Test-only introspection of in-memory coordinator map sizes.  Used to
+    /// prove that queued-cancelled missions do not leak per-mission state.
+    #[cfg(test)]
+    fn map_sizes(&self) -> (usize, usize, usize, usize) {
+        if let Ok(state) = self.state.lock() {
+            (
+                state.statuses.len(),
+                state.cancelled.len(),
+                state.cancellation.len(),
+                state.pause_flags.len(),
+            )
+        } else {
+            (0, 0, 0, 0)
+        }
     }
 }
 
@@ -452,6 +546,7 @@ fn execute_mission(
     kernel: Arc<Mutex<Kernel<ProductionKernelPolicy>>>,
     job: &QueuedMission,
     cancellation: CancellationToken,
+    pause: Arc<AtomicBool>,
 ) -> AcResult<String> {
     let db = ControlPlaneDb::open(db_path)?;
     db.update_session_state(&job.session_id, "running")?;
@@ -463,8 +558,12 @@ fn execute_mission(
             let has_tasks = hydrated.graph.tasks().next().is_some();
             has_tasks.then_some(hydrated.graph)
         });
-    let session =
-        AgentSession::with_id_and_token(job.session_id.clone(), Worker::new(), cancellation);
+    let session = AgentSession::with_id_token_and_pause(
+        job.session_id.clone(),
+        Worker::new(),
+        cancellation,
+        pause,
+    );
     let worktree = workspace_root
         .join(".agentcode-worktrees")
         .join(job.session_id.as_str());
@@ -926,8 +1025,13 @@ impl DaemonService {
             ));
         }
         self.lifecycle = DaemonLifecycle::Stopping;
-        self.kernel_lock()?.stop()?;
+        // Cancel in-flight work and join the mission worker BEFORE stopping the
+        // kernel.  A mission cancelled mid-flight must still be able to
+        // transition its kernel mission to a terminal state during
+        // reconciliation; stopping the kernel first would reject those
+        // transitions with KERNEL-NOT_RUNNING and leave the mission failed.
         self.coordinator.stop()?;
+        self.kernel_lock()?.stop()?;
         self.lock_file = None;
         let _ = fs::remove_file(&self.lock_path);
         self.lifecycle = DaemonLifecycle::Stopped;
@@ -1084,7 +1188,13 @@ impl DaemonService {
         self.ensure_running()?;
         self.coordinator.resume(mission_id)?;
         if let Some(status) = self.coordinator.status(mission_id) {
-            self.db.update_session_state(&status.session_id, "queued")?;
+            let persisted = match status.state.as_str() {
+                "paused" => "paused",
+                "running" => "running",
+                _ => "queued",
+            };
+            self.db
+                .update_session_state(&status.session_id, persisted)?;
         }
         Ok(())
     }
@@ -2766,6 +2876,135 @@ mod tests {
             let status = daemon.mission_status(mid.as_str()).unwrap();
             assert_eq!(status.state, "cancelled");
         }
+        daemon.stop().unwrap();
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn coordinator_queued_cancelled_missions_do_not_leak_maps() {
+        // P1-06: a queued mission cancelled before the worker dequeues it must
+        // not leak entries in the cancelled/cancellation/pause_flags maps.  The
+        // worker's cancelled branch is the only place such a mission is seen.
+        let (dir, db, lock) = temp_paths();
+        // Isolated workspace so a racing worker can never touch the repo cwd.
+        let workspace = dir.join("workspace");
+        fs::create_dir_all(&workspace).unwrap();
+        let mut daemon = DaemonService::open(&db, &lock).unwrap();
+        daemon.start().unwrap();
+        let mut mission_ids = Vec::new();
+        for i in 0..8 {
+            let (mission_id, _sid) = match daemon
+                .handle(DaemonCommand::CreateSession {
+                    goal: format!("queued-cancel-{i}"),
+                    workspace_root: Some(workspace.to_string_lossy().to_string()),
+                })
+                .unwrap()
+            {
+                DaemonResponse::SessionCreated {
+                    mission_id,
+                    session_id,
+                } => (mission_id, session_id),
+                _ => panic!("expected session"),
+            };
+            // Cancel while still queued (no worker dequeue happens because the
+            // daemon never ran the mock provider for these missions).
+            daemon.cancel_mission(mission_id.as_str()).unwrap();
+            mission_ids.push(mission_id);
+        }
+        // Give the worker a moment to drain the channel messages for the
+        // cancelled missions and perform cleanup.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let (_, cancelled_len, cancellation_len, pause_flags_len) =
+                daemon.coordinator.map_sizes();
+            if cancelled_len == 0 && cancellation_len == 0 && pause_flags_len == 0 {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "coordinator maps still hold cancelled missions: cancelled={cancelled_len} cancellation={cancellation_len} pause_flags={pause_flags_len}"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        for mid in &mission_ids {
+            let status = daemon.mission_status(mid.as_str()).unwrap();
+            assert_eq!(status.state, "cancelled", "status must remain cancelled");
+        }
+        daemon.stop().unwrap();
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn active_mission_pause_blocks_forward_work_and_resumes() {
+        // P1-02: pausing an ACTIVE mission must set its pause flag, and resume
+        // must clear it.  Constructs the coordinator directly so the worker
+        // thread never executes the synthetic mission (deterministic).
+        let (dir, db, lock) = temp_paths();
+        let mut daemon = DaemonService::open(&db, &lock).unwrap();
+        daemon.start().unwrap();
+        let mission_id = StableId::new("pause-active");
+        let session_id = StableId::new("session-pause-active");
+        let kernel = Arc::clone(&daemon.kernel);
+        let coordinator = MissionCoordinator::new(db.clone(), kernel);
+        {
+            let mut state = coordinator.state.lock().unwrap();
+            state.active = Some(mission_id.clone());
+            state.statuses.insert(
+                mission_id.to_string(),
+                MissionExecutionStatus {
+                    mission_id: mission_id.clone(),
+                    session_id: session_id.clone(),
+                    state: "running".to_string(),
+                },
+            );
+            state
+                .cancellation
+                .insert(mission_id.to_string(), CancellationToken::new());
+            state
+                .pause_flags
+                .insert(mission_id.to_string(), Arc::new(AtomicBool::new(false)));
+        }
+        let pause = coordinator
+            .state
+            .lock()
+            .unwrap()
+            .pause_flags
+            .get(mission_id.as_str())
+            .cloned()
+            .unwrap();
+        coordinator.pause(mission_id.as_str()).unwrap();
+        assert!(
+            pause.load(Ordering::SeqCst),
+            "active pause must set the flag"
+        );
+        assert_eq!(
+            coordinator.status(mission_id.as_str()).unwrap().state,
+            "paused"
+        );
+        coordinator.resume(mission_id.as_str()).unwrap();
+        assert!(
+            !pause.load(Ordering::SeqCst),
+            "resume must clear the pause flag"
+        );
+        assert_eq!(
+            coordinator.status(mission_id.as_str()).unwrap().state,
+            "running"
+        );
+        // Cancellation of a paused mission must still work and clear the flag.
+        coordinator.pause(mission_id.as_str()).unwrap();
+        assert!(pause.load(Ordering::SeqCst));
+        coordinator.cancel(mission_id.as_str()).unwrap();
+        assert!(!pause.load(Ordering::SeqCst));
+        let token = coordinator
+            .state
+            .lock()
+            .unwrap()
+            .cancellation
+            .get(mission_id.as_str())
+            .cloned()
+            .unwrap();
+        assert!(token.is_cancelled());
+        coordinator.stop().unwrap();
         daemon.stop().unwrap();
         let _ = fs::remove_dir_all(dir);
     }

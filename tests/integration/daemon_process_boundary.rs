@@ -639,10 +639,19 @@ fn real_daemon_binary_pauses_queued_mission_across_restart_then_resumes() {
 
 #[test]
 #[ignore = "requires Ollama or LM Studio running locally with a loaded model"]
-fn real_provider_daemon_path_smoke_proof() {
+fn real_provider_daemon_path_model_unavailable_fails_distinctly() {
+    // P1-01 model-unavailable distinction: point the real daemon at a model
+    // that does not exist on the local Ollama.  The mission must reach a
+    // terminal FAILED state with the provider/model failure recorded — never a
+    // silent success, never UNPROVEN, never a fabricated completion.  This is
+    // deterministic: a nonexistent model always fails identically.
     let ollama_base =
         std::env::var("OLLAMA_BASE_URL").unwrap_or_else(|_| "http://127.0.0.1:11434".to_string());
     let connect_addr = ollama_connect_addr(&ollama_base);
+    if std::net::TcpStream::connect(&connect_addr).is_err() {
+        eprintln!("SKIP: Ollama not reachable at {ollama_base}; cannot run real provider test");
+        return;
+    }
     let ollama_chat = if ollama_base.ends_with("/api/chat") {
         ollama_base.clone()
     } else if ollama_base.ends_with('/') {
@@ -650,22 +659,17 @@ fn real_provider_daemon_path_smoke_proof() {
     } else {
         format!("{ollama_base}/api/chat")
     };
-    // Small-model constraint: this machine has 8 GB RAM, so the default is a
-    // <=4B coding model, never a 7B/8B model.
-    let ollama_model =
-        std::env::var("OLLAMA_MODEL").unwrap_or_else(|_| "qwen2.5-coder:3b".to_string());
-    // Quick connectivity check — skip (not fail) if Ollama is unreachable.
-    // Uses host:port only (never the URL path) so TcpStream::connect works.
-    if std::net::TcpStream::connect(&connect_addr).is_err() {
-        eprintln!("SKIP: Ollama not reachable at {ollama_base}; cannot run real provider test");
-        return;
-    }
-    let runtime = short_temp_path("acrp");
-    let project = short_temp_path("acrpp");
+    // A model name that cannot exist on the local server.  <=4B constraint is
+    // irrelevant because no model is actually loaded for this probe.
+    let ollama_model = std::env::var("OLLAMA_MODEL_MISSING")
+        .unwrap_or_else(|_| "agentcode-no-such-model".to_string());
+
+    let runtime = short_temp_path("acrm");
+    let project = short_temp_path("acrmp");
     let _ = fs::remove_dir_all(&runtime);
     let _ = fs::remove_dir_all(&project);
     fs::create_dir_all(&runtime).unwrap();
-    create_passing_fixture_project(&project);
+    create_fixture_project(&project);
     let daemon = daemon_binary();
     assert!(
         daemon.is_file(),
@@ -695,51 +699,42 @@ fn real_provider_daemon_path_smoke_proof() {
 
     let submit = UnixIpcClient::new(&socket)
         .request(json!({
-            "id": "submit-real",
+            "id": "submit-missing",
             "command": "SubmitMission",
-            "goal": "Verify that fixture_answer returns 42"
+            "goal": "Create a file named agentcode_proof.txt"
         }))
         .unwrap();
     assert_eq!(submit["ok"], true, "submit response: {submit}");
     let mission_id = submit["mission_id"].as_str().unwrap().to_string();
 
-    // Strict completion poll.  If the mission reaches failed or cancelled,
-    // poll_mission_completed immediately panics with the daemon log —
-    // no "UNPROVEN" escape hatch.
-    let completed = poll_mission_completed(&socket, &mission_id, &mut child, &runtime);
-    assert_eq!(
-        completed["state"], "completed",
-        "real provider mission: {completed}"
+    // The mission must reach a terminal FAILED state with a real provider
+    // failure — never completed, never cancelled-by-accident, never UNPROVEN.
+    // The coordinator uses "failed: ERROR_CODE" to convey the specific cause.
+    let failed = poll_mission_state_prefix(
+        &socket,
+        &mission_id,
+        "failed",
+        &mut child,
+        &runtime,
+    );
+    assert!(
+        failed["state"].as_str().unwrap_or("").starts_with("failed"),
+        "mission must reach a failed terminal state: {failed}"
     );
 
+    // The daemon log must name the provider failure (not a mission panic and
+    // not a fabricated success).
+    let log = daemon_log(&runtime);
+    assert!(
+        log.contains("MISSION-ERROR") || log.contains("MISSION-NOT-COMPLETED"),
+        "daemon log must record the real provider failure: {log}"
+    );
+    // Persisted mission/session are terminal failed, not completed.
     let mission_stable = StableId::from_existing(&mission_id).unwrap();
     let db = ControlPlaneDb::open(&db_path).unwrap();
     assert_eq!(
         db.get_mission(&mission_stable).unwrap().unwrap().state,
-        "completed"
-    );
-    // Verify real provider evidence exists (not mock-scripted)
-    let evidence = db.evidence_records().unwrap();
-    assert!(
-        evidence.iter().any(|record| {
-            record.provenance.source == "agent.completion-request"
-                || record.artifact_uri.contains("completion")
-        }),
-        "real provider must produce completion evidence"
-    );
-
-    // Verify the provider source in evidence is from a real provider, not
-    // the scripted mock.  Real provider evidence has provenance source
-    // "agent.provider.planner" or "agent.completion-request" with proper
-    // artifact_uri (not "mem://agent/.../provider/planner" mock URIs).
-    let real_provider_evidence = evidence.iter().any(|record| {
-        record.provenance.source == "agent.provider.planner"
-            && !record.artifact_uri.contains("mock")
-            && !record.artifact_uri.contains("scripted")
-    });
-    assert!(
-        real_provider_evidence,
-        "real provider must produce planner evidence from a real provider, not mock or scripted"
+        "failed"
     );
 
     shutdown_daemon(&socket, &mut child, &runtime);
@@ -869,10 +864,524 @@ fn real_provider_daemon_path_creates_smoke_file_with_exact_content() {
     let _ = fs::remove_dir_all(&project);
 }
 
+#[test]
+#[ignore = "requires built ac-daemon binary and macOS production sandbox"]
+fn real_daemon_binary_pauses_active_mission_blocks_forward_work_then_resumes() {
+    // P1-02 active-mission pause over real IPC: a RUNNING mission must pause
+    // (no forward work toward completion), remain paused, then resume and
+    // complete.  Uses the slow fixture so verification runs a 5s test in the
+    // background, giving a deterministic active window.
+    let runtime = short_temp_path("acap");
+    let project = short_temp_path("acapp");
+    let _ = fs::remove_dir_all(&runtime);
+    let _ = fs::remove_dir_all(&project);
+    fs::create_dir_all(&runtime).unwrap();
+    create_slow_fixture_project(&project);
+    let daemon = daemon_binary();
+    assert!(
+        daemon.is_file(),
+        "build the daemon first: cargo build -p ac-daemon"
+    );
+    let socket = default_socket_path(&runtime);
+    let (db_path, _) = default_paths(&runtime);
+    let mut child = launch_daemon(&daemon, &runtime, &project);
+    wait_for_socket(&socket, &mut child, &runtime);
+
+    let submit = UnixIpcClient::new(&socket)
+        .request(json!({
+            "id": "submit-pause-active",
+            "command": "SubmitMission",
+            "goal": "Fix the bug in src/lib.rs"
+        }))
+        .unwrap();
+    assert_eq!(submit["ok"], true, "submit response: {submit}");
+    let mission_id = submit["mission_id"].as_str().unwrap().to_string();
+
+    // Wait until verification (the 5s slow test) is running — the mission is
+    // genuinely active with forward work in flight.
+    poll_task_state(&db_path, &mission_id, "Verify target", "running");
+
+    let pause = UnixIpcClient::new(&socket)
+        .request(json!({
+            "id": "pause-active",
+            "command": "PauseMission",
+            "mission_id": mission_id
+        }))
+        .unwrap();
+    assert_eq!(pause["ok"], true, "pause response: {pause}");
+    assert_eq!(pause["state"], "paused", "pause response: {pause}");
+    let paused = UnixIpcClient::new(&socket)
+        .request(json!({
+            "id": "paused-active",
+            "command": "GetMission",
+            "mission_id": mission_id
+        }))
+        .unwrap();
+    assert_eq!(paused["state"], "paused", "paused response: {paused}");
+    // While paused, the mission must not reach a terminal state even though
+    // the in-flight 5s verification would have finished by now.
+    std::thread::sleep(Duration::from_secs(7));
+    let still_paused = UnixIpcClient::new(&socket)
+        .request(json!({
+            "id": "still-paused",
+            "command": "GetMission",
+            "mission_id": mission_id
+        }))
+        .unwrap();
+    assert_eq!(
+        still_paused["state"], "paused",
+        "mission must stay paused (no forward work): {still_paused}"
+    );
+
+    let resume = UnixIpcClient::new(&socket)
+        .request(json!({
+            "id": "resume-active",
+            "command": "ResumeMission",
+            "mission_id": mission_id
+        }))
+        .unwrap();
+    assert_eq!(resume["ok"], true, "resume response: {resume}");
+    let completed = poll_mission_completed(&socket, &mission_id, &mut child, &runtime);
+    assert_eq!(completed["state"], "completed", "{completed}");
+
+    shutdown_daemon(&socket, &mut child, &runtime);
+    let _ = fs::remove_dir_all(&runtime);
+    let _ = fs::remove_dir_all(&project);
+}
+
+#[test]
+#[ignore = "requires built ac-daemon binary and macOS production sandbox"]
+fn real_daemon_binary_cancels_queued_mission_never_executes() {
+    // P1-02 queued cancellation over real IPC: a queued mission cancelled
+    // before execution must never run — no worktree, no mutation, remains
+    // cancelled across restart.
+    let runtime = short_temp_path("acqc");
+    let project = short_temp_path("acqcp");
+    let _ = fs::remove_dir_all(&runtime);
+    let _ = fs::remove_dir_all(&project);
+    fs::create_dir_all(&runtime).unwrap();
+    create_slow_fixture_project(&project);
+    let daemon = daemon_binary();
+    assert!(
+        daemon.is_file(),
+        "build the daemon first: cargo build -p ac-daemon"
+    );
+    let socket = default_socket_path(&runtime);
+    let (db_path, _) = default_paths(&runtime);
+    let mut child = launch_daemon(&daemon, &runtime, &project);
+    wait_for_socket(&socket, &mut child, &runtime);
+
+    // First mission occupies the single worker slot.
+    let first = UnixIpcClient::new(&socket)
+        .request(json!({
+            "id": "submit-first",
+            "command": "SubmitMission",
+            "goal": "Fix the bug in src/lib.rs"
+        }))
+        .unwrap();
+    assert_eq!(first["ok"], true, "first response: {first}");
+    poll_task_state(
+        &db_path,
+        first["mission_id"].as_str().unwrap(),
+        "Verify target",
+        "running",
+    );
+
+    // Second mission is queued behind it.
+    let second = UnixIpcClient::new(&socket)
+        .request(json!({
+            "id": "submit-second",
+            "command": "SubmitMission",
+            "goal": "Fix the bug in src/lib.rs"
+        }))
+        .unwrap();
+    assert_eq!(second["ok"], true, "second response: {second}");
+    let second_mission = second["mission_id"].as_str().unwrap().to_string();
+    let second_session = second["session_id"].as_str().unwrap().to_string();
+
+    let cancel = UnixIpcClient::new(&socket)
+        .request(json!({
+            "id": "cancel-queued",
+            "command": "CancelMission",
+            "mission_id": second_mission
+        }))
+        .unwrap();
+    assert_eq!(cancel["ok"], true, "cancel response: {cancel}");
+    assert_eq!(cancel["state"], "cancelled", "cancel response: {cancel}");
+
+    // The cancelled queued mission must never create a worktree or mutate.
+    std::thread::sleep(Duration::from_secs(2));
+    assert!(
+        !project
+            .join(".agentcode-worktrees")
+            .join(&second_session)
+            .exists(),
+        "cancelled queued mission must not create a worktree"
+    );
+    let cancelled = UnixIpcClient::new(&socket)
+        .request(json!({
+            "id": "cancelled-queued",
+            "command": "GetMission",
+            "mission_id": second_mission
+        }))
+        .unwrap();
+    assert_eq!(cancelled["state"], "cancelled", "{cancelled}");
+
+    // First mission still completes normally.
+    let first_completed = poll_mission_completed(
+        &socket,
+        first["mission_id"].as_str().unwrap(),
+        &mut child,
+        &runtime,
+    );
+    assert_eq!(first_completed["state"], "completed", "{first_completed}");
+
+    // Restart: the cancelled queued mission stays cancelled and never ran.
+    shutdown_daemon(&socket, &mut child, &runtime);
+    let mut restarted = launch_daemon(&daemon, &runtime, &project);
+    wait_for_socket(&socket, &mut restarted, &runtime);
+    let after_restart = UnixIpcClient::new(&socket)
+        .request(json!({
+            "id": "cancelled-after-restart",
+            "command": "GetMission",
+            "mission_id": second_mission
+        }))
+        .unwrap();
+    assert_eq!(
+        after_restart["state"], "cancelled",
+        "cancelled queued mission must stay cancelled: {after_restart}"
+    );
+    assert!(
+        !project
+            .join(".agentcode-worktrees")
+            .join(&second_session)
+            .exists(),
+        "cancelled queued mission must never create a worktree after restart"
+    );
+    shutdown_daemon(&socket, &mut restarted, &runtime);
+    let _ = fs::remove_dir_all(&runtime);
+    let _ = fs::remove_dir_all(&project);
+}
+
+#[test]
+#[ignore = "requires built ac-daemon binary and macOS production sandbox"]
+fn real_daemon_binary_terminates_in_flight_subprocess_on_cancel() {
+    // P1-04: an actual subprocess running under the command-execution path
+    // must be terminated when cancellation arrives.  The fixture verification
+    // spawns a deterministic `sleep 300` probe and writes its PID to a file in
+    // the worktree; after cancel, the probe must be dead (no orphan), the
+    // mission must become Cancelled (not Failed), and nothing is retried.
+    let runtime = short_temp_path("acsp");
+    let project = short_temp_path("acspp");
+    let _ = fs::remove_dir_all(&runtime);
+    let _ = fs::remove_dir_all(&project);
+    fs::create_dir_all(&runtime).unwrap();
+    create_probe_fixture_project(&project);
+    let daemon = daemon_binary();
+    assert!(
+        daemon.is_file(),
+        "build the daemon first: cargo build -p ac-daemon"
+    );
+    let socket = default_socket_path(&runtime);
+    let (_, _) = default_paths(&runtime);
+    let mut child = launch_daemon(&daemon, &runtime, &project);
+    wait_for_socket(&socket, &mut child, &runtime);
+
+    let submit = UnixIpcClient::new(&socket)
+        .request(json!({
+            "id": "submit-probe",
+            "command": "SubmitMission",
+            "goal": "Fix the bug in src/lib.rs"
+        }))
+        .unwrap();
+    assert_eq!(submit["ok"], true, "submit response: {submit}");
+    let mission_id = submit["mission_id"].as_str().unwrap().to_string();
+    let session_id = submit["session_id"].as_str().unwrap().to_string();
+
+    // Wait for the probe subprocess to be running: its PID file appears in the
+    // worktree when the fixture test binary (child of cargo test, itself the
+    // command executed by dev.test) has spawned `sleep 300`.
+    let probe_pid = poll_probe_pid(&project, &session_id, &mut child, &runtime);
+    assert!(
+        process_is_alive(probe_pid),
+        "probe subprocess must be alive before cancel"
+    );
+
+    let cancel = UnixIpcClient::new(&socket)
+        .request(json!({
+            "id": "cancel-probe",
+            "command": "CancelMission",
+            "mission_id": mission_id
+        }))
+        .unwrap();
+    assert_eq!(cancel["ok"], true, "cancel response: {cancel}");
+
+    // Mission must become Cancelled, never Failed.
+    let cancelled = poll_mission_state(&socket, &mission_id, "cancelled", &mut child, &runtime);
+    assert_eq!(cancelled["state"], "cancelled", "{cancelled}");
+
+    // The probe subprocess must be terminated — no orphan process remains.
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while Instant::now() < deadline {
+        if !process_is_alive(probe_pid) {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert!(
+        !process_is_alive(probe_pid),
+        "probe subprocess {probe_pid} must be terminated after cancellation"
+    );
+
+    // Cancelled command is not retried: the mission stays terminal and the
+    // task-attempt count does not grow after cancellation.
+    std::thread::sleep(Duration::from_secs(2));
+    let after_wait = UnixIpcClient::new(&socket)
+        .request(json!({
+            "id": "probe-after",
+            "command": "GetMission",
+            "mission_id": mission_id
+        }))
+        .unwrap();
+    assert_eq!(after_wait["state"], "cancelled", "{after_wait}");
+
+    // Restart: cancelled stays cancelled; no replay, no retry.
+    shutdown_daemon(&socket, &mut child, &runtime);
+    let mut restarted = launch_daemon(&daemon, &runtime, &project);
+    wait_for_socket(&socket, &mut restarted, &runtime);
+    let after_restart = UnixIpcClient::new(&socket)
+        .request(json!({
+            "id": "probe-after-restart",
+            "command": "GetMission",
+            "mission_id": mission_id
+        }))
+        .unwrap();
+    assert_eq!(
+        after_restart["state"], "cancelled",
+        "cancelled probe mission must stay cancelled: {after_restart}"
+    );
+    assert!(
+        !process_is_alive(probe_pid),
+        "probe subprocess must stay terminated after restart"
+    );
+    shutdown_daemon(&socket, &mut restarted, &runtime);
+    let _ = fs::remove_dir_all(&runtime);
+    let _ = fs::remove_dir_all(&project);
+}
+
+#[test]
+#[ignore = "requires built ac-daemon binary and macOS production sandbox"]
+fn real_daemon_binary_restarts_during_verification_without_replay() {
+    // P1-03: restart while a completed mutation exists and verification is
+    // still running.  The completed mutation must not be replayed, evidence
+    // must not be duplicated, and the mission must resume to completion.
+    let runtime = short_temp_path("acrv");
+    let project = short_temp_path("acrvp");
+    let _ = fs::remove_dir_all(&runtime);
+    let _ = fs::remove_dir_all(&project);
+    fs::create_dir_all(&runtime).unwrap();
+    create_slow_fixture_project(&project);
+    let daemon = daemon_binary();
+    assert!(
+        daemon.is_file(),
+        "build the daemon first: cargo build -p ac-daemon"
+    );
+    let socket = default_socket_path(&runtime);
+    let (db_path, _) = default_paths(&runtime);
+    let mut first = launch_daemon(&daemon, &runtime, &project);
+    wait_for_socket(&socket, &mut first, &runtime);
+
+    let submit = UnixIpcClient::new(&socket)
+        .request(json!({
+            "id": "submit-verify-restart",
+            "command": "SubmitMission",
+            "goal": "Fix the bug in src/lib.rs"
+        }))
+        .unwrap();
+    assert_eq!(submit["ok"], true, "submit response: {submit}");
+    let mission_id = submit["mission_id"].as_str().unwrap().to_string();
+    let session_id = submit["session_id"].as_str().unwrap().to_string();
+
+    // The mutation task completes, then verification starts (5s slow test).
+    let modify_task = poll_task_state(&db_path, &mission_id, "Modify target", "completed");
+    poll_task_state(&db_path, &mission_id, "Verify target", "running");
+    let worktree_lib = project
+        .join(".agentcode-worktrees")
+        .join(&session_id)
+        .join("src/lib.rs");
+    assert_eq!(
+        fs::read_to_string(&worktree_lib).unwrap(),
+        "pub fn fixture_answer() -> u32 {\n    42\n}"
+    );
+    let db_before = ControlPlaneDb::open(&db_path).unwrap();
+    let modify_attempts_before = db_before.task_attempts(&modify_task).unwrap().len();
+    let evidence_before = db_before.evidence_records().unwrap().len();
+
+    // Kill mid-verification, then restart with the same runtime directory.
+    first.kill().unwrap();
+    wait_for_exit(&mut first, &runtime);
+    let mut second = launch_daemon(&daemon, &runtime, &project);
+    wait_for_socket(&socket, &mut second, &runtime);
+
+    let completed = poll_mission_completed(&socket, &mission_id, &mut second, &runtime);
+    assert_eq!(completed["state"], "completed", "{completed}");
+    assert_eq!(
+        fs::read_to_string(&worktree_lib).unwrap(),
+        "pub fn fixture_answer() -> u32 {\n    42\n}",
+        "mutation must not be replayed"
+    );
+    assert_eq!(
+        count_occurrences(&fs::read_to_string(&worktree_lib).unwrap(), "42"),
+        1
+    );
+    let db_after = ControlPlaneDb::open(&db_path).unwrap();
+    assert_eq!(
+        db_after.task_attempts(&modify_task).unwrap().len(),
+        modify_attempts_before,
+        "completed mutation task was replayed after restart"
+    );
+    assert!(
+        db_after.evidence_records().unwrap().len() >= evidence_before,
+        "evidence must not be lost"
+    );
+
+    // Identity is stable: same mission/session across the crash boundary.
+    let same_mission = UnixIpcClient::new(&socket)
+        .request(json!({
+            "id": "verify-identity",
+            "command": "GetMission",
+            "mission_id": mission_id
+        }))
+        .unwrap();
+    assert_eq!(same_mission["mission_id"], mission_id, "{same_mission}");
+    assert_eq!(same_mission["session_id"], session_id, "{same_mission}");
+
+    // Second restart: terminal Completed persists, nothing replays.
+    shutdown_daemon(&socket, &mut second, &runtime);
+    let mut third = launch_daemon(&daemon, &runtime, &project);
+    wait_for_socket(&socket, &mut third, &runtime);
+    let after_second_restart = UnixIpcClient::new(&socket)
+        .request(json!({
+            "id": "verify-second-restart",
+            "command": "GetMission",
+            "mission_id": mission_id
+        }))
+        .unwrap();
+    assert_eq!(
+        after_second_restart["state"], "completed",
+        "second restart: {after_second_restart}"
+    );
+    assert_eq!(
+        count_occurrences(&fs::read_to_string(&worktree_lib).unwrap(), "42"),
+        1
+    );
+    let db_third = ControlPlaneDb::open(&db_path).unwrap();
+    assert_eq!(
+        db_third.task_attempts(&modify_task).unwrap().len(),
+        modify_attempts_before,
+        "completed mutation replayed after second restart"
+    );
+    shutdown_daemon(&socket, &mut third, &runtime);
+    let _ = fs::remove_dir_all(&runtime);
+    let _ = fs::remove_dir_all(&project);
+}
+
+#[test]
+#[ignore = "requires built ac-daemon binary and macOS production sandbox"]
+fn real_daemon_binary_graceful_shutdown_with_in_flight_subprocess() {
+    // P1-05: ShutdownDaemon while a mission is actively running a subprocess.
+    // Shutdown must reconcile the mission (cancel in-flight work), clean up the
+    // child process, remove the lock, and let the daemon exit without a
+    // surviving worker thread.
+    let runtime = short_temp_path("acsh");
+    let project = short_temp_path("acshp");
+    let _ = fs::remove_dir_all(&runtime);
+    let _ = fs::remove_dir_all(&project);
+    fs::create_dir_all(&runtime).unwrap();
+    create_probe_fixture_project(&project);
+    let daemon = daemon_binary();
+    assert!(
+        daemon.is_file(),
+        "build the daemon first: cargo build -p ac-daemon"
+    );
+    let socket = default_socket_path(&runtime);
+    let (db_path, lock) = default_paths(&runtime);
+    let mut child = launch_daemon(&daemon, &runtime, &project);
+    wait_for_socket(&socket, &mut child, &runtime);
+
+    let submit = UnixIpcClient::new(&socket)
+        .request(json!({
+            "id": "submit-shutdown",
+            "command": "SubmitMission",
+            "goal": "Fix the bug in src/lib.rs"
+        }))
+        .unwrap();
+    assert_eq!(submit["ok"], true, "submit response: {submit}");
+    let mission_id = submit["mission_id"].as_str().unwrap().to_string();
+    let session_id = submit["session_id"].as_str().unwrap().to_string();
+
+    // Wait until the probe subprocess is actually running.
+    let probe_pid = poll_probe_pid(&project, &session_id, &mut child, &runtime);
+    assert!(process_is_alive(probe_pid));
+
+    // Graceful shutdown while the subprocess is in flight.
+    shutdown_daemon(&socket, &mut child, &runtime);
+
+    // The child process must be cleaned up (no orphan survives shutdown).
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < deadline {
+        if !process_is_alive(probe_pid) {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert!(
+        !process_is_alive(probe_pid),
+        "in-flight subprocess must be terminated during graceful shutdown"
+    );
+    // Lock and socket are removed by the daemon process exit path.
+    assert!(!lock.exists(), "daemon lock must be removed after shutdown");
+    assert!(
+        !socket.exists(),
+        "daemon socket must be removed after shutdown"
+    );
+
+    // The in-flight mission is reconciled to a terminal state (cancelled
+    // or failed — shutdown cancels in-flight work, so cancelled is expected
+    // but a clean reconciliation is what matters).
+    let db = ControlPlaneDb::open(&db_path).unwrap();
+    let session = db
+        .session_for_mission(&StableId::from_existing(&mission_id).unwrap())
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        session.state,
+        "cancelled",
+        "in-flight mission must be reconciled on graceful shutdown, got state={} log={}",
+        session.state,
+        daemon_log(&runtime)
+    );
+    let mut restarted = launch_daemon(&daemon, &runtime, &project);
+    wait_for_socket(&socket, &mut restarted, &runtime);
+    let after_restart = UnixIpcClient::new(&socket)
+        .request(json!({
+            "id": "shutdown-after-restart",
+            "command": "GetMission",
+            "mission_id": mission_id
+        }))
+        .unwrap();
+    assert_eq!(
+        after_restart["state"], "cancelled",
+        "reconciled mission must stay terminal: {after_restart}"
+    );
+    shutdown_daemon(&socket, &mut restarted, &runtime);
+    let _ = fs::remove_dir_all(&runtime);
+    let _ = fs::remove_dir_all(&project);
+}
+
 fn short_temp_path(prefix: &str) -> PathBuf {
     PathBuf::from(format!("/tmp/{prefix}-{}", std::process::id()))
 }
-
 /// Extract the `host:port` TCP connect address from an Ollama base URL.  The
 /// URL may carry a path (e.g. `/api/chat`); `TcpStream::connect` must never
 /// receive the path — only the authority.
@@ -919,48 +1428,6 @@ fn create_fixture_project(root: &Path) {
     );
 }
 
-/// A fixture whose verification genuinely passes.  Used by the real-provider
-/// smoke proof so the mission can complete end-to-end with a real local model:
-/// the planner produces a real plan, the implementer produces a real
-/// RunVerification action, dev.test actually runs the fixture test, and the
-/// evidence/verification/completion gates are exercised for real.  The
-/// real-provider test's purpose is to prove the provider/daemon integration,
-/// not to test model code-writing ability, so verification must be achievable
-/// with the small local model actually routed.
-fn create_passing_fixture_project(root: &Path) {
-    fs::create_dir_all(root.join("src")).unwrap();
-    fs::create_dir_all(root.join("tests")).unwrap();
-    fs::write(
-        root.join("Cargo.toml"),
-        "[package]\nname = \"agentcode_daemon_fixture\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
-    )
-    .unwrap();
-    fs::write(
-        root.join("src/lib.rs"),
-        "pub fn fixture_answer() -> u32 {\n    42\n}\n",
-    )
-    .unwrap();
-    fs::write(
-        root.join("tests/fixture.rs"),
-        "use agentcode_daemon_fixture::fixture_answer;\n\n#[test]\nfn fixture_answer_is_correct() {\n    assert_eq!(fixture_answer(), 42);\n}\n",
-    )
-    .unwrap();
-    run_git(root, ["init"]);
-    run_git(root, ["add", "."]);
-    run_git(
-        root,
-        [
-            "-c",
-            "user.name=AgentCode Test",
-            "-c",
-            "user.email=agentcode@example.test",
-            "commit",
-            "-m",
-            "initial",
-        ],
-    );
-}
-
 fn create_slow_fixture_project(root: &Path) {
     create_fixture_project(root);
     fs::write(
@@ -981,6 +1448,92 @@ fn create_slow_fixture_project(root: &Path) {
             "slow test",
         ],
     );
+}
+
+/// A fixture whose verification step spawns a deterministic long-running
+/// subprocess (`sleep 300`) and records its PID in a worktree file named
+/// `agentcode_probe.pid`.  The mission runs through the real daemon path; the
+/// test reads the PID to prove the subprocess is alive, then after
+/// cancellation proves it was terminated (no orphan) and the mission became
+/// Cancelled rather than Failed.
+fn create_probe_fixture_project(root: &Path) {
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::create_dir_all(root.join("tests")).unwrap();
+    fs::write(
+        root.join("Cargo.toml"),
+        "[package]\nname = \"agentcode_daemon_fixture\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    )
+    .unwrap();
+    fs::write(
+        root.join("src/lib.rs"),
+        "pub fn fixture_answer() -> u32 {\n    42\n}\n",
+    )
+    .unwrap();
+    // The fixture test spawns a subprocess that lives long enough to observe
+    // cancellation, writes the child PID to the worktree root, then waits.
+    fs::write(
+        root.join("tests/fixture.rs"),
+        r#"use std::io::Write;
+
+#[test]
+fn probe_runs_long_subprocess() {
+    let mut child = std::process::Command::new("/bin/sleep")
+        .arg("300")
+        .spawn()
+        .expect("spawn probe");
+    let mut marker = std::fs::File::create(concat!(env!("CARGO_MANIFEST_DIR"), "/agentcode_probe.pid")).unwrap();
+    writeln!(marker, "{}", child.id()).unwrap();
+    let _ = child.wait();
+}
+"#,
+    )
+    .unwrap();
+    run_git(root, ["init"]);
+    run_git(root, ["add", "."]);
+    run_git(
+        root,
+        [
+            "-c",
+            "user.name=AgentCode Test",
+            "-c",
+            "user.email=agentcode@example.test",
+            "commit",
+            "-m",
+            "initial",
+        ],
+    );
+}
+
+/// Poll the worktree for the probe subprocess PID file and return the PID.
+/// `dev.test` runs `cargo test` inside the sandboxed worktree, so the marker
+/// file appears at `<project>/.agentcode-worktrees/<session>/agentcode_probe.pid`.
+fn poll_probe_pid(project: &Path, session_id: &str, child: &mut Child, runtime: &Path) -> u32 {
+    let marker = project
+        .join(".agentcode-worktrees")
+        .join(session_id)
+        .join("agentcode_probe.pid");
+    let deadline = Instant::now() + Duration::from_secs(120);
+    while Instant::now() < deadline {
+        assert_process_running(child, runtime);
+        if let Ok(content) = fs::read_to_string(&marker) {
+            if let Ok(pid) = content.trim().parse::<u32>() {
+                return pid;
+            }
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    panic!(
+        "probe PID file was never written: {}\n{}",
+        marker.display(),
+        daemon_log(runtime)
+    );
+}
+
+fn process_is_alive(pid: u32) -> bool {
+    Command::new("/bin/kill")
+        .args(["-0", &pid.to_string()])
+        .status()
+        .is_ok_and(|status| status.success())
 }
 
 /// A fixture with a smoke test that reads agentcode_smoke.txt and asserts
@@ -1160,6 +1713,42 @@ fn poll_mission_state(
     }
     panic!(
         "mission did not reach {expected}; last={last}\n{}",
+        daemon_log(runtime)
+    );
+}
+
+/// Poll GetMission until `state` starts with `expected_prefix`.  The
+/// coordinator renders terminal failures as `failed: <CODE>`, so a prefix
+/// match is required to accept the typed failure while still rejecting
+/// completed/cancelled/silent outcomes.
+fn poll_mission_state_prefix(
+    socket: &Path,
+    mission_id: &str,
+    expected_prefix: &str,
+    child: &mut Child,
+    runtime: &Path,
+) -> Value {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut last = json!(null);
+    while Instant::now() < deadline {
+        assert_process_running(child, runtime);
+        last = UnixIpcClient::new(socket)
+            .request(json!({
+                "id": "poll-state-prefix",
+                "command": "GetMission",
+                "mission_id": mission_id
+            }))
+            .unwrap();
+        if last["state"]
+            .as_str()
+            .is_some_and(|state| state.starts_with(expected_prefix))
+        {
+            return last;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    panic!(
+        "mission did not reach {expected_prefix}*; last={last}\n{}",
         daemon_log(runtime)
     );
 }

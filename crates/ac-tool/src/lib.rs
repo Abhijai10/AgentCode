@@ -96,6 +96,12 @@ pub struct SecretProcessRequest<'a> {
     pub secret_references: &'a BTreeMap<String, String>,
 }
 
+/// Maximum number of finished process records retained per ProcessManager
+/// instance.  Finished records are observability-only; capping prevents
+/// unbounded growth within a single long-running mission.  The currently
+/// running record is always kept.
+const MAX_PROCESS_RECORDS: usize = 1024;
+
 #[derive(Clone, Default)]
 pub struct ProcessManager {
     children: Arc<Mutex<BTreeMap<StableId, std::process::Child>>>,
@@ -173,6 +179,27 @@ impl SecurityScannerExecutor for GovernedScannerExecutor {
 }
 
 impl ProcessManager {
+    /// Evict oldest finished records beyond the in-memory cap.  Running
+    /// records are never evicted because they describe live work.
+    fn prune_records(records: &mut BTreeMap<StableId, ProcessRecord>) {
+        if records.len() <= MAX_PROCESS_RECORDS {
+            return;
+        }
+        let mut finished = records
+            .iter()
+            .filter(|(_, record)| record.state != ProcessState::Running)
+            .map(|(id, record)| (record.started_at.as_millis(), id.clone()))
+            .collect::<Vec<_>>();
+        finished.sort_unstable();
+        while records.len() > MAX_PROCESS_RECORDS {
+            let Some((_, id)) = finished.first().cloned() else {
+                break;
+            };
+            finished.remove(0);
+            records.remove(&id);
+        }
+    }
+
     pub fn run(
         &self,
         task: impl Into<String>,
@@ -228,6 +255,7 @@ impl ProcessManager {
             .lock()
             .expect("process records lock")
             .insert(id.clone(), record.clone());
+        Self::prune_records(&mut self.records.lock().expect("process records lock"));
         let deadline = Instant::now() + Duration::from_millis(plan.timeout_ms);
         let cleanup_paths = plan.cleanup_paths.clone();
         loop {
@@ -248,6 +276,7 @@ impl ProcessManager {
                         .lock()
                         .expect("process records lock")
                         .insert(id, finished.clone());
+                    Self::prune_records(&mut self.records.lock().expect("process records lock"));
                     cleanup_plan_paths(&cleanup_paths);
                     return Ok(NativeProcessResult {
                         record: finished,
@@ -267,6 +296,7 @@ impl ProcessManager {
                         .lock()
                         .expect("process records lock")
                         .insert(id, cancelled_record);
+                    Self::prune_records(&mut self.records.lock().expect("process records lock"));
                     cleanup_plan_paths(&cleanup_paths);
                     return Err(AcError::new(
                         "TOOL-COMMAND_CANCELLED",
@@ -284,6 +314,7 @@ impl ProcessManager {
                         .lock()
                         .expect("process records lock")
                         .insert(id, timed_out);
+                    Self::prune_records(&mut self.records.lock().expect("process records lock"));
                     cleanup_plan_paths(&cleanup_paths);
                     return Err(AcError::new(
                         "TOOL-COMMAND_TIMEOUT",
@@ -342,6 +373,7 @@ impl ProcessManager {
             .lock()
             .expect("process records lock")
             .insert(id.clone(), record);
+        Self::prune_records(&mut self.records.lock().expect("process records lock"));
         Ok(id)
     }
 
@@ -3114,6 +3146,76 @@ mod tests {
             assert!(!profile.exists(), "profile leaked after cancellation");
         }
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn process_manager_caps_finished_records_without_losing_running_state() {
+        // P1-06: ProcessManager in-memory finished records are observability
+        // only and must be bounded so a long-running mission cannot grow memory
+        // without limit.  Running records are never evicted.
+        let mut records = BTreeMap::new();
+        let running_id = StableId::new("running");
+        let sandbox_ev = ac_sandbox::SandboxEvidence {
+            backend_name: String::new(),
+            requested_isolation: ac_sandbox::IsolationLevel::ProcessRestricted,
+            achieved_isolation: ac_sandbox::IsolationLevel::ProcessRestricted,
+            workspace_roots: Vec::new(),
+            network_policy: ac_sandbox::NetworkPolicy::DenyAll,
+            allowed_env_keys: Vec::new(),
+            timeout_ms: 1_000,
+            max_output_bytes: 8192,
+            process_tree_control: false,
+        };
+        records.insert(
+            running_id.clone(),
+            ProcessRecord {
+                id: running_id.clone(),
+                task: "running-task".to_string(),
+                manifest: ExecutionManifest {
+                    argv: Vec::new(),
+                    cwd: PathBuf::from("/tmp"),
+                    timeout_ms: 1_000,
+                    network: false,
+                },
+                pid: 1,
+                state: ProcessState::Running,
+                started_at: TimestampMillis::now(),
+                sandbox: sandbox_ev.clone(),
+                cleanup_paths: Vec::new(),
+            },
+        );
+        let base = TimestampMillis::now().as_millis();
+        for i in 0..(MAX_PROCESS_RECORDS + 64) {
+            let id = StableId::new("finished");
+            records.insert(
+                id.clone(),
+                ProcessRecord {
+                    id: id.clone(),
+                    task: "finished-task".to_string(),
+                    manifest: ExecutionManifest {
+                        argv: Vec::new(),
+                        cwd: PathBuf::from("/tmp"),
+                        timeout_ms: 1_000,
+                        network: false,
+                    },
+                    pid: 1000 + i as u32,
+                    state: ProcessState::Finished,
+                    started_at: TimestampMillis::from_millis(base + i as u128),
+                    sandbox: sandbox_ev.clone(),
+                    cleanup_paths: Vec::new(),
+                },
+            );
+        }
+        ProcessManager::prune_records(&mut records);
+        assert!(
+            records.len() <= MAX_PROCESS_RECORDS,
+            "finished records must be capped, got {}",
+            records.len()
+        );
+        assert!(
+            records.contains_key(&running_id),
+            "running record must never be evicted"
+        );
     }
 
     fn permitted_sandbox(root: PathBuf, timeout_ms: u64) -> SandboxManager {

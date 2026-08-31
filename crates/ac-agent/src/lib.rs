@@ -993,6 +993,7 @@ impl<P: PolicyBoundary> AutonomousAgent<P> {
             .collect::<BTreeSet<_>>();
 
         loop {
+            self.session.wait_while_paused();
             if self.session.is_cancelled() || self.session.state() == AgentSessionState::Cancelling
             {
                 self.state = AutonomousState::Cancelled;
@@ -1833,6 +1834,7 @@ impl<P: PolicyBoundary> AutonomousAgent<P> {
         let mut attempts = VecDeque::from_iter(0..max_attempts.max(1));
         let mut last = None;
         while attempts.pop_front().is_some() {
+            self.session.wait_while_paused();
             let cancelled = self.session.cancellation_token().flag();
             let result = self.tools.invoke_with_cancellation(
                 ToolRequest {
@@ -6664,6 +6666,81 @@ mod tests {
             report.state,
             AutonomousState::Cancelled,
             "in-flight cancellation during tool execution must produce Cancelled, not Failed"
+        );
+    }
+
+    #[test]
+    fn paused_agent_blocks_forward_work_until_resumed() {
+        // P1-02: a paused session must block forward work (no tool calls, no
+        // task progression) until resumed.  Uses a scripted provider so the
+        // run is deterministic; the pause flag is set before the run starts and
+        // cleared from a helper thread while the mission runs on this thread.
+        let mut tools = ToolBroker::new(
+            CapabilityPolicy::new().allow(Capability::ProcessExec("*".to_string())),
+        );
+        for id in ["fs.read", "repo.diff", "dev.test"] {
+            tools
+                .register_tool(
+                    ToolDefinition {
+                        id: id.to_string(),
+                        version: "1".to_string(),
+                        required_capabilities: Vec::new(),
+                    },
+                    Box::new(EchoTool),
+                )
+                .unwrap();
+        }
+        let responses = VecDeque::from([
+            planner_plan_only(
+                "src/lib.rs",
+                &[("task-a", "run test a", "RunTests", &[][..])],
+            ),
+            action_proposal_json(
+                "run test a",
+                "run test a",
+                r#"[{ "type": "RunVerification", "tool_id": "dev.test", "plan_name": "agent-dynamic-validation" }]"#,
+                false,
+            ),
+        ]);
+        let session = AgentSession::new(Worker::new());
+        let pause_flag = session.pause_flag();
+        pause_flag.store(true, Ordering::SeqCst);
+        let mut agent = AutonomousAgent::new(
+            ac_kernel::Kernel::new(AllowAllPolicy),
+            session,
+            provider_registry_with(
+                "test-provider",
+                Box::new(SequencedProvider {
+                    responses: Mutex::new(responses),
+                }),
+            ),
+            tools,
+            EvidenceStore::new(),
+            MemoryService::new(),
+            GitCoordinator::new(),
+            VerificationEngine::new(CapabilityPolicy::new()),
+        );
+        bind_unit_test_workspace(&mut agent);
+        // Resume from a helper thread after the run has had time to block.
+        let resume = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(1500));
+            pause_flag.store(false, Ordering::SeqCst);
+        });
+        let started = std::time::Instant::now();
+        let report = agent
+            .run_goal(Goal::new("paused forward work").unwrap())
+            .unwrap();
+        let elapsed = started.elapsed();
+        resume.join().unwrap();
+        assert!(
+            elapsed >= std::time::Duration::from_millis(800),
+            "paused mission must block until resumed, elapsed={elapsed:?}"
+        );
+        assert_eq!(report.state, AutonomousState::Completed);
+        assert!(
+            !report.observations.is_empty(),
+            "task must have executed after resume: {}",
+            report.observations.len()
         );
     }
 

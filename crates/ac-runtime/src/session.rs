@@ -9,6 +9,7 @@ pub struct AgentSession {
     worker: Worker,
     state: AgentSessionState,
     token: CancellationToken,
+    pause: Arc<AtomicBool>,
     queue: VecDeque<String>,
     events: Vec<RuntimeEvent>,
     checkpoints: Vec<RuntimeCheckpoint>,
@@ -60,11 +61,21 @@ impl AgentSession {
     }
 
     pub fn with_id_and_token(id: StableId, worker: Worker, token: CancellationToken) -> Self {
+        Self::with_id_token_and_pause(id, worker, token, Arc::new(AtomicBool::new(false)))
+    }
+
+    pub fn with_id_token_and_pause(
+        id: StableId,
+        worker: Worker,
+        token: CancellationToken,
+        pause: Arc<AtomicBool>,
+    ) -> Self {
         let mut session = Self {
             id,
             worker,
             state: AgentSessionState::Created,
             token,
+            pause,
             queue: VecDeque::new(),
             events: Vec::new(),
             checkpoints: Vec::new(),
@@ -191,6 +202,30 @@ impl AgentSession {
 
     pub fn request_cancel(&self) {
         self.token.cancel();
+    }
+
+    pub fn request_pause(&self) {
+        self.pause.store(true, Ordering::SeqCst);
+    }
+
+    pub fn request_resume(&self) {
+        self.pause.store(false, Ordering::SeqCst);
+    }
+
+    pub fn is_paused(&self) -> bool {
+        self.pause.load(Ordering::SeqCst)
+    }
+
+    pub fn pause_flag(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.pause)
+    }
+
+    /// Block while the pause flag is set and the cancellation token is not
+    /// cancelled.  Returns when the mission is resumed or cancelled.
+    pub fn wait_while_paused(&self) {
+        while self.pause.load(Ordering::SeqCst) && !self.token.is_cancelled() {
+            std::thread::sleep(Duration::from_millis(50));
+        }
     }
 
     pub fn cancellation_token(&self) -> CancellationToken { self.token.clone() }
