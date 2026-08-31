@@ -28,8 +28,8 @@ export function Sidebar({
   return (
     <aside className="w-64 h-full shrink-0 flex flex-col py-6 bg-surface-container-low border-r border-outline-variant/40 dark:bg-surface-container-low dark:border-white/5">
       <div className="px-6 mb-8 flex items-center gap-3">
-        <div className="w-10 h-10 rounded-xl neo-raised flex items-center justify-center text-primary">
-          <Icon name="terminal" size={22} fill />
+        <div className="w-10 h-10 rounded-xl neo-raised overflow-hidden">
+          <img src="/logo.png" className="w-full h-full object-cover" alt="AgentCode" />
         </div>
         <div>
           <h1 className="font-bold text-on-surface tracking-tight text-lg leading-tight">AgentCode</h1>

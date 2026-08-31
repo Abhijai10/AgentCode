@@ -42,8 +42,8 @@ export function HomeView({
       <main className="flex-1 overflow-y-auto p-8 relative flex items-center justify-center">
         <div className="max-w-2xl mx-auto flex flex-col gap-8 w-full">
           <div className="text-center space-y-4">
-            <div className="inline-flex items-center justify-center w-16 h-16 rounded-2xl neo-raised mb-4 text-primary">
-              <Icon name="smart_toy" size={32} fill />
+            <div className="inline-flex items-center justify-center w-16 h-16 rounded-2xl neo-raised mb-4 overflow-hidden">
+              <img src="/logo.png" className="w-full h-full object-cover" alt="AgentCode" />
             </div>
             <h2 className="text-4xl font-semibold text-on-surface tracking-tight">Welcome to AgentCode</h2>
             <p className="text-on-surface-variant text-lg max-w-xl mx-auto">Open an existing project or start a new one from scratch to begin building.</p>
@@ -109,8 +109,8 @@ export function HomeView({
     <main className="flex-1 overflow-y-auto p-8 relative">
       <div className="max-w-3xl mx-auto flex flex-col gap-8 h-full justify-center pb-20">
         <div className="text-center space-y-4 mb-8">
-          <div className="inline-flex items-center justify-center w-16 h-16 rounded-2xl neo-raised mb-4 text-primary">
-            <Icon name="smart_toy" size={32} fill />
+          <div className="inline-flex items-center justify-center w-16 h-16 rounded-2xl neo-raised mb-4 overflow-hidden">
+            <img src="/logo.png" className="w-full h-full object-cover" alt="AgentCode" />
           </div>
           <h2 className="text-4xl font-semibold text-on-surface tracking-tight">What do you want to build?</h2>
           <p className="text-on-surface-variant text-lg max-w-xl mx-auto">Working in <span className="font-semibold text-primary">{project.name}</span>. Describe your vision — the agent will orchestrate design, logic, and infrastructure to bring it to life.</p>
