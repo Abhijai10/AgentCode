@@ -431,7 +431,7 @@ impl MissionCoordinator {
             .or_insert_with(|| Arc::new(AtomicBool::new(false)));
         Ok(())
     }
-    fn cancel(&self, mission_id: &str) -> AcResult<()> {
+    fn cancel(&self, mission_id: &str) -> AcResult<bool> {
         let mut state = self.state.lock().map_err(|_| {
             AcError::conflict("DAEMON-COORDINATOR_POISONED", "coordinator lock poisoned")
         })?;
@@ -441,6 +441,14 @@ impl MissionCoordinator {
                 "mission is not known to coordinator",
             ));
         }
+        let was_running = state
+            .active
+            .as_ref()
+            .is_some_and(|id| id.as_str() == mission_id)
+            || state
+                .statuses
+                .get(mission_id)
+                .is_some_and(|s| s.state == "running");
         if let Some(token) = state.cancellation.get(mission_id) {
             token.cancel();
         }
@@ -456,7 +464,7 @@ impl MissionCoordinator {
         if let Some(status) = state.statuses.get_mut(mission_id) {
             status.state = "cancelled".to_string();
         }
-        Ok(())
+        Ok(was_running)
     }
 
     fn stop(&self) -> AcResult<()> {
@@ -540,6 +548,43 @@ fn is_terminal_status(state: &str) -> bool {
     matches!(state, "completed" | "cancelled" | "failed") || state.starts_with("failed:")
 }
 
+/// Transition an Active kernel mission to a terminal state and persist it.
+/// Respects the Phase 4 rule: genuine cancellation MUST become Cancelled
+/// rather than Failed, even when the transition happens before the agent's
+/// own cancellation checks can fire.
+fn transition_mission_to_terminal(
+    kernel: &Arc<Mutex<Kernel<ProductionKernelPolicy>>>,
+    db: &ControlPlaneDb,
+    mission_id: &StableId,
+    cancelled: bool,
+) {
+    let cancelled = cancelled
+        || db
+            .session_for_mission(mission_id)
+            .ok()
+            .flatten()
+            .is_some_and(|s| s.state == "cancelled");
+    if let Ok(mut kernel) = kernel.lock() {
+        let is_active = kernel
+            .mission(mission_id)
+            .is_some_and(|m| m.state == ac_kernel::MissionState::Active);
+        if is_active {
+            let target = if cancelled {
+                ac_kernel::MissionState::Cancelled
+            } else {
+                ac_kernel::MissionState::Failed
+            };
+            let _ = kernel.transition_mission(mission_id, target, Vec::new());
+        }
+        if let Some(mission) = kernel.mission(mission_id) {
+            let _ = db.put_mission(mission);
+        }
+        for event in kernel.events() {
+            let _ = db.append_kernel_event(event);
+        }
+    }
+}
+
 fn execute_mission(
     db_path: &Path,
     workspace_root: &Path,
@@ -558,6 +603,8 @@ fn execute_mission(
             let has_tasks = hydrated.graph.tasks().next().is_some();
             has_tasks.then_some(hydrated.graph)
         });
+    // Capture cancellation state before the token is moved into AgentSession.
+    let cancelled = cancellation.is_cancelled();
     let session = AgentSession::with_id_token_and_pause(
         job.session_id.clone(),
         Worker::new(),
@@ -573,8 +620,14 @@ fn execute_mission(
         .transpose()?;
     // Provider routing is backend-owned: build the mission's model broker from
     // the durable provider catalog/accounts, falling back to the environment.
-    let providers = daemon_provider_registry(&db, db_path)?;
-    let mut agent = ac_agent::bound_workspace_agent_with_providers(
+    let providers = match daemon_provider_registry(&db, db_path) {
+        Ok(providers) => providers,
+        Err(error) => {
+            transition_mission_to_terminal(&kernel, &db, &job.mission_id, cancelled);
+            return Err(error);
+        }
+    };
+    let mut agent = match ac_agent::bound_workspace_agent_with_providers(
         workspace_root.to_path_buf(),
         worktree,
         Arc::clone(&kernel),
@@ -587,31 +640,20 @@ fn execute_mission(
             db_path: db_path.to_path_buf(),
         })),
         providers,
-    )?;
+    ) {
+        Ok(agent) => agent,
+        Err(error) => {
+            transition_mission_to_terminal(&kernel, &db, &job.mission_id, cancelled);
+            return Err(error);
+        }
+    };
     let report = match agent.run_goal(ac_agent::Goal::new(job.goal.clone())?) {
         Ok(report) => report,
         Err(error) => {
             // Even when the agent run itself fails to produce a report,
             // the kernel mission must be transitioned to a terminal state
             // so it does not incorrectly remain Active.
-            if let Ok(mut kernel) = kernel.lock() {
-                let is_active = kernel
-                    .mission(&job.mission_id)
-                    .is_some_and(|m| m.state == ac_kernel::MissionState::Active);
-                if is_active {
-                    let _ = kernel.transition_mission(
-                        &job.mission_id,
-                        ac_kernel::MissionState::Failed,
-                        Vec::new(),
-                    );
-                }
-                if let Some(mission) = kernel.mission(&job.mission_id) {
-                    let _ = db.put_mission(mission);
-                }
-                for event in kernel.events() {
-                    let _ = db.append_kernel_event(event);
-                }
-            }
+            transition_mission_to_terminal(&kernel, &db, &job.mission_id, cancelled);
             return Err(error);
         }
     };
@@ -1201,10 +1243,32 @@ impl DaemonService {
 
     pub fn cancel_mission(&mut self, mission_id: &str) -> AcResult<()> {
         self.ensure_running()?;
-        self.coordinator.cancel(mission_id)?;
+        let was_running = self.coordinator.cancel(mission_id)?;
         if let Some(status) = self.coordinator.status(mission_id) {
             self.db
                 .update_session_state(&status.session_id, "cancelled")?;
+        }
+        // A queued or paused mission cancelled before its agent ever ran has no
+        // run loop to perform the kernel transition (the agent's cancellation
+        // checks only execute once execution starts).  Transition and persist
+        // the kernel mission to Cancelled here so the authoritative mission
+        // state is terminal and survives restart, not left Active forever.
+        if !was_running {
+            let mut kernel = self.kernel_lock()?;
+            let id = StableId::from_existing(mission_id)?;
+            let is_active = kernel
+                .mission(&id)
+                .is_some_and(|m| m.state == ac_kernel::MissionState::Active);
+            if is_active {
+                let _ =
+                    kernel.transition_mission(&id, ac_kernel::MissionState::Cancelled, Vec::new());
+            }
+            if let Some(mission) = kernel.mission(&id) {
+                self.db.put_mission(mission)?;
+                for event in kernel.events() {
+                    let _ = self.db.append_kernel_event(event);
+                }
+            }
         }
         Ok(())
     }
@@ -3489,6 +3553,77 @@ mod tests {
                 evidence_count_before,
                 "cycle {cycle}: evidence count must not change across restarts"
             );
+        }
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn queued_cancelled_mission_persists_terminal_cancelled_state_across_restart() {
+        let (dir, db_path, lock) = temp_paths();
+        let workspace = dir.join("workspace");
+        fs::create_dir_all(&workspace).unwrap();
+        let status = std::process::Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(&workspace)
+            .status()
+            .unwrap();
+        assert!(status.success(), "git init must succeed");
+        let mission_id = {
+            let mut daemon = DaemonService::open(&db_path, &lock).unwrap();
+            daemon.start().unwrap();
+            let (mission_id, _session_id) = match daemon
+                .handle(DaemonCommand::CreateSession {
+                    goal: "queued-cancel-terminal".to_string(),
+                    workspace_root: Some(workspace.to_string_lossy().to_string()),
+                })
+                .unwrap()
+            {
+                DaemonResponse::SessionCreated {
+                    mission_id,
+                    session_id,
+                } => (mission_id, session_id),
+                _ => panic!("expected session"),
+            };
+            daemon.cancel_mission(mission_id.as_str()).unwrap();
+            // Wait for the worker to drain the queued Run message.
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            loop {
+                let (_, cancelled_len, cancellation_len, pause_flags_len) =
+                    daemon.coordinator.map_sizes();
+                if cancelled_len == 0 && cancellation_len == 0 && pause_flags_len == 0 {
+                    break;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "coordinator maps not cleaned: cancelled={cancelled_len} cancellation={cancellation_len} pause_flags={pause_flags_len}"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            // The persisted missions row must be "cancelled", not "active".
+            {
+                let db = ControlPlaneDb::open(&db_path).unwrap();
+                let persisted = db.get_mission(&mission_id).unwrap().unwrap();
+                assert_eq!(
+                    persisted.state, "cancelled",
+                    "queued-cancelled mission must persist as cancelled, got {}",
+                    persisted.state
+                );
+            }
+            daemon.stop().unwrap();
+            mission_id
+        };
+        // Restart: the mission must remain terminal Cancelled in the kernel.
+        for cycle in 0..3 {
+            let mut daemon = DaemonService::open(&db_path, &lock).unwrap();
+            daemon.start().unwrap();
+            let db = ControlPlaneDb::open(&db_path).unwrap();
+            let persisted = db.get_mission(&mission_id).unwrap().unwrap();
+            assert_eq!(
+                persisted.state, "cancelled",
+                "cycle {cycle}: queued-cancelled mission must stay cancelled, got {}",
+                persisted.state
+            );
+            daemon.stop().unwrap();
         }
         let _ = fs::remove_dir_all(dir);
     }
