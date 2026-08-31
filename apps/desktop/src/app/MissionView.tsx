@@ -252,7 +252,12 @@ export function MissionView({ missionId, onOpenSettings }: { missionId: string |
   const state = details.state;
   const terminal = details.terminal;
   const progressPct = details.task_count > 0 ? Math.round((details.progress ?? 0) * 100) : 0;
-  const showPause = state === "queued";
+  // Pause is available for any non-terminal mission that is not already
+  // paused.  The backend supports pausing queued and running missions alike
+  // (P1 added active-mission pause), so we must not restrict Pause to
+  // queued-only.
+  const pausable = !terminal && !["paused", "cancelled", "failed", "completed"].includes(state) && !state.startsWith("failed:");
+  const showPause = pausable;
   const showResume = state === "paused";
   const showCancel = !terminal && (state === "queued" || state === "paused" || state === "running" || state === "ready" || state === "retryable" || state === "pending");
 

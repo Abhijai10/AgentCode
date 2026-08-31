@@ -390,7 +390,16 @@ export function SettingsView() {
             <div className="neo-raised p-8 rounded-2xl">
               <h3 className="font-semibold text-lg text-on-surface mb-4">Tools</h3>
               <div className="space-y-3">
-                {tools.length === 0 && <p className="text-sm text-on-surface-variant">Tool availability from daemon.</p>}
+                <div className="neo-pressed rounded-xl p-4 flex items-center gap-3">
+                  <Icon name="info" size={18} className="text-primary" />
+                  <div>
+                    <p className="text-sm font-medium text-on-surface">Tool catalog unavailable</p>
+                    <p className="text-xs text-on-surface-variant mt-0.5">
+                      The daemon IPC does not expose a tool catalog in this build. Tool execution is
+                      owned by the backend Tool Broker; this screen shows nothing fabricated.
+                    </p>
+                  </div>
+                </div>
                 {tools.map((t) => (
                   <div key={t.id} className="neo-pressed p-4 rounded-xl flex items-center justify-between">
                     <span className="text-sm font-medium text-on-surface">{t.name}</span>
@@ -410,7 +419,16 @@ export function SettingsView() {
             <div className="neo-raised p-8 rounded-2xl">
               <h3 className="font-semibold text-lg text-on-surface mb-4">Security Scanners</h3>
               <div className="space-y-3">
-                {scanners.length === 0 && <p className="text-sm text-on-surface-variant">Scanner status from daemon.</p>}
+                <div className="neo-pressed rounded-xl p-4 flex items-center gap-3">
+                  <Icon name="info" size={18} className="text-primary" />
+                  <div>
+                    <p className="text-sm font-medium text-on-surface">Scanner status unavailable</p>
+                    <p className="text-xs text-on-surface-variant mt-0.5">
+                      The daemon IPC does not expose scanner status in this build. Scanner
+                      execution is owned by the backend security subsystem.
+                    </p>
+                  </div>
+                </div>
                 {scanners.map((s) => (
                   <div key={s.id} className="neo-pressed p-4 rounded-xl flex items-center justify-between">
                     <span className="text-sm font-medium text-on-surface">{s.name}</span>
@@ -431,10 +449,18 @@ export function SettingsView() {
           {tab === "memory" && (
             <div className="neo-raised p-8 rounded-2xl">
               <h3 className="font-semibold text-lg text-on-surface mb-4">Memory</h3>
-              {memory.length === 0 ? (
-                <p className="text-sm text-on-surface-variant">Memory facts from daemon.</p>
-              ) : (
-                <div className="space-y-3">
+              <div className="neo-pressed rounded-xl p-4 flex items-center gap-3">
+                <Icon name="info" size={18} className="text-primary" />
+                <div>
+                  <p className="text-sm font-medium text-on-surface">Memory inspection unavailable</p>
+                  <p className="text-xs text-on-surface-variant mt-0.5">
+                    The daemon IPC does not expose durable memory facts in this build. Long-lived
+                    memory is owned by the backend context subsystem.
+                  </p>
+                </div>
+              </div>
+              {memory.length > 0 && (
+                <div className="space-y-3 mt-3">
                   {memory.map((m) => (
                     <div key={m.id} className="neo-pressed p-4 rounded-xl">
                       <p className="text-sm font-medium text-on-surface">{m.statement}</p>

@@ -135,7 +135,7 @@ function AppShell() {
         <div className="flex-1 flex flex-col overflow-hidden">
           <TopBar
             project={project ? `Project: ${project.name}` : "No Project Open"}
-            branch={project ? "main" : "—"}
+            workspace={project?.path}
             onOpenProject={() => setProjectModal(project ? "open" : "choose")}
             onNewMission={() => {
               if (project) {
@@ -151,12 +151,42 @@ function AppShell() {
               onOpenProject={() => setProjectModal("choose")}
               onSubmit={handleNewMission}
               onConfigureProviders={() => setView("settings")}
+              onNavigate={(target) => {
+                if (target === "mission") {
+                  if (activeMission) setView("mission");
+                  else setProjectAlert(true);
+                } else {
+                  setView(target);
+                }
+              }}
             />
           )}
           {view === "mission" && <MissionView missionId={activeMission} onOpenSettings={() => setView("settings")} />}
-          {view === "discuss" && <DiscussView project={project?.name ?? "AgentCode"} branch="main" />}
-          {view === "design" && <DesignView />}
-          {view === "security" && <SecurityView />}
+          {view === "discuss" && (
+            <DiscussView
+              project={project}
+              missionId={activeMission}
+              onOpenMission={(missionId) => {
+                setActiveMission(missionId);
+                setView("mission");
+              }}
+              onNewMission={() => {
+                if (project) setView("home");
+                else setProjectModal("choose");
+              }}
+            />
+          )}
+          {view === "design" && (
+            <DesignView
+              project={project}
+              missionId={activeMission}
+              onOpenMission={(missionId) => {
+                setActiveMission(missionId);
+                setView("mission");
+              }}
+            />
+          )}
+          {view === "security" && <SecurityView project={project} onOpenSettings={() => setView("settings")} />}
           {view === "settings" && <SettingsView />}
           <Footer
             daemonConnected={daemonConnected}

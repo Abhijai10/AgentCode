@@ -710,13 +710,7 @@ fn real_provider_daemon_path_model_unavailable_fails_distinctly() {
     // The mission must reach a terminal FAILED state with a real provider
     // failure — never completed, never cancelled-by-accident, never UNPROVEN.
     // The coordinator uses "failed: ERROR_CODE" to convey the specific cause.
-    let failed = poll_mission_state_prefix(
-        &socket,
-        &mission_id,
-        "failed",
-        &mut child,
-        &runtime,
-    );
+    let failed = poll_mission_state_prefix(&socket, &mission_id, "failed", &mut child, &runtime);
     assert!(
         failed["state"].as_str().unwrap_or("").starts_with("failed"),
         "mission must reach a failed terminal state: {failed}"

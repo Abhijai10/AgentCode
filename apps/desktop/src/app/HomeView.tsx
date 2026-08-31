@@ -8,11 +8,13 @@ export function HomeView({
   onOpenProject,
   onSubmit,
   onConfigureProviders,
+  onNavigate,
 }: {
   project: Project | null;
   onOpenProject(): void;
   onSubmit(goal: string): Promise<{ ok: boolean; error?: string }>;
   onConfigureProviders(): void;
+  onNavigate(view: "design" | "mission" | "settings"): void;
 }) {
   const [goal, setGoal] = useState("");
   const [hasUsableRoute, setHasUsableRoute] = useState(true);
@@ -182,31 +184,40 @@ export function HomeView({
         </div>
 
         <div className="grid grid-cols-1 md:grid-cols-3 gap-6 mt-4">
-          <button className="neo-raised p-5 rounded-2xl flex flex-col gap-3 text-left hover:text-primary transition-colors duration-200 active:scale-[0.98]">
+          <button
+            onClick={() => onNavigate("design")}
+            className="neo-raised p-5 rounded-2xl flex flex-col gap-3 text-left hover:text-primary transition-colors duration-200 active:scale-[0.98]"
+          >
             <div className="w-10 h-10 rounded-full neo-pressed flex items-center justify-center text-primary">
-              <Icon name="architecture" size={20} />
+              <Icon name="design_services" size={20} />
             </div>
             <div>
-              <h3 className="font-semibold text-on-surface text-sm mb-1">Design System</h3>
-              <p className="text-xs text-on-surface-variant">Configure visual language</p>
+              <h3 className="font-semibold text-on-surface text-sm mb-1">Current Plan</h3>
+              <p className="text-xs text-on-surface-variant">View task plan and dependencies</p>
             </div>
           </button>
-          <button className="neo-raised p-5 rounded-2xl flex flex-col gap-3 text-left hover:text-primary transition-colors duration-200 active:scale-[0.98]">
+          <button
+            onClick={() => onNavigate("mission")}
+            className="neo-raised p-5 rounded-2xl flex flex-col gap-3 text-left hover:text-primary transition-colors duration-200 active:scale-[0.98]"
+          >
             <div className="w-10 h-10 rounded-full neo-pressed flex items-center justify-center text-tertiary">
-              <Icon name="database" size={20} />
+              <Icon name="terminal" size={20} />
             </div>
             <div>
-              <h3 className="font-semibold text-on-surface text-sm mb-1">Data Models</h3>
-              <p className="text-xs text-on-surface-variant">Define schema & rules</p>
+              <h3 className="font-semibold text-on-surface text-sm mb-1">Active Mission</h3>
+              <p className="text-xs text-on-surface-variant">View mission progress and activity</p>
             </div>
           </button>
-          <button className="neo-raised p-5 rounded-2xl flex flex-col gap-3 text-left hover:text-primary transition-colors duration-200 active:scale-[0.98]">
+          <button
+            onClick={() => onNavigate("settings")}
+            className="neo-raised p-5 rounded-2xl flex flex-col gap-3 text-left hover:text-primary transition-colors duration-200 active:scale-[0.98]"
+          >
             <div className="w-10 h-10 rounded-full neo-pressed flex items-center justify-center text-primary">
-              <Icon name="api" size={20} />
+              <Icon name="tune" size={20} />
             </div>
             <div>
-              <h3 className="font-semibold text-on-surface text-sm mb-1">Integrations</h3>
-              <p className="text-xs text-on-surface-variant">Connect external services</p>
+              <h3 className="font-semibold text-on-surface text-sm mb-1">Configuration</h3>
+              <p className="text-xs text-on-surface-variant">Manage providers and settings</p>
             </div>
           </button>
         </div>
