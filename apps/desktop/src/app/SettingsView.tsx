@@ -25,7 +25,7 @@ export function SettingsView() {
   const [scanners, setScanners] = useState<ScannerInfo[]>([]);
   const [memory, setMemory] = useState<MemoryInfo[]>([]);
   const [ollamaStatus, setOllamaStatus] = useState<{ running: boolean; models: string[] }>({ running: false, models: [] });
-  const { theme, set: setTheme } = useTheme();
+  const { appearance, set: setTheme } = useTheme();
 
   useEffect(() => {
     (async () => {
@@ -503,11 +503,11 @@ export function SettingsView() {
                   <button
                     key={t}
                     onClick={() => {
-                      if (t !== "system") setTheme(t);
+                      setTheme(t);
                       updateSettings({ appearance: t });
                     }}
                     className={`px-5 py-2 rounded-lg text-sm font-medium flex items-center gap-2 transition-colors ${
-                      (t === "light" && theme === "light") || (t === "dark" && theme === "dark") || (t === "system" && settings?.appearance === "system")
+                      appearance === t
                         ? "bg-surface text-primary neo-raised"
                         : "text-on-surface-variant hover:text-on-surface"
                     }`}

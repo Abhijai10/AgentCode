@@ -2,28 +2,37 @@ import { createContext, useContext, useState, useEffect, type ReactNode } from "
 import { daemon } from "./daemon";
 
 type Theme = "light" | "dark";
+type AppearancePref = "light" | "dark" | "system";
 
 interface ThemeContextValue {
   theme: Theme;
+  appearance: AppearancePref;
   toggle: () => void;
-  set: (t: Theme) => void;
+  set: (t: AppearancePref) => void;
 }
 
 const ThemeContext = createContext<ThemeContextValue>({
   theme: "light",
+  appearance: "light",
   toggle: () => {},
   set: () => {},
 });
 
-function getInitialTheme(): Theme {
+function getInitialAppearance(): AppearancePref {
   if (typeof window === "undefined") return "light";
   const stored = localStorage.getItem("agentcode-theme");
-  if (stored === "dark" || stored === "light") return stored;
+  if (stored === "dark" || stored === "light" || stored === "system") return stored;
   return "light";
 }
 
+function systemPrefersDark(): boolean {
+  return typeof window !== "undefined" && window.matchMedia("(prefers-color-scheme: dark)").matches;
+}
+
 export function ThemeProvider({ children }: { children: ReactNode }) {
-  const [theme, setTheme] = useState<Theme>(getInitialTheme);
+  const [appearance, setAppearance] = useState<AppearancePref>(getInitialAppearance);
+  const [systemDark, setSystemDark] = useState<boolean>(systemPrefersDark);
+  const theme: Theme = appearance === "system" ? (systemDark ? "dark" : "light") : appearance;
 
   // Load the persisted daemon appearance setting on mount (the real app setting).
   useEffect(() => {
@@ -31,8 +40,8 @@ export function ThemeProvider({ children }: { children: ReactNode }) {
     (async () => {
       const settings = await daemon.getSettings();
       if (cancelled) return;
-      if (settings.appearance === "dark" || settings.appearance === "light") {
-        setTheme(settings.appearance);
+      if (settings.appearance === "dark" || settings.appearance === "light" || settings.appearance === "system") {
+        setAppearance(settings.appearance);
       }
     })();
     return () => {
@@ -40,17 +49,27 @@ export function ThemeProvider({ children }: { children: ReactNode }) {
     };
   }, []);
 
+  // Follow OS appearance changes when in "system" mode.
+  useEffect(() => {
+    if (appearance !== "system") return;
+    const mql = window.matchMedia("(prefers-color-scheme: dark)");
+    const onChange = (e: MediaQueryListEvent) => setSystemDark(e.matches);
+    mql.addEventListener("change", onChange);
+    setSystemDark(mql.matches);
+    return () => mql.removeEventListener("change", onChange);
+  }, [appearance]);
+
   useEffect(() => {
     document.documentElement.classList.toggle("dark", theme === "dark");
-    localStorage.setItem("agentcode-theme", theme);
-    daemon.setSettings({ appearance: theme });
-  }, [theme]);
+    localStorage.setItem("agentcode-theme", appearance);
+    daemon.setSettings({ appearance });
+  }, [theme, appearance]);
 
-  const toggle = () => setTheme((t) => (t === "light" ? "dark" : "light"));
-  const set = (t: Theme) => setTheme(t);
+  const toggle = () => setAppearance((t) => (t === "dark" || (t === "system" && systemDark) ? "light" : "dark"));
+  const set = (t: AppearancePref) => setAppearance(t);
 
   return (
-    <ThemeContext.Provider value={{ theme, toggle, set }}>
+    <ThemeContext.Provider value={{ theme, appearance, toggle, set }}>
       {children}
     </ThemeContext.Provider>
   );

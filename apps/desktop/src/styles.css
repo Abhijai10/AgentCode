@@ -125,6 +125,14 @@
   background-color: rgb(var(--surface));
   transition: all 0.2s ease;
 }
+.neo-button:focus-visible, .neo-raised:focus-visible, .neo-pressed:focus-visible {
+  outline: 2px solid rgb(var(--primary));
+  outline-offset: 2px;
+}
+button:focus-visible, a:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-visible {
+  outline: 2px solid rgb(var(--primary));
+  outline-offset: 2px;
+}
 .neo-button:active {
   box-shadow: inset 4px 4px 8px rgba(0,0,0,0.06), inset -4px -4px 8px rgba(255,255,255,0.5);
 }

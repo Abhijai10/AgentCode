@@ -163,19 +163,11 @@ export function HomeView({
                   }
                 }}
               />
-            <div className="flex justify-between items-center mt-4 pt-4 border-t border-outline-variant/40 dark:border-white/5">
-              <div className="flex gap-2">
-                <button className="w-9 h-9 rounded-full neo-button flex items-center justify-center text-on-surface-variant hover:text-primary transition-all duration-150">
-                  <Icon name="attach_file" size={18} />
-                </button>
-                <button className="w-9 h-9 rounded-full neo-button flex items-center justify-center text-on-surface-variant hover:text-primary transition-all duration-150">
-                  <Icon name="mic" size={18} />
-                </button>
-              </div>
+            <div className="flex items-center mt-4 pt-4 border-t border-outline-variant/40 dark:border-white/5">
               <button
                 onClick={() => send()}
                 disabled={submitting || !goal.trim()}
-                className="w-12 h-12 rounded-full bg-surface shadow-neo-raised-primary flex items-center justify-center text-primary hover:text-primary-container transition-all duration-150 active:shadow-neo-pressed disabled:opacity-50"
+                className="ml-auto w-12 h-12 rounded-full bg-surface shadow-neo-raised-primary flex items-center justify-center text-primary hover:text-primary-container transition-all duration-150 active:shadow-neo-pressed disabled:opacity-50"
               >
                 <Icon name={submitting ? "autorenew" : "send"} size={24} fill className={submitting ? "animate-spin" : ""} />
               </button>
