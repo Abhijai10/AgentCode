@@ -1,4 +1,45 @@
-export type View = "home" | "mission" | "discuss" | "design" | "security" | "settings";
+export type View = "home" | "mission" | "chat" | "discuss" | "design" | "security" | "settings";
+
+export type ConversationMode = "GOAL" | "DISCUSS" | "DESIGN" | "SECURITY";
+
+export interface Conversation {
+  id: string;
+  project_path: string;
+  mode: ConversationMode;
+  title: string;
+  state: "active" | "archived" | "deleted";
+  current_mission_id?: string | null;
+  created_at_ms: number;
+  updated_at_ms: number;
+}
+
+export interface Message {
+  id: string;
+  conversation_id: string;
+  role: "user" | "assistant" | "system" | "researcher";
+  content: string;
+  mission_ref?: string | null;
+  metadata?: string;
+  created_at_ms: number;
+}
+
+export interface Attachment {
+  id: string;
+  conversation_id: string;
+  message_id?: string | null;
+  project_path: string;
+  filename: string;
+  mime_type: string;
+  size_bytes: number;
+  sha256: string;
+  sensitivity: string;
+  created_at_ms: number;
+}
+
+export interface ConversationDetail extends Conversation {
+  messages: Message[];
+  attachments: Attachment[];
+}
 
 export interface MissionSummary {
   mission_id: string;

@@ -831,6 +831,7 @@ fn backend_tool_policy() -> ac_security::CapabilityPolicy {
 include!("release.rs");
 include!("observability.rs");
 include!("ipc.rs");
+include!("conversation.rs");
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum DaemonLifecycle {

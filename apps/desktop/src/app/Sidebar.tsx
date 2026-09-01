@@ -4,8 +4,8 @@ import type { Project } from "./ProjectContext";
 
 const NAV: { view: View; label: string; icon: string }[] = [
   { view: "home", label: "Home", icon: "home" },
+  { view: "chat", label: "Chat", icon: "forum" },
   { view: "mission", label: "Mission", icon: "terminal" },
-  { view: "discuss", label: "Discuss", icon: "forum" },
   { view: "design", label: "Design", icon: "draw" },
   { view: "security", label: "Security", icon: "security" },
 ];

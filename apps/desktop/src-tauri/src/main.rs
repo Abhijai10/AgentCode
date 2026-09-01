@@ -920,47 +920,283 @@ fn daemon_security_findings(state: tauri::State<DaemonClient>) -> Result<Value, 
 }
 
 #[tauri::command]
-fn daemon_discuss_sessions(state: tauri::State<DaemonClient>) -> Result<Value, String> {
-    let _ = &state.0;
-    Ok(json!([]))
-}
-
-#[tauri::command]
-fn daemon_discuss_messages(
+fn daemon_conversation_create(
     state: tauri::State<DaemonClient>,
-    session_id: String,
+    project_path: String,
+    mode: Option<String>,
+    title: String,
 ) -> Result<Value, String> {
-    let _ = &state.0;
-    let _ = session_id;
-    Ok(json!([]))
+    request(
+        &state.0,
+        "ui",
+        "ConversationCreate",
+        json!({
+            "project_path": project_path,
+            "mode": mode.unwrap_or_else(|| "GOAL".to_string()),
+            "title": title,
+        }),
+    )
 }
 
 #[tauri::command]
-fn daemon_discuss_send(
+fn daemon_conversation_list(
     state: tauri::State<DaemonClient>,
-    session_id: String,
+    project_path: String,
+) -> Result<Value, String> {
+    request(
+        &state.0,
+        "ui",
+        "ConversationList",
+        json!({ "project_path": project_path }),
+    )
+}
+
+#[tauri::command]
+fn daemon_conversation_get(
+    state: tauri::State<DaemonClient>,
+    conversation_id: String,
+) -> Result<Value, String> {
+    request(
+        &state.0,
+        "ui",
+        "ConversationGet",
+        json!({ "conversation_id": conversation_id }),
+    )
+}
+
+#[tauri::command]
+fn daemon_conversation_rename(
+    state: tauri::State<DaemonClient>,
+    conversation_id: String,
+    title: String,
+) -> Result<Value, String> {
+    request(
+        &state.0,
+        "ui",
+        "ConversationRename",
+        json!({ "conversation_id": conversation_id, "title": title }),
+    )
+}
+
+#[tauri::command]
+fn daemon_conversation_archive(
+    state: tauri::State<DaemonClient>,
+    conversation_id: String,
+) -> Result<Value, String> {
+    request(
+        &state.0,
+        "ui",
+        "ConversationArchive",
+        json!({ "conversation_id": conversation_id }),
+    )
+}
+
+#[tauri::command]
+fn daemon_conversation_delete(
+    state: tauri::State<DaemonClient>,
+    conversation_id: String,
+) -> Result<Value, String> {
+    request(
+        &state.0,
+        "ui",
+        "ConversationDelete",
+        json!({ "conversation_id": conversation_id }),
+    )
+}
+
+#[tauri::command]
+fn daemon_message_append(
+    state: tauri::State<DaemonClient>,
+    conversation_id: String,
+    role: String,
     content: String,
+    mission_ref: Option<String>,
 ) -> Result<Value, String> {
-    let _ = &state.0;
-    let _ = session_id;
-    let _ = content;
-    Ok(json!([]))
+    let mut payload = json!({
+        "conversation_id": conversation_id,
+        "role": role,
+        "content": content,
+        "mission_ref": mission_ref,
+    });
+    if payload["mission_ref"] == Value::Null {
+        payload["mission_ref"] = Value::Null;
+    }
+    request(&state.0, "ui", "MessageAppend", payload)
 }
 
 #[tauri::command]
-fn daemon_design_sessions(state: tauri::State<DaemonClient>) -> Result<Value, String> {
-    let _ = &state.0;
-    Ok(json!([]))
-}
-
-#[tauri::command]
-fn daemon_design_session(
+fn daemon_goal_submit(
     state: tauri::State<DaemonClient>,
-    session_id: String,
+    conversation_id: String,
+    goal: String,
+    attachment_ids: Option<Vec<String>>,
 ) -> Result<Value, String> {
-    let _ = &state.0;
-    let _ = session_id;
-    Ok(json!([]))
+    let mut payload = json!({
+        "conversation_id": conversation_id,
+        "goal": goal,
+        "attachment_ids": attachment_ids.unwrap_or_default(),
+    });
+    if payload["attachment_ids"] == Value::Null {
+        payload["attachment_ids"] = json!([]);
+    }
+    request(&state.0, "ui", "GoalSubmit", payload)
+}
+
+/// Pick a file via the native dialog, persist it inside the project workspace
+/// under `.agentcode/attachments/`, and register its metadata with the daemon.
+/// The raw file bytes never enter localStorage or frontend state; only safe
+/// metadata is returned.  Path validation (workspace boundary) is enforced by
+/// the daemon before the row is stored.
+#[tauri::command]
+fn daemon_add_attachment(
+    state: tauri::State<DaemonClient>,
+    conversation_id: String,
+    project_path: String,
+) -> Result<Value, String> {
+    let picked = rfd::FileDialog::new()
+        .set_title("Attach a File")
+        .pick_file()
+        .ok_or_else(|| "ATTACH-CANCELLED: no file selected".to_string())?;
+    let source_path = std::path::PathBuf::from(&picked);
+    let filename = source_path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .ok_or_else(|| "ATTACH-INVALID_PATH: invalid file path".to_string())?;
+    let bytes =
+        std::fs::read(&source_path).map_err(|error| format!("ATTACH-READ_FAILED: {error}"))?;
+    if bytes.is_empty() {
+        return Err("ATTACH-EMPTY: file is empty".to_string());
+    }
+    if bytes.len() > 25 * 1024 * 1024 {
+        return Err("ATTACH-TOO_LARGE: attachment exceeds 25MB limit".to_string());
+    }
+    let mime = guess_mime(filename);
+    // Persist inside the project workspace under .agentcode/attachments/
+    let attachments_dir = std::path::Path::new(&project_path)
+        .join(".agentcode")
+        .join("attachments")
+        .join(&conversation_id);
+    std::fs::create_dir_all(&attachments_dir)
+        .map_err(|error| format!("ATTACH-MKDIR_FAILED: {error}"))?;
+    let unique = format!("{}-{}", chrono_like_id(), filename);
+    let rel_path = format!(".agentcode/attachments/{conversation_id}/{unique}");
+    let target = std::path::Path::new(&project_path).join(&rel_path);
+    std::fs::write(&target, &bytes).map_err(|error| format!("ATTACH-WRITE_FAILED: {error}"))?;
+    // Compute FNV-1a 64 hash (matches daemon content hash format)
+    let content_hash = fnv1a64_hex(&bytes);
+    request(
+        &state.0,
+        "ui",
+        "AttachmentRegister",
+        json!({
+            "conversation_id": conversation_id,
+            "project_path": project_path,
+            "filename": filename,
+            "mime_type": mime,
+            "size_bytes": bytes.len() as i64,
+            "content_hash": content_hash,
+            "rel_path": rel_path,
+        }),
+    )
+}
+
+#[tauri::command]
+fn daemon_attachment_path(
+    state: tauri::State<DaemonClient>,
+    attachment_id: String,
+    project_path: String,
+) -> Result<Value, String> {
+    request(
+        &state.0,
+        "ui",
+        "AttachmentPath",
+        json!({ "attachment_id": attachment_id, "project_path": project_path }),
+    )
+}
+
+#[tauri::command]
+fn daemon_attachment_list(
+    state: tauri::State<DaemonClient>,
+    conversation_id: String,
+) -> Result<Value, String> {
+    request(
+        &state.0,
+        "ui",
+        "AttachmentList",
+        json!({ "conversation_id": conversation_id }),
+    )
+}
+
+#[tauri::command]
+fn daemon_attachment_remove(
+    state: tauri::State<DaemonClient>,
+    attachment_id: String,
+) -> Result<Value, String> {
+    request(
+        &state.0,
+        "ui",
+        "AttachmentRemove",
+        json!({ "attachment_id": attachment_id }),
+    )
+}
+
+fn guess_mime(filename: &str) -> String {
+    let lower = filename.to_ascii_lowercase();
+    if lower.ends_with(".png") {
+        "image/png".to_string()
+    } else if lower.ends_with(".jpg") || lower.ends_with(".jpeg") {
+        "image/jpeg".to_string()
+    } else if lower.ends_with(".gif") {
+        "image/gif".to_string()
+    } else if lower.ends_with(".webp") {
+        "image/webp".to_string()
+    } else if lower.ends_with(".pdf") {
+        "application/pdf".to_string()
+    } else if lower.ends_with(".md") {
+        "text/markdown".to_string()
+    } else if lower.ends_with(".json") {
+        "application/json".to_string()
+    } else if lower.ends_with(".txt")
+        || lower.ends_with(".rs")
+        || lower.ends_with(".ts")
+        || lower.ends_with(".tsx")
+        || lower.ends_with(".js")
+        || lower.ends_with(".jsx")
+        || lower.ends_with(".py")
+        || lower.ends_with(".go")
+        || lower.ends_with(".c")
+        || lower.ends_with(".h")
+        || lower.ends_with(".cpp")
+        || lower.ends_with(".toml")
+        || lower.ends_with(".yml")
+        || lower.ends_with(".yaml")
+        || lower.ends_with(".sh")
+        || lower.ends_with(".css")
+        || lower.ends_with(".html")
+    {
+        "text/plain".to_string()
+    } else {
+        "application/octet-stream".to_string()
+    }
+}
+
+/// FNV-1a 64-bit hash hex string, matching the daemon's attachment hash.
+fn fnv1a64_hex(bytes: &[u8]) -> String {
+    let hash = bytes.iter().fold(0xcbf29ce484222325_u64, |hash, byte| {
+        (hash ^ u64::from(*byte)).wrapping_mul(0x100000001b3)
+    });
+    format!("fnv1a64:{hash:016x}")
+}
+
+/// Micro timestamp used to keep staged attachment filenames unique.
+fn chrono_like_id() -> String {
+    format!(
+        "{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_micros())
+            .unwrap_or(0)
+    )
 }
 
 fn main() {
@@ -1000,11 +1236,18 @@ fn main() {
             daemon_list_scanners,
             daemon_list_memory,
             daemon_security_findings,
-            daemon_discuss_sessions,
-            daemon_discuss_messages,
-            daemon_discuss_send,
-            daemon_design_sessions,
-            daemon_design_session,
+            daemon_conversation_create,
+            daemon_conversation_list,
+            daemon_conversation_get,
+            daemon_conversation_rename,
+            daemon_conversation_archive,
+            daemon_conversation_delete,
+            daemon_message_append,
+            daemon_goal_submit,
+            daemon_add_attachment,
+            daemon_attachment_path,
+            daemon_attachment_list,
+            daemon_attachment_remove,
         ])
         .run(tauri::generate_context!())
         .expect("error while running AgentCode desktop application");

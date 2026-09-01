@@ -859,6 +859,261 @@ fn real_provider_daemon_path_creates_smoke_file_with_exact_content() {
 }
 
 #[test]
+#[ignore = "requires Ollama running locally with a loaded model (<=4B)"]
+fn real_provider_daemon_path_conversation_chat_to_mission_e2e() {
+    // Phase 16 E2E: Project → New Goal Chat → user message → attachment →
+    // submit → real daemon → real mission → execution → verification →
+    // conversation remains persisted with messages, attachments, mission ref.
+    let ollama_base =
+        std::env::var("OLLAMA_BASE_URL").unwrap_or_else(|_| "http://127.0.0.1:11434".to_string());
+    let connect_addr = ollama_connect_addr(&ollama_base);
+    if std::net::TcpStream::connect(&connect_addr).is_err() {
+        eprintln!("SKIP: Ollama not reachable at {ollama_base}; cannot run E2E conversation test");
+        return;
+    }
+    let ollama_chat = if ollama_base.ends_with("/api/chat") {
+        ollama_base.clone()
+    } else if ollama_base.ends_with('/') {
+        format!("{ollama_base}api/chat")
+    } else {
+        format!("{ollama_base}/api/chat")
+    };
+    // Small-model constraint: <=4B only (8 GB RAM host).
+    let ollama_model =
+        std::env::var("OLLAMA_MODEL").unwrap_or_else(|_| "qwen2.5-coder:3b".to_string());
+
+    let runtime = short_temp_path("acrp");
+    let project = short_temp_path("acrpp");
+    let _ = fs::remove_dir_all(&runtime);
+    let _ = fs::remove_dir_all(&project);
+    fs::create_dir_all(&runtime).unwrap();
+    create_smoke_fixture_project(&project);
+    // AgentCode-managed state (attachments) lives under .agentcode/ inside the
+    // project.  It must be gitignored so writing an attachment does not dirty
+    // the base repository before the mission creates its worktree.
+    fs::write(project.join(".gitignore"), ".agentcode/\n").unwrap();
+    run_git(&project, ["add", ".gitignore"]);
+    run_git(
+        &project,
+        [
+            "-c",
+            "user.name=AgentCode Test",
+            "-c",
+            "user.email=agentcode@example.test",
+            "commit",
+            "-m",
+            "ignore agentcode state",
+        ],
+    );
+    let daemon = daemon_binary();
+    assert!(
+        daemon.is_file(),
+        "build the daemon first: cargo build -p ac-daemon"
+    );
+    let socket = default_socket_path(&runtime);
+    let (db_path, _) = default_paths(&runtime);
+
+    let mut child = Command::new(&daemon)
+        .env("AGENTCODE_RUNTIME_DIR", &runtime)
+        .env("AGENTCODE_WORKSPACE_ROOT", &project)
+        .env("OLLAMA_BASE_URL", &ollama_chat)
+        .env("OLLAMA_MODEL", &ollama_model)
+        .stdout(Stdio::from(
+            File::create(runtime.join("daemon.log")).unwrap(),
+        ))
+        .stderr(Stdio::from(
+            File::options()
+                .create(true)
+                .append(true)
+                .open(runtime.join("daemon.log"))
+                .unwrap(),
+        ))
+        .spawn()
+        .unwrap();
+    wait_for_socket(&socket, &mut child, &runtime);
+
+    // 1. Create a GOAL conversation via the real daemon IPC.
+    let project_path = project.to_string_lossy().to_string();
+    let create = UnixIpcClient::new(&socket)
+        .request(json!({
+            "id": "e2e-create",
+            "command": "ConversationCreate",
+            "project_path": project_path,
+            "mode": "GOAL",
+            "title": "E2E Goal Chat"
+        }))
+        .unwrap();
+    assert_eq!(create["ok"], true, "create conversation: {create}");
+    let cid = create["conversation_id"].as_str().unwrap().to_string();
+
+    // 2. Register an attachment: a reference file that the model can inspect.
+    let att_dir = project.join(".agentcode").join("attachments").join(&cid);
+    fs::create_dir_all(&att_dir).unwrap();
+    let att_content = b"reference constant: 42";
+    let att_rel = format!(".agentcode/attachments/{cid}/input.txt");
+    fs::write(project.join(&att_rel), att_content).unwrap();
+    let att_hash = format!(
+        "fnv1a64:{:016x}",
+        att_content
+            .iter()
+            .fold(0xcbf29ce484222325_u64, |h, b| (h ^ u64::from(*b))
+                .wrapping_mul(0x100000001b3))
+    );
+    let attach = UnixIpcClient::new(&socket)
+        .request(json!({
+            "id": "e2e-attach",
+            "command": "AttachmentRegister",
+            "conversation_id": cid,
+            "project_path": project_path,
+            "filename": "input.txt",
+            "mime_type": "text/plain",
+            "size_bytes": att_content.len() as i64,
+            "content_hash": att_hash,
+            "rel_path": att_rel
+        }))
+        .unwrap();
+    assert_eq!(attach["ok"], true, "register attachment: {attach}");
+    let att_id = attach["attachment"]["id"].as_str().unwrap().to_string();
+
+    // 3. Submit the goal via GoalSubmit — this creates a real mission through
+    //    the kernel, persists the user message with mission_ref, and links the
+    //    mission to the conversation.  The exact original request is preserved.
+    let goal = "Create a file named agentcode_smoke.txt containing exactly: AgentCode operational smoke test";
+    let submit = UnixIpcClient::new(&socket)
+        .request(json!({
+            "id": "e2e-submit",
+            "command": "GoalSubmit",
+            "conversation_id": cid,
+            "goal": goal,
+            "attachment_ids": [att_id]
+        }))
+        .unwrap();
+    assert_eq!(submit["ok"], true, "goal submit: {submit}");
+    let mission_id = submit["mission_id"].as_str().unwrap().to_string();
+    let session_id = submit["session_id"].as_str().unwrap().to_string();
+
+    // 4. Poll for mission completion (real model execution).
+    let completed = poll_mission_completed(&socket, &mission_id, &mut child, &runtime);
+    assert_eq!(
+        completed["state"], "completed",
+        "mission must complete: {completed}"
+    );
+
+    // 5. Verify the file was created by the model (ChangeSet execution).
+    let worktree_dir = project.join(".agentcode-worktrees").join(&session_id);
+    let candidates = [
+        worktree_dir.join("agentcode_smoke.txt"),
+        worktree_dir.join("tests/agentcode_smoke.txt"),
+    ];
+    let found = candidates.iter().find(|path| path.exists());
+    assert!(
+        found.is_some(),
+        "agentcode_smoke.txt must exist in the worktree after mission completion"
+    );
+    let content = fs::read_to_string(found.unwrap()).unwrap();
+    assert_eq!(
+        content.trim(),
+        "AgentCode operational smoke test",
+        "file content must match exactly"
+    );
+
+    // 6. Verify the conversation remains persisted with messages, mission_ref,
+    //    and attachment.
+    let get_conv = UnixIpcClient::new(&socket)
+        .request(json!({
+            "id": "e2e-get",
+            "command": "ConversationGet",
+            "conversation_id": cid
+        }))
+        .unwrap();
+    assert_eq!(
+        get_conv["ok"], true,
+        "get conversation after mission: {get_conv}"
+    );
+    assert_eq!(
+        get_conv["conversation"]["current_mission_id"]
+            .as_str()
+            .unwrap(),
+        mission_id,
+        "conversation must still reference the completed mission"
+    );
+    let msgs = get_conv["conversation"]["messages"].as_array().unwrap();
+    assert_eq!(msgs.len(), 1, "goal message must be preserved");
+    assert_eq!(msgs[0]["role"], "user");
+    assert_eq!(msgs[0]["content"], goal);
+    assert_eq!(
+        msgs[0]["mission_ref"].as_str().unwrap(),
+        mission_id,
+        "message must reference the mission"
+    );
+    let conv_atts = get_conv["conversation"]["attachments"].as_array().unwrap();
+    assert!(
+        conv_atts
+            .iter()
+            .any(|a| a["id"].as_str().unwrap() == att_id),
+        "attachment must still be associated with the conversation"
+    );
+
+    // 7. Verify the persisted mission/session are terminal completed.
+    let mission_stable = StableId::from_existing(&mission_id).unwrap();
+    let db = ControlPlaneDb::open(&db_path).unwrap();
+    assert_eq!(
+        db.get_mission(&mission_stable).unwrap().unwrap().state,
+        "completed"
+    );
+    let evidence = db.evidence_records().unwrap();
+    assert!(
+        evidence.iter().any(|record| {
+            record.provenance.source == "agent.completion-request"
+                || record.artifact_uri.contains("completion")
+        }),
+        "real provider must produce completion evidence"
+    );
+    // Verify real provider evidence (not mock/scripted).
+    let real_provider_evidence = evidence.iter().any(|record| {
+        record.provenance.source == "agent.provider.planner"
+            && !record.artifact_uri.contains("mock")
+            && !record.artifact_uri.contains("scripted")
+    });
+    assert!(
+        real_provider_evidence,
+        "real provider must produce planner evidence from a real provider, not mock or scripted"
+    );
+
+    // 8. Verify the conversation + attachment + message survive a daemon restart.
+    shutdown_daemon(&socket, &mut child, &runtime);
+    let mut restarted = launch_daemon(&daemon, &runtime, &project);
+    wait_for_socket(&socket, &mut restarted, &runtime);
+    let after_restart = UnixIpcClient::new(&socket)
+        .request(json!({
+            "id": "e2e-restart",
+            "command": "ConversationGet",
+            "conversation_id": cid
+        }))
+        .unwrap();
+    assert_eq!(after_restart["ok"], true, "after restart: {after_restart}");
+    assert_eq!(
+        after_restart["conversation"]["current_mission_id"]
+            .as_str()
+            .unwrap(),
+        mission_id,
+        "mission ref must survive restart"
+    );
+    let after_msgs = after_restart["conversation"]["messages"]
+        .as_array()
+        .unwrap();
+    assert_eq!(after_msgs.len(), 1, "messages must survive restart");
+    let after_atts = after_restart["conversation"]["attachments"]
+        .as_array()
+        .unwrap();
+    assert!(!after_atts.is_empty(), "attachments must survive restart");
+
+    shutdown_daemon(&socket, &mut restarted, &runtime);
+    let _ = fs::remove_dir_all(&runtime);
+    let _ = fs::remove_dir_all(&project);
+}
+
+#[test]
 #[ignore = "requires built ac-daemon binary and macOS production sandbox"]
 fn real_daemon_binary_pauses_active_mission_blocks_forward_work_then_resumes() {
     // P1-02 active-mission pause over real IPC: a RUNNING mission must pause

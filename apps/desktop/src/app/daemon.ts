@@ -22,6 +22,10 @@ import type {
   ChangeSetSummary,
   EvidenceSummaryItem,
   VerificationSummary,
+  Conversation,
+  ConversationDetail,
+  Message,
+  Attachment,
 } from "./types";
 
 function toDaemonStatus(h: DaemonHealth): DaemonStatus {
@@ -417,6 +421,191 @@ export const daemon = {
       return await invoke<DesignSession>("daemon_design_session", { sessionId });
     } catch {
       return null;
+    }
+  },
+
+  // ── Conversations (real, project-bound chat) ────────────────────────────
+
+  async createConversation(
+    projectPath: string,
+    mode: string,
+    title: string
+  ): Promise<{ ok: boolean; conversation_id?: string; error?: string }> {
+    try {
+      const res = await invoke<{ conversation_id: string }>("daemon_conversation_create", {
+        projectPath,
+        mode,
+        title,
+      });
+      return { ok: true, conversation_id: res.conversation_id };
+    } catch (e: unknown) {
+      const message = e instanceof Error ? e.message : String(e);
+      const cleaned = message.replace(/^[A-Z0-9_-]+:\s*/, "");
+      return { ok: false, error: cleaned || message };
+    }
+  },
+
+  async listConversations(projectPath: string): Promise<Conversation[]> {
+    try {
+      const res = await invoke<{ conversations: Conversation[] }>("daemon_conversation_list", {
+        projectPath,
+      });
+      return res.conversations ?? [];
+    } catch {
+      return [];
+    }
+  },
+
+  async getConversation(conversationId: string): Promise<ConversationDetail | null> {
+    try {
+      const res = await invoke<{ conversation: ConversationDetail }>("daemon_conversation_get", {
+        conversationId,
+      });
+      return res.conversation ?? null;
+    } catch {
+      return null;
+    }
+  },
+
+  async renameConversation(
+    conversationId: string,
+    title: string
+  ): Promise<{ ok: boolean; error?: string }> {
+    try {
+      await invoke("daemon_conversation_rename", { conversationId, title });
+      return { ok: true };
+    } catch (e: unknown) {
+      const message = e instanceof Error ? e.message : String(e);
+      const cleaned = message.replace(/^[A-Z0-9_-]+:\s*/, "");
+      return { ok: false, error: cleaned || message };
+    }
+  },
+
+  async archiveConversation(
+    conversationId: string
+  ): Promise<{ ok: boolean; error?: string }> {
+    try {
+      await invoke("daemon_conversation_archive", { conversationId });
+      return { ok: true };
+    } catch (e: unknown) {
+      const message = e instanceof Error ? e.message : String(e);
+      const cleaned = message.replace(/^[A-Z0-9_-]+:\s*/, "");
+      return { ok: false, error: cleaned || message };
+    }
+  },
+
+  async deleteConversation(
+    conversationId: string
+  ): Promise<{ ok: boolean; error?: string }> {
+    try {
+      await invoke("daemon_conversation_delete", { conversationId });
+      return { ok: true };
+    } catch (e: unknown) {
+      const message = e instanceof Error ? e.message : String(e);
+      const cleaned = message.replace(/^[A-Z0-9_-]+:\s*/, "");
+      return { ok: false, error: cleaned || message };
+    }
+  },
+
+  async appendMessage(
+    conversationId: string,
+    role: string,
+    content: string,
+    missionRef?: string
+  ): Promise<{ ok: boolean; message?: Message; error?: string }> {
+    try {
+      const res = await invoke<{ message: Message }>("daemon_message_append", {
+        conversationId,
+        role,
+        content,
+        missionRef: missionRef ?? null,
+      });
+      return { ok: true, message: res.message };
+    } catch (e: unknown) {
+      const message = e instanceof Error ? e.message : String(e);
+      const cleaned = message.replace(/^[A-Z0-9_-]+:\s*/, "");
+      return { ok: false, error: cleaned || message };
+    }
+  },
+
+  async submitGoalFromConversation(
+    conversationId: string,
+    goal: string,
+    attachmentIds?: string[]
+  ): Promise<
+    | { ok: true; mission_id: string; session_id: string }
+    | { ok: false; error: string }
+  > {
+    try {
+      const result = await invoke<{ mission_id: string; session_id: string }>(
+        "daemon_goal_submit",
+        {
+          conversationId,
+          goal,
+          attachmentIds: attachmentIds ?? [],
+        }
+      );
+      return { ok: true, mission_id: result.mission_id, session_id: result.session_id };
+    } catch (e: unknown) {
+      const message = e instanceof Error ? e.message : String(e);
+      const cleaned = message.replace(/^[A-Z0-9_-]+:\s*/, "");
+      return { ok: false, error: cleaned || message };
+    }
+  },
+
+  async addAttachment(
+    conversationId: string,
+    projectPath: string
+  ): Promise<{ ok: boolean; attachment?: Attachment; error?: string }> {
+    try {
+      const res = await invoke<{ attachment: Attachment }>("daemon_add_attachment", {
+        conversationId,
+        projectPath,
+      });
+      return { ok: true, attachment: res.attachment };
+    } catch (e: unknown) {
+      const message = e instanceof Error ? e.message : String(e);
+      const cleaned = message.replace(/^[A-Z0-9_-]+:\s*/, "");
+      return { ok: false, error: cleaned || message };
+    }
+  },
+
+  async attachmentPath(
+    attachmentId: string,
+    projectPath: string
+  ): Promise<string | null> {
+    try {
+      const res = await invoke<{ path: string }>("daemon_attachment_path", {
+        attachmentId,
+        projectPath,
+      });
+      return res.path ?? null;
+    } catch {
+      return null;
+    }
+  },
+
+  async listAttachments(conversationId: string): Promise<Attachment[]> {
+    try {
+      const res = await invoke<{ attachments: Attachment[] }>("daemon_attachment_list", {
+        conversationId,
+      });
+      return res.attachments ?? [];
+    } catch {
+      return [];
+    }
+  },
+
+  async removeAttachment(
+    attachmentId: string
+  ): Promise<{ ok: boolean; error?: string }> {
+    try {
+      await invoke("daemon_attachment_remove", { attachmentId });
+      return { ok: true };
+    } catch (e: unknown) {
+      const message = e instanceof Error ? e.message : String(e);
+      const cleaned = message.replace(/^[A-Z0-9_-]+:\s*/, "");
+      return { ok: false, error: cleaned || message };
     }
   },
 };

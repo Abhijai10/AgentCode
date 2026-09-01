@@ -1,4 +1,4 @@
-pub const CURRENT_SCHEMA_VERSION: u32 = 23;
+pub const CURRENT_SCHEMA_VERSION: u32 = 24;
 
 impl ControlPlaneDb {
     pub fn open(path: impl AsRef<Path>) -> AcResult<Self> {
@@ -158,6 +158,12 @@ impl ControlPlaneDb {
         }
         if current_version < 23 {
             add_column_if_missing(&tx, "agent_sessions", "workspace_root", "TEXT")?;
+        }
+        if current_version < 24 {
+            tx.execute_batch(include_str!(
+                "../../../migrations/0023_conversations.sql"
+            ))
+            .map_err(db_error)?;
         }
         tx.pragma_update(None, "user_version", CURRENT_SCHEMA_VERSION)
             .map_err(db_error)?;

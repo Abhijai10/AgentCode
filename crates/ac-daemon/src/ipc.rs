@@ -405,6 +405,110 @@ fn dispatch_request(request: &Value, daemon: &mut DaemonService) -> (Value, bool
             Ok(preferences) => json!({"id": correlation_id, "ok": true, "appearance": preferences.appearance, "notifications_enabled": preferences.notifications_enabled, "completion_sound_enabled": preferences.completion_sound_enabled, "reduced_motion": preferences.reduced_motion, "budget_limit_micros": preferences.budget_limit_micros}),
             Err(error) => error_response(correlation_id, error.code(), error.to_string()),
         },
+        "ConversationCreate" => {
+            let project_path = request.get("project_path").and_then(Value::as_str).unwrap_or("");
+            let mode = request.get("mode").and_then(Value::as_str).unwrap_or("GOAL");
+            let title = request.get("title").and_then(Value::as_str).unwrap_or("");
+            match daemon.create_conversation(project_path, mode, title) {
+                Ok(id) => json!({"id": correlation_id, "ok": true, "conversation_id": id.to_string()}),
+                Err(error) => error_response(correlation_id, error.code(), error.to_string()),
+            }
+        },
+        "ConversationList" => {
+            let project_path = request.get("project_path").and_then(Value::as_str).unwrap_or("");
+            match daemon.list_conversations(project_path) {
+                Ok(conversations) => json!({"id": correlation_id, "ok": true, "conversations": conversations.into_iter().map(conversation_json).collect::<Vec<_>>()}),
+                Err(error) => error_response(correlation_id, error.code(), error.to_string()),
+            }
+        },
+        "ConversationGet" => match request.get("conversation_id").and_then(Value::as_str) {
+            Some(id) => match daemon.get_conversation_with_messages(id) {
+                Ok(Some(conversation)) => json!({"id": correlation_id, "ok": true, "conversation": conversation_with_messages_json(conversation)}),
+                Ok(None) => error_response(correlation_id, "CONVERSATION-NOT_FOUND", "conversation not found".to_string()),
+                Err(error) => error_response(correlation_id, error.code(), error.to_string()),
+            },
+            None => error_response(correlation_id, "DAEMON-IPC_INVALID", "conversation_id is required".to_string()),
+        },
+        "ConversationRename" => {
+            let id = request.get("conversation_id").and_then(Value::as_str).unwrap_or("");
+            let title = request.get("title").and_then(Value::as_str).unwrap_or("");
+            match daemon.rename_conversation(id, title) {
+                Ok(()) => json!({"id": correlation_id, "ok": true, "conversation_id": id}),
+                Err(error) => error_response(correlation_id, error.code(), error.to_string()),
+            }
+        },
+        "ConversationArchive" => {
+            let id = request.get("conversation_id").and_then(Value::as_str).unwrap_or("");
+            match daemon.archive_conversation(id) {
+                Ok(()) => json!({"id": correlation_id, "ok": true, "conversation_id": id}),
+                Err(error) => error_response(correlation_id, error.code(), error.to_string()),
+            }
+        },
+        "ConversationDelete" => {
+            let id = request.get("conversation_id").and_then(Value::as_str).unwrap_or("");
+            match daemon.delete_conversation(id) {
+                Ok(()) => json!({"id": correlation_id, "ok": true, "conversation_id": id}),
+                Err(error) => error_response(correlation_id, error.code(), error.to_string()),
+            }
+        },
+        "MessageAppend" => {
+            let id = request.get("conversation_id").and_then(Value::as_str).unwrap_or("");
+            let role = request.get("role").and_then(Value::as_str).unwrap_or("user");
+            let content = request.get("content").and_then(Value::as_str).unwrap_or("");
+            let mission_ref = request.get("mission_ref").and_then(Value::as_str);
+            let metadata_json = request.get("metadata").and_then(Value::as_str).unwrap_or("{}");
+            match daemon.append_message(id, role, content, mission_ref, metadata_json) {
+                Ok(message) => json!({"id": correlation_id, "ok": true, "message": message_json(message)}),
+                Err(error) => error_response(correlation_id, error.code(), error.to_string()),
+            }
+        },
+        "AttachmentRegister" => {
+            let conversation_id = request.get("conversation_id").and_then(Value::as_str).unwrap_or("");
+            let project_path = request.get("project_path").and_then(Value::as_str).unwrap_or("");
+            let filename = request.get("filename").and_then(Value::as_str).unwrap_or("");
+            let mime_type = request.get("mime_type").and_then(Value::as_str).unwrap_or("");
+            let size_bytes = request.get("size_bytes").and_then(Value::as_i64).unwrap_or(0);
+            let content_hash = request.get("content_hash").and_then(Value::as_str).unwrap_or("");
+            let rel_path = request.get("rel_path").and_then(Value::as_str).unwrap_or("");
+            match daemon.register_attachment(conversation_id, project_path, filename, mime_type, size_bytes, content_hash, rel_path) {
+                Ok(attachment) => json!({"id": correlation_id, "ok": true, "attachment": attachment_json(attachment)}),
+                Err(error) => error_response(correlation_id, error.code(), error.to_string()),
+            }
+        },
+        "AttachmentList" => {
+            let conversation_id = request.get("conversation_id").and_then(Value::as_str).unwrap_or("");
+            match daemon.list_attachments(conversation_id) {
+                Ok(attachments) => json!({"id": correlation_id, "ok": true, "attachments": attachments.into_iter().map(attachment_json).collect::<Vec<_>>()}),
+                Err(error) => error_response(correlation_id, error.code(), error.to_string()),
+            }
+        },
+        "AttachmentPath" => {
+            let attachment_id = request.get("attachment_id").and_then(Value::as_str).unwrap_or("");
+            let project_path = request.get("project_path").and_then(Value::as_str).unwrap_or("");
+            match daemon.attachment_path(attachment_id, project_path) {
+                Ok(Some(path)) => json!({"id": correlation_id, "ok": true, "path": path}),
+                Ok(None) => error_response(correlation_id, "CONVERSATION-ATTACHMENT_NOT_FOUND", "attachment not found".to_string()),
+                Err(error) => error_response(correlation_id, error.code(), error.to_string()),
+            }
+        },
+        "AttachmentRemove" => {
+            let id = request.get("attachment_id").and_then(Value::as_str).unwrap_or("");
+            match daemon.remove_attachment(id) {
+                Ok(()) => json!({"id": correlation_id, "ok": true, "attachment_id": id}),
+                Err(error) => error_response(correlation_id, error.code(), error.to_string()),
+            }
+        },
+        "GoalSubmit" => {
+            let conversation_id = request.get("conversation_id").and_then(Value::as_str).unwrap_or("");
+            let goal = request.get("goal").and_then(Value::as_str).unwrap_or("");
+            let attachment_ids = request.get("attachment_ids").and_then(Value::as_array).map(|arr| {
+                arr.iter().filter_map(Value::as_str).map(ToString::to_string).collect::<Vec<_>>()
+            }).unwrap_or_default();
+            match daemon.goal_submit(conversation_id, goal, &attachment_ids) {
+                Ok((mission_id, session_id)) => json!({"id": correlation_id, "ok": true, "mission_id": mission_id.to_string(), "session_id": session_id.to_string()}),
+                Err(error) => error_response(correlation_id, error.code(), error.to_string()),
+            }
+        },
         "SetDesktopSettings" => {
             let appearance = request.get("appearance").and_then(Value::as_str).unwrap_or("light").to_string();
             let notifications = request.get("notifications_enabled").and_then(Value::as_bool).unwrap_or(true);
@@ -424,6 +528,61 @@ fn dispatch_request(request: &Value, daemon: &mut DaemonService) -> (Value, bool
 }
 
 fn error_response(id: &str, code: &str, message: String) -> Value { json!({"id": id, "ok": false, "error": {"code": code, "message": message}}) }
+
+fn conversation_json(row: ac_db::ConversationRow) -> Value {
+    json!({
+        "id": row.id,
+        "project_path": row.project_path,
+        "mode": row.mode,
+        "title": row.title,
+        "state": row.state,
+        "current_mission_id": row.current_mission_id,
+        "created_at_ms": row.created_at_ms,
+        "updated_at_ms": row.updated_at_ms,
+    })
+}
+
+fn message_json(row: ac_db::ConversationMessageRow) -> Value {
+    json!({
+        "id": row.id,
+        "conversation_id": row.conversation_id,
+        "role": row.role,
+        "content": row.content,
+        "mission_ref": row.mission_ref,
+        "metadata": row.metadata_json,
+        "created_at_ms": row.created_at_ms,
+    })
+}
+
+fn attachment_json(row: ac_db::AttachmentRow) -> Value {
+    json!({
+        "id": row.id,
+        "conversation_id": row.conversation_id,
+        "message_id": row.message_id,
+        "project_path": row.project_path,
+        "filename": row.filename,
+        "mime_type": row.mime_type,
+        "size_bytes": row.size_bytes,
+        "sha256": row.sha256,
+        "sensitivity": row.sensitivity,
+        "created_at_ms": row.created_at_ms,
+    })
+}
+
+fn conversation_with_messages_json(data: crate::ConversationWithMessages) -> Value {
+    json!({
+        "id": data.conversation.id,
+        "project_path": data.conversation.project_path,
+        "mode": data.conversation.mode,
+        "title": data.conversation.title,
+        "state": data.conversation.state,
+        "current_mission_id": data.conversation.current_mission_id,
+        "created_at_ms": data.conversation.created_at_ms,
+        "updated_at_ms": data.conversation.updated_at_ms,
+        "messages": data.messages.into_iter().map(message_json).collect::<Vec<_>>(),
+        "attachments": data.attachments.into_iter().map(attachment_json).collect::<Vec<_>>(),
+    })
+}
 
 /// Backend-owned provider catalog JSON.  Contains metadata only — never a
 /// credential value.
@@ -1336,4 +1495,422 @@ mod ipc_tests {
         }
         let _ = fs::remove_dir_all(dir);
     }
+
+    #[test]
+    fn conversation_create_list_get_rename_archive_delete_via_ipc() {
+        let (dir, db, lock, socket) = temp_paths("conv-crud");
+        let mut daemon = DaemonService::open(&db, &lock).unwrap();
+        daemon.start().unwrap();
+        let Some((server, listener)) = bind_or_skip(&socket, None) else {
+            daemon.shutdown().unwrap();
+            let _ = fs::remove_dir_all(dir);
+            return;
+        };
+
+        // Create
+        let create = request_via_ipc(
+            &server, &listener, &mut daemon,
+            json!({"id":"c1","command":"ConversationCreate","project_path":"/tmp/test-proj","mode":"GOAL","title":"Test Goal Chat"}),
+        );
+        assert_eq!(create["ok"], true, "create: {create}");
+        let cid = create["conversation_id"].as_str().unwrap().to_string();
+
+        // List
+        let list = request_via_ipc(
+            &server, &listener, &mut daemon,
+            json!({"id":"c2","command":"ConversationList","project_path":"/tmp/test-proj"}),
+        );
+        assert_eq!(list["ok"], true, "list: {list}");
+        let convs = list["conversations"].as_array().unwrap();
+        assert_eq!(convs.len(), 1);
+        assert_eq!(convs[0]["title"], "Test Goal Chat");
+
+        // Get
+        let get = request_via_ipc(
+            &server, &listener, &mut daemon,
+            json!({"id":"c3","command":"ConversationGet","conversation_id": cid}),
+        );
+        assert_eq!(get["ok"], true, "get: {get}");
+        assert_eq!(get["conversation"]["title"], "Test Goal Chat");
+        assert_eq!(get["conversation"]["mode"], "GOAL");
+
+        // Rename
+        let rename = request_via_ipc(
+            &server, &listener, &mut daemon,
+            json!({"id":"c4","command":"ConversationRename","conversation_id": cid, "title": "Renamed"}),
+        );
+        assert_eq!(rename["ok"], true);
+        let get2 = request_via_ipc(
+            &server, &listener, &mut daemon,
+            json!({"id":"c5","command":"ConversationGet","conversation_id": cid}),
+        );
+        assert_eq!(get2["conversation"]["title"], "Renamed");
+
+        // Archive
+        let archive = request_via_ipc(
+            &server, &listener, &mut daemon,
+            json!({"id":"c6","command":"ConversationArchive","conversation_id": cid}),
+        );
+        assert_eq!(archive["ok"], true);
+        let list2 = request_via_ipc(
+            &server, &listener, &mut daemon,
+            json!({"id":"c7","command":"ConversationList","project_path":"/tmp/test-proj"}),
+        );
+        // Archived conversations should still appear (include_archived=true)
+        assert_eq!(list2["conversations"].as_array().unwrap().len(), 1);
+
+        // Delete
+        let del = request_via_ipc(
+            &server, &listener, &mut daemon,
+            json!({"id":"c8","command":"ConversationDelete","conversation_id": cid}),
+        );
+        assert_eq!(del["ok"], true);
+        let list3 = request_via_ipc(
+            &server, &listener, &mut daemon,
+            json!({"id":"c9","command":"ConversationList","project_path":"/tmp/test-proj"}),
+        );
+        assert_eq!(list3["conversations"].as_array().unwrap().len(), 0);
+
+        server.cleanup();
+        daemon.shutdown().unwrap();
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn conversation_message_append_and_retrieve_via_ipc() {
+        let (dir, db, lock, socket) = temp_paths("conv-msg");
+        let mut daemon = DaemonService::open(&db, &lock).unwrap();
+        daemon.start().unwrap();
+        let Some((server, listener)) = bind_or_skip(&socket, None) else {
+            daemon.shutdown().unwrap();
+            let _ = fs::remove_dir_all(dir);
+            return;
+        };
+
+        let create = request_via_ipc(
+            &server, &listener, &mut daemon,
+            json!({"id":"c1","command":"ConversationCreate","project_path":"/tmp/msg-proj","mode":"GOAL","title":"Msg Chat"}),
+        );
+        let cid = create["conversation_id"].as_str().unwrap().to_string();
+
+        let append = request_via_ipc(
+            &server, &listener, &mut daemon,
+            json!({"id":"m1","command":"MessageAppend","conversation_id": cid, "role": "user", "content": "Hello from conversation test"}),
+        );
+        assert_eq!(append["ok"], true, "append: {append}");
+        assert_eq!(append["message"]["role"], "user");
+        assert_eq!(append["message"]["content"], "Hello from conversation test");
+        assert!(append["message"]["id"].as_str().unwrap().starts_with("msg-"));
+
+        // Retrieve via ConversationGet
+        let get = request_via_ipc(
+            &server, &listener, &mut daemon,
+            json!({"id":"g1","command":"ConversationGet","conversation_id": cid}),
+        );
+        assert_eq!(get["ok"], true);
+        let msgs = get["conversation"]["messages"].as_array().unwrap();
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0]["content"], "Hello from conversation test");
+
+        server.cleanup();
+        daemon.shutdown().unwrap();
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn conversation_project_isolation_via_ipc() {
+        let (dir, db, lock, socket) = temp_paths("conv-iso");
+        let mut daemon = DaemonService::open(&db, &lock).unwrap();
+        daemon.start().unwrap();
+        let Some((server, listener)) = bind_or_skip(&socket, None) else {
+            daemon.shutdown().unwrap();
+            let _ = fs::remove_dir_all(dir);
+            return;
+        };
+
+        let c1 = request_via_ipc(
+            &server, &listener, &mut daemon,
+            json!({"id":"c1","command":"ConversationCreate","project_path":"/proj/A","mode":"GOAL","title":"A1"}),
+        );
+        assert_eq!(c1["ok"], true);
+        let c2 = request_via_ipc(
+            &server, &listener, &mut daemon,
+            json!({"id":"c2","command":"ConversationCreate","project_path":"/proj/A","mode":"GOAL","title":"A2"}),
+        );
+        assert_eq!(c2["ok"], true);
+        let c3 = request_via_ipc(
+            &server, &listener, &mut daemon,
+            json!({"id":"c3","command":"ConversationCreate","project_path":"/proj/B","mode":"GOAL","title":"B1"}),
+        );
+        assert_eq!(c3["ok"], true);
+
+        let list_a = request_via_ipc(
+            &server, &listener, &mut daemon,
+            json!({"id":"la","command":"ConversationList","project_path":"/proj/A"}),
+        );
+        assert_eq!(list_a["conversations"].as_array().unwrap().len(), 2);
+
+        let list_b = request_via_ipc(
+            &server, &listener, &mut daemon,
+            json!({"id":"lb","command":"ConversationList","project_path":"/proj/B"}),
+        );
+        assert_eq!(list_b["conversations"].as_array().unwrap().len(), 1);
+
+        server.cleanup();
+        daemon.shutdown().unwrap();
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn conversation_operations_return_errors_for_invalid_inputs() {
+        let (dir, db, lock, socket) = temp_paths("conv-err");
+        let mut daemon = DaemonService::open(&db, &lock).unwrap();
+        daemon.start().unwrap();
+        let Some((server, listener)) = bind_or_skip(&socket, None) else {
+            daemon.shutdown().unwrap();
+            let _ = fs::remove_dir_all(dir);
+            return;
+        };
+
+        // Get non-existent conversation
+        let get = request_via_ipc(
+            &server, &listener, &mut daemon,
+            json!({"id":"e1","command":"ConversationGet","conversation_id":"conv-nope"}),
+        );
+        assert!(!get["ok"].as_bool().unwrap());
+        assert_eq!(get["error"]["code"], "CONVERSATION-NOT_FOUND");
+
+        // MessageAppend on non-existent conversation
+        let append = request_via_ipc(
+            &server, &listener, &mut daemon,
+            json!({"id":"e2","command":"MessageAppend","conversation_id":"conv-nope","role":"user","content":"test"}),
+        );
+        assert!(!append["ok"].as_bool().unwrap());
+        assert_eq!(append["error"]["code"], "CONVERSATION-NOT_FOUND");
+
+        server.cleanup();
+        daemon.shutdown().unwrap();
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn goal_submit_links_conversation_to_real_mission() {
+        let (dir, db, lock, socket) = temp_paths("conv-goal");
+        // A real project workspace directory is required by goal_submit
+        let project_dir = dir.join("workspace");
+        fs::create_dir_all(&project_dir).unwrap();
+        let project_path = project_dir.to_string_lossy().to_string();
+
+        let mut daemon = DaemonService::open(&db, &lock).unwrap();
+        daemon.start().unwrap();
+        let Some((server, listener)) = bind_or_skip(&socket, None) else {
+            daemon.shutdown().unwrap();
+            let _ = fs::remove_dir_all(dir);
+            return;
+        };
+
+        let create = request_via_ipc(
+            &server, &listener, &mut daemon,
+            json!({"id":"c1","command":"ConversationCreate","project_path": project_path, "mode":"GOAL","title":"Goal Chat"}),
+        );
+        assert_eq!(create["ok"], true, "create: {create}");
+        let cid = create["conversation_id"].as_str().unwrap().to_string();
+
+        // Original request must be preserved and submitted as a real mission.
+        let goal = "Fix the authentication bug where expired refresh tokens are accepted.";
+        let submit = request_via_ipc(
+            &server, &listener, &mut daemon,
+            json!({"id":"s1","command":"GoalSubmit","conversation_id": cid, "goal": goal}),
+        );
+        assert_eq!(submit["ok"], true, "submit: {submit}");
+        let mission_id = submit["mission_id"].as_str().unwrap().to_string();
+        assert!(mission_id.starts_with("mission-"), "mission id prefix: {mission_id}");
+        assert!(submit["session_id"].as_str().unwrap().starts_with("session-"));
+
+        // The conversation must now be attached to the mission.
+        let get = request_via_ipc(
+            &server, &listener, &mut daemon,
+            json!({"id":"g1","command":"ConversationGet","conversation_id": cid}),
+        );
+        assert_eq!(get["ok"], true);
+        assert_eq!(
+            get["conversation"]["current_mission_id"].as_str().unwrap(),
+            mission_id
+        );
+        // The exact original request is preserved as a user message.
+        let msgs = get["conversation"]["messages"].as_array().unwrap();
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0]["role"], "user");
+        assert_eq!(msgs[0]["content"], goal);
+        assert_eq!(msgs[0]["mission_ref"].as_str().unwrap(), mission_id);
+
+        // Cancel immediately (matching the durable-submission test pattern) so
+        // the coordinator worker never executes the mission against real
+        // providers in the test environment.
+        let cancel = request_via_ipc(
+            &server, &listener, &mut daemon,
+            json!({"id":"x1","command":"CancelMission","mission_id": mission_id}),
+        );
+        assert_eq!(cancel["ok"], true, "cancel: {cancel}");
+
+        server.cleanup();
+        daemon.shutdown().unwrap();
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn attachment_register_list_path_and_remove_via_ipc() {
+        let (dir, db, lock, socket) = temp_paths("conv-att");
+        let project_dir = dir.join("workspace");
+        fs::create_dir_all(&project_dir).unwrap();
+        let project_path = project_dir.to_string_lossy().to_string();
+
+        let mut daemon = DaemonService::open(&db, &lock).unwrap();
+        daemon.start().unwrap();
+        let Some((server, listener)) = bind_or_skip(&socket, None) else {
+            daemon.shutdown().unwrap();
+            let _ = fs::remove_dir_all(dir);
+            return;
+        };
+
+        let create = request_via_ipc(
+            &server, &listener, &mut daemon,
+            json!({"id":"c1","command":"ConversationCreate","project_path": project_path, "mode":"GOAL","title":"Attach Chat"}),
+        );
+        let cid = create["conversation_id"].as_str().unwrap().to_string();
+
+        // Write a real attachment file inside the project workspace, as the
+        // Tauri add_attachment command does.
+        let att_dir = project_dir.join(".agentcode").join("attachments").join(&cid);
+        fs::create_dir_all(&att_dir).unwrap();
+        let content = b"hello attachment world";
+        let rel_path = format!(".agentcode/attachments/{cid}/img.png");
+        fs::write(project_dir.join(&rel_path), content).unwrap();
+        let hash = format!(
+            "fnv1a64:{:016x}",
+            content
+                .iter()
+                .fold(0xcbf29ce484222325_u64, |h, b| (h ^ u64::from(*b)).wrapping_mul(0x100000001b3))
+        );
+
+        let reg = request_via_ipc(
+            &server, &listener, &mut daemon,
+            json!({"id":"a1","command":"AttachmentRegister","conversation_id": cid, "project_path": project_path, "filename":"img.png","mime_type":"image/png","size_bytes": content.len() as i64,"content_hash": hash,"rel_path": rel_path}),
+        );
+        assert_eq!(reg["ok"], true, "register: {reg}");
+        let attachment = &reg["attachment"];
+        assert_eq!(attachment["filename"], "img.png");
+        assert_eq!(attachment["mime_type"], "image/png");
+        assert_eq!(attachment["size_bytes"], content.len() as i64);
+        assert!(attachment["id"].as_str().unwrap().starts_with("att-"));
+        let att_id = attachment["id"].as_str().unwrap().to_string();
+
+        // List
+        let list = request_via_ipc(
+            &server, &listener, &mut daemon,
+            json!({"id":"a2","command":"AttachmentList","conversation_id": cid}),
+        );
+        assert_eq!(list["ok"], true);
+        assert_eq!(list["attachments"].as_array().unwrap().len(), 1);
+
+        // Path (project isolation + workspace boundary)
+        let path = request_via_ipc(
+            &server, &listener, &mut daemon,
+            json!({"id":"a3","command":"AttachmentPath","attachment_id": att_id, "project_path": project_path}),
+        );
+        assert_eq!(path["ok"], true, "path: {path}");
+        let resolved = path["path"].as_str().unwrap();
+        assert!(resolved.ends_with("img.png"));
+        let project_canonical = fs::canonicalize(&project_dir).unwrap();
+        assert!(
+            resolved.starts_with(project_canonical.to_string_lossy().as_ref()),
+            "resolved {resolved} must be inside project {project_canonical:?}"
+        );
+
+        // Remove
+        let remove = request_via_ipc(
+            &server, &listener, &mut daemon,
+            json!({"id":"a4","command":"AttachmentRemove","attachment_id": att_id}),
+        );
+        assert_eq!(remove["ok"], true);
+        let list2 = request_via_ipc(
+            &server, &listener, &mut daemon,
+            json!({"id":"a5","command":"AttachmentList","conversation_id": cid}),
+        );
+        assert_eq!(list2["attachments"].as_array().unwrap().len(), 0);
+
+        server.cleanup();
+        daemon.shutdown().unwrap();
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn attachment_rejects_invalid_mime_oversize_and_workspace_escape() {
+        let (dir, db, lock, socket) = temp_paths("conv-att-sec");
+        let project_dir = dir.join("workspace");
+        fs::create_dir_all(&project_dir).unwrap();
+        let project_path = project_dir.to_string_lossy().to_string();
+
+        let mut daemon = DaemonService::open(&db, &lock).unwrap();
+        daemon.start().unwrap();
+        let Some((server, listener)) = bind_or_skip(&socket, None) else {
+            daemon.shutdown().unwrap();
+            let _ = fs::remove_dir_all(dir);
+            return;
+        };
+
+        let create = request_via_ipc(
+            &server, &listener, &mut daemon,
+            json!({"id":"c1","command":"ConversationCreate","project_path": project_path, "mode":"GOAL","title":"Secure Attach"}),
+        );
+        let cid = create["conversation_id"].as_str().unwrap().to_string();
+
+        // 1. Invalid MIME type must be rejected.
+        let att_dir = project_dir.join(".agentcode").join("attachments").join(&cid);
+        fs::create_dir_all(&att_dir).unwrap();
+        let bad = format!(".agentcode/attachments/{cid}/evil.exe");
+        fs::write(project_dir.join(&bad), b"x").unwrap();
+        let bad_mime = request_via_ipc(
+            &server, &listener, &mut daemon,
+            json!({"id":"b1","command":"AttachmentRegister","conversation_id": cid, "project_path": project_path, "filename":"evil.exe","mime_type":"application/x-msdownload","size_bytes":1,"content_hash":"fnv1a64:0000000000000001","rel_path": bad}),
+        );
+        assert!(!bad_mime["ok"].as_bool().unwrap());
+        assert_eq!(bad_mime["error"]["code"], "CONVERSATION-INVALID_MIME");
+
+        // 2. Oversized attachment must be rejected.
+        let big = format!(".agentcode/attachments/{cid}/big.bin");
+        fs::write(project_dir.join(&big), vec![0u8; 26 * 1024 * 1024]).unwrap();
+        let big_att = request_via_ipc(
+            &server, &listener, &mut daemon,
+            json!({"id":"b2","command":"AttachmentRegister","conversation_id": cid, "project_path": project_path, "filename":"big.bin","mime_type":"application/octet-stream","size_bytes": 26 * 1024 * 1024,"content_hash":"fnv1a64:0000000000000001","rel_path": big}),
+        );
+        assert!(!big_att["ok"].as_bool().unwrap());
+        assert_eq!(big_att["error"]["code"], "CONVERSATION-INVALID_SIZE");
+
+        // 3. Workspace escape via rel_path traversal must be rejected.
+        let outside = project_dir.join("..").join("outside.png");
+        fs::create_dir_all(project_dir.parent().unwrap()).unwrap();
+        fs::write(&outside, b"png").unwrap();
+        let escape = request_via_ipc(
+            &server, &listener, &mut daemon,
+            json!({"id":"b3","command":"AttachmentRegister","conversation_id": cid, "project_path": project_path, "filename":"outside.png","mime_type":"image/png","size_bytes":3,"content_hash":"fnv1a64:0000000000000001","rel_path":"../outside.png"}),
+        );
+        assert!(!escape["ok"].as_bool().unwrap());
+        assert_eq!(escape["error"]["code"], "CONVERSATION-FILE_ESCAPE");
+
+        // 4. AttachmentPath for another project must be denied (isolation).
+        let other = dir.join("other-project");
+        fs::create_dir_all(&other).unwrap();
+        let other_path = request_via_ipc(
+            &server, &listener, &mut daemon,
+            json!({"id":"b4","command":"AttachmentPath","attachment_id":"att-none","project_path": other.to_string_lossy().to_string()}),
+        );
+        assert!(!other_path["ok"].as_bool().unwrap());
+        assert_eq!(other_path["error"]["code"], "CONVERSATION-ATTACHMENT_NOT_FOUND");
+
+        server.cleanup();
+        daemon.shutdown().unwrap();
+        let _ = fs::remove_dir_all(dir);
+    }
+
 }

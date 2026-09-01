@@ -6,6 +6,7 @@ import { TopBar } from "./TopBar";
 import { Footer } from "./Footer";
 import { HomeView } from "./HomeView";
 import { MissionView } from "./MissionView";
+import { ChatView } from "./ChatView";
 import { DiscussView } from "./DiscussView";
 import { DesignView } from "./DesignView";
 import { SecurityView } from "./SecurityView";
@@ -15,7 +16,7 @@ import { Icon } from "./Icon";
 import { daemon } from "./daemon";
 import type { View, MissionSummary, DaemonStatus } from "./types";
 
-const PROJECT_REQUIRED_VIEWS: View[] = ["mission", "discuss", "design", "security"];
+const PROJECT_REQUIRED_VIEWS: View[] = ["mission", "chat", "discuss", "design", "security"];
 
 function AppShell() {
   const [view, setView] = useState<View>("home");
@@ -162,6 +163,16 @@ function AppShell() {
             />
           )}
           {view === "mission" && <MissionView missionId={activeMission} onOpenSettings={() => setView("settings")} />}
+          {view === "chat" && (
+            <ChatView
+              project={project}
+              onOpenMission={(missionId) => {
+                setActiveMission(missionId);
+                setView("mission");
+              }}
+              daemonConnected={daemonConnected}
+            />
+          )}
           {view === "discuss" && (
             <DiscussView
               project={project}

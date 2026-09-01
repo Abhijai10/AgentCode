@@ -205,6 +205,44 @@ pub struct DiscussMessageRow {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ConversationRow {
+    pub id: String,
+    pub project_path: String,
+    pub mode: String,
+    pub title: String,
+    pub state: String,
+    pub current_mission_id: Option<String>,
+    pub created_at_ms: i64,
+    pub updated_at_ms: i64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ConversationMessageRow {
+    pub id: String,
+    pub conversation_id: String,
+    pub role: String,
+    pub content: String,
+    pub mission_ref: Option<String>,
+    pub metadata_json: String,
+    pub created_at_ms: i64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AttachmentRow {
+    pub id: String,
+    pub conversation_id: String,
+    pub message_id: Option<String>,
+    pub project_path: String,
+    pub filename: String,
+    pub mime_type: String,
+    pub size_bytes: i64,
+    pub sha256: String,
+    pub storage_key: String,
+    pub sensitivity: String,
+    pub created_at_ms: i64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DiscussDecisionCandidateRow {
     pub id: String,
     pub session_id: String,
