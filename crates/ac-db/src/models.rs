@@ -611,6 +611,7 @@ pub struct FinalAuditRow {
     pub passed: bool,
     pub return_to_repair: bool,
     pub completion_allowed: bool,
+    pub remaining_uncertainty: String,
     pub created_at_ms: i64,
 }
 
@@ -733,6 +734,29 @@ pub struct RoutingDecisionRecord {
     pub input_tokens: u32,
     pub output_tokens: u32,
     pub estimated_cost_micros: u64,
+    pub created_at_ms: i64,
+}
+
+/// A durable, factual provider/model routing record for the conversation
+/// activity projection.  Never contains credentials or secrets — only
+/// identifiers, model name, routing mode, attempt number, outcome and a
+/// failure classification when one exists.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProviderModelRecordRow {
+    pub id: String,
+    pub project_path: Option<String>,
+    pub conversation_id: Option<String>,
+    pub mission_id: Option<String>,
+    pub session_id: Option<String>,
+    pub task_id: Option<String>,
+    pub provider_id: String,
+    pub provider_account_id: Option<String>,
+    pub model_id: String,
+    pub model_name: String,
+    pub routing_mode: String,
+    pub attempt_number: u32,
+    pub success: bool,
+    pub failure_class: Option<String>,
     pub created_at_ms: i64,
 }
 

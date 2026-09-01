@@ -182,6 +182,113 @@ impl ControlPlaneDb {
         Ok(())
     }
 
+    pub fn save_provider_model_record(&self, record: &ProviderModelRecordRow) -> AcResult<()> {
+        self.connection
+            .execute(
+                "INSERT INTO provider_model_records (
+                    id, project_path, conversation_id, mission_id, session_id, task_id,
+                    provider_id, provider_account_id, model_id, model_name, routing_mode,
+                    attempt_number, success, failure_class, created_at_ms
+                 )
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+                params![
+                    record.id,
+                    record.project_path,
+                    record.conversation_id,
+                    record.mission_id,
+                    record.session_id,
+                    record.task_id,
+                    record.provider_id,
+                    record.provider_account_id,
+                    record.model_id,
+                    record.model_name,
+                    record.routing_mode,
+                    record.attempt_number,
+                    record.success as i64,
+                    record.failure_class,
+                    record.created_at_ms,
+                ],
+            )
+            .map_err(db_error)?;
+        Ok(())
+    }
+
+    pub fn provider_model_records_for_mission(
+        &self,
+        mission_id: &str,
+    ) -> AcResult<Vec<ProviderModelRecordRow>> {
+        let mut stmt = self
+            .connection
+            .prepare(
+                "SELECT id, project_path, conversation_id, mission_id, session_id, task_id,
+                        provider_id, provider_account_id, model_id, model_name, routing_mode,
+                        attempt_number, success, failure_class, created_at_ms
+                 FROM provider_model_records
+                 WHERE mission_id=?1 ORDER BY created_at_ms ASC",
+            )
+            .map_err(db_error)?;
+        let rows = stmt
+            .query_map(params![mission_id], |row| {
+                Ok(ProviderModelRecordRow {
+                    id: row.get(0)?,
+                    project_path: row.get(1)?,
+                    conversation_id: row.get(2)?,
+                    mission_id: row.get(3)?,
+                    session_id: row.get(4)?,
+                    task_id: row.get(5)?,
+                    provider_id: row.get(6)?,
+                    provider_account_id: row.get(7)?,
+                    model_id: row.get(8)?,
+                    model_name: row.get(9)?,
+                    routing_mode: row.get(10)?,
+                    attempt_number: row.get::<_, i64>(11)? as u32,
+                    success: row.get::<_, i64>(12)? != 0,
+                    failure_class: row.get(13)?,
+                    created_at_ms: row.get(14)?,
+                })
+            })
+            .map_err(db_error)?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(db_error)
+    }
+
+    pub fn provider_model_records_for_conversation(
+        &self,
+        conversation_id: &str,
+    ) -> AcResult<Vec<ProviderModelRecordRow>> {
+        let mut stmt = self
+            .connection
+            .prepare(
+                "SELECT id, project_path, conversation_id, mission_id, session_id, task_id,
+                        provider_id, provider_account_id, model_id, model_name, routing_mode,
+                        attempt_number, success, failure_class, created_at_ms
+                 FROM provider_model_records
+                 WHERE conversation_id=?1 ORDER BY created_at_ms ASC",
+            )
+            .map_err(db_error)?;
+        let rows = stmt
+            .query_map(params![conversation_id], |row| {
+                Ok(ProviderModelRecordRow {
+                    id: row.get(0)?,
+                    project_path: row.get(1)?,
+                    conversation_id: row.get(2)?,
+                    mission_id: row.get(3)?,
+                    session_id: row.get(4)?,
+                    task_id: row.get(5)?,
+                    provider_id: row.get(6)?,
+                    provider_account_id: row.get(7)?,
+                    model_id: row.get(8)?,
+                    model_name: row.get(9)?,
+                    routing_mode: row.get(10)?,
+                    attempt_number: row.get::<_, i64>(11)? as u32,
+                    success: row.get::<_, i64>(12)? != 0,
+                    failure_class: row.get(13)?,
+                    created_at_ms: row.get(14)?,
+                })
+            })
+            .map_err(db_error)?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(db_error)
+    }
+
     pub fn routing_decision(&self, id: &str) -> AcResult<Option<RoutingDecisionRecord>> {
         let mut stmt = self
             .connection

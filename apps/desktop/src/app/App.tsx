@@ -176,14 +176,10 @@ function AppShell() {
           {view === "discuss" && (
             <DiscussView
               project={project}
-              missionId={activeMission}
+              daemonConnected={daemonConnected}
               onOpenMission={(missionId) => {
                 setActiveMission(missionId);
                 setView("mission");
-              }}
-              onNewMission={() => {
-                if (project) setView("home");
-                else setProjectModal("choose");
               }}
             />
           )}

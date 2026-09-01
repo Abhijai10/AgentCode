@@ -344,6 +344,139 @@ impl DaemonService {
         Ok((mission_id, session.id().clone()))
     }
 
+    /// DiscussSend: append a user message, build a bounded project-aware
+    /// prompt, call the provider for a conversational answer, and persist
+    /// the assistant response.  The provider/model routing decision is
+    /// persisted through the agent durability path.  This is a read-only
+    /// conversational exchange — no repository mutation occurs.
+    pub fn discuss_send(
+        &mut self,
+        conversation_id: &str,
+        content: &str,
+        _attachment_ids: &[String],
+    ) -> AcResult<ac_db::ConversationMessageRow> {
+        self.ensure_running()?;
+        let conv = self
+            .db
+            .conversation(conversation_id)?
+            .ok_or_else(|| {
+                AcError::validation("CONVERSATION-NOT_FOUND", "conversation not found")
+            })?;
+        if conv.mode != "DISCUSS" {
+            return Err(AcError::validation(
+                "CONVERSATION-WRONG_MODE",
+                "discuss_send requires a DISCUSS conversation",
+            ));
+        }
+        if content.trim().is_empty() {
+            return Err(AcError::validation(
+                "CONVERSATION-EMPTY_CONTENT",
+                "message content must not be empty",
+            ));
+        }
+        // Append user message
+        let _user_msg = self.append_message(conversation_id, "user", content, None, "{}")?;
+        // Build bounded context: recent messages + project context
+        let messages = self.db.messages_for_conversation(conversation_id)?;
+        let recent = messages
+            .iter()
+            .rev()
+            .take(20)
+            .map(|m| format!("{}: {}", m.role, bounded_ui_summary(&m.content, 4096)))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let project_hint = format!("Project: {}\n", conv.project_path);
+        let prompt = format!(
+            "{}\n{}\n\n--\nProvide a helpful, project-aware conversational response. \
+             Do NOT write code, modify files, or execute commands. \
+             Only discuss the project, architecture, design, and implementation ideas.\n",
+            project_hint, recent
+        );
+        // Build a lightweight provider registry and request a conversational answer
+        let db_path = self.db_path.clone();
+        let mut providers = crate::daemon_provider_registry(&self.db, &db_path)
+            .map_err(|error| {
+                AcError::validation(
+                    "DISCUSS-PROVIDER_SETUP",
+                    format!("cannot initialize provider registry: {error}"),
+                )
+            })?;
+        let profile = ac_provider::TaskProfile::discuss(
+            ac_common::StableId::new("discuss"),
+            ac_provider::RoutingProfile::LocalFirst,
+        );
+        let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let result = providers.request_model(
+            &profile,
+            prompt,
+            4096,
+            &|| cancel.load(std::sync::atomic::Ordering::Relaxed),
+        );
+        let content = match result {
+            Ok(ref execution) => {
+                let text = ac_agent::provider_events_text(&execution.events);
+                // Persist the provider/model routing record through the daemon path
+                let mission_id = StableId::new("discuss");
+                if let Some(selected) = &execution.decision.selected {
+                    let record = ac_agent::ProviderModelRecord {
+                        provider_id: selected.provider_id.to_string(),
+                        provider_account_id: Some(selected.connection_id.to_string()),
+                        model_id: selected.model_identity_id.to_string(),
+                        model_name: selected.model_name.clone(),
+                        routing_mode: format!("{:?}", profile.routing_profile),
+                        attempt_number: 1,
+                        success: true,
+                        failure_class: None,
+                        created_at_ms: ac_common::TimestampMillis::now().as_millis() as i64,
+                    };
+                    if let Ok(dur) = ac_db::ControlPlaneDb::open(&db_path) {
+                        let _ = dur.save_provider_model_record(&ac_db::ProviderModelRecordRow {
+                            id: format!("pmr-discuss-{}", StableId::new("record")),
+                            project_path: Some(conv.project_path.clone()),
+                            conversation_id: Some(conversation_id.to_string()),
+                            mission_id: Some(mission_id.to_string()),
+                            session_id: None,
+                            task_id: None,
+                            provider_id: record.provider_id,
+                            provider_account_id: record.provider_account_id,
+                            model_id: record.model_id,
+                            model_name: record.model_name,
+                            routing_mode: record.routing_mode,
+                            attempt_number: 1,
+                            success: true,
+                            failure_class: None,
+                            created_at_ms: record.created_at_ms,
+                        });
+                    }
+                }
+                if text.is_empty() {
+                    "[empty response from model]".to_string()
+                } else {
+                    text
+                }
+            }
+            Err(ref failure) => {
+                format!("[provider unavailable: {failure:?}]")
+            }
+        };
+        // Append assistant message
+        let metadata = json!({
+            "mode": "discuss",
+            "provider_model": result.as_ref().ok().and_then(|exec| {
+                exec.decision.selected.as_ref().map(|s| {
+                    json!({"provider_id": s.provider_id.to_string(), "model_name": s.model_name})
+                })
+            }),
+        });
+        self.append_message(
+            conversation_id,
+            "assistant",
+            &content,
+            None,
+            &metadata.to_string(),
+        )
+    }
+
     /// Read bounded attachment content from the workspace, validate security
     /// boundaries, and produce typed `ContextAttachment` values for the model
     /// context pipeline.  Each attachment is independently bounded:

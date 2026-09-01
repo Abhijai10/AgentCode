@@ -359,6 +359,222 @@ mod tests {
     }
 
     #[test]
+    fn provider_model_records_persist_and_survive_reopen() {
+        let path = std::env::temp_dir().join(format!(
+            "agentcode-pmr-{}.sqlite",
+            StableId::new("db")
+        ));
+        let now = millis(TimestampMillis::now());
+        {
+            let mut db = ControlPlaneDb::open(&path).unwrap();
+            db.migrate().unwrap();
+            let record = ProviderModelRecordRow {
+                id: "pmr-1".to_string(),
+                project_path: Some("/proj/a".to_string()),
+                conversation_id: Some("conv-1".to_string()),
+                mission_id: Some("mission-1".to_string()),
+                session_id: Some("session-1".to_string()),
+                task_id: Some("task-1".to_string()),
+                provider_id: "ollama".to_string(),
+                provider_account_id: Some("ollama-default".to_string()),
+                model_id: "qwen2.5-coder:3b".to_string(),
+                model_name: "qwen2.5-coder:3b".to_string(),
+                routing_mode: "LocalFirst".to_string(),
+                attempt_number: 1,
+                success: true,
+                failure_class: None,
+                created_at_ms: now,
+            };
+            db.save_provider_model_record(&record).unwrap();
+        }
+        {
+            let db = ControlPlaneDb::open(&path).unwrap();
+            let loaded = db.provider_model_records_for_mission("mission-1").unwrap();
+            assert_eq!(loaded.len(), 1);
+            assert_eq!(loaded[0].provider_id, "ollama");
+            assert_eq!(loaded[0].model_name, "qwen2.5-coder:3b");
+            assert_eq!(loaded[0].routing_mode, "LocalFirst");
+            assert!(loaded[0].success);
+            assert_eq!(loaded[0].attempt_number, 1);
+            let by_conv = db
+                .provider_model_records_for_conversation("conv-1")
+                .unwrap();
+            assert_eq!(by_conv.len(), 1);
+        }
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn provider_model_records_multiple_attempts_are_distinguishable_and_isolated() {
+        let path = std::env::temp_dir().join(format!(
+            "agentcode-pmr2-{}.sqlite",
+            StableId::new("db")
+        ));
+        let now = millis(TimestampMillis::now());
+        let mut db = ControlPlaneDb::open(&path).unwrap();
+        db.migrate().unwrap();
+        let base = ProviderModelRecordRow {
+            id: String::new(),
+            project_path: Some("/proj/a".to_string()),
+            conversation_id: Some("conv-1".to_string()),
+            mission_id: Some("mission-1".to_string()),
+            session_id: Some("session-1".to_string()),
+            task_id: Some("task-1".to_string()),
+            provider_id: "ollama".to_string(),
+            provider_account_id: Some("ollama-default".to_string()),
+            model_id: "qwen2.5-coder:3b".to_string(),
+            model_name: "qwen2.5-coder:3b".to_string(),
+            routing_mode: "LocalFirst".to_string(),
+            attempt_number: 1,
+            success: true,
+            failure_class: None,
+            created_at_ms: now,
+        };
+        let mut attempt_a = base.clone();
+        attempt_a.id = "pmr-attempt-a".to_string();
+        attempt_a.created_at_ms = now + 1;
+        let mut attempt_b = base.clone();
+        attempt_b.id = "pmr-attempt-b".to_string();
+        attempt_b.success = false;
+        attempt_b.failure_class = Some("ModelUnavailable".to_string());
+        attempt_b.attempt_number = 2;
+        attempt_b.created_at_ms = now + 2;
+        let mut other_project = base.clone();
+        other_project.id = "pmr-other-project".to_string();
+        other_project.project_path = Some("/proj/b".to_string());
+        other_project.conversation_id = Some("conv-b".to_string());
+        other_project.mission_id = Some("mission-b".to_string());
+        db.save_provider_model_record(&attempt_a).unwrap();
+        db.save_provider_model_record(&attempt_b).unwrap();
+        db.save_provider_model_record(&other_project).unwrap();
+
+        // Multiple attempts remain distinguishable
+        let attempts = db.provider_model_records_for_mission("mission-1").unwrap();
+        assert_eq!(attempts.len(), 2);
+        assert_ne!(attempts[0].id, attempts[1].id);
+        let failed = attempts.iter().find(|r| !r.success).unwrap();
+        assert_eq!(failed.failure_class.as_deref(), Some("ModelUnavailable"));
+        assert_eq!(failed.attempt_number, 2);
+        // Project isolation
+        let other = db.provider_model_records_for_conversation("conv-b").unwrap();
+        assert_eq!(other.len(), 1);
+        assert_eq!(other[0].mission_id.as_deref(), Some("mission-b"));
+        assert!(db
+            .provider_model_records_for_mission("mission-1")
+            .unwrap()
+            .iter()
+            .all(|r| r.project_path.as_deref() == Some("/proj/a")));
+        // Never persist secrets: no record contains credential material.  The
+        // canary value would only appear if secret material leaked into the
+        // durable row; ordinary identifier strings like "task-" are unrelated.
+        let canary = "sk-SECRET_CANARY_VALUE";
+        let all: Vec<String> = attempts
+            .iter()
+            .map(|r| format!("{r:?}"))
+            .collect();
+        assert!(!all.join("\n").contains(canary));
+        assert!(!all.join("\n").contains("api_key"));
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn final_audit_remaining_uncertainty_survives_reopen() {
+        let path = std::env::temp_dir().join(format!(
+            "agentcode-unc-{}.sqlite",
+            StableId::new("db")
+        ));
+        let mut evidence = ac_evidence::EvidenceStore::new();
+        let engine = ac_verification::VerificationEngine::new(ac_security::CapabilityPolicy::new());
+        let requirement_id = StableId::new("req");
+        let audit = engine
+            .final_audit(
+                ac_verification::FinalAuditInput {
+                    original_goal: "complete feature".to_string(),
+                    requirements: vec!["works".to_string()],
+                    required_requirement_ids: vec![requirement_id.clone()],
+                    verified_requirement_ids: vec![requirement_id.clone()],
+                    evidence_refs: vec![StableId::new("evidence")],
+                    worker_completion_text: "done".to_string(),
+                    unresolved_limitations: vec![
+                        "verification required 1 retry attempt(s)".to_string(),
+                        "observed task failure: ModelUnavailable".to_string(),
+                    ],
+                },
+                &mut evidence,
+            )
+            .unwrap();
+        {
+            let mut db = ControlPlaneDb::open(&path).unwrap();
+            db.migrate().unwrap();
+            db.save_final_audit(
+                "mission-unc",
+                "complete feature",
+                &["works".to_string()],
+                &audit,
+                true,
+                "verification required 1 retry attempt(s)\nobserved task failure: ModelUnavailable",
+            )
+            .unwrap();
+        }
+        {
+            let db = ControlPlaneDb::open(&path).unwrap();
+            let audits = db.final_audits("mission-unc").unwrap();
+            assert_eq!(audits.len(), 1);
+            assert!(audits[0].completion_allowed);
+            assert!(audits[0].remaining_uncertainty.contains("retry"));
+            assert!(audits[0].remaining_uncertainty.contains("ModelUnavailable"));
+
+            assert!(audits[0].passed);
+        }
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn final_audit_no_uncertainty_is_not_fabricated() {
+        let path = std::env::temp_dir().join(format!(
+            "agentcode-unc2-{}.sqlite",
+            StableId::new("db")
+        ));
+        let mut evidence = ac_evidence::EvidenceStore::new();
+        let engine = ac_verification::VerificationEngine::new(ac_security::CapabilityPolicy::new());
+        let requirement_id = StableId::new("req2");
+        let audit = engine
+            .final_audit(
+                ac_verification::FinalAuditInput {
+                    original_goal: "clean mission".to_string(),
+                    requirements: vec!["clean".to_string()],
+                    required_requirement_ids: vec![requirement_id.clone()],
+                    verified_requirement_ids: vec![requirement_id.clone()],
+                    evidence_refs: vec![StableId::new("evidence2")],
+                    worker_completion_text: "done".to_string(),
+                    unresolved_limitations: Vec::new(),
+                },
+                &mut evidence,
+            )
+            .unwrap();
+        {
+            let mut db = ControlPlaneDb::open(&path).unwrap();
+            db.migrate().unwrap();
+            db.save_final_audit(
+                "mission-clean",
+                "clean mission",
+                &["clean".to_string()],
+                &audit,
+                true,
+                "",
+            )
+            .unwrap();
+        }
+        {
+            let db = ControlPlaneDb::open(&path).unwrap();
+            let audits = db.final_audits("mission-clean").unwrap();
+            assert_eq!(audits[0].remaining_uncertainty, "");
+            assert!(audits[0].passed);
+        }
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
     fn durable_evidence_survives_reopen_without_secret_payloads() {
         let path =
             std::env::temp_dir().join(format!("agentcode-evidence-{}.sqlite", StableId::new("db")));
@@ -1014,6 +1230,7 @@ mod tests {
                 &["verification evidence exists".to_string()],
                 &audit,
                 true,
+                "",
             )
             .unwrap();
         }

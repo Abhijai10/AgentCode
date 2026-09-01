@@ -134,6 +134,70 @@ impl ControlPlaneDb {
         Ok(())
     }
 
+    /// Find the conversation that references a mission, either as its current
+    /// mission or via any message mission_ref.  Returns the most recently
+    /// updated match.  This is authoritative — no fabricated association.
+    pub fn conversation_for_mission(
+        &self,
+        mission_id: &str,
+    ) -> AcResult<Option<ConversationRow>> {
+        let mut stmt = self
+            .connection
+            .prepare(
+                "SELECT id, project_path, mode, title, state, current_mission_id,
+                 created_at_ms, updated_at_ms FROM conversations
+                 WHERE current_mission_id=?1
+                 ORDER BY updated_at_ms DESC LIMIT 1",
+            )
+            .map_err(db_error)?;
+        if let Some(row) = stmt
+            .query_row([mission_id], |row| {
+                Ok(ConversationRow {
+                    id: row.get(0)?,
+                    project_path: row.get(1)?,
+                    mode: row.get(2)?,
+                    title: row.get(3)?,
+                    state: row.get(4)?,
+                    current_mission_id: row.get(5)?,
+                    created_at_ms: row.get(6)?,
+                    updated_at_ms: row.get(7)?,
+                })
+            })
+            .optional()
+            .map_err(db_error)?
+        {
+            return Ok(Some(row));
+        }
+        // Fall back to message-level references (follow-up missions).
+        let mut stmt = self
+            .connection
+            .prepare(
+                "SELECT c.id, c.project_path, c.mode, c.title, c.state, c.current_mission_id,
+                 c.created_at_ms, c.updated_at_ms
+                 FROM conversations c
+                 JOIN conversation_messages m ON m.conversation_id = c.id
+                 WHERE m.mission_ref=?1 AND c.state!='deleted'
+                 ORDER BY c.updated_at_ms DESC LIMIT 1",
+            )
+            .map_err(db_error)?;
+        let row = stmt
+            .query_row([mission_id], |row| {
+                Ok(ConversationRow {
+                    id: row.get(0)?,
+                    project_path: row.get(1)?,
+                    mode: row.get(2)?,
+                    title: row.get(3)?,
+                    state: row.get(4)?,
+                    current_mission_id: row.get(5)?,
+                    created_at_ms: row.get(6)?,
+                    updated_at_ms: row.get(7)?,
+                })
+            })
+            .optional()
+            .map_err(db_error)?;
+        Ok(row)
+    }
+
     // ── Messages ───────────────────────────────────────────────────────────────
 
     pub fn save_message(&self, row: &ConversationMessageRow) -> AcResult<()> {

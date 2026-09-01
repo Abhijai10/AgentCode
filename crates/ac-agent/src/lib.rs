@@ -842,6 +842,37 @@ pub trait AgentDurabilityObserver: Send {
     fn load_evidence_records(&mut self, _ids: &[StableId]) -> AcResult<Vec<EvidenceRecord>> {
         Ok(Vec::new())
     }
+
+    /// Persist a provider/model routing decision.  The record is a minimal
+    /// factual summary: provider & model identities, routing mode, attempt
+    /// number, success/failure, failure classification, and timestamp.
+    /// The implementor resolves project_path and conversation_id from the
+    /// mission/session identifiers if needed.
+    fn provider_routing_recorded(
+        &mut self,
+        _mission_id: &str,
+        _session_id: &str,
+        _task_id: Option<&str>,
+        _record: &ProviderModelRecord,
+    ) -> AcResult<()> {
+        Ok(())
+    }
+}
+
+/// A durable, factual record of a provider/model routing decision.
+/// Never contains credentials or secrets — only identifiers, model name,
+/// routing mode, attempt number, outcome, and failure classification.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProviderModelRecord {
+    pub provider_id: String,
+    pub provider_account_id: Option<String>,
+    pub model_id: String,
+    pub model_name: String,
+    pub routing_mode: String,
+    pub attempt_number: u32,
+    pub success: bool,
+    pub failure_class: Option<String>,
+    pub created_at_ms: i64,
 }
 
 pub struct AutonomousAgent<P: PolicyBoundary> {
@@ -1007,6 +1038,83 @@ impl<P: PolicyBoundary> AutonomousAgent<P> {
             }
         }
         Ok(())
+    }
+
+    /// Derive remaining uncertainty from authoritative backend state that the
+    /// agent actually knows about.  Nothing is invented: only replans that
+    /// occurred, failed observations with failure classes, and bounded
+    /// verification-failure signals are reported.  Empty when the run was
+    /// clean.
+    fn remaining_uncertainty(&self) -> Vec<String> {
+        let mut limitations = Vec::new();
+        if !self.replans.is_empty() {
+            limitations.push(format!(
+                "mission required replanning {} time(s)",
+                self.replans.len()
+            ));
+        }
+        let failed_classes = self
+            .observations
+            .iter()
+            .filter(|observation| !observation.success)
+            .filter_map(|observation| observation.failure_class.clone())
+            .collect::<std::collections::BTreeSet<_>>();
+        for class in failed_classes {
+            limitations.push(format!("observed task failure: {class}"));
+        }
+        if self.verification_failures_remaining > 0 {
+            limitations.push(format!(
+                "verification required {} retry attempt(s)",
+                self.verification_failures_remaining
+            ));
+        }
+        limitations
+    }
+
+    /// Persist a provider/model routing decision through the durability
+    /// observer so the conversation activity projection can report which
+    /// provider and model actually served each request.  Failures are
+    /// recorded with the failure classification and success=false; successes
+    /// record the selected provider/model.  The record is never skipped
+    /// silently: routing is backend-owned and factual.
+    fn persist_provider_routing(
+        &mut self,
+        mission_id: &StableId,
+        task_id: Option<&StableId>,
+        profile: &TaskProfile,
+        decision: &ac_provider::RoutingDecision,
+    ) -> AcResult<()> {
+        let Some(observer) = &mut self.durability else {
+            return Ok(());
+        };
+        let selected = decision.selected.as_ref();
+        let attempt_number = routing_attempt_number(decision);
+        let record = ProviderModelRecord {
+            provider_id: selected
+                .map(|c| c.provider_id.to_string())
+                .unwrap_or_else(|| "unknown".to_string()),
+            provider_account_id: selected.map(|c| c.connection_id.to_string()),
+            model_id: selected
+                .map(|c| c.model_identity_id.to_string())
+                .unwrap_or_else(|| "unknown".to_string()),
+            model_name: selected
+                .map(|c| c.model_name.clone())
+                .unwrap_or_else(|| "unknown".to_string()),
+            routing_mode: format!("{:?}", profile.routing_profile),
+            attempt_number,
+            success: selected.is_some(),
+            failure_class: decision
+                .fallback_reason
+                .clone()
+                .or_else(|| decision.rejected.last().cloned()),
+            created_at_ms: decision.created_at.as_millis() as i64,
+        };
+        observer.provider_routing_recorded(
+            mission_id.as_str(),
+            self.session.id().as_str(),
+            task_id.map(StableId::as_str),
+            &record,
+        )
     }
 
     /// Load persisted evidence records into the in-memory EvidenceStore.
@@ -1504,15 +1612,42 @@ impl<P: PolicyBoundary> AutonomousAgent<P> {
             _ => TaskProfile::coding(goal.id.clone(), RoutingProfile::FreeFirst),
         };
         profile.required_context = context.budget;
-        let execution = self
+        let mission_id = self.bound_mission_id.clone();
+        let prompt = build_provider_prompt(role, goal, context, task, &self.observations);
+        let max_tokens = if role == "planner" { 4096 } else { 8192 };
+        let result = self
             .providers
-            .request_model(
-                &profile,
-                build_provider_prompt(role, goal, context, task, &self.observations),
-                if role == "planner" { 4096 } else { 8192 },
-                &|| self.session.is_cancelled(),
-            )
-            .map_err(provider_error)?;
+            .request_model(&profile, prompt, max_tokens, &|| {
+                self.session.is_cancelled()
+            });
+        let execution = match result {
+            Ok(execution) => {
+                if let Some(ref mid) = mission_id {
+                    let task_id = task.map(|t| t.id.clone());
+                    let _ = self.persist_provider_routing(
+                        mid,
+                        task_id.as_ref(),
+                        &profile,
+                        &execution.decision,
+                    );
+                }
+                execution
+            }
+            Err(failure) => {
+                if let Some(ref mid) = mission_id {
+                    if let Some(decision) = self.providers.routing_decisions().last().cloned() {
+                        let task_id = task.map(|t| t.id.clone());
+                        let _ = self.persist_provider_routing(
+                            mid,
+                            task_id.as_ref(),
+                            &profile,
+                            &decision,
+                        );
+                    }
+                }
+                return Err(provider_error(failure));
+            }
+        };
         let events = execution.events;
         let text = provider_events_text(&events);
         let evidence = self.evidence.append(
@@ -2147,7 +2282,7 @@ impl<P: PolicyBoundary> AutonomousAgent<P> {
                 evidence_refs: accepted.clone(),
                 worker_completion_text: "worker requests completion with verification evidence"
                     .to_string(),
-                unresolved_limitations: Vec::new(),
+                unresolved_limitations: self.remaining_uncertainty(),
             },
             &mut self.evidence,
         )?;
@@ -3200,6 +3335,22 @@ fn truncate_for_log(text: &str, max_chars: usize) -> String {
     }
 }
 
+/// Derive the routing attempt number from a routing decision.  The provider
+/// layer encodes retry attempts in `fallback_reason` (e.g. `attempt1`,
+/// `attempt2`).  When no attempt marker exists (e.g. a first success) this
+/// returns 1 so the persisted record always carries a meaningful attempt.
+fn routing_attempt_number(decision: &ac_provider::RoutingDecision) -> u32 {
+    let fallback = decision.fallback_reason.as_deref().unwrap_or("");
+    let attempt = fallback.split("attempt").nth(1).and_then(|tail| {
+        tail.chars()
+            .take_while(|c| c.is_ascii_digit())
+            .collect::<String>()
+            .parse::<u32>()
+            .ok()
+    });
+    attempt.unwrap_or(1)
+}
+
 fn verifier_profile(task_id: StableId) -> TaskProfile {
     let mut profile = TaskProfile::coding(task_id, RoutingProfile::QualityFirst);
     profile.role = "verifier".to_string();
@@ -3373,7 +3524,7 @@ fn strip_markdown_code_fences(text: &str) -> &str {
     trimmed
 }
 
-fn provider_events_text(events: &[ProviderStreamEvent]) -> String {
+pub fn provider_events_text(events: &[ProviderStreamEvent]) -> String {
     events
         .iter()
         .filter_map(|event| match event {

@@ -103,6 +103,49 @@ impl ac_agent::AgentDurabilityObserver for SqliteAgentDurability {
             .filter(|record| ids.contains(&record.id))
             .collect())
     }
+
+    fn provider_routing_recorded(
+        &mut self,
+        mission_id: &str,
+        session_id: &str,
+        task_id: Option<&str>,
+        record: &ac_agent::ProviderModelRecord,
+    ) -> AcResult<()> {
+        let db = self.db()?;
+        // Resolve project_path and conversation_id from authoritative state.
+        // Conversations are the user-facing container; a mission may be
+        // referenced by a conversation's current_mission_id or by message
+        // mission_refs.  Never fabricate either association.
+        let mission = StableId::from_existing(mission_id)?;
+        let conversation = db.conversation_for_mission(&mission.to_string())?;
+        let project_path = conversation
+            .as_ref()
+            .map(|c| c.project_path.clone())
+            .or_else(|| {
+                db.session_for_mission(&mission)
+                    .ok()
+                    .flatten()
+                    .and_then(|session| session.workspace_root)
+            });
+        let row = ac_db::ProviderModelRecordRow {
+            id: format!("pmr-{}-{}", StableId::new("record"), record.created_at_ms),
+            project_path,
+            conversation_id: conversation.map(|c| c.id),
+            mission_id: Some(mission_id.to_string()),
+            session_id: Some(session_id.to_string()),
+            task_id: task_id.map(ToString::to_string),
+            provider_id: record.provider_id.clone(),
+            provider_account_id: record.provider_account_id.clone(),
+            model_id: record.model_id.clone(),
+            model_name: record.model_name.clone(),
+            routing_mode: record.routing_mode.clone(),
+            attempt_number: record.attempt_number,
+            success: record.success,
+            failure_class: record.failure_class.clone(),
+            created_at_ms: record.created_at_ms,
+        };
+        db.save_provider_model_record(&row)
+    }
 }
 
 #[derive(Default)]

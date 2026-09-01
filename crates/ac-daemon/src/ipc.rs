@@ -509,6 +509,17 @@ fn dispatch_request(request: &Value, daemon: &mut DaemonService) -> (Value, bool
                 Err(error) => error_response(correlation_id, error.code(), error.to_string()),
             }
         },
+        "DiscussSend" => {
+            let conversation_id = request.get("conversation_id").and_then(Value::as_str).unwrap_or("");
+            let content = request.get("content").and_then(Value::as_str).unwrap_or("");
+            let attachment_ids = request.get("attachment_ids").and_then(Value::as_array).map(|arr| {
+                arr.iter().filter_map(Value::as_str).map(ToString::to_string).collect::<Vec<_>>()
+            }).unwrap_or_default();
+            match daemon.discuss_send(conversation_id, content, &attachment_ids) {
+                Ok(message) => json!({"id": correlation_id, "ok": true, "message": message_json(message)}),
+                Err(error) => error_response(correlation_id, error.code(), error.to_string()),
+            }
+        },
         "ConversationActivity" => {
             let conversation_id = request.get("conversation_id").and_then(Value::as_str).unwrap_or("");
             match daemon.conversation_activity(conversation_id) {
@@ -1124,6 +1135,7 @@ mod ipc_tests {
                 &["feature works".to_string()],
                 &audit,
                 true,
+                "",
             )
             .unwrap();
         }
@@ -2706,4 +2718,340 @@ mod ipc_tests {
         let _ = fs::remove_dir_all(dir);
     }
 
+    #[test]
+    fn conversation_activity_projects_provider_models_and_uncertainty() {
+        let (dir, db_path, lock, socket) = temp_paths("conv-provider-uncertainty");
+        let seeded_mission_id;
+        {
+            let mut db = ControlPlaneDb::open(&db_path).unwrap();
+            db.migrate().unwrap();
+            let seeded = seed_observability_mission(&db, true);
+            seeded_mission_id = seeded.mission_id;
+            let now = ac_common::TimestampMillis::now().as_millis() as i64;
+            db.save_provider_model_record(&ac_db::ProviderModelRecordRow {
+                id: "pmr-seed-1".to_string(),
+                project_path: Some("/tmp/observability-workspace".to_string()),
+                conversation_id: None,
+                mission_id: Some(seeded_mission_id.clone()),
+                session_id: Some("session-seed".to_string()),
+                task_id: Some("task-seed".to_string()),
+                provider_id: "ollama".to_string(),
+                provider_account_id: Some("ollama-default".to_string()),
+                model_id: "qwen2.5-coder:3b".to_string(),
+                model_name: "qwen2.5-coder:3b".to_string(),
+                routing_mode: "LocalFirst".to_string(),
+                attempt_number: 1,
+                success: true,
+                failure_class: None,
+                created_at_ms: now,
+            })
+            .unwrap();
+        }
+        let mut daemon = DaemonService::open(&db_path, &lock).unwrap();
+        let Some((server, listener)) = bind_or_skip(&socket, None) else {
+            daemon.shutdown().unwrap();
+            let _ = fs::remove_dir_all(dir);
+            return;
+        };
+        let details = request_via_ipc(
+            &server, &listener, &mut daemon,
+            json!({"id":"obs","command":"GetMissionDetails","mission_id": seeded_mission_id}),
+        );
+        assert_eq!(details["ok"], true);
+
+        let verification = request_via_ipc(
+            &server, &listener, &mut daemon,
+            json!({"id":"v1","command":"GetVerificationSummary","mission_id": seeded_mission_id}),
+        );
+        assert_eq!(verification["ok"], true);
+        if let Some(audits) = verification["final_audits"].as_array() {
+            if !audits.is_empty() {
+                assert!(audits[0].get("remaining_uncertainty").is_some());
+            }
+        }
+
+        server.cleanup();
+        daemon.shutdown().unwrap();
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn discuss_send_creates_discuss_conversation_and_appends_messages() {
+        let _env_lock = crate::TEST_ENV_LOCK.lock().unwrap();
+        std::env::set_var("AGENTCODE_PROVIDER_MODE", "mock");
+        let (dir, db, lock, socket) = temp_paths("ipc-discuss");
+        let project_dir = dir.join("workspace");
+        fs::create_dir_all(&project_dir).unwrap();
+        let project_path = project_dir.to_string_lossy().to_string();
+
+        let mut daemon = DaemonService::open(&db, &lock).unwrap();
+        daemon.start().unwrap();
+        let Some((server, listener)) = bind_or_skip(&socket, None) else {
+            daemon.shutdown().unwrap();
+            std::env::remove_var("AGENTCODE_PROVIDER_MODE");
+            let _ = fs::remove_dir_all(dir);
+            return;
+        };
+
+        // Create a DISCUSS conversation
+        let create = request_via_ipc(
+            &server, &listener, &mut daemon,
+            json!({"id":"c1","command":"ConversationCreate","project_path": project_path, "mode":"DISCUSS","title":"Discuss Test"}),
+        );
+        assert_eq!(create["ok"], true, "create: {create}");
+        let cid = create["conversation_id"].as_str().unwrap().to_string();
+
+        // Verify the conversation mode is DISCUSS
+        let get = request_via_ipc(
+            &server, &listener, &mut daemon,
+            json!({"id":"g1","command":"ConversationGet","conversation_id": cid}),
+        );
+        assert_eq!(get["ok"], true);
+        assert_eq!(get["conversation"]["mode"], "DISCUSS");
+
+        // Send a discuss message
+        let send = request_via_ipc(
+            &server, &listener, &mut daemon,
+            json!({"id":"d1","command":"DiscussSend","conversation_id": cid, "content": "What does this project use for authentication?"}),
+        );
+        assert_eq!(send["ok"], true, "send: {send}");
+        let msg = &send["message"];
+        assert_eq!(msg["role"], "assistant");
+        assert_eq!(msg["conversation_id"], cid);
+
+        // Conversation must have both messages (user + assistant)
+        let get2 = request_via_ipc(
+            &server, &listener, &mut daemon,
+            json!({"id":"g2","command":"ConversationGet","conversation_id": cid}),
+        );
+        assert_eq!(get2["ok"], true);
+        let msgs = get2["conversation"]["messages"].as_array().unwrap();
+        assert_eq!(msgs.len(), 2, "should have 2 messages, got {msgs:?}");
+        assert_eq!(msgs[0]["role"], "user");
+        assert_eq!(msgs[1]["role"], "assistant");
+
+        // A second DiscussSend appends a third message
+        let send2 = request_via_ipc(
+            &server, &listener, &mut daemon,
+            json!({"id":"d2","command":"DiscussSend","conversation_id": cid, "content": "How is the daemon structured?"}),
+        );
+        assert_eq!(send2["ok"], true);
+        let get3 = request_via_ipc(
+            &server, &listener, &mut daemon,
+            json!({"id":"g3","command":"ConversationGet","conversation_id": cid}),
+        );
+        assert_eq!(get3["ok"], true);
+        let msgs3 = get3["conversation"]["messages"].as_array().unwrap();
+        assert_eq!(msgs3.len(), 4, "should have 4 messages, got {msgs3:?}");
+
+        server.cleanup();
+        daemon.shutdown().unwrap();
+        std::env::remove_var("AGENTCODE_PROVIDER_MODE");
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn discuss_send_requires_discuss_mode_and_rejects_other_modes() {
+        let _env_lock = crate::TEST_ENV_LOCK.lock().unwrap();
+        std::env::set_var("AGENTCODE_PROVIDER_MODE", "mock");
+        let (dir, db, lock, socket) = temp_paths("ipc-discuss-mode");
+        let project_dir = dir.join("workspace");
+        fs::create_dir_all(&project_dir).unwrap();
+        let project_path = project_dir.to_string_lossy().to_string();
+
+        let mut daemon = DaemonService::open(&db, &lock).unwrap();
+        daemon.start().unwrap();
+        let Some((server, listener)) = bind_or_skip(&socket, None) else {
+            daemon.shutdown().unwrap();
+            std::env::remove_var("AGENTCODE_PROVIDER_MODE");
+            let _ = fs::remove_dir_all(dir);
+            return;
+        };
+
+        // Create a GOAL conversation
+        let create = request_via_ipc(
+            &server, &listener, &mut daemon,
+            json!({"id":"c1","command":"ConversationCreate","project_path": project_path, "mode":"GOAL","title":"Goal Chat"}),
+        );
+        let cid = create["conversation_id"].as_str().unwrap().to_string();
+
+        // DiscussSend must fail with WRONG_MODE for GOAL conversations
+        let send = request_via_ipc(
+            &server, &listener, &mut daemon,
+            json!({"id":"d1","command":"DiscussSend","conversation_id": cid, "content": "test"}),
+        );
+        assert_eq!(send["ok"], false, "should reject GOAL mode");
+        assert_eq!(send["error"]["code"], "CONVERSATION-WRONG_MODE");
+
+        // Create a DISCUSS conversation (should succeed)
+        let create2 = request_via_ipc(
+            &server, &listener, &mut daemon,
+            json!({"id":"c2","command":"ConversationCreate","project_path": project_path, "mode":"DISCUSS","title":"Discuss Chat"}),
+        );
+        assert_eq!(create2["ok"], true);
+        let cid2 = create2["conversation_id"].as_str().unwrap().to_string();
+
+        let send2 = request_via_ipc(
+            &server, &listener, &mut daemon,
+            json!({"id":"d2","command":"DiscussSend","conversation_id": cid2, "content": "What is the architecture?"}),
+        );
+        assert_eq!(send2["ok"], true, "DISCUSS mode should work: {send2}");
+
+        server.cleanup();
+        daemon.shutdown().unwrap();
+        std::env::remove_var("AGENTCODE_PROVIDER_MODE");
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn discuss_conversation_persists_after_daemon_restart() {
+        let _env_lock = crate::TEST_ENV_LOCK.lock().unwrap();
+        std::env::set_var("AGENTCODE_PROVIDER_MODE", "mock");
+        let (dir, db, lock, socket) = temp_paths("ipc-discuss-restart");
+        let project_dir = dir.join("workspace");
+        fs::create_dir_all(&project_dir).unwrap();
+        let project_path = project_dir.to_string_lossy().to_string();
+
+        let mut daemon = DaemonService::open(&db, &lock).unwrap();
+        daemon.start().unwrap();
+        let Some((server, listener)) = bind_or_skip(&socket, None) else {
+            daemon.shutdown().unwrap();
+            std::env::remove_var("AGENTCODE_PROVIDER_MODE");
+            let _ = fs::remove_dir_all(dir);
+            return;
+        };
+
+        let create = request_via_ipc(
+            &server, &listener, &mut daemon,
+            json!({"id":"c1","command":"ConversationCreate","project_path": project_path, "mode":"DISCUSS","title":"Restart Test"}),
+        );
+        let cid = create["conversation_id"].as_str().unwrap().to_string();
+
+        let send = request_via_ipc(
+            &server, &listener, &mut daemon,
+            json!({"id":"d1","command":"DiscussSend","conversation_id": cid, "content": "Explain the IPC architecture"}),
+        );
+        assert_eq!(send["ok"], true);
+
+        server.cleanup();
+        daemon.shutdown().unwrap();
+
+        let mut daemon2 = DaemonService::open(&db, &lock).unwrap();
+        daemon2.start().unwrap();
+        let Some((server2, listener2)) = bind_or_skip(&socket, None) else {
+            daemon2.shutdown().unwrap();
+            std::env::remove_var("AGENTCODE_PROVIDER_MODE");
+            let _ = fs::remove_dir_all(dir);
+            return;
+        };
+
+        let get = request_via_ipc(
+            &server2, &listener2, &mut daemon2,
+            json!({"id":"g1","command":"ConversationGet","conversation_id": cid}),
+        );
+        assert_eq!(get["ok"], true);
+        assert_eq!(get["conversation"]["mode"], "DISCUSS");
+        let msgs = get["conversation"]["messages"].as_array().unwrap();
+        assert!(
+            !msgs.is_empty(),
+            "messages must survive restart, got {}",
+            msgs.len()
+        );
+
+        let send2 = request_via_ipc(
+            &server2, &listener2, &mut daemon2,
+            json!({"id":"d2","command":"DiscussSend","conversation_id": cid, "content": "Continue after restart"}),
+        );
+        assert_eq!(send2["ok"], true);
+
+        let get2 = request_via_ipc(
+            &server2, &listener2, &mut daemon2,
+            json!({"id":"g2","command":"ConversationGet","conversation_id": cid}),
+        );
+        let msgs2 = get2["conversation"]["messages"].as_array().unwrap();
+        assert!(
+            msgs2.len() > 1,
+            "messages must grow after restart, got {}",
+            msgs2.len()
+        );
+
+        server2.cleanup();
+        daemon2.shutdown().unwrap();
+        std::env::remove_var("AGENTCODE_PROVIDER_MODE");
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn discuss_project_isolation_multiple_conversations() {
+        let _env_lock = crate::TEST_ENV_LOCK.lock().unwrap();
+        std::env::set_var("AGENTCODE_PROVIDER_MODE", "mock");
+        let (dir, db, lock, socket) = temp_paths("ipc-discuss-isolation");
+        let project_a = dir.join("proj-a");
+        let project_b = dir.join("proj-b");
+        fs::create_dir_all(&project_a).unwrap();
+        fs::create_dir_all(&project_b).unwrap();
+        let path_a = project_a.to_string_lossy().to_string();
+        let path_b = project_b.to_string_lossy().to_string();
+
+        let mut daemon = DaemonService::open(&db, &lock).unwrap();
+        daemon.start().unwrap();
+        let Some((server, listener)) = bind_or_skip(&socket, None) else {
+            daemon.shutdown().unwrap();
+            std::env::remove_var("AGENTCODE_PROVIDER_MODE");
+            let _ = fs::remove_dir_all(dir);
+            return;
+        };
+
+        let ca = request_via_ipc(
+            &server, &listener, &mut daemon,
+            json!({"id":"c1","command":"ConversationCreate","project_path": path_a, "mode":"DISCUSS","title":"Proj A Discuss"}),
+        );
+        let cid_a = ca["conversation_id"].as_str().unwrap().to_string();
+
+        let cb = request_via_ipc(
+            &server, &listener, &mut daemon,
+            json!({"id":"c2","command":"ConversationCreate","project_path": path_b, "mode":"DISCUSS","title":"Proj B Discuss"}),
+        );
+        let cid_b = cb["conversation_id"].as_str().unwrap().to_string();
+
+        let send_a = request_via_ipc(
+            &server, &listener, &mut daemon,
+            json!({"id":"d1","command":"DiscussSend","conversation_id": cid_a, "content": "Question about project A"}),
+        );
+        assert_eq!(send_a["ok"], true);
+
+        let send_b = request_via_ipc(
+            &server, &listener, &mut daemon,
+            json!({"id":"d2","command":"DiscussSend","conversation_id": cid_b, "content": "Question about project B"}),
+        );
+        assert_eq!(send_b["ok"], true);
+
+        let list_a = request_via_ipc(
+            &server, &listener, &mut daemon,
+            json!({"id":"l1","command":"ConversationList","project_path": path_a}),
+        );
+        let convs_a = list_a["conversations"].as_array().unwrap();
+        assert_eq!(convs_a.len(), 1);
+        assert_eq!(convs_a[0]["id"], cid_a);
+
+        let list_b = request_via_ipc(
+            &server, &listener, &mut daemon,
+            json!({"id":"l2","command":"ConversationList","project_path": path_b}),
+        );
+        let convs_b = list_b["conversations"].as_array().unwrap();
+        assert_eq!(convs_b.len(), 1);
+        assert_eq!(convs_b[0]["id"], cid_b);
+
+        let get_a = request_via_ipc(
+            &server, &listener, &mut daemon,
+            json!({"id":"g1","command":"ConversationGet","conversation_id": cid_a}),
+        );
+        let msgs_a = get_a["conversation"]["messages"].as_array().unwrap();
+        assert!(msgs_a[0]["content"].as_str().unwrap().contains("project A"));
+
+        server.cleanup();
+        daemon.shutdown().unwrap();
+        std::env::remove_var("AGENTCODE_PROVIDER_MODE");
+        let _ = fs::remove_dir_all(dir);
+    }
 }

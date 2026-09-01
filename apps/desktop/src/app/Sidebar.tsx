@@ -5,6 +5,7 @@ import type { Project } from "./ProjectContext";
 const NAV: { view: View; label: string; icon: string }[] = [
   { view: "home", label: "Home", icon: "home" },
   { view: "chat", label: "Chat", icon: "forum" },
+  { view: "discuss", label: "Discuss", icon: "smart_toy" },
   { view: "mission", label: "Mission", icon: "terminal" },
   { view: "design", label: "Design", icon: "draw" },
   { view: "security", label: "Security", icon: "security" },

@@ -1,4 +1,4 @@
-pub const CURRENT_SCHEMA_VERSION: u32 = 24;
+pub const CURRENT_SCHEMA_VERSION: u32 = 25;
 
 impl ControlPlaneDb {
     pub fn open(path: impl AsRef<Path>) -> AcResult<Self> {
@@ -162,6 +162,12 @@ impl ControlPlaneDb {
         if current_version < 24 {
             tx.execute_batch(include_str!(
                 "../../../migrations/0023_conversations.sql"
+            ))
+            .map_err(db_error)?;
+        }
+        if current_version < 25 {
+            tx.execute_batch(include_str!(
+                "../../../migrations/0024_provider_model_and_uncertainty.sql"
             ))
             .map_err(db_error)?;
         }

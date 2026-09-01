@@ -1153,6 +1153,24 @@ fn daemon_conversation_activity(
     )
 }
 
+#[tauri::command]
+fn daemon_discuss_send(
+    state: tauri::State<DaemonClient>,
+    conversation_id: String,
+    content: String,
+    attachment_ids: Option<Vec<String>>,
+) -> Result<Value, String> {
+    let mut payload = json!({
+        "conversation_id": conversation_id,
+        "content": content,
+        "attachment_ids": attachment_ids.unwrap_or_default(),
+    });
+    if payload["attachment_ids"] == Value::Null {
+        payload["attachment_ids"] = json!([]);
+    }
+    request(&state.0, "ui", "DiscussSend", payload)
+}
+
 fn guess_mime(filename: &str) -> String {
     let lower = filename.to_ascii_lowercase();
     if lower.ends_with(".png") {
@@ -1262,6 +1280,7 @@ fn main() {
             daemon_attachment_list,
             daemon_attachment_remove,
             daemon_conversation_activity,
+            daemon_discuss_send,
         ])
         .run(tauri::generate_context!())
         .expect("error while running AgentCode desktop application");

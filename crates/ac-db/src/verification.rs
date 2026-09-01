@@ -372,10 +372,13 @@ impl ControlPlaneDb {
         requirements: &[String],
         audit: &FinalAuditReport,
         completion_allowed: bool,
+        remaining_uncertainty: &str,
     ) -> AcResult<()> {
         self.connection
             .execute(
-                "INSERT INTO final_audits VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                "INSERT INTO final_audits (id, mission_id, original_goal, requirements, evidence_refs,
+                         passed, return_to_repair, completion_allowed, created_at_ms, remaining_uncertainty)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
                 params![
                     audit.id.to_string(),
                     mission_id,
@@ -390,7 +393,8 @@ impl ControlPlaneDb {
                     if audit.passed { 1_i64 } else { 0_i64 },
                     if audit.return_to_repair { 1_i64 } else { 0_i64 },
                     if completion_allowed { 1_i64 } else { 0_i64 },
-                    millis(TimestampMillis::now())
+                    millis(TimestampMillis::now()),
+                    remaining_uncertainty,
                 ],
             )
             .map_err(db_error)?;
@@ -461,7 +465,7 @@ impl ControlPlaneDb {
             .connection
             .prepare(
                 "SELECT id, mission_id, original_goal, requirements, evidence_refs, passed,
-                        return_to_repair, completion_allowed, created_at_ms
+                        return_to_repair, completion_allowed, created_at_ms, remaining_uncertainty
                  FROM final_audits WHERE mission_id=?1 ORDER BY created_at_ms ASC",
             )
             .map_err(db_error)?;
@@ -477,6 +481,7 @@ impl ControlPlaneDb {
                     return_to_repair: row.get::<_, i64>(6)? != 0,
                     completion_allowed: row.get::<_, i64>(7)? != 0,
                     created_at_ms: row.get(8)?,
+                    remaining_uncertainty: row.get(9)?,
                 })
             })
             .map_err(db_error)?;

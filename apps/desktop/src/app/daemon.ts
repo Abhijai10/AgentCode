@@ -554,6 +554,25 @@ export const daemon = {
     }
   },
 
+  async discussSend(
+    conversationId: string,
+    content: string,
+    attachmentIds?: string[]
+  ): Promise<{ ok: boolean; message?: Message; error?: string }> {
+    try {
+      const res = await invoke<{ message: Message }>("daemon_discuss_send", {
+        conversationId,
+        content,
+        attachmentIds: attachmentIds ?? [],
+      });
+      return { ok: true, message: res.message };
+    } catch (e: unknown) {
+      const message = e instanceof Error ? e.message : String(e);
+      const cleaned = message.replace(/^[A-Z0-9_-]+:\s*/, "");
+      return { ok: false, error: cleaned || message };
+    }
+  },
+
   async addAttachment(
     conversationId: string,
     projectPath: string

@@ -327,6 +327,7 @@ export interface FinalAuditInfo {
   audit_id: string;
   passed: boolean;
   completion_allowed: boolean;
+  remaining_uncertainty?: string;
   created_at_ms: number;
 }
 
@@ -359,10 +360,29 @@ export interface ConversationActivityMission {
     failed_task_count: number;
     retry_count: number;
   };
+  /** Durable provider/model routing records for this mission. */
+  provider_models?: ProviderModelRecord[];
+  /** Remaining uncertainty persisted by the final audit (empty when none). */
+  remaining_uncertainty?: string;
 }
 
 export interface ConversationActivity {
   conversation_id: string;
   project_path: string;
   missions: ConversationActivityMission[];
+}
+
+// ── Durable provider/model records & remaining uncertainty (G2 fixes) ─────
+// Read from authoritative backend state, never fabricated by the UI.
+
+export interface ProviderModelRecord {
+  provider_id: string;
+  provider_account_id?: string | null;
+  model_id: string;
+  model_name: string;
+  routing_mode: string;
+  attempt_number: number;
+  success: boolean;
+  failure_class?: string | null;
+  created_at_ms: number;
 }

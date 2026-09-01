@@ -266,6 +266,7 @@ impl DaemonService {
                     "audit_id": a.id,
                     "passed": a.passed,
                     "completion_allowed": a.completion_allowed,
+                    "remaining_uncertainty": a.remaining_uncertainty,
                     "created_at_ms": a.created_at_ms,
                 })
             })
@@ -310,6 +311,18 @@ impl DaemonService {
             let verification = self.verification_summary(&mission_ref).unwrap_or_else(|_| json!({}));
             let status = self.mission_status(&mission_ref);
             let summary = mission_activity_summary(&tasks, &changesets, &evidence, &verification);
+            let provider_models = self
+                .db
+                .provider_model_records_for_mission(&mission_ref)
+                .unwrap_or_default();
+            let remaining_uncertainty = verification
+                .get("final_audits")
+                .and_then(Value::as_array)
+                .and_then(|audits| audits.last())
+                .and_then(|audit| audit.get("remaining_uncertainty"))
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
             blocks.push(json!({
                 "mission_id": mission_ref,
                 "conversation_id": conversation_id,
@@ -321,6 +334,18 @@ impl DaemonService {
                 "evidence": evidence,
                 "verification": verification,
                 "summary": summary,
+                "provider_models": provider_models.into_iter().map(|pm| json!({
+                    "provider_id": pm.provider_id,
+                    "provider_account_id": pm.provider_account_id,
+                    "model_id": pm.model_id,
+                    "model_name": pm.model_name,
+                    "routing_mode": pm.routing_mode,
+                    "attempt_number": pm.attempt_number,
+                    "success": pm.success,
+                    "failure_class": pm.failure_class,
+                    "created_at_ms": pm.created_at_ms,
+                })).collect::<Vec<_>>(),
+                "remaining_uncertainty": remaining_uncertainty,
             }));
         }
         Ok(json!({
