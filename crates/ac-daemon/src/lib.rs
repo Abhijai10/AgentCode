@@ -6,6 +6,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread::{self, JoinHandle};
 
+use ac_agent::{AttachmentContent, ContextAttachment};
 use ac_common::{AcError, AcResult, StableId, TimestampMillis};
 use ac_db::{ControlPlaneDb, PersistedSession, PersistedWorktree, ProviderCatalogRow};
 use ac_git::{WorktreeRecord, WorktreeStatus};
@@ -35,6 +36,7 @@ struct QueuedMission {
     session_id: StableId,
     goal: String,
     workspace_root: PathBuf,
+    attachments: Vec<ContextAttachment>,
 }
 
 enum CoordinatorMessage {
@@ -647,7 +649,10 @@ fn execute_mission(
             return Err(error);
         }
     };
-    let report = match agent.run_goal(ac_agent::Goal::new(job.goal.clone())?) {
+    let report = match agent.run_goal(ac_agent::Goal::with_attachments(
+        job.goal.clone(),
+        job.attachments.clone(),
+    )?) {
         Ok(report) => report,
         Err(error) => {
             // Even when the agent run itself fails to produce a report,
@@ -1048,6 +1053,7 @@ impl DaemonService {
                     session_id: StableId::from_existing(&hydrated.session.id)?,
                     goal: mission.original_goal,
                     workspace_root,
+                    attachments: Vec::new(),
                 };
                 match hydrated.session.state.as_str() {
                     "paused" => self.coordinator.remember_paused(job)?,
@@ -1631,6 +1637,7 @@ impl DaemonService {
                     session_id: session.id().clone(),
                     goal,
                     workspace_root: workspace,
+                    attachments: Vec::new(),
                 })?;
                 Ok(DaemonResponse::SessionCreated {
                     mission_id,

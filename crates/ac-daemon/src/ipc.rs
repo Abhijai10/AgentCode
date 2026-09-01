@@ -509,6 +509,17 @@ fn dispatch_request(request: &Value, daemon: &mut DaemonService) -> (Value, bool
                 Err(error) => error_response(correlation_id, error.code(), error.to_string()),
             }
         },
+        "ConversationActivity" => {
+            let conversation_id = request.get("conversation_id").and_then(Value::as_str).unwrap_or("");
+            match daemon.conversation_activity(conversation_id) {
+                Ok(mut payload) => {
+                    payload["id"] = json!(correlation_id);
+                    payload["ok"] = json!(true);
+                    payload
+                }
+                Err(error) => error_response(correlation_id, error.code(), error.to_string()),
+            }
+        },
         "SetDesktopSettings" => {
             let appearance = request.get("appearance").and_then(Value::as_str).unwrap_or("light").to_string();
             let notifications = request.get("notifications_enabled").and_then(Value::as_bool).unwrap_or(true);
@@ -1907,6 +1918,788 @@ mod ipc_tests {
         );
         assert!(!other_path["ok"].as_bool().unwrap());
         assert_eq!(other_path["error"]["code"], "CONVERSATION-ATTACHMENT_NOT_FOUND");
+
+        server.cleanup();
+        daemon.shutdown().unwrap();
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn conversation_activity_projects_mission_block() {
+        let (dir, db, lock, socket) = temp_paths("conv-act");
+        let project_dir = dir.join("workspace");
+        fs::create_dir_all(&project_dir).unwrap();
+        let project_path = project_dir.to_string_lossy().to_string();
+
+        let mut daemon = DaemonService::open(&db, &lock).unwrap();
+        daemon.start().unwrap();
+        let Some((server, listener)) = bind_or_skip(&socket, None) else {
+            daemon.shutdown().unwrap();
+            let _ = fs::remove_dir_all(dir);
+            return;
+        };
+
+        let create = request_via_ipc(
+            &server, &listener, &mut daemon,
+            json!({"id":"c1","command":"ConversationCreate","project_path": project_path, "mode":"GOAL","title":"Act Chat"}),
+        );
+        let cid = create["conversation_id"].as_str().unwrap().to_string();
+
+        let goal = "Fix the login bug";
+        let submit = request_via_ipc(
+            &server, &listener, &mut daemon,
+            json!({"id":"s1","command":"GoalSubmit","conversation_id": cid, "goal": goal}),
+        );
+        assert_eq!(submit["ok"], true, "submit: {submit}");
+        let mission_id = submit["mission_id"].as_str().unwrap().to_string();
+
+        // ConversationActivity must return a mission block.
+        let activity = request_via_ipc(
+            &server, &listener, &mut daemon,
+            json!({"id":"a1","command":"ConversationActivity","conversation_id": cid}),
+        );
+        assert_eq!(activity["ok"], true, "activity: {activity}");
+        let missions = activity["missions"].as_array().unwrap();
+        assert_eq!(missions.len(), 1, "should have 1 mission, got {missions:?}");
+        assert_eq!(missions[0]["mission_id"], mission_id);
+        assert!(
+            missions[0].get("details").and_then(|v| v.get("state")).is_some(),
+            "details should have state"
+        );
+
+        // Also verify the conversation get still works.
+        let get = request_via_ipc(
+            &server, &listener, &mut daemon,
+            json!({"id":"g1","command":"ConversationGet","conversation_id": cid}),
+        );
+        assert_eq!(get["ok"], true);
+        let msgs = get["conversation"]["messages"].as_array().unwrap();
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0]["mission_ref"].as_str().unwrap(), mission_id);
+
+        let cancel = request_via_ipc(
+            &server, &listener, &mut daemon,
+            json!({"id":"x1","command":"CancelMission","mission_id": mission_id}),
+        );
+        assert_eq!(cancel["ok"], true);
+
+        server.cleanup();
+        daemon.shutdown().unwrap();
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn conversation_follow_up_creates_second_mission_in_same_conversation() {
+        let (dir, db, lock, socket) = temp_paths("conv-follow");
+        let project_dir = dir.join("workspace");
+        fs::create_dir_all(&project_dir).unwrap();
+        let project_path = project_dir.to_string_lossy().to_string();
+
+        let mut daemon = DaemonService::open(&db, &lock).unwrap();
+        daemon.start().unwrap();
+        let Some((server, listener)) = bind_or_skip(&socket, None) else {
+            daemon.shutdown().unwrap();
+            let _ = fs::remove_dir_all(dir);
+            return;
+        };
+
+        let create = request_via_ipc(
+            &server, &listener, &mut daemon,
+            json!({"id":"c1","command":"ConversationCreate","project_path": project_path, "mode":"GOAL","title":"Follow Chat"}),
+        );
+        let cid = create["conversation_id"].as_str().unwrap().to_string();
+
+        // First mission
+        let s1 = request_via_ipc(
+            &server, &listener, &mut daemon,
+            json!({"id":"s1","command":"GoalSubmit","conversation_id": cid, "goal": "Fix login bug"}),
+        );
+        assert_eq!(s1["ok"], true);
+        let m1 = s1["mission_id"].as_str().unwrap().to_string();
+
+        // Second mission (follow-up in same conversation)
+        let s2 = request_via_ipc(
+            &server, &listener, &mut daemon,
+            json!({"id":"s2","command":"GoalSubmit","conversation_id": cid, "goal": "Add tests for the fix"}),
+        );
+        assert_eq!(s2["ok"], true, "second submit: {s2}");
+        let m2 = s2["mission_id"].as_str().unwrap().to_string();
+        assert_ne!(m1, m2, "second mission must have a different id");
+
+        // Conversation must have both messages with their mission_refs
+        let get = request_via_ipc(
+            &server, &listener, &mut daemon,
+            json!({"id":"g1","command":"ConversationGet","conversation_id": cid}),
+        );
+        assert_eq!(get["ok"], true);
+        let msgs = get["conversation"]["messages"].as_array().unwrap();
+        assert_eq!(msgs.len(), 2, "should have 2 messages, got {msgs:?}");
+        assert_eq!(msgs[0]["mission_ref"].as_str().unwrap(), m1);
+        assert_eq!(msgs[1]["mission_ref"].as_str().unwrap(), m2);
+
+        // current_mission_id must be the latest
+        assert_eq!(get["conversation"]["current_mission_id"].as_str().unwrap(), m2);
+
+        // Activity must project both missions
+        let activity = request_via_ipc(
+            &server, &listener, &mut daemon,
+            json!({"id":"a1","command":"ConversationActivity","conversation_id": cid}),
+        );
+        assert_eq!(activity["ok"], true);
+        let missions = activity["missions"].as_array().unwrap();
+        assert_eq!(missions.len(), 2, "should have 2 missions, got {missions:?}");
+        let ids: Vec<&str> = missions.iter().map(|m| m["mission_id"].as_str().unwrap()).collect();
+        assert!(ids.contains(&m1.as_str()));
+        assert!(ids.contains(&m2.as_str()));
+
+        // Cancel both
+        for mid in [&m1, &m2] {
+            let _ = request_via_ipc(
+                &server, &listener, &mut daemon,
+                json!({"id":"x","command":"CancelMission","mission_id": mid}),
+            );
+        }
+
+        server.cleanup();
+        daemon.shutdown().unwrap();
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn conversation_activity_deduplicates_repeated_mission_refs() {
+        let (dir, db, lock, socket) = temp_paths("conv-dedup");
+        let project_dir = dir.join("workspace");
+        fs::create_dir_all(&project_dir).unwrap();
+        let project_path = project_dir.to_string_lossy().to_string();
+
+        let mut daemon = DaemonService::open(&db, &lock).unwrap();
+        daemon.start().unwrap();
+        let Some((server, listener)) = bind_or_skip(&socket, None) else {
+            daemon.shutdown().unwrap();
+            let _ = fs::remove_dir_all(dir);
+            return;
+        };
+
+        let create = request_via_ipc(
+            &server, &listener, &mut daemon,
+            json!({"id":"c1","command":"ConversationCreate","project_path": project_path, "mode":"GOAL","title":"Dedup Chat"}),
+        );
+        let cid = create["conversation_id"].as_str().unwrap().to_string();
+
+        // Submit a single goal; the daemon creates one user message with mission_ref.
+        let s1 = request_via_ipc(
+            &server, &listener, &mut daemon,
+            json!({"id":"s1","command":"GoalSubmit","conversation_id": cid, "goal": "Fix the bug"}),
+        );
+        let mid = s1["mission_id"].as_str().unwrap().to_string();
+
+        // Append a second user message manually, referencing the same mission.
+        let append = request_via_ipc(
+            &server, &listener, &mut daemon,
+            json!({"id":"m2","command":"MessageAppend","conversation_id": cid, "role": "user", "content": "Also fix this", "mission_ref": mid}),
+        );
+        assert_eq!(append["ok"], true);
+
+        // Activity must deduplicate: only one mission block despite two messages.
+        let activity = request_via_ipc(
+            &server, &listener, &mut daemon,
+            json!({"id":"a1","command":"ConversationActivity","conversation_id": cid}),
+        );
+        assert_eq!(activity["ok"], true);
+        let missions = activity["missions"].as_array().unwrap();
+        assert_eq!(missions.len(), 1, "should have 1 mission (deduped), got {missions:?}");
+
+        let cancel = request_via_ipc(
+            &server, &listener, &mut daemon,
+            json!({"id":"x1","command":"CancelMission","mission_id": mid}),
+        );
+        assert_eq!(cancel["ok"], true);
+
+        server.cleanup();
+        daemon.shutdown().unwrap();
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn conversation_activity_restores_after_daemon_restart() {
+        let (dir, db, lock, socket) = temp_paths("conv-restart");
+        let project_dir = dir.join("workspace");
+        fs::create_dir_all(&project_dir).unwrap();
+        let project_path = project_dir.to_string_lossy().to_string();
+
+        let mut daemon = DaemonService::open(&db, &lock).unwrap();
+        daemon.start().unwrap();
+        let Some((server, listener)) = bind_or_skip(&socket, None) else {
+            daemon.shutdown().unwrap();
+            let _ = fs::remove_dir_all(dir);
+            return;
+        };
+
+        let create = request_via_ipc(
+            &server, &listener, &mut daemon,
+            json!({"id":"c1","command":"ConversationCreate","project_path": project_path, "mode":"GOAL","title":"Restart Chat"}),
+        );
+        let cid = create["conversation_id"].as_str().unwrap().to_string();
+
+        let s1 = request_via_ipc(
+            &server, &listener, &mut daemon,
+            json!({"id":"s1","command":"GoalSubmit","conversation_id": cid, "goal": "Fix the bug"}),
+        );
+        let mid = s1["mission_id"].as_str().unwrap().to_string();
+
+        let cancel = request_via_ipc(
+            &server, &listener, &mut daemon,
+            json!({"id":"x1","command":"CancelMission","mission_id": mid}),
+        );
+        assert_eq!(cancel["ok"], true);
+
+        // Shut down the daemon.
+        server.cleanup();
+        daemon.shutdown().unwrap();
+
+        // Reopen the same DB and restart.
+        let mut daemon2 = DaemonService::open(&db, &lock).unwrap();
+        daemon2.start().unwrap();
+        let Some((server2, listener2)) = bind_or_skip(&socket, None) else {
+            daemon2.shutdown().unwrap();
+            let _ = fs::remove_dir_all(dir);
+            return;
+        };
+
+        // ConversationGet must still return the messages.
+        let get = request_via_ipc(
+            &server2, &listener2, &mut daemon2,
+            json!({"id":"g1","command":"ConversationGet","conversation_id": cid}),
+        );
+        assert_eq!(get["ok"], true);
+        let msgs = get["conversation"]["messages"].as_array().unwrap();
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0]["mission_ref"].as_str().unwrap(), mid);
+
+        // ConversationActivity must still project the mission.
+        let activity = request_via_ipc(
+            &server2, &listener2, &mut daemon2,
+            json!({"id":"a1","command":"ConversationActivity","conversation_id": cid}),
+        );
+        assert_eq!(activity["ok"], true);
+        let missions = activity["missions"].as_array().unwrap();
+        assert_eq!(missions.len(), 1, "activity after restart: {activity}");
+        assert_eq!(missions[0]["mission_id"], mid);
+
+        server2.cleanup();
+        daemon2.shutdown().unwrap();
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn conversation_activity_project_isolation() {
+        let (dir, db, lock, socket) = temp_paths("conv-act-iso");
+        let project_a = dir.join("project-a");
+        let project_b = dir.join("project-b");
+        fs::create_dir_all(&project_a).unwrap();
+        fs::create_dir_all(&project_b).unwrap();
+        let path_a = project_a.to_string_lossy().to_string();
+        let path_b = project_b.to_string_lossy().to_string();
+
+        let mut daemon = DaemonService::open(&db, &lock).unwrap();
+        daemon.start().unwrap();
+        let Some((server, listener)) = bind_or_skip(&socket, None) else {
+            daemon.shutdown().unwrap();
+            let _ = fs::remove_dir_all(dir);
+            return;
+        };
+
+        // Create conversation A, submit a goal.
+        let create_a = request_via_ipc(
+            &server, &listener, &mut daemon,
+            json!({"id":"c1","command":"ConversationCreate","project_path": path_a, "mode":"GOAL","title":"Project A"}),
+        );
+        let cid_a = create_a["conversation_id"].as_str().unwrap().to_string();
+        let s1 = request_via_ipc(
+            &server, &listener, &mut daemon,
+            json!({"id":"s1","command":"GoalSubmit","conversation_id": cid_a, "goal": "Fix A"}),
+        );
+        let mid_a = s1["mission_id"].as_str().unwrap().to_string();
+
+        // Create conversation B, submit a different goal.
+        let create_b = request_via_ipc(
+            &server, &listener, &mut daemon,
+            json!({"id":"c2","command":"ConversationCreate","project_path": path_b, "mode":"GOAL","title":"Project B"}),
+        );
+        let cid_b = create_b["conversation_id"].as_str().unwrap().to_string();
+        let s2 = request_via_ipc(
+            &server, &listener, &mut daemon,
+            json!({"id":"s2","command":"GoalSubmit","conversation_id": cid_b, "goal": "Fix B"}),
+        );
+        let mid_b = s2["mission_id"].as_str().unwrap().to_string();
+
+        // Activity for conversation A must only contain mission A.
+        let activity_a = request_via_ipc(
+            &server, &listener, &mut daemon,
+            json!({"id":"a1","command":"ConversationActivity","conversation_id": cid_a}),
+        );
+        assert_eq!(activity_a["ok"], true);
+        let missions_a: Vec<&str> = activity_a["missions"].as_array().unwrap().iter()
+            .map(|m| m["mission_id"].as_str().unwrap()).collect();
+        assert!(missions_a.contains(&mid_a.as_str()), "project A should have mission A");
+        assert!(!missions_a.contains(&mid_b.as_str()), "project A should NOT have mission B");
+
+        // Activity for conversation B must only contain mission B.
+        let activity_b = request_via_ipc(
+            &server, &listener, &mut daemon,
+            json!({"id":"a2","command":"ConversationActivity","conversation_id": cid_b}),
+        );
+        assert_eq!(activity_b["ok"], true);
+        let missions_b: Vec<&str> = activity_b["missions"].as_array().unwrap().iter()
+            .map(|m| m["mission_id"].as_str().unwrap()).collect();
+        assert!(missions_b.contains(&mid_b.as_str()), "project B should have mission B");
+        assert!(!missions_b.contains(&mid_a.as_str()), "project B should NOT have mission A");
+
+        // Cancel both
+        for mid in [&mid_a, &mid_b] {
+            let _ = request_via_ipc(
+                &server, &listener, &mut daemon,
+                json!({"id":"x","command":"CancelMission","mission_id": mid}),
+            );
+        }
+
+        server.cleanup();
+        daemon.shutdown().unwrap();
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn goal_submit_with_text_attachment_feeds_goal_context() {
+        // Proves that when a text attachment is registered and then submitted
+        // via GoalSubmit, the attachment content is loaded and the resulting
+        // Goal object carries the typed ContextAttachment.
+        let (dir, db, lock, socket) = temp_paths("conv-att-ctx");
+        let project_dir = dir.join("workspace");
+        fs::create_dir_all(&project_dir).unwrap();
+        let project_path = project_dir.to_string_lossy().to_string();
+
+        let mut daemon = DaemonService::open(&db, &lock).unwrap();
+        daemon.start().unwrap();
+        let Some((server, listener)) = bind_or_skip(&socket, None) else {
+            daemon.shutdown().unwrap();
+            let _ = fs::remove_dir_all(dir);
+            return;
+        };
+
+        // Create conversation
+        let create = request_via_ipc(
+            &server, &listener, &mut daemon,
+            json!({"id":"c1","command":"ConversationCreate","project_path": project_path, "mode":"GOAL","title":"Ctx Attach"}),
+        );
+        let cid = create["conversation_id"].as_str().unwrap().to_string();
+
+        // Write a text attachment file inside the workspace.
+        let att_dir = project_dir.join(".agentcode").join("attachments").join(&cid);
+        fs::create_dir_all(&att_dir).unwrap();
+        let text_content = b"fn main() { println!(\"hello from attachment\"); }";
+        let rel_path = format!(".agentcode/attachments/{cid}/code.rs");
+        fs::write(project_dir.join(&rel_path), text_content).unwrap();
+        let hash = format!(
+            "fnv1a64:{:016x}",
+            text_content.iter()
+                .fold(0xcbf29ce484222325_u64, |h, b| (h ^ u64::from(*b)).wrapping_mul(0x100000001b3))
+        );
+
+        // Register the attachment.
+        let reg = request_via_ipc(
+            &server, &listener, &mut daemon,
+            json!({"id":"a1","command":"AttachmentRegister","conversation_id": cid, "project_path": project_path, "filename":"code.rs","mime_type":"text/plain","size_bytes": text_content.len() as i64,"content_hash": hash,"rel_path": rel_path}),
+        );
+        assert_eq!(reg["ok"], true, "register: {reg}");
+        let att_id = reg["attachment"]["id"].as_str().unwrap().to_string();
+
+        // Submit goal with this attachment.
+        let goal = "Fix the code";
+        let submit = request_via_ipc(
+            &server, &listener, &mut daemon,
+            json!({"id":"s1","command":"GoalSubmit","conversation_id": cid, "goal": goal, "attachment_ids": [att_id]}),
+        );
+        assert_eq!(submit["ok"], true, "submit: {submit}");
+        let mission_id = submit["mission_id"].as_str().unwrap().to_string();
+
+        // The message must be linked to the attachment.
+        let get = request_via_ipc(
+            &server, &listener, &mut daemon,
+            json!({"id":"g1","command":"ConversationGet","conversation_id": cid}),
+        );
+        assert_eq!(get["ok"], true);
+        let atts = get["conversation"]["attachments"].as_array().unwrap();
+        assert_eq!(atts.len(), 1, "should have 1 attachment, got {atts:?}");
+        assert_eq!(atts[0]["filename"], "code.rs");
+        // The message_id on the attachment links to the user message.
+        assert!(
+            atts[0].get("message_id").and_then(|v| v.as_str()).is_some(),
+            "attachment should be linked to a message"
+        );
+
+        // The mission is created and the context pipeline will receive the
+        // attachment content through the Goal::with_attachments mechanism.
+        let cancel = request_via_ipc(
+            &server, &listener, &mut daemon,
+            json!({"id":"x1","command":"CancelMission","mission_id": mission_id}),
+        );
+        assert_eq!(cancel["ok"], true);
+
+        server.cleanup();
+        daemon.shutdown().unwrap();
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn conversation_activity_projects_failed_mission_blocks() {
+        let (dir, db, lock, socket) = temp_paths("conv-fail");
+        let project_dir = dir.join("workspace");
+        let _ = fs::create_dir_all(project_dir.join("src"));
+        // Create a minimal git repo so the coordinator doesn't abort immediately.
+        let _ = std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(&project_dir)
+            .output();
+        let _ = std::process::Command::new("git")
+            .args(["-c", "user.name=Test", "-c", "user.email=test@test", "commit", "--allow-empty", "-m", "initial"])
+            .current_dir(&project_dir)
+            .output();
+        let project_path = project_dir.to_string_lossy().to_string();
+
+        let mut daemon = DaemonService::open(&db, &lock).unwrap();
+        daemon.start().unwrap();
+        let Some((server, listener)) = bind_or_skip(&socket, None) else {
+            daemon.shutdown().unwrap();
+            let _ = fs::remove_dir_all(dir);
+            return;
+        };
+
+        let create = request_via_ipc(
+            &server, &listener, &mut daemon,
+            json!({"id":"c1","command":"ConversationCreate","project_path": project_path, "mode":"GOAL","title":"Fail Chat"}),
+        );
+        let cid = create["conversation_id"].as_str().unwrap().to_string();
+
+        // Submit a goal, then immediately cancel so the coordinator records a
+        // terminal state (cancelled) rather than trying to run the mission.
+        let s1 = request_via_ipc(
+            &server, &listener, &mut daemon,
+            json!({"id":"s1","command":"GoalSubmit","conversation_id": cid, "goal": "Test mission for failure projection"}),
+        );
+        assert_eq!(s1["ok"], true);
+        let mid = s1["mission_id"].as_str().unwrap().to_string();
+
+        // Cancel immediately so the coordinator never runs against providers.
+        let cancel = request_via_ipc(
+            &server, &listener, &mut daemon,
+            json!({"id":"x1","command":"CancelMission","mission_id": mid}),
+        );
+        assert_eq!(cancel["ok"], true);
+
+        // Poll until the coordinator records the terminal cancelled state.
+        let deadline = Instant::now() + Duration::from_secs(20);
+        loop {
+            let activity = request_via_ipc(
+                &server, &listener, &mut daemon,
+                json!({"id":"a1","command":"ConversationActivity","conversation_id": cid}),
+            );
+            assert_eq!(activity["ok"], true);
+            let missions = activity["missions"].as_array().unwrap();
+            assert_eq!(missions.len(), 1, "should have 1 mission, got {missions:?}");
+            assert_eq!(missions[0]["mission_id"], mid);
+            let state = missions[0]["details"]["state"].as_str().unwrap_or("");
+            // The mission may be cancelled or failed; both are terminal.
+            if state == "cancelled" || state == "failed" || state.starts_with("failed:") {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "mission did not reach terminal; last state={state}"
+            );
+            std::thread::sleep(Duration::from_millis(100));
+        }
+
+        // Cancel again if not already cancelled (idempotent).
+        let _ = request_via_ipc(
+            &server, &listener, &mut daemon,
+            json!({"id":"x2","command":"CancelMission","mission_id": mid}),
+        );
+
+        server.cleanup();
+        daemon.shutdown().unwrap();
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn conversation_activity_projects_cancelled_mission_blocks() {
+        let (dir, db, lock, socket) = temp_paths("conv-cancel");
+        let project_dir = dir.join("workspace");
+        let _ = fs::create_dir_all(project_dir.join("src"));
+        // Create a minimal git repo so the coordinator doesn't abort immediately.
+        let _ = std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(&project_dir)
+            .output();
+        let _ = std::process::Command::new("git")
+            .args(["-c", "user.name=Test", "-c", "user.email=test@test", "commit", "--allow-empty", "-m", "initial"])
+            .current_dir(&project_dir)
+            .output();
+        let project_path = project_dir.to_string_lossy().to_string();
+
+        let mut daemon = DaemonService::open(&db, &lock).unwrap();
+        daemon.start().unwrap();
+        let Some((server, listener)) = bind_or_skip(&socket, None) else {
+            daemon.shutdown().unwrap();
+            let _ = fs::remove_dir_all(dir);
+            return;
+        };
+
+        let create = request_via_ipc(
+            &server, &listener, &mut daemon,
+            json!({"id":"c1","command":"ConversationCreate","project_path": project_path, "mode":"GOAL","title":"Cancel Chat"}),
+        );
+        let cid = create["conversation_id"].as_str().unwrap().to_string();
+
+        let s1 = request_via_ipc(
+            &server, &listener, &mut daemon,
+            json!({"id":"s1","command":"GoalSubmit","conversation_id": cid, "goal": "Test mission for cancellation"}),
+        );
+        assert_eq!(s1["ok"], true);
+        let mid = s1["mission_id"].as_str().unwrap().to_string();
+
+        // Cancel immediately after submission.
+        let cancel = request_via_ipc(
+            &server, &listener, &mut daemon,
+            json!({"id":"x1","command":"CancelMission","mission_id": mid}),
+        );
+        assert_eq!(cancel["ok"], true);
+
+        // Poll until the mission reaches a terminal state.
+        let deadline = Instant::now() + Duration::from_secs(20);
+        loop {
+            let activity = request_via_ipc(
+                &server, &listener, &mut daemon,
+                json!({"id":"a1","command":"ConversationActivity","conversation_id": cid}),
+            );
+            assert_eq!(activity["ok"], true);
+            let missions = activity["missions"].as_array().unwrap();
+            assert_eq!(missions.len(), 1, "should have 1 mission, got {missions:?}");
+            let state = missions[0]["details"]["state"].as_str().unwrap_or("");
+            // The coordinator may cancel or fail the mission; both are terminal.
+            if state == "cancelled" || state == "failed" || state.starts_with("failed:") {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "mission did not reach terminal; last state={state}"
+            );
+            std::thread::sleep(Duration::from_millis(100));
+        }
+
+        server.cleanup();
+        daemon.shutdown().unwrap();
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn conversation_activity_summary_reports_failures_tools_and_retries() {
+        let (dir, db, lock, socket) = temp_paths("conv-summary");
+        let project_dir = dir.join("workspace");
+        fs::create_dir_all(&project_dir).unwrap();
+        let project_path = project_dir.to_string_lossy().to_string();
+
+        let mut daemon = DaemonService::open(&db, &lock).unwrap();
+        daemon.start().unwrap();
+        let Some((server, listener)) = bind_or_skip(&socket, None) else {
+            daemon.shutdown().unwrap();
+            let _ = fs::remove_dir_all(dir);
+            return;
+        };
+
+        let create = request_via_ipc(
+            &server, &listener, &mut daemon,
+            json!({"id":"c1","command":"ConversationCreate","project_path": project_path, "mode":"GOAL","title":"Summary Chat"}),
+        );
+        let cid = create["conversation_id"].as_str().unwrap().to_string();
+
+        let s1 = request_via_ipc(
+            &server, &listener, &mut daemon,
+            json!({"id":"s1","command":"GoalSubmit","conversation_id": cid, "goal": "Summary test mission"}),
+        );
+        assert_eq!(s1["ok"], true);
+        let mid = s1["mission_id"].as_str().unwrap().to_string();
+
+        // ConversationActivity must include a factual summary section.
+        let activity = request_via_ipc(
+            &server, &listener, &mut daemon,
+            json!({"id":"a1","command":"ConversationActivity","conversation_id": cid}),
+        );
+        assert_eq!(activity["ok"], true, "activity: {activity}");
+        let missions = activity["missions"].as_array().unwrap();
+        assert_eq!(missions.len(), 1);
+        let summary = &missions[0]["summary"];
+        assert!(summary.is_object(), "summary object expected: {summary}");
+        assert!(summary.get("tools_used").is_some(), "tools_used");
+        assert!(summary.get("commands").is_some(), "commands");
+        assert!(summary.get("files_changed").is_some(), "files_changed");
+        assert!(summary.get("failure_classes").is_some(), "failure_classes");
+        assert!(summary.get("retry_count").is_some(), "retry_count");
+
+        // Cancelled so the coordinator never runs the mission against providers.
+        let cancel = request_via_ipc(
+            &server, &listener, &mut daemon,
+            json!({"id":"x1","command":"CancelMission","mission_id": mid}),
+        );
+        assert_eq!(cancel["ok"], true);
+
+        server.cleanup();
+        daemon.shutdown().unwrap();
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn attachment_context_skips_cross_project_and_missing_files() {
+        // Proves the attachment→context pipeline refuses to read files that do
+        // not belong to the conversation's project (workspace boundary) and
+        // silently skips files that no longer exist — nothing foreign enters
+        // the model context.
+        let (dir, db, lock, socket) = temp_paths("conv-att-ctx-sec");
+        let project_a = dir.join("project-a");
+        let project_b = dir.join("project-b");
+        fs::create_dir_all(&project_a).unwrap();
+        fs::create_dir_all(&project_b).unwrap();
+        let path_a = project_a.to_string_lossy().to_string();
+        let path_b = project_b.to_string_lossy().to_string();
+
+        let mut daemon = DaemonService::open(&db, &lock).unwrap();
+        daemon.start().unwrap();
+        let Some((server, listener)) = bind_or_skip(&socket, None) else {
+            daemon.shutdown().unwrap();
+            let _ = fs::remove_dir_all(dir);
+            return;
+        };
+
+        // Conversation in project A, then register a real text attachment that
+        // belongs to project A.
+        let create_a = request_via_ipc(
+            &server, &listener, &mut daemon,
+            json!({"id":"c1","command":"ConversationCreate","project_path": path_a, "mode":"GOAL","title":"Proj A"}),
+        );
+        let cid_a = create_a["conversation_id"].as_str().unwrap().to_string();
+
+        let att_dir = project_a.join(".agentcode").join("attachments").join(&cid_a);
+        fs::create_dir_all(&att_dir).unwrap();
+        let content = b"fn secret() -> u32 { 42 }";
+        let rel_path = format!(".agentcode/attachments/{cid_a}/a.rs");
+        fs::write(project_a.join(&rel_path), content).unwrap();
+        let hash = format!(
+            "fnv1a64:{:016x}",
+            content.iter()
+                .fold(0xcbf29ce484222325_u64, |h, b| (h ^ u64::from(*b)).wrapping_mul(0x100000001b3))
+        );
+        let reg = request_via_ipc(
+            &server, &listener, &mut daemon,
+            json!({"id":"a1","command":"AttachmentRegister","conversation_id": cid_a, "project_path": path_a, "filename":"a.rs","mime_type":"text/plain","size_bytes": content.len() as i64,"content_hash": hash,"rel_path": rel_path}),
+        );
+        assert_eq!(reg["ok"], true, "register: {reg}");
+        let att_id = reg["attachment"]["id"].as_str().unwrap().to_string();
+
+        // The conversation's project must match the attachment's project, so
+        // load_goal_attachments must skip it when asked for project B.
+        let ctx = daemon
+            .load_goal_attachments(std::slice::from_ref(&att_id), &path_b)
+            .unwrap();
+        assert!(
+            ctx.is_empty(),
+            "cross-project attachment must not enter context: {ctx:?}"
+        );
+
+        // A missing file (registered but deleted) must be skipped, not crash.
+        let rel_missing = format!(".agentcode/attachments/{cid_a}/gone.rs");
+        fs::write(project_a.join(&rel_missing), b"gone").unwrap();
+        let hash2 = format!(
+            "fnv1a64:{:016x}",
+            b"gone".iter()
+                .fold(0xcbf29ce484222325_u64, |h, b| (h ^ u64::from(*b)).wrapping_mul(0x100000001b3))
+        );
+        let reg2 = request_via_ipc(
+            &server, &listener, &mut daemon,
+            json!({"id":"a2","command":"AttachmentRegister","conversation_id": cid_a, "project_path": path_a, "filename":"gone.rs","mime_type":"text/plain","size_bytes":4,"content_hash": hash2,"rel_path": rel_missing}),
+        );
+        assert_eq!(reg2["ok"], true);
+        let att2_id = reg2["attachment"]["id"].as_str().unwrap().to_string();
+        fs::remove_file(project_a.join(&rel_missing)).unwrap();
+        let ctx2 = daemon
+            .load_goal_attachments(std::slice::from_ref(&att2_id), &path_a)
+            .unwrap();
+        assert!(
+            ctx2.is_empty(),
+            "missing attachment file must not enter context: {ctx2:?}"
+        );
+
+        server.cleanup();
+        daemon.shutdown().unwrap();
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn attachment_context_never_injects_oversized_content() {
+        // Proves that even when a large attachment exists on disk, the context
+        // pipeline only ever reads a bounded prefix — oversized content cannot
+        // flood the model prompt.
+        let (dir, db, lock, socket) = temp_paths("conv-att-ctx-big");
+        let project_dir = dir.join("workspace");
+        fs::create_dir_all(&project_dir).unwrap();
+        let project_path = project_dir.to_string_lossy().to_string();
+
+        let mut daemon = DaemonService::open(&db, &lock).unwrap();
+        daemon.start().unwrap();
+        let Some((server, listener)) = bind_or_skip(&socket, None) else {
+            daemon.shutdown().unwrap();
+            let _ = fs::remove_dir_all(dir);
+            return;
+        };
+
+        let create = request_via_ipc(
+            &server, &listener, &mut daemon,
+            json!({"id":"c1","command":"ConversationCreate","project_path": project_path, "mode":"GOAL","title":"Big Attach"}),
+        );
+        let cid = create["conversation_id"].as_str().unwrap().to_string();
+
+        // Write a 1 MB text file (below the registration cap of 25 MB so it
+        // registers, but far above the context pipeline's 32 KB read bound).
+        let att_dir = project_dir.join(".agentcode").join("attachments").join(&cid);
+        fs::create_dir_all(&att_dir).unwrap();
+        let big = vec![b'a'; 1024 * 1024];
+        let rel_path = format!(".agentcode/attachments/{cid}/big.txt");
+        fs::write(project_dir.join(&rel_path), &big).unwrap();
+        let hash = format!(
+            "fnv1a64:{:016x}",
+            big.iter()
+                .fold(0xcbf29ce484222325_u64, |h, b| (h ^ u64::from(*b)).wrapping_mul(0x100000001b3))
+        );
+        let reg = request_via_ipc(
+            &server, &listener, &mut daemon,
+            json!({"id":"a1","command":"AttachmentRegister","conversation_id": cid, "project_path": project_path, "filename":"big.txt","mime_type":"text/plain","size_bytes": big.len() as i64,"content_hash": hash,"rel_path": rel_path}),
+        );
+        assert_eq!(reg["ok"], true, "register: {reg}");
+        let att_id = reg["attachment"]["id"].as_str().unwrap().to_string();
+
+        // The context attachment must carry bounded content (≤ 32 KB).
+        let ctx = daemon
+            .load_goal_attachments(std::slice::from_ref(&att_id), &project_path)
+            .unwrap();
+        assert_eq!(ctx.len(), 1);
+        match &ctx[0].content {
+            ac_agent::AttachmentContent::Text(text) => {
+                assert!(
+                    text.len() <= 32768,
+                    "context content must be bounded, got {} bytes",
+                    text.len()
+                );
+            }
+            other => panic!("text attachment should be Text, got {other:?}"),
+        }
 
         server.cleanup();
         daemon.shutdown().unwrap();

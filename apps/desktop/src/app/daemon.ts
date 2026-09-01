@@ -26,6 +26,7 @@ import type {
   ConversationDetail,
   Message,
   Attachment,
+  ConversationActivity,
 } from "./types";
 
 function toDaemonStatus(h: DaemonHealth): DaemonStatus {
@@ -606,6 +607,16 @@ export const daemon = {
       const message = e instanceof Error ? e.message : String(e);
       const cleaned = message.replace(/^[A-Z0-9_-]+:\s*/, "");
       return { ok: false, error: cleaned || message };
+    }
+  },
+
+  async getConversationActivity(conversationId: string): Promise<ConversationActivity | null> {
+    try {
+      return await invoke<ConversationActivity>("daemon_conversation_activity", {
+        conversationId,
+      });
+    } catch {
+      return null;
     }
   },
 };

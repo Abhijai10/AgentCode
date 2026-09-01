@@ -230,8 +230,7 @@ impl DaemonService {
     /// Safe verification results.  Exposes id, task association, environment,
     /// normalized_result, command (bounded), tool_version, evidence_ref, and
     /// timestamps.  raw_artifact (unbounded command output) is never returned.
-    pub fn verification_summary(&self, mission_id: &str) -> AcResult<Value> {
-        let mid = StableId::from_existing(mission_id)?;
+    pub fn verification_summary(&self, mission_id: &str) -> AcResult<Value> {        let mid = StableId::from_existing(mission_id)?;
         if self.db.get_mission(&mid)?.is_none() {
             return Err(AcError::validation(
                 "DAEMON-MISSION_NOT_FOUND",
@@ -273,6 +272,156 @@ impl DaemonService {
             .collect();
         Ok(json!({ "verifications": list, "final_audits": audit_list }))
     }
+
+    /// Mission→conversation projection: the structured execution activity for
+    /// every mission referenced by this conversation's messages.  All data is
+    /// read from authoritative backend state (missions, tasks, attempts,
+    /// events, changesets, evidence, verification) — nothing is fabricated.
+    /// A message whose `mission_ref` points at a real mission yields a block;
+    /// messages without a mission reference are plain chat and are skipped.
+    pub fn conversation_activity(&self, conversation_id: &str) -> AcResult<Value> {
+        let conv = self.db.conversation(conversation_id)?.ok_or_else(|| {
+            AcError::validation("CONVERSATION-NOT_FOUND", "conversation not found")
+        })?;
+        let messages = self.db.messages_for_conversation(conversation_id)?;
+        let mut seen = std::collections::BTreeSet::new();
+        let mut blocks = Vec::new();
+        for message in messages {
+            let Some(mission_ref) = message.mission_ref.clone() else {
+                continue;
+            };
+            // A conversation may reference the same mission from multiple
+            // messages (follow-ups, retries).  Project each mission once.
+            if !seen.insert(mission_ref.clone()) {
+                continue;
+            }
+            let mid = match StableId::from_existing(&mission_ref) {
+                Ok(id) => id,
+                Err(_) => continue,
+            };
+            if self.db.get_mission(&mid)?.is_none() {
+                continue;
+            }
+            let details = self.mission_details(&mission_ref).unwrap_or_else(|_| json!({}));
+            let tasks = self.task_details(&mission_ref).unwrap_or_else(|_| json!({}));
+            let events = self.mission_events(&mission_ref, Some(200)).unwrap_or_else(|_| json!({}));
+            let changesets = self.changeset_summary(&mission_ref).unwrap_or_else(|_| json!({}));
+            let evidence = self.evidence_summary(&mission_ref).unwrap_or_else(|_| json!({}));
+            let verification = self.verification_summary(&mission_ref).unwrap_or_else(|_| json!({}));
+            let status = self.mission_status(&mission_ref);
+            let summary = mission_activity_summary(&tasks, &changesets, &evidence, &verification);
+            blocks.push(json!({
+                "mission_id": mission_ref,
+                "conversation_id": conversation_id,
+                "status": status.map(|s| s.state.clone()),
+                "details": details,
+                "tasks": tasks,
+                "events": events,
+                "changesets": changesets,
+                "evidence": evidence,
+                "verification": verification,
+                "summary": summary,
+            }));
+        }
+        Ok(json!({
+            "conversation_id": conversation_id,
+            "project_path": conv.project_path,
+            "missions": blocks,
+        }))
+    }
+}
+
+/// Derive a factual execution summary from authoritative persisted state:
+/// which tools were used, which commands/tests ran, which files changed,
+/// whether any failure occurred, and how much recovery (retries) happened.
+/// Nothing is synthesized beyond what the persisted rows contain.
+fn mission_activity_summary(
+    tasks: &Value,
+    changesets: &Value,
+    evidence: &Value,
+    verification: &Value,
+) -> Value {
+    // Tools used: provenance.tool on evidence records + verification tool_version.
+    let mut tools = std::collections::BTreeSet::new();
+    if let Some(list) = evidence.get("evidence").and_then(Value::as_array) {
+        for item in list {
+            if let Some(tool) = item.get("provenance_tool").and_then(Value::as_str) {
+                if !tool.trim().is_empty() {
+                    tools.insert(tool.to_string());
+                }
+            }
+        }
+    }
+    if let Some(list) = verification.get("verifications").and_then(Value::as_array) {
+        for item in list {
+            if let Some(tool) = item.get("tool_version").and_then(Value::as_str) {
+                if !tool.trim().is_empty() {
+                    tools.insert(tool.to_string());
+                }
+            }
+        }
+    }
+
+    // Commands / tests run: verification run command strings (bounded).
+    let mut commands = Vec::new();
+    if let Some(list) = verification.get("verifications").and_then(Value::as_array) {
+        for item in list {
+            if let Some(command) = item.get("command").and_then(Value::as_str) {
+                commands.push(bounded_ui_summary(command, 512));
+            }
+        }
+    }
+
+    // Files changed: edit_operations paths from changesets.
+    let mut files = Vec::new();
+    if let Some(list) = changesets.get("changesets").and_then(Value::as_array) {
+        for changeset in list {
+            if let Some(file_list) = changeset.get("files").and_then(Value::as_array) {
+                for file in file_list {
+                    if let Some(path) = file.get("path").and_then(Value::as_str) {
+                        if !files.iter().any(|existing: &String| existing == path) {
+                            files.push(path.to_string());
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Failures: task attempts with a failure_class.
+    let mut failure_classes = std::collections::BTreeSet::new();
+    let mut failed_task_count = 0;
+    if let Some(list) = tasks.get("tasks").and_then(Value::as_array) {
+        for task in list {
+            if let Some(attempts) = task.get("attempts").and_then(Value::as_array) {
+                for attempt in attempts {
+                    if let Some(failure) = attempt.get("failure_class").and_then(Value::as_str) {
+                        if !failure.trim().is_empty() {
+                            failure_classes.insert(failure.to_string());
+                            failed_task_count += 1;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Recovery: total retries across tasks (retry_count > 0 proves a retry).
+    let mut retry_count = 0_i64;
+    if let Some(list) = tasks.get("tasks").and_then(Value::as_array) {
+        for task in list {
+            retry_count += task.get("retry_count").and_then(Value::as_i64).unwrap_or(0);
+        }
+    }
+
+    json!({
+        "tools_used": tools.into_iter().collect::<Vec<_>>(),
+        "commands": commands,
+        "files_changed": files,
+        "failure_classes": failure_classes.into_iter().collect::<Vec<_>>(),
+        "failed_task_count": failed_task_count,
+        "retry_count": retry_count,
+    })
 }
 
 /// UTF-8-safe bounded summary helper (mirrors the evidence crate's

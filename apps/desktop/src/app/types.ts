@@ -334,3 +334,35 @@ export interface VerificationSummary {
   verifications: VerificationRun[];
   final_audits: FinalAuditInfo[];
 }
+
+// ── Conversation activity projection (G2) ──────────────────────────────
+// All data originates from authoritative backend state projected per mission
+// referenced by the conversation's messages.  Nothing here is fabricated.
+
+export interface ConversationActivityMission {
+  mission_id: string;
+  conversation_id: string;
+  /** Live coordinator status (queued/running/paused/cancelled/failed/completed). */
+  status?: string | null;
+  details: MissionDetails;
+  tasks: { tasks: TaskDetail[] };
+  events: { events: MissionActivityEvent[] };
+  changesets: { changesets: ChangeSetSummary[] };
+  evidence: { evidence: EvidenceSummaryItem[] };
+  verification: VerificationSummary;
+  /** Factual execution summary derived from authoritative persisted state. */
+  summary?: {
+    tools_used: string[];
+    commands: string[];
+    files_changed: string[];
+    failure_classes: string[];
+    failed_task_count: number;
+    retry_count: number;
+  };
+}
+
+export interface ConversationActivity {
+  conversation_id: string;
+  project_path: string;
+  missions: ConversationActivityMission[];
+}

@@ -50,10 +50,25 @@ pub struct Goal {
     pub id: StableId,
     pub text: String,
     pub stopping_condition: String,
+    /// Typed attachment content that must influence model context.  Content is
+    /// bounded and workspace-validated by the daemon before it reaches the
+    /// agent; this list is never used to bypass Tool Broker or sandbox policy.
+    pub attachments: Vec<ContextAttachment>,
 }
 
 impl Goal {
     pub fn new(text: impl Into<String>) -> AcResult<Self> {
+        Self::with_attachments(text, Vec::new())
+    }
+
+    /// Construct a goal with typed attachment context.  Attachments are
+    /// opt-in context inputs: text/code carries bounded extracted content,
+    /// images carry a reference (never raw pixels), and documents carry
+    /// metadata with an explicit extraction state.
+    pub fn with_attachments(
+        text: impl Into<String>,
+        attachments: Vec<ContextAttachment>,
+    ) -> AcResult<Self> {
         let text = text.into();
         if text.trim().is_empty() {
             return Err(AcError::validation(
@@ -65,8 +80,35 @@ impl Goal {
             id: StableId::new("goal"),
             text,
             stopping_condition: "changeset prepared with verification evidence".to_string(),
+            attachments,
         })
     }
+}
+
+/// A typed, bounded attachment that may influence model context.  The daemon
+/// is the only writer: it validates the workspace boundary, applies size
+/// limits, and classifies content before constructing these values.  The agent
+/// never reads arbitrary files from this structure.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ContextAttachment {
+    pub attachment_id: String,
+    pub filename: String,
+    pub mime_type: String,
+    pub project_path: String,
+    pub conversation_id: String,
+    pub content: AttachmentContent,
+}
+
+/// Classified attachment content.  Only `Text` carries raw content, and it is
+/// already bounded by the daemon.  Images are references only — pixel data is
+/// never placed in the context, and vision capability is reported honestly by
+/// the provider routing layer.  Documents expose metadata and an explicit
+/// extraction state; unsupported documents are never silently downgraded.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum AttachmentContent {
+    Text(String),
+    Image { reference: String },
+    Document { unsupported: bool },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -553,6 +595,9 @@ impl ContextBuilder {
             protected: true,
             degraded: false,
         });
+        for attachment in &goal.attachments {
+            nodes.push(attachment_context_node(attachment));
+        }
         for evidence_ref in prior_evidence {
             nodes.push(ContextNode {
                 id: StableId::new("ctxnode"),
@@ -631,6 +676,60 @@ impl ContextBuilder {
             });
         }
         self.engine.build_context_pack(nodes, 512)
+    }
+}
+
+fn attachment_context_node(attachment: &ContextAttachment) -> ContextNode {
+    let content = match &attachment.content {
+        AttachmentContent::Text(text) => {
+            let bounded = if text.len() > 16384 {
+                format!("{}…[+{}]", &text[..16384], text.len() - 16384)
+            } else {
+                text.clone()
+            };
+            format!(
+                "attachment:{} mime:{} id:{} project:{} conversation:{}\n{}",
+                attachment.filename,
+                attachment.mime_type,
+                attachment.attachment_id,
+                attachment.project_path,
+                attachment.conversation_id,
+                bounded
+            )
+        }
+        AttachmentContent::Image { reference } => {
+            format!(
+                "attachment:{} mime:{} id:{} project:{} conversation:{} ref:{} — image; current text pipeline cannot consume image pixels",
+                attachment.filename,
+                attachment.mime_type,
+                attachment.attachment_id,
+                attachment.project_path,
+                attachment.conversation_id,
+                reference
+            )
+        }
+        AttachmentContent::Document { unsupported } => {
+            format!(
+                "attachment:{} mime:{} id:{} project:{} conversation:{} unsupported_extraction:{}",
+                attachment.filename,
+                attachment.mime_type,
+                attachment.attachment_id,
+                attachment.project_path,
+                attachment.conversation_id,
+                unsupported
+            )
+        }
+    };
+    let token_estimate = content.len().min(4096) as u32 / 4;
+    ContextNode {
+        id: StableId::new("ctxnode"),
+        source_ref: ac_common::StableId::from_existing(&attachment.attachment_id)
+            .unwrap_or_else(|_| StableId::new("att")),
+        authority: AuthorityClass::RuntimeContext,
+        content,
+        token_estimate,
+        protected: false,
+        degraded: false,
     }
 }
 
@@ -5460,6 +5559,182 @@ mod tests {
             .iter()
             .any(|node| node.authority == AuthorityClass::RetrievalAccelerator));
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn attachment_text_reaches_context_pack() {
+        let goal = Goal::with_attachments(
+            "Fix the code",
+            vec![
+                ContextAttachment {
+                    attachment_id: "att-001".to_string(),
+                    filename: "main.rs".to_string(),
+                    mime_type: "text/plain".to_string(),
+                    project_path: "/proj/a".to_string(),
+                    conversation_id: "conv-x".to_string(),
+                    content: AttachmentContent::Text(
+                        "fn main() { println!(\"hello\"); }".to_string(),
+                    ),
+                },
+                ContextAttachment {
+                    attachment_id: "att-002".to_string(),
+                    filename: "logo.png".to_string(),
+                    mime_type: "image/png".to_string(),
+                    project_path: "/proj/a".to_string(),
+                    conversation_id: "conv-x".to_string(),
+                    content: AttachmentContent::Image {
+                        reference: ".agentcode/attachments/logo.png".to_string(),
+                    },
+                },
+                ContextAttachment {
+                    attachment_id: "att-003".to_string(),
+                    filename: "doc.pdf".to_string(),
+                    mime_type: "application/pdf".to_string(),
+                    project_path: "/proj/b".to_string(),
+                    conversation_id: "conv-y".to_string(),
+                    content: AttachmentContent::Document { unsupported: true },
+                },
+            ],
+        )
+        .unwrap();
+        let mut code_intel = CodeIntelligenceService::new();
+        let context = ContextBuilder::default()
+            .build(
+                &goal,
+                &[],
+                &mut MemoryService::new(),
+                &mut code_intel,
+                None,
+                Vec::new(),
+            )
+            .unwrap();
+        // Text attachment content must be present in context nodes.
+        let text_node = context
+            .nodes
+            .iter()
+            .find(|n| n.content.contains("main.rs"))
+            .expect("text attachment node");
+        assert!(
+            text_node.content.contains("fn main()"),
+            "text content: {}",
+            text_node.content
+        );
+        assert!(
+            text_node.content.contains("att-001"),
+            "attachment id: {}",
+            text_node.content
+        );
+        assert!(
+            text_node.content.contains("text/plain"),
+            "mime: {}",
+            text_node.content
+        );
+        // Project/conversation association preserved.
+        assert!(
+            text_node.content.contains("/proj/a"),
+            "project: {}",
+            text_node.content
+        );
+        assert!(
+            text_node.content.contains("conv-x"),
+            "conversation: {}",
+            text_node.content
+        );
+        assert_eq!(text_node.authority, AuthorityClass::RuntimeContext);
+        // Image attachment must be present as a reference node (no raw pixels).
+        let img_node = context
+            .nodes
+            .iter()
+            .find(|n| n.content.contains("logo.png"))
+            .expect("image attachment node");
+        assert!(
+            img_node.content.contains("cannot consume image"),
+            "image note: {}",
+            img_node.content
+        );
+        assert!(
+            img_node.content.contains("att-002"),
+            "image id: {}",
+            img_node.content
+        );
+        // Document with unsupported extraction must be present with metadata.
+        let doc_node = context
+            .nodes
+            .iter()
+            .find(|n| n.content.contains("doc.pdf"))
+            .expect("doc attachment node");
+        assert!(
+            doc_node.content.contains("unsupported_extraction:true"),
+            "doc note: {}",
+            doc_node.content
+        );
+        assert!(
+            doc_node.content.contains("/proj/b"),
+            "doc project: {}",
+            doc_node.content
+        );
+        assert!(
+            doc_node.content.contains("conv-y"),
+            "doc conversation: {}",
+            doc_node.content
+        );
+        // Bounded content: a long text attachment is truncated to 16384 bytes.
+        let long_text = "a".repeat(20000);
+        // The attachment_context_node function bounds content to 16384 bytes.
+        let bounded_attachment = ContextAttachment {
+            attachment_id: "att-long".to_string(),
+            filename: "long.txt".to_string(),
+            mime_type: "text/plain".to_string(),
+            project_path: "/proj/a".to_string(),
+            conversation_id: "conv-x".to_string(),
+            content: AttachmentContent::Text(long_text),
+        };
+        let bounded_node = attachment_context_node(&bounded_attachment);
+        assert!(
+            bounded_node.content.len() < 20000,
+            "content should be bounded, got {}",
+            bounded_node.content.len()
+        );
+        assert!(
+            bounded_node.content.contains("[+"),
+            "truncation marker: {}",
+            bounded_node.content
+        );
+        assert!(
+            bounded_node.content.contains("long.txt"),
+            "filename: {}",
+            bounded_node.content
+        );
+        // The bounded content also reaches the context pack when budget allows.
+        let goal_big = Goal::with_attachments("Bounded test", vec![bounded_attachment]).unwrap();
+        let context2 = ContextBuilder::default()
+            .build(
+                &goal_big,
+                &[],
+                &mut MemoryService::new(),
+                &mut code_intel,
+                None,
+                Vec::new(),
+            )
+            .unwrap();
+        // The attachment node may be dropped by pack budget; verify by
+        // checking that IF it is present the content is truncated.
+        if let Some(node) = context2
+            .nodes
+            .iter()
+            .find(|n| n.content.contains("long.txt"))
+        {
+            assert!(
+                node.content.len() < 20000,
+                "bounded in pack: {}",
+                node.content.len()
+            );
+            assert!(
+                node.content.contains("[+"),
+                "truncation marker in pack: {}",
+                node.content
+            );
+        }
     }
 
     #[test]

@@ -1140,6 +1140,19 @@ fn daemon_attachment_remove(
     )
 }
 
+#[tauri::command]
+fn daemon_conversation_activity(
+    state: tauri::State<DaemonClient>,
+    conversation_id: String,
+) -> Result<Value, String> {
+    request(
+        &state.0,
+        "ui",
+        "ConversationActivity",
+        json!({ "conversation_id": conversation_id }),
+    )
+}
+
 fn guess_mime(filename: &str) -> String {
     let lower = filename.to_ascii_lowercase();
     if lower.ends_with(".png") {
@@ -1248,6 +1261,7 @@ fn main() {
             daemon_attachment_path,
             daemon_attachment_list,
             daemon_attachment_remove,
+            daemon_conversation_activity,
         ])
         .run(tauri::generate_context!())
         .expect("error while running AgentCode desktop application");

@@ -322,6 +322,7 @@ impl DaemonService {
             session_id: session.id().clone(),
             goal: goal.to_string(),
             workspace_root: workspace,
+            attachments: self.load_goal_attachments(attachment_ids, &conv.project_path)?,
         })?;
         // Persist the user's goal as a message with mission_ref
         let now = TimestampMillis::now().as_millis() as i64;
@@ -341,6 +342,74 @@ impl DaemonService {
         }
         self.db.set_conversation_mission(conversation_id, &mission_id.to_string())?;
         Ok((mission_id, session.id().clone()))
+    }
+
+    /// Read bounded attachment content from the workspace, validate security
+    /// boundaries, and produce typed `ContextAttachment` values for the model
+    /// context pipeline.  Each attachment is independently bounded:
+    /// - text/code: up to 32 KB extracted content
+    /// - images: reference only, never raw bytes
+    /// - PDFs/documents: metadata + unsupported extraction state
+    /// - oversized or binary: document-unsupported
+    fn load_goal_attachments(
+        &self,
+        attachment_ids: &[String],
+        project_path: &str,
+    ) -> AcResult<Vec<ContextAttachment>> {
+        let mut result = Vec::new();
+        for att_id in attachment_ids {
+            let row = match self.db.attachment(att_id)? {
+                Some(r) => r,
+                None => continue,
+            };
+            if row.project_path != project_path {
+                continue;
+            }
+            // A registered-but-missing file must be skipped, never crash the
+            // goal submission.  Only an out-of-project or escaping attachment
+            // is a hard error (workspace boundary policy).
+            let file_path = match self.attachment_path(att_id, project_path) {
+                Ok(Some(p)) => p,
+                Ok(None) => continue,
+                Err(error)
+                    if error.code() == "CONVERSATION-FILE_NOT_FOUND"
+                        || error.code() == "CONVERSATION-PROJECT_PATH" =>
+                {
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
+            let mime = row.mime_type.as_str();
+            let content = if mime.starts_with("text/")
+                || mime == "application/json"
+                || mime == "application/octet-stream"
+            {
+                let mut bounded = Vec::with_capacity(32768.min(row.size_bytes as usize));
+                if let Ok(mut f) = std::fs::File::open(&file_path) {
+                    let mut buf = [0u8; 32768];
+                    let n = f.read(&mut buf).unwrap_or(0);
+                    bounded.extend_from_slice(&buf[..n]);
+                }
+                let text = String::from_utf8_lossy(&bounded).to_string();
+                AttachmentContent::Text(text)
+            } else if mime.starts_with("image/") {
+                // Reference only — never raw bytes or absolute workspace paths.
+                AttachmentContent::Image {
+                    reference: row.storage_key.clone(),
+                }
+            } else {
+                AttachmentContent::Document { unsupported: true }
+            };
+            result.push(ContextAttachment {
+                attachment_id: att_id.clone(),
+                filename: row.filename,
+                mime_type: row.mime_type,
+                project_path: row.project_path.clone(),
+                conversation_id: row.conversation_id.clone(),
+                content,
+            });
+        }
+        Ok(result)
     }
 }
 

@@ -33,6 +33,10 @@ path = "final_release_flow.rs"
 name = "daemon_process_boundary"
 path = "daemon_process_boundary.rs"
 
+[[test]]
+name = "realtime_conversation_e2e"
+path = "realtime_conversation_e2e.rs"
+
 [dev-dependencies]
 ac-agent = { path = "../../crates/ac-agent" }
 ac-changeset = { path = "../../crates/ac-changeset" }
