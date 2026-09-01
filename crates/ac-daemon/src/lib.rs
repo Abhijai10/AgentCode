@@ -146,6 +146,25 @@ impl ac_agent::AgentDurabilityObserver for SqliteAgentDurability {
         };
         db.save_provider_model_record(&row)
     }
+
+    fn final_audit_recorded(
+        &mut self,
+        mission_id: &str,
+        original_goal: &str,
+        requirements: &[String],
+        audit: &ac_verification::FinalAuditReport,
+        completion_allowed: bool,
+        remaining_uncertainty: &str,
+    ) -> AcResult<()> {
+        self.db()?.save_final_audit(
+            mission_id,
+            original_goal,
+            requirements,
+            audit,
+            completion_allowed,
+            remaining_uncertainty,
+        )
+    }
 }
 
 #[derive(Default)]

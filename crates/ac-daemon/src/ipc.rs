@@ -3054,4 +3054,324 @@ mod ipc_tests {
         std::env::remove_var("AGENTCODE_PROVIDER_MODE");
         let _ = fs::remove_dir_all(dir);
     }
+
+    #[test]
+    fn discuss_to_goal_to_mission_preserves_conversation_and_reference() {
+        let _env_lock = crate::TEST_ENV_LOCK.lock().unwrap();
+        std::env::set_var("AGENTCODE_PROVIDER_MODE", "mock");
+        let (dir, db, lock, socket) = temp_paths("ipc-discuss-mission");
+        let project_dir = dir.join("workspace");
+        fs::create_dir_all(&project_dir).unwrap();
+        let project_path = project_dir.to_string_lossy().to_string();
+
+        let mut daemon = DaemonService::open(&db, &lock).unwrap();
+        daemon.start().unwrap();
+        let Some((server, listener)) = bind_or_skip(&socket, None) else {
+            daemon.shutdown().unwrap();
+            std::env::remove_var("AGENTCODE_PROVIDER_MODE");
+            let _ = fs::remove_dir_all(dir);
+            return;
+        };
+
+        // 1. Create a Discuss conversation
+        let create = request_via_ipc(
+            &server, &listener, &mut daemon,
+            json!({"id":"c1","command":"ConversationCreate","project_path": project_path, "mode":"DISCUSS","title":"Discuss Mission Path"}),
+        );
+        assert_eq!(create["ok"], true, "create: {create}");
+        let cid = create["conversation_id"].as_str().unwrap().to_string();
+
+        // 2. Have a real discussion (assistant reply persisted)
+        let send = request_via_ipc(
+            &server, &listener, &mut daemon,
+            json!({"id":"d1","command":"DiscussSend","conversation_id": cid, "content": "Should we move authentication into a separate service?"}),
+        );
+        assert_eq!(send["ok"], true, "discuss: {send}");
+
+        // 3. Transition: user asks to implement, becomes a GoalSubmit in the SAME conversation
+        let goal = "Move authentication into a separate service module.";
+        let submit = request_via_ipc(
+            &server, &listener, &mut daemon,
+            json!({"id":"s1","command":"GoalSubmit","conversation_id": cid, "goal": goal}),
+        );
+        assert_eq!(submit["ok"], true, "goal submit: {submit}");
+        let mission_id = submit["mission_id"].as_str().unwrap().to_string();
+        assert!(mission_id.starts_with("mission-"));
+
+        // 4. Mission reference preserved in the conversation
+        let get = request_via_ipc(
+            &server, &listener, &mut daemon,
+            json!({"id":"g1","command":"ConversationGet","conversation_id": cid}),
+        );
+        assert_eq!(get["ok"], true);
+        assert_eq!(get["conversation"]["current_mission_id"].as_str().unwrap(), mission_id);
+        let msgs = get["conversation"]["messages"].as_array().unwrap();
+        // user discussion message + assistant reply + user goal message
+        assert!(msgs.len() >= 3, "messages: {msgs:?}");
+        let goal_msg = msgs
+            .iter()
+            .find(|m| m["mission_ref"].as_str() == Some(mission_id.as_str()))
+            .unwrap();
+        assert_eq!(goal_msg["content"], goal);
+        // project preserved
+        assert_eq!(get["conversation"]["project_path"].as_str().unwrap(), project_path);
+        // mode still DISCUSS (a discussion that grew a mission)
+        assert_eq!(get["conversation"]["mode"], "DISCUSS");
+
+        // 5. Mission appears in activity projection
+        let activity = request_via_ipc(
+            &server, &listener, &mut daemon,
+            json!({"id":"a1","command":"ConversationActivity","conversation_id": cid}),
+        );
+        assert_eq!(activity["ok"], true);
+        let missions = activity["missions"].as_array().unwrap();
+        assert!(
+            missions.iter().any(|m| m["mission_id"].as_str() == Some(mission_id.as_str())),
+            "mission must appear in activity"
+        );
+
+        // Cancel so the coordinator never runs it against real providers.
+        let cancel = request_via_ipc(
+            &server, &listener, &mut daemon,
+            json!({"id":"x1","command":"CancelMission","mission_id": mission_id}),
+        );
+        assert_eq!(cancel["ok"], true);
+
+        server.cleanup();
+        daemon.shutdown().unwrap();
+        std::env::remove_var("AGENTCODE_PROVIDER_MODE");
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn three_discuss_chats_switch_restart_and_restore_all() {
+        let _env_lock = crate::TEST_ENV_LOCK.lock().unwrap();
+        std::env::set_var("AGENTCODE_PROVIDER_MODE", "mock");
+        let (dir, db, lock, socket) = temp_paths("ipc-discuss-3chat");
+        let project_dir = dir.join("workspace");
+        fs::create_dir_all(&project_dir).unwrap();
+        let project_path = project_dir.to_string_lossy().to_string();
+
+        let mut daemon = DaemonService::open(&db, &lock).unwrap();
+        daemon.start().unwrap();
+        let Some((server, listener)) = bind_or_skip(&socket, None) else {
+            daemon.shutdown().unwrap();
+            std::env::remove_var("AGENTCODE_PROVIDER_MODE");
+            let _ = fs::remove_dir_all(dir);
+            return;
+        };
+
+        // Create 3 distinct Discuss chats
+        let mut cids = Vec::new();
+        for (i, title) in ["Chat A", "Chat B", "Chat C"].iter().enumerate() {
+            let create = request_via_ipc(
+                &server, &listener, &mut daemon,
+                json!({"id": format!("c{i}"), "command":"ConversationCreate","project_path": project_path, "mode":"DISCUSS","title": title}),
+            );
+            assert_eq!(create["ok"], true, "create {title}: {create}");
+            cids.push(create["conversation_id"].as_str().unwrap().to_string());
+        }
+        assert_ne!(cids[0], cids[1]);
+        assert_ne!(cids[1], cids[2]);
+
+        // Write a distinct message to each
+        let topics = [
+            "Explain the authentication architecture.",
+            "Let's design a new payment subsystem.",
+            "Why is the daemon IPC structured this way?",
+        ];
+        for (i, (cid, topic)) in cids.iter().zip(topics.iter()).enumerate() {
+            let send = request_via_ipc(
+                &server, &listener, &mut daemon,
+                json!({"id": format!("d{i}"), "command":"DiscussSend","conversation_id": cid, "content": topic}),
+            );
+            assert_eq!(send["ok"], true, "send to {cid}: {send}");
+        }
+
+        // Switch between them: verify each restores its own history
+        for (cid, topic) in cids.iter().zip(topics.iter()) {
+            let get = request_via_ipc(
+                &server, &listener, &mut daemon,
+                json!({"id":"gx","command":"ConversationGet","conversation_id": cid}),
+            );
+            assert_eq!(get["ok"], true);
+            let msgs = get["conversation"]["messages"].as_array().unwrap();
+            assert!(
+                msgs.iter()
+                    .any(|m| m["content"].as_str() == Some(topic)),
+                "wrong history for {cid}"
+            );
+        }
+
+        // Restart daemon
+        server.cleanup();
+        daemon.shutdown().unwrap();
+
+        let mut daemon2 = DaemonService::open(&db, &lock).unwrap();
+        daemon2.start().unwrap();
+        let Some((server2, listener2)) = bind_or_skip(&socket, None) else {
+            daemon2.shutdown().unwrap();
+            std::env::remove_var("AGENTCODE_PROVIDER_MODE");
+            let _ = fs::remove_dir_all(dir);
+            return;
+        };
+
+        // All three restored with correct distinct histories
+        let list = request_via_ipc(
+            &server2, &listener2, &mut daemon2,
+            json!({"id":"l1","command":"ConversationList","project_path": project_path}),
+        );
+        assert_eq!(list["ok"], true);
+        let convs = list["conversations"].as_array().unwrap();
+        assert_eq!(convs.len(), 3, "all three chats must survive restart");
+        for (cid, topic) in cids.iter().zip(topics.iter()) {
+            let get = request_via_ipc(
+                &server2, &listener2, &mut daemon2,
+                json!({"id":"gx","command":"ConversationGet","conversation_id": cid}),
+            );
+            assert_eq!(get["ok"], true);
+            let msgs = get["conversation"]["messages"].as_array().unwrap();
+            assert!(
+                msgs.iter()
+                    .any(|m| m["content"].as_str() == Some(topic)),
+                "restored history wrong for {cid}"
+            );
+            assert_eq!(get["conversation"]["mode"], "DISCUSS");
+        }
+
+        server2.cleanup();
+        daemon2.shutdown().unwrap();
+        std::env::remove_var("AGENTCODE_PROVIDER_MODE");
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    /// Real E2E: Discuss conversation → user message → real small local model
+    /// (≤4B) → assistant response → persisted message → provider/model record
+    /// → second Discuss chat → GoalSubmit → mission reference → activity.
+    ///
+    /// Requires:
+    /// - Ollama running on 127.0.0.1:11434 with a ≤4B model
+    /// - Default model: qwen2.5-coder:3b (3.1B, 1.9GB)
+    /// - OLLAMA_BASE_URL must include the full chat endpoint path so the
+    ///   environment-registry provider uses the correct URL (the catalog path
+    ///   appends /api/chat automatically; the env path uses the value raw).
+    /// - Override model via OLLAMA_MODEL env var
+    ///
+    /// Run: OLLAMA_BASE_URL=http://127.0.0.1:11434/api/chat \
+    ///      OLLAMA_MODEL=qwen2.5-coder:3b \
+    ///      cargo test -p ac-daemon real_discuss_e2e_small_model -- --ignored
+    #[test]
+    #[ignore = "requires Ollama with a ≤4B model (set OLLAMA_MODEL, OLLAMA_BASE_URL)"]
+    fn real_discuss_e2e_small_model() {
+        // Verify Ollama is reachable with the configured model
+        let model = std::env::var("OLLAMA_MODEL").unwrap_or_else(|_| "qwen2.5-coder:3b".to_string());
+        let base = std::env::var("OLLAMA_BASE_URL")
+            .unwrap_or_else(|_| "http://127.0.0.1:11434/api/chat".to_string());
+        let host = base
+            .strip_suffix("/api/chat")
+            .unwrap_or(&base)
+            .to_string();
+        let check = std::process::Command::new("curl")
+            .args(["-s", "-o", "/dev/null", "-w", "%{http_code}", &format!("{host}/api/tags")])
+            .output()
+            .expect("ollama must be running for this test");
+        let status = String::from_utf8_lossy(&check.stdout);
+        if !status.starts_with('2') {
+            eprintln!("SKIP: Ollama not reachable at {host}");
+            return;
+        }
+        let (dir, db, lock, socket) = temp_paths("e2e-discuss-real");
+        let project_dir = dir.join("workspace");
+        fs::create_dir_all(&project_dir).unwrap();
+        let project_path = project_dir.to_string_lossy().to_string();
+
+        let mut daemon = DaemonService::open(&db, &lock).unwrap();
+        daemon.start().unwrap();
+        let Some((server, listener)) = bind_or_skip(&socket, None) else {
+            daemon.shutdown().unwrap();
+            let _ = fs::remove_dir_all(dir);
+            return;
+        };
+
+        // 1. Create Discuss chat
+        let create = request_via_ipc(
+            &server, &listener, &mut daemon,
+            json!({"id":"c1","command":"ConversationCreate","project_path": project_path, "mode":"DISCUSS","title":"E2E Discuss"}),
+        );
+        assert_eq!(create["ok"], true, "create: {create}");
+        let cid = create["conversation_id"].as_str().unwrap().to_string();
+
+        // 2. Send a real question — the daemon calls the real model via provider
+        let send = request_via_ipc(
+            &server, &listener, &mut daemon,
+            json!({"id":"d1","command":"DiscussSend","conversation_id": cid, "content": "What file types does this project use?"}),
+        );
+        assert_eq!(send["ok"], true, "send: {send}");
+        let msg = &send["message"];
+        assert_eq!(msg["role"], "assistant");
+        let content = msg["content"].as_str().unwrap_or("");
+        assert!(!content.is_empty(), "real model must produce a non-empty response");
+        assert!(!content.contains("[error"), "real model response must not be an error: {content}");
+
+        // 3. Provider/model record was persisted
+        let pmrs = daemon.db.provider_model_records_for_conversation(&cid).unwrap();
+        assert!(!pmrs.is_empty(), "provider/model record must be persisted");
+        assert!(
+            pmrs.iter().any(|r| r.success && r.model_name == model),
+            "expected successful record for {model}, got: {pmrs:?}"
+        );
+
+        // 4. Provider/model metadata in message
+        let metadata = msg["metadata"].as_str().unwrap_or("{}");
+        assert!(metadata.contains(&model), "metadata must contain model: {metadata}");
+
+        // 5. ConversationGet returns the persisted discussion
+        let get = request_via_ipc(
+            &server, &listener, &mut daemon,
+            json!({"id":"g1","command":"ConversationGet","conversation_id": cid}),
+        );
+        assert_eq!(get["ok"], true);
+        let msgs = get["conversation"]["messages"].as_array().unwrap();
+        assert_eq!(msgs.len(), 2, "user + assistant");
+        assert_eq!(msgs[0]["role"], "user");
+        assert_eq!(msgs[1]["role"], "assistant");
+
+        // 6. Transition to mission: Discuss → GoalSubmit
+        let goal = "List the project files and their purposes.";
+        let submit = request_via_ipc(
+            &server, &listener, &mut daemon,
+            json!({"id":"s1","command":"GoalSubmit","conversation_id": cid, "goal": goal}),
+        );
+        assert_eq!(submit["ok"], true, "submit: {submit}");
+        let mission_id = submit["mission_id"].as_str().unwrap().to_string();
+
+        // 7. Mission reference appears in conversation
+        let get2 = request_via_ipc(
+            &server, &listener, &mut daemon,
+            json!({"id":"g2","command":"ConversationGet","conversation_id": cid}),
+        );
+        assert_eq!(get2["ok"], true);
+        assert_eq!(get2["conversation"]["current_mission_id"].as_str().unwrap(), mission_id);
+
+        // 8. Activity projection surfaces the mission
+        let activity = request_via_ipc(
+            &server, &listener, &mut daemon,
+            json!({"id":"a1","command":"ConversationActivity","conversation_id": cid}),
+        );
+        assert_eq!(activity["ok"], true);
+        assert!(activity["missions"].as_array().unwrap().iter().any(|m| {
+            m["mission_id"].as_str() == Some(mission_id.as_str())
+        }));
+
+        // 9. Cancel mission so coordinator doesn't run it against real providers
+        let cancel = request_via_ipc(
+            &server, &listener, &mut daemon,
+            json!({"id":"x1","command":"CancelMission","mission_id": mission_id}),
+        );
+        assert_eq!(cancel["ok"], true);
+
+        server.cleanup();
+        daemon.shutdown().unwrap();
+        let _ = fs::remove_dir_all(dir);
+    }
 }

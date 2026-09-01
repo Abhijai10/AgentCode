@@ -353,7 +353,7 @@ impl DaemonService {
         &mut self,
         conversation_id: &str,
         content: &str,
-        _attachment_ids: &[String],
+        attachment_ids: &[String],
     ) -> AcResult<ac_db::ConversationMessageRow> {
         self.ensure_running()?;
         let conv = self
@@ -374,9 +374,28 @@ impl DaemonService {
                 "message content must not be empty",
             ));
         }
-        // Append user message
-        let _user_msg = self.append_message(conversation_id, "user", content, None, "{}")?;
-        // Build bounded context: recent messages + project context
+        // Append user message and link attachments
+        let user_msg = self.append_message(conversation_id, "user", content, None, "{}")?;
+        for att_id in attachment_ids {
+            let _ = self.db.link_message_attachment(att_id, &user_msg.id);
+        }
+        // Load bounded attachment content through the existing security pipeline
+        let attachments = self.load_goal_attachments(attachment_ids, &conv.project_path)?;
+        let mut attachment_block = String::new();
+        for att in &attachments {
+            if let ac_agent::AttachmentContent::Text(text) = &att.content {
+                let bounded = if text.len() > 4096 {
+                    format!("{}...\n[truncated {} chars]", &text[..4096], text.len())
+                } else {
+                    text.clone()
+                };
+                attachment_block.push_str(&format!(
+                    "\n--- Attachment: {} ---\n{}\n--- end {} ---",
+                    att.filename, bounded, att.filename
+                ));
+            }
+        }
+        // Build bounded context: recent messages + project context + attachments
         let messages = self.db.messages_for_conversation(conversation_id)?;
         let recent = messages
             .iter()
@@ -386,11 +405,12 @@ impl DaemonService {
             .collect::<Vec<_>>()
             .join("\n");
         let project_hint = format!("Project: {}\n", conv.project_path);
+        let project_files = bounded_project_listing(&conv.project_path, 80);
         let prompt = format!(
-            "{}\n{}\n\n--\nProvide a helpful, project-aware conversational response. \
+            "{}\n{}\n{}\n{}\n\n--\nProvide a helpful, project-aware conversational response. \
              Do NOT write code, modify files, or execute commands. \
              Only discuss the project, architecture, design, and implementation ideas.\n",
-            project_hint, recent
+            project_hint, project_files, recent, attachment_block,
         );
         // Build a lightweight provider registry and request a conversational answer
         let db_path = self.db_path.clone();
@@ -405,6 +425,10 @@ impl DaemonService {
             ac_common::StableId::new("discuss"),
             ac_provider::RoutingProfile::LocalFirst,
         );
+        // Bound the required context so already-installed small local models
+        // (e.g. qwen2.5-coder:3b with an 8K window) satisfy the routing check.
+        let mut profile = profile;
+        profile.required_context = 4096;
         let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let result = providers.request_model(
             &profile,
@@ -554,6 +578,35 @@ pub struct ConversationWithMessages {
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
+
+/// Bounded project file listing for Discuss context.  Reads at most 80 files
+/// from the project root (non-recursive, skipping hidden/dependency dirs) so
+/// the model has relevant project context without injecting the entire repo.
+fn bounded_project_listing(project_path: &str, max_files: usize) -> String {
+    let dir = std::path::Path::new(project_path);
+    if !dir.is_dir() {
+        return String::new();
+    }
+    let mut entries = Vec::new();
+    if let Ok(read) = std::fs::read_dir(dir) {
+        for entry in read.flatten().take(max_files) {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if name.starts_with('.') || name == "node_modules" || name == "target" {
+                continue;
+            }
+            let meta = entry.metadata().ok();
+            let is_dir = meta.as_ref().map(|m| m.is_dir()).unwrap_or(false);
+            let kind = if is_dir { "dir" } else { "file" };
+            let size = meta.as_ref().map(|m| m.len()).unwrap_or(0);
+            entries.push(format!("  {name} ({kind}, {size} bytes)"));
+        }
+    }
+    if entries.is_empty() {
+        String::new()
+    } else {
+        format!("Project files:\n{}\n", entries.join("\n"))
+    }
+}
 
 /// FNV-1a 64-bit hash of file bytes, producing a "fnv1a64:" hex string.
 /// Consistent with ac-evidence::content_hash for uniformity.

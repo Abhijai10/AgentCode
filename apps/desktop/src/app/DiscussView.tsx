@@ -210,6 +210,19 @@ export function DiscussView({
   function renderMessage(msg: Message) {
     const isUser = msg.role === "user";
     const isAssistant = msg.role === "assistant";
+    let providerModel: { provider_id?: string; model_name?: string } | null =
+      null;
+    if (isAssistant && msg.metadata) {
+      try {
+        const meta =
+          typeof msg.metadata === "string"
+            ? JSON.parse(msg.metadata)
+            : msg.metadata;
+        if (meta?.provider_model) providerModel = meta.provider_model;
+      } catch {
+        providerModel = null;
+      }
+    }
     return (
       <div
         key={msg.id}
@@ -226,10 +239,16 @@ export function DiscussView({
             <p className="text-sm whitespace-pre-wrap break-words">
               {msg.content}
             </p>
-            {isAssistant && msg.metadata && (
+            {isAssistant && (providerModel || msg.metadata) && (
               <div className="mt-2 flex items-center gap-2 text-[10px] text-on-surface-variant">
                 <Icon name="smart_toy" size={12} />
-                <span>AI response</span>
+                <span>
+                  {providerModel?.model_name
+                    ? providerModel.model_name
+                    : providerModel?.provider_id
+                      ? providerModel.provider_id
+                      : "AI response"}
+                </span>
               </div>
             )}
             {msg.mission_ref && (

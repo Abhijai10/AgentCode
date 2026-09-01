@@ -36,7 +36,8 @@ use ac_security::{
 use ac_tool::{ToolBroker, ToolRequest, ToolResult, ToolStatus};
 use ac_verification::{
     DesignAccessibilityReport, DesignFunctionalReport, DesignResponsiveReport,
-    DesignVisualEvaluation, FinalAuditInput, ValidationRunReport, VerificationEngine,
+    DesignVisualEvaluation, FinalAuditInput, FinalAuditReport, ValidationRunReport,
+    VerificationEngine,
 };
 use serde_json::Value;
 
@@ -857,6 +858,21 @@ pub trait AgentDurabilityObserver: Send {
     ) -> AcResult<()> {
         Ok(())
     }
+
+    /// Persist the final audit (including remaining uncertainty) when a
+    /// mission requests completion.  This is the authoritative record the
+    /// conversation activity projection reads for remaining_uncertainty.
+    fn final_audit_recorded(
+        &mut self,
+        _mission_id: &str,
+        _original_goal: &str,
+        _requirements: &[String],
+        _audit: &FinalAuditReport,
+        _completion_allowed: bool,
+        _remaining_uncertainty: &str,
+    ) -> AcResult<()> {
+        Ok(())
+    }
 }
 
 /// A durable, factual record of a provider/model routing decision.
@@ -1114,6 +1130,33 @@ impl<P: PolicyBoundary> AutonomousAgent<P> {
             self.session.id().as_str(),
             task_id.map(StableId::as_str),
             &record,
+        )
+    }
+
+    /// Persist the final audit through the durability observer so the
+    /// conversation activity projection can expose remaining uncertainty
+    /// from authoritative backend state.  Only called when a mission
+    /// actually reaches the completion gate.
+    fn persist_final_audit(
+        &mut self,
+        mission_id: &StableId,
+        goal: &Goal,
+        requirements: &[String],
+        audit: &FinalAuditReport,
+        completion_allowed: bool,
+    ) -> AcResult<()> {
+        // Compute uncertainty before borrowing durability mutably.
+        let uncertainty = self.remaining_uncertainty().join("\n");
+        let Some(observer) = &mut self.durability else {
+            return Ok(());
+        };
+        observer.final_audit_recorded(
+            mission_id.as_str(),
+            &goal.text,
+            requirements,
+            audit,
+            completion_allowed,
+            &uncertainty,
         )
     }
 
@@ -1502,8 +1545,9 @@ impl<P: PolicyBoundary> AutonomousAgent<P> {
         match self.planner.runtime_plan(mission_id.clone(), reasoning) {
             Ok(plan) => Ok(plan),
             Err(first) => {
-                let repair = self.providers.request_model(
-                    &planner_profile(goal_id_from_mission(&mission_id)),
+                let profile = planner_profile(goal_id_from_mission(&mission_id));
+                let result = self.providers.request_model(
+                    &profile,
                     format!(
                         "repair invalid planner JSON; previous_error:{first}; return schema_version 1 JSON only\n{}",
                         PLANNER_SCHEMA_EXAMPLE
@@ -1511,7 +1555,31 @@ impl<P: PolicyBoundary> AutonomousAgent<P> {
                     4096,
                     &|| self.session.is_cancelled(),
                 );
-                let events = repair.map_err(provider_error)?.events;
+                let execution = match result {
+                    Ok(execution) => {
+                        if let Some(mid) = self.bound_mission_id.clone() {
+                            let _ = self.persist_provider_routing(
+                                &mid,
+                                None,
+                                &profile,
+                                &execution.decision,
+                            );
+                        }
+                        execution
+                    }
+                    Err(failure) => {
+                        if let Some(mid) = self.bound_mission_id.clone() {
+                            if let Some(decision) =
+                                self.providers.routing_decisions().last().cloned()
+                            {
+                                let _ =
+                                    self.persist_provider_routing(&mid, None, &profile, &decision);
+                            }
+                        }
+                        return Err(provider_error(failure));
+                    }
+                };
+                let events = execution.events;
                 let text = provider_events_text(&events);
                 self.planner
                     .runtime_plan(mission_id, &ProviderReasoning { text, events })
@@ -1550,10 +1618,35 @@ impl<P: PolicyBoundary> AutonomousAgent<P> {
             ));
             let mut profile = TaskProfile::coding(goal.id.clone(), RoutingProfile::FreeFirst);
             profile.required_context = context.budget;
-            let repair = self
+            let result = self
                 .providers
-                .request_model(&profile, prompt, 8192, &|| self.session.is_cancelled())
-                .map_err(provider_error)?;
+                .request_model(&profile, prompt, 8192, &|| self.session.is_cancelled());
+            let repair = match result {
+                Ok(execution) => {
+                    if let Some(mid) = self.bound_mission_id.clone() {
+                        let _ = self.persist_provider_routing(
+                            &mid,
+                            Some(&task.id),
+                            &profile,
+                            &execution.decision,
+                        );
+                    }
+                    execution
+                }
+                Err(failure) => {
+                    if let Some(mid) = self.bound_mission_id.clone() {
+                        if let Some(decision) = self.providers.routing_decisions().last().cloned() {
+                            let _ = self.persist_provider_routing(
+                                &mid,
+                                Some(&task.id),
+                                &profile,
+                                &decision,
+                            );
+                        }
+                    }
+                    return Err(provider_error(failure));
+                }
+            };
             let text = provider_events_text(&repair.events);
             match ActionProposal::parse(&text) {
                 Ok(proposal) => return Ok(proposal),
@@ -2273,6 +2366,7 @@ impl<P: PolicyBoundary> AutonomousAgent<P> {
                 verified_requirement_ids.push(StableId::from_existing(&criterion.id)?);
             }
         }
+        let audit_requirements = requirements.clone();
         let audit = self.verification.final_audit(
             FinalAuditInput {
                 original_goal: goal.text.clone(),
@@ -2296,6 +2390,8 @@ impl<P: PolicyBoundary> AutonomousAgent<P> {
                 gate.reason,
             ));
         }
+        let _ =
+            self.persist_final_audit(mission_id, goal, &audit_requirements, &audit, gate.allowed);
         accepted.push(audit.evidence_ref);
         self.kernel_lock()?
             .transition_mission(mission_id, MissionState::Completed, accepted)
