@@ -1,14 +1,20 @@
 use std::collections::{BTreeMap, VecDeque};
 use std::fs::{self, File, OpenOptions};
-use std::io::Write;
+use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread::{self, JoinHandle};
+use std::time::Instant;
 
-use ac_agent::{AttachmentContent, ContextAttachment};
+use ac_agent::{provider_events_text, AttachmentContent, ContextAttachment};
 use ac_common::{AcError, AcResult, StableId, TimestampMillis};
-use ac_db::{ControlPlaneDb, PersistedSession, PersistedWorktree, ProviderCatalogRow};
+use ac_db::{
+    ControlPlaneDb, DesignCritiqueRow, DesignDocumentRow, DesignPreviewRow, PersistedSession,
+    PersistedWorktree, ProviderCatalogRow,
+};
+use ac_evidence::EvidenceStore;
 use ac_git::{WorktreeRecord, WorktreeStatus};
 use ac_kernel::{Kernel, KernelDecisionKind, MissionState, PermissionDecision, PolicyBoundary};
 use ac_provider::catalog::{
@@ -899,6 +905,7 @@ include!("release.rs");
 include!("observability.rs");
 include!("ipc.rs");
 include!("conversation.rs");
+include!("design.rs");
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum DaemonLifecycle {
@@ -999,6 +1006,10 @@ pub struct DaemonService {
     /// workspace_root; a supplied project root always wins and is never
     /// silently replaced by this default.
     default_workspace_root: PathBuf,
+    /// Live dev-server children keyed by design conversation id.  Managed by
+    /// the Design Studio preview lifecycle; children are killed on stop and
+    /// are dropped when the daemon exits.
+    design_children: Mutex<BTreeMap<String, std::process::Child>>,
 }
 
 /// Production daemon policy. Tool capability checks remain owned by ToolBroker;
@@ -1045,6 +1056,7 @@ impl DaemonService {
             recovered: Vec::new(),
             hydrated: Vec::new(),
             default_workspace_root: workspace_root,
+            design_children: Mutex::new(BTreeMap::new()),
         })
     }
 
@@ -2128,6 +2140,15 @@ impl Drop for DaemonService {
         self.lock_file = None;
         if self.lifecycle == DaemonLifecycle::Running {
             let _ = fs::remove_file(&self.lock_path);
+        }
+        // Kill any live dev server children
+        let mut children = self.design_children.lock().unwrap();
+        let ids: Vec<String> = children.keys().cloned().collect();
+        for id in ids {
+            if let Some(mut child) = children.remove(&id) {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
         }
     }
 }

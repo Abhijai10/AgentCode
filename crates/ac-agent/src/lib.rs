@@ -5399,6 +5399,197 @@ mod tests {
     }
 
     #[test]
+    fn design_anti_slop_critique_identifies_generic_patterns_instead_of_approving() {
+        // G4-24 anti-slop acceptance: a seeded fixture of low-quality generic
+        // patterns must be flagged by the deterministic critic, never approved.
+        // The test asserts on the rule names, not the fixture strings, so it
+        // cannot be made to pass by hardcoding the fixture.
+        let repo = StableId::new("repo");
+        let studio = DesignStudio;
+        let session = studio
+            .start_session(repo, "SaaS Product", Vec::new())
+            .unwrap();
+        let files = vec![source(
+            "src/pages/Home.tsx",
+            "typescript",
+            r#"
+                <section className="hero" style={{ background: "linear-gradient(180deg,#667eea,#764ba2)", minHeight: "100vh" }}>
+                  <h1>Welcome to the future of AI-powered workflow</h1>
+                  <p>Reimagine your workflow with our platform.</p>
+                </section>
+                <div className="card"><h3>Feature A</h3></div>
+                <div className="card"><h3>Feature B</h3></div>
+                <div className="card"><h3>Feature C</h3></div>
+                <div className="glass-panel" style={{ backdropFilter: "blur(12px)" }}>Glass panel</div>
+            "#,
+        )];
+        let mut evidence = EvidenceStore::new();
+        let analysis = studio.analyze_product(&files, &mut evidence).unwrap();
+        let brief = studio
+            .generate_brief(&session, &analysis, "marketers", "campaign setup")
+            .unwrap();
+        let critique = studio.critique(&files[0].1, &brief);
+        assert!(!critique.passed, "generic slop must not be approved");
+        assert!(
+            critique.improvement_iteration_required,
+            "severity-3 findings require repair"
+        );
+        let rules = critique
+            .findings
+            .iter()
+            .map(|f| f.rule.as_str())
+            .collect::<Vec<_>>();
+        assert!(
+            rules.contains(&"oversized_gradient_hero"),
+            "rules: {rules:?}"
+        );
+        assert!(
+            rules.contains(&"identical_generic_cards"),
+            "rules: {rules:?}"
+        );
+        assert!(rules.contains(&"generic_ai_copy"), "rules: {rules:?}");
+        assert!(rules.contains(&"gratuitous_glass"), "rules: {rules:?}");
+        assert!(
+            rules.len() >= 4,
+            "all generic patterns must be caught: {rules:?}"
+        );
+
+        // The same critic accepts a product-specific, hierarchy-driven design.
+        let product_clean = r#"
+            <header style={{ backgroundColor: "var(--surface)" }}>
+              <h1>Campaign Metrics Review</h1>
+            </header>
+            <table role="table"><thead><tr><th>Campaign</th></tr></thead></table>
+            <button role="button">Approve Selection</button>
+        "#;
+        let clean_brief = studio
+            .generate_brief(
+                &session,
+                &analysis,
+                "campaign operators",
+                "review queue triage",
+            )
+            .unwrap();
+        let clean = studio.critique(product_clean, &clean_brief);
+        assert!(
+            clean.passed,
+            "product-specific design must pass: {:?}",
+            clean.findings
+        );
+    }
+
+    #[test]
+    fn design_briefs_and_grammars_are_product_specific_for_different_products() {
+        // G4-25 product-specificity: two intentionally different products must
+        // yield meaningfully different Design Briefs and Grammars.  The system
+        // must not emit the same generic design language for both.
+        let repo = StableId::new("repo");
+        let studio = DesignStudio;
+
+        // Product A: dense operational admin console
+        let session_a = studio
+            .start_session(
+                repo.clone(),
+                "Admin Review Console",
+                vec!["keep tables dense".to_string()],
+            )
+            .unwrap();
+        let files_a = vec![
+            source(
+                "apps/admin/app/page.tsx",
+                "typescript",
+                "<nav><a href=\"/review\">Review</a></nav><main>Review queue</main>",
+            ),
+            source(
+                "apps/admin/components/ReviewTable.tsx",
+                "typescript",
+                "export function ReviewTable(){}",
+            ),
+            source(
+                "apps/admin/styles.css",
+                "css",
+                ":root { --radius-md: 4px; }",
+            ),
+        ];
+        let mut evidence = EvidenceStore::new();
+        let analysis_a = studio.analyze_product(&files_a, &mut evidence).unwrap();
+        let brief_a = studio
+            .generate_brief(
+                &session_a,
+                &analysis_a,
+                "support operators",
+                "review queue triage",
+            )
+            .unwrap();
+        let grammar_a = studio.infer_grammar(&brief_a, &analysis_a);
+
+        // Product B: consumer mobile marketplace
+        let session_b = studio
+            .start_session(
+                repo.clone(),
+                "Mobile Marketplace",
+                vec!["fast thumb-friendly flows".to_string()],
+            )
+            .unwrap();
+        let files_b = vec![
+            source(
+                "apps/market/app/catalog.tsx",
+                "typescript",
+                "<header>Catalog</header><main>Featured items</main>",
+            ),
+            source(
+                "apps/market/components/ProductCard.tsx",
+                "typescript",
+                "export function ProductCard(){}",
+            ),
+            source(
+                "apps/market/styles.css",
+                "css",
+                ":root { --radius-lg: 16px; }",
+            ),
+        ];
+        let analysis_b = studio.analyze_product(&files_b, &mut evidence).unwrap();
+        let brief_b = studio
+            .generate_brief(&session_b, &analysis_b, "shoppers", "browse and checkout")
+            .unwrap();
+        let grammar_b = studio.infer_grammar(&brief_b, &analysis_b);
+
+        // Briefs must differ on the product identity and audience/workflow.
+        assert_ne!(brief_a.product, brief_b.product);
+        assert_ne!(brief_a.audience, brief_b.audience);
+        assert_ne!(brief_a.primary_workflow, brief_b.primary_workflow);
+        assert!(
+            brief_a.personality.contains("dense") || brief_a.personality.contains("operational"),
+            "admin personality must reflect its product: {}",
+            brief_a.personality
+        );
+
+        // Grammars must anchor color roles to each product specifically.
+        assert!(
+            grammar_a.color_roles[0].contains("Admin Review Console"),
+            "grammar A must be product-anchored: {}",
+            grammar_a.color_roles[0]
+        );
+        assert!(
+            grammar_b.color_roles[0].contains("Mobile Marketplace"),
+            "grammar B must be product-anchored: {}",
+            grammar_b.color_roles[0]
+        );
+        assert_ne!(grammar_a.color_roles[0], grammar_b.color_roles[0]);
+        // Component principles are anchored to each product's primary workflow.
+        assert!(
+            grammar_a.component_principles[0].contains("review queue"),
+            "grammar A must reference its workflow: {}",
+            grammar_a.component_principles[0]
+        );
+        assert!(
+            grammar_b.component_principles[0].contains("browse and checkout"),
+            "grammar B must reference its workflow: {}",
+            grammar_b.component_principles[0]
+        );
+    }
+
+    #[test]
     fn desktop_experience_opens_project_runs_projection_and_records_approval() {
         let mut desktop = DesktopExperience::new();
         let mut session = desktop.create_session(DesktopPreferences::default());

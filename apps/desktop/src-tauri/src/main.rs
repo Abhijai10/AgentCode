@@ -1171,6 +1171,210 @@ fn daemon_discuss_send(
     request(&state.0, "ui", "DiscussSend", payload)
 }
 
+#[tauri::command]
+fn daemon_design_send(
+    state: tauri::State<DaemonClient>,
+    conversation_id: String,
+    content: String,
+    attachment_ids: Option<Vec<String>>,
+) -> Result<Value, String> {
+    let mut payload = json!({
+        "conversation_id": conversation_id,
+        "content": content,
+        "attachment_ids": attachment_ids.unwrap_or_default(),
+    });
+    if payload["attachment_ids"] == Value::Null {
+        payload["attachment_ids"] = json!([]);
+    }
+    request(&state.0, "ui", "DesignSend", payload)
+}
+
+#[tauri::command]
+fn daemon_design_understand(
+    state: tauri::State<DaemonClient>,
+    conversation_id: String,
+) -> Result<Value, String> {
+    request(
+        &state.0,
+        "ui",
+        "DesignUnderstand",
+        json!({ "conversation_id": conversation_id }),
+    )
+}
+
+#[tauri::command]
+fn daemon_design_brief(
+    state: tauri::State<DaemonClient>,
+    conversation_id: String,
+    audience: String,
+    workflow: String,
+) -> Result<Value, String> {
+    request(
+        &state.0,
+        "ui",
+        "DesignBrief",
+        json!({ "conversation_id": conversation_id, "audience": audience, "workflow": workflow }),
+    )
+}
+
+#[tauri::command]
+fn daemon_design_grammar(
+    state: tauri::State<DaemonClient>,
+    conversation_id: String,
+) -> Result<Value, String> {
+    request(
+        &state.0,
+        "ui",
+        "DesignGrammar",
+        json!({ "conversation_id": conversation_id }),
+    )
+}
+
+#[tauri::command]
+fn daemon_design_state(
+    state: tauri::State<DaemonClient>,
+    conversation_id: String,
+) -> Result<Value, String> {
+    request(
+        &state.0,
+        "ui",
+        "DesignState",
+        json!({ "conversation_id": conversation_id }),
+    )
+}
+
+#[tauri::command]
+fn daemon_design_critique(
+    state: tauri::State<DaemonClient>,
+    conversation_id: String,
+    content: String,
+    doc_type: String,
+) -> Result<Value, String> {
+    request(
+        &state.0,
+        "ui",
+        "DesignCritique",
+        json!({ "conversation_id": conversation_id, "content": content, "doc_type": doc_type }),
+    )
+}
+
+#[tauri::command]
+fn daemon_design_repair(
+    state: tauri::State<DaemonClient>,
+    conversation_id: String,
+    content: String,
+    doc_type: String,
+) -> Result<Value, String> {
+    request(
+        &state.0,
+        "ui",
+        "DesignRepair",
+        json!({ "conversation_id": conversation_id, "content": content, "doc_type": doc_type }),
+    )
+}
+
+#[tauri::command]
+fn daemon_design_preview_start(
+    state: tauri::State<DaemonClient>,
+    conversation_id: String,
+) -> Result<Value, String> {
+    request(
+        &state.0,
+        "ui",
+        "DesignPreviewStart",
+        json!({ "conversation_id": conversation_id }),
+    )
+}
+
+#[tauri::command]
+fn daemon_design_preview_status(
+    state: tauri::State<DaemonClient>,
+    conversation_id: String,
+) -> Result<Value, String> {
+    request(
+        &state.0,
+        "ui",
+        "DesignPreviewStatus",
+        json!({ "conversation_id": conversation_id }),
+    )
+}
+
+#[tauri::command]
+fn daemon_design_preview_stop(
+    state: tauri::State<DaemonClient>,
+    conversation_id: String,
+) -> Result<Value, String> {
+    request(
+        &state.0,
+        "ui",
+        "DesignPreviewStop",
+        json!({ "conversation_id": conversation_id }),
+    )
+}
+
+#[tauri::command]
+fn daemon_design_browser(
+    state: tauri::State<DaemonClient>,
+    conversation_id: String,
+    url: String,
+    html: String,
+    deterministic: bool,
+) -> Result<Value, String> {
+    request(
+        &state.0,
+        "ui",
+        "DesignBrowser",
+        json!({
+            "conversation_id": conversation_id,
+            "url": url,
+            "html": html,
+            "deterministic": deterministic,
+        }),
+    )
+}
+
+#[tauri::command]
+fn daemon_design_qa_responsive(
+    state: tauri::State<DaemonClient>,
+    conversation_id: String,
+    content: String,
+) -> Result<Value, String> {
+    request(
+        &state.0,
+        "ui",
+        "DesignQAResponsive",
+        json!({ "conversation_id": conversation_id, "content": content }),
+    )
+}
+
+#[tauri::command]
+fn daemon_design_qa_accessibility(
+    state: tauri::State<DaemonClient>,
+    conversation_id: String,
+    content: String,
+) -> Result<Value, String> {
+    request(
+        &state.0,
+        "ui",
+        "DesignQAAccessibility",
+        json!({ "conversation_id": conversation_id, "content": content }),
+    )
+}
+
+#[tauri::command]
+fn daemon_design_qa_functional(
+    state: tauri::State<DaemonClient>,
+    conversation_id: String,
+    content: String,
+) -> Result<Value, String> {
+    request(
+        &state.0,
+        "ui",
+        "DesignQAFunctional",
+        json!({ "conversation_id": conversation_id, "content": content }),
+    )
+}
+
 fn guess_mime(filename: &str) -> String {
     let lower = filename.to_ascii_lowercase();
     if lower.ends_with(".png") {
@@ -1281,6 +1485,20 @@ fn main() {
             daemon_attachment_remove,
             daemon_conversation_activity,
             daemon_discuss_send,
+            daemon_design_send,
+            daemon_design_understand,
+            daemon_design_brief,
+            daemon_design_grammar,
+            daemon_design_state,
+            daemon_design_critique,
+            daemon_design_repair,
+            daemon_design_preview_start,
+            daemon_design_preview_status,
+            daemon_design_preview_stop,
+            daemon_design_browser,
+            daemon_design_qa_responsive,
+            daemon_design_qa_accessibility,
+            daemon_design_qa_functional,
         ])
         .run(tauri::generate_context!())
         .expect("error while running AgentCode desktop application");

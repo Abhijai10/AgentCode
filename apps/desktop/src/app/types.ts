@@ -386,3 +386,113 @@ export interface ProviderModelRecord {
   failure_class?: string | null;
   created_at_ms: number;
 }
+
+// ── Design Studio (G4) ───────────────────────────────────────────────────
+// Real Design Studio contract from the daemon IPC. Design conversations are
+// DESIGN-mode conversations in the existing conversations table; the structured
+// documents (analysis/brief/grammar/state), preview lifecycle, critique and
+// browser evidence are exposed by Design* IPC commands below.
+
+export interface ProductAnalysis {
+  framework?: string | null;
+  routes: string[];
+  components: string[];
+  style_files: string[];
+  tokens: string[];
+  fonts: string[];
+  assets: string[];
+  navigation: string[];
+}
+
+export interface DesignBrief {
+  product: string;
+  audience: string;
+  personality: string;
+  density: string;
+  primary_workflow: string;
+  framework?: string;
+  routes?: number;
+  components?: number;
+  visual_goals: string[];
+  patterns_to_avoid: string[];
+  things_to_preserve?: string[];
+  things_to_avoid?: string[];
+}
+
+export interface DesignGrammar {
+  type_scale: string[];
+  spacing: string[];
+  radii: string[];
+  surfaces: string[];
+  color_roles: string[];
+  semantic_states?: string[];
+  navigation: string[];
+  motion: string[];
+  iconography: string[];
+  component_principles: string[];
+  density?: string;
+  interaction?: string[];
+  responsive_principles?: string[];
+}
+
+export interface DesignState {
+  facts: string[];
+  grammar_principles: string[];
+  content: string;
+}
+
+export interface AntiSlopFinding {
+  rule: string;
+  severity: number;
+  explanation: string;
+}
+
+export interface DesignCritique {
+  passed: boolean;
+  improvement_required: boolean;
+  findings: AntiSlopFinding[];
+}
+
+export interface DesignRepair {
+  passed: boolean;
+  repairs: { issue: string; repair: string }[];
+  improvement_required: boolean;
+}
+
+export interface DesignPreview {
+  status: string;
+  port?: number | null;
+  ready_url?: string | null;
+  pid?: number | null;
+  command?: string;
+  detail?: string;
+}
+
+export interface DesignPreviewStatus {
+  process_alive: boolean;
+  http_ready: boolean;
+  port: number;
+  ready_url: string;
+  status?: string;
+}
+
+export interface DesignBrowserResult {
+  url: string;
+  visible_text: string;
+  controls: string[];
+  accessibility_tree: string[];
+  diagnostics: {
+    console_errors: string[];
+    page_errors: string[];
+    network_failures: string[];
+    http_status: number;
+  };
+  screenshot_uri: string;
+  screenshot_evidence_ref: string;
+}
+
+export interface DesignQaReport {
+  passed: boolean;
+  issues: string[];
+  [key: string]: unknown;
+}

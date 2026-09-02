@@ -1,296 +1,951 @@
-import { useEffect, useState } from "react";
+import { useEffect, useState, useRef, useCallback } from "react";
+import type { KeyboardEvent } from "react";
 import { Icon } from "./Icon";
 import { daemon } from "./daemon";
 import type { Project } from "./ProjectContext";
 import type {
-  MissionDetails,
-  TaskDetail,
-  ChangeSetSummary,
-  VerificationSummary,
+  Conversation,
+  ConversationDetail,
+  Message,
+  Attachment,
+  ProductAnalysis,
+  DesignBrief,
+  DesignGrammar,
+  DesignState,
+  DesignCritique,
+  DesignRepair,
+  DesignBrowserResult,
+  DesignQaReport,
 } from "./types";
 
-function stateLabel(state: string): string {
-  switch (state) {
-    case "queued": return "Queued";
-    case "pending": return "Pending";
-    case "ready": return "Ready";
-    case "running": return "Running";
-    case "retryable": return "Retryable";
-    case "completed": return "Completed";
-    case "cancelled": return "Cancelled";
-    case "paused": return "Paused";
-    default:
-      if (state.startsWith("failed:")) return "Failed";
-      if (state === "failed") return "Failed";
-      return state.charAt(0).toUpperCase() + state.slice(1);
+function formatTime(ms: number): string {
+  const d = new Date(ms);
+  const now = new Date();
+  if (d.toDateString() === now.toDateString()) {
+    return d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
   }
+  return (
+    d.toLocaleDateString([], { month: "short", day: "numeric" }) +
+    " " +
+    d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })
+  );
 }
 
-function stateColor(state: string): string {
-  if (state === "completed") return "text-emerald-600 dark:text-emerald-400";
-  if (state === "cancelled") return "text-on-surface-variant";
-  if (state === "failed" || state.startsWith("failed:")) return "text-red-600 dark:text-red-400";
-  if (state === "paused") return "text-amber-600 dark:text-amber-400";
-  if (state === "running" || state === "retryable") return "text-primary";
+function severityColor(severity: number): string {
+  if (severity >= 3) return "text-red-600 dark:text-red-400";
+  if (severity === 2) return "text-amber-600 dark:text-amber-400";
   return "text-on-surface-variant";
+}
+
+function listTags(value: string[] | undefined): JSX.Element | null {
+  if (!value || value.length === 0) return null;
+  return (
+    <ul className="space-y-1">
+      {value.map((item, i) => (
+        <li key={i} className="text-xs text-on-surface-variant flex gap-1.5">
+          <span className="text-primary mt-0.5">·</span>
+          <span>{item}</span>
+        </li>
+      ))}
+    </ul>
+  );
 }
 
 export function DesignView({
   project,
-  missionId,
   onOpenMission,
+  daemonConnected = false,
+  ...props
 }: {
   project: Project | null;
   missionId: string | null;
+  daemonConnected?: boolean;
   onOpenMission(missionId: string): void;
 }) {
-  const [details, setDetails] = useState<MissionDetails | null>(null);
-  const [tasks, setTasks] = useState<TaskDetail[]>([]);
-  const [changesets, setChangesets] = useState<ChangeSetSummary[]>([]);
-  const [verification, setVerification] = useState<VerificationSummary | null>(null);
-  const [status, setStatus] = useState<"loading" | "no_mission" | "daemon_unavailable" | "loaded">(
-    missionId ? "loading" : "no_mission"
-  );
+  void props.missionId;
+  const [conversations, setConversations] = useState<Conversation[]>([]);
+  const [activeConvId, setActiveConvId] = useState<string | null>(null);
+  const [convDetail, setConvDetail] = useState<ConversationDetail | null>(null);
+  const [input, setInput] = useState("");
+  const [sending, setSending] = useState(false);
+  const [thinking, setThinking] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [pendingAttachments, setPendingAttachments] = useState<Attachment[]>([]);
+  const [status, setStatus] = useState<
+    "no_project" | "loading" | "loaded" | "daemon_unavailable" | "no_chat"
+  >(project ? "loading" : "no_project");
+  const [renameTarget, setRenameTarget] = useState<string | null>(null);
+  const [renameValue, setRenameValue] = useState("");
+
+  // Right-panel design state
+  const [analysis, setAnalysis] = useState<ProductAnalysis | null>(null);
+  const [brief, setBrief] = useState<DesignBrief | null>(null);
+  const [grammar, setGrammar] = useState<DesignGrammar | null>(null);
+  const [designState, setDesignState] = useState<DesignState | null>(null);
+  const [critique, setCritique] = useState<DesignCritique | null>(null);
+  const [repair, setRepair] = useState<DesignRepair | null>(null);
+  const [browser, setBrowser] = useState<DesignBrowserResult | null>(null);
+  const [qa, setQa] = useState<{
+    responsive?: DesignQaReport;
+    accessibility?: DesignQaReport;
+    functional?: DesignQaReport;
+  }>({});
+  const [panelBusy, setPanelBusy] = useState(false);
+  const [rightOpen, setRightOpen] = useState(true);
+
+  const messagesEndRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
-    if (!missionId) {
-      setDetails(null);
-      setTasks([]);
-      setChangesets([]);
-      setVerification(null);
-      setStatus("no_mission");
+    if (!project) {
+      setStatus("no_project");
+      setConversations([]);
+      setActiveConvId(null);
+      setConvDetail(null);
       return;
     }
-    let cancelled = false;
     setStatus("loading");
+    let cancelled = false;
     (async () => {
-      const [d, t, c, v] = await Promise.all([
-        daemon.getMissionDetails(missionId),
-        daemon.getTaskDetails(missionId),
-        daemon.getChangeSetSummary(missionId),
-        daemon.getVerificationSummary(missionId),
-      ]);
+      const convs = await daemon.listConversations(project.path);
       if (cancelled) return;
-      if (d) {
-        setDetails(d);
-        setTasks(t ?? []);
-        setChangesets(c ?? []);
-        setVerification(v);
-        setStatus("loaded");
-      } else {
-        const health = await daemon.health();
-        if (cancelled) return;
-        setStatus(health.state === "running" ? "no_mission" : "daemon_unavailable");
+      const designConvs = convs.filter((c) => c.mode === "DESIGN");
+      setConversations(designConvs);
+      if (!activeConvId && designConvs.length > 0) {
+        setActiveConvId(designConvs[0].id);
       }
+      setStatus(designConvs.length > 0 ? "loaded" : "no_chat");
     })();
     return () => {
       cancelled = true;
     };
-  }, [missionId]);
+  }, [project]);
 
-  return (
-    <main className="flex-1 flex flex-col overflow-hidden">
-      <div className="flex-1 overflow-y-auto p-6 md:p-8">
-        <div className="max-w-5xl mx-auto flex flex-col gap-6">
-          <div className="flex items-center justify-between gap-3">
-            <div>
-              <h2 className="text-2xl font-semibold text-on-surface tracking-tight">Design &amp; Plan</h2>
-              <p className="text-sm text-on-surface-variant mt-1">
-                {project ? `Project: ${project.name}` : "No project open"} — real task plan and
-                architecture state from the daemon.
-              </p>
-            </div>
-            {missionId && (
-              <button
-                onClick={() => onOpenMission(missionId)}
-                className="neo-button px-4 py-2 rounded-xl text-sm text-primary font-medium flex items-center gap-2 shrink-0"
-              >
-                <Icon name="terminal" size={16} />
-                Open Mission
-              </button>
+  useEffect(() => {
+    if (!activeConvId) {
+      setConvDetail(null);
+      return;
+    }
+    let cancelled = false;
+    (async () => {
+      const detail = await daemon.getConversation(activeConvId);
+      if (cancelled) return;
+      if (detail) setConvDetail(detail);
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [activeConvId]);
+
+  useEffect(() => {
+    messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
+  }, [convDetail?.messages?.length]);
+
+  const refreshConversations = useCallback(async () => {
+    if (!project) return;
+    const convs = await daemon.listConversations(project.path);
+    setConversations(convs.filter((c) => c.mode === "DESIGN"));
+  }, [project]);
+
+  const refreshActive = useCallback(async () => {
+    if (!activeConvId) return;
+    const detail = await daemon.getConversation(activeConvId);
+    if (detail) setConvDetail(detail);
+  }, [activeConvId]);
+
+  const handleNewChat = async () => {
+    if (!project) return;
+    setError(null);
+    const result = await daemon.createConversation(project.path, "DESIGN", "New Design Chat");
+    if (result.ok && result.conversation_id) {
+      setActiveConvId(result.conversation_id);
+      await refreshConversations();
+      setStatus("loaded");
+    } else {
+      setError(result.error || "Could not create design chat");
+    }
+  };
+
+  const handleSend = async () => {
+    const trimmed = input.trim();
+    if (!trimmed || !activeConvId || sending || thinking) return;
+    setSending(true);
+    setError(null);
+    const userResult = await daemon.appendMessage(activeConvId, "user", trimmed);
+    if (!userResult.ok) {
+      setError(userResult.error || "Could not send message");
+      setSending(false);
+      return;
+    }
+    setInput("");
+    await refreshActive();
+    setSending(false);
+    setThinking(true);
+    const replyResult = await daemon.designSend(
+      activeConvId,
+      trimmed,
+      pendingAttachments.map((a) => a.id)
+    );
+    if (replyResult.ok) {
+      setPendingAttachments([]);
+      await refreshActive();
+    } else {
+      setError(replyResult.error || "Could not get design response");
+    }
+    setThinking(false);
+  };
+
+  const handleAttach = async () => {
+    if (!project || !activeConvId) return;
+    setError(null);
+    const result = await daemon.addAttachment(activeConvId, project.path);
+    if (result.ok && result.attachment) {
+      setPendingAttachments((prev) => [...prev, result.attachment!]);
+    } else {
+      setError(result.error || "Could not attach file");
+    }
+  };
+
+  const handleRemovePending = (id: string) => {
+    setPendingAttachments((prev) => prev.filter((a) => a.id !== id));
+  };
+
+  const handleKeyDown = (e: KeyboardEvent) => {
+    if (e.key === "Enter" && !e.shiftKey) {
+      e.preventDefault();
+      handleSend();
+    }
+  };
+
+  const handleRename = async (id: string) => {
+    const trimmed = renameValue.trim();
+    if (!trimmed) {
+      setRenameTarget(null);
+      return;
+    }
+    await daemon.renameConversation(id, trimmed);
+    setRenameTarget(null);
+    await refreshConversations();
+  };
+
+  const handleArchive = async (id: string) => {
+    await daemon.archiveConversation(id);
+    if (activeConvId === id) setActiveConvId(null);
+    await refreshConversations();
+  };
+
+  const handleDelete = async (id: string) => {
+    await daemon.deleteConversation(id);
+    if (activeConvId === id) setActiveConvId(null);
+    await refreshConversations();
+  };
+
+  // ── Design panel actions ──────────────────────────────────────────────
+
+  const runPanel = async (fn: () => Promise<void>) => {
+    if (!activeConvId || panelBusy) return;
+    setPanelBusy(true);
+    setError(null);
+    try {
+      await fn();
+    } catch (e: unknown) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setPanelBusy(false);
+    }
+  };
+
+  const handleUnderstand = () =>
+    runPanel(async () => {
+      const r = await daemon.designUnderstand(activeConvId!);
+      if (r.ok && r.analysis) setAnalysis(r.analysis);
+      else setError(r.error || "Could not analyze project");
+    });
+
+  const handleBrief = () =>
+    runPanel(async () => {
+      const r = await daemon.designBrief(activeConvId!, "target users", "primary workflow");
+      if (r.ok && r.brief) setBrief(r.brief);
+      else setError(r.error || "Could not create design brief");
+    });
+
+  const handleGrammar = () =>
+    runPanel(async () => {
+      const r = await daemon.designGrammar(activeConvId!);
+      if (r.ok && r.grammar) setGrammar(r.grammar);
+      else setError(r.error || "Could not create design grammar");
+    });
+
+  const handleDesignState = () =>
+    runPanel(async () => {
+      const r = await daemon.designState(activeConvId!);
+      if (r.ok && r.state) setDesignState(r.state);
+      else setError(r.error || "Could not generate design state");
+    });
+
+  const handleCritique = () =>
+    runPanel(async () => {
+      const domText = browser?.visible_text ?? "";
+      const r = await daemon.designCritique(
+        activeConvId!,
+        domText || brief?.product || "implementation",
+        "rendered"
+      );
+      if (r.ok && r.critique) setCritique(r.critique);
+      else setError(r.error || "Could not critique design");
+    });
+
+  const handleRepair = () =>
+    runPanel(async () => {
+      const domText = browser?.visible_text ?? "";
+      const r = await daemon.designRepair(activeConvId!, domText || "implementation", "rendered");
+      if (r.ok && r.repair) setRepair(r.repair);
+      else setError(r.error || "Could not generate repair plan");
+    });
+
+  const handleBrowser = () =>
+    runPanel(async () => {
+      const r = await daemon.designBrowser(activeConvId!);
+      if (r.ok && r.browser) {
+        setBrowser(r.browser);
+        const dom = r.browser.visible_text;
+        const [resp, acc, fun] = await Promise.all([
+          daemon.designQa(activeConvId!, "responsive", dom),
+          daemon.designQa(activeConvId!, "accessibility", dom),
+          daemon.designQa(activeConvId!, "functional", dom),
+        ]);
+        setQa({
+          responsive: resp.ok ? resp.qa : undefined,
+          accessibility: acc.ok ? acc.qa : undefined,
+          functional: fun.ok ? fun.qa : undefined,
+        });
+      } else {
+        setError(r.error || "Could not inspect browser");
+      }
+    });
+
+  const handlePreview = () =>
+    runPanel(async () => {
+      const r = await daemon.designPreviewStart(activeConvId!);
+      if (!r.ok) setError(r.error || "Could not start preview");
+    });
+
+  // ── Render helpers ────────────────────────────────────────────────────
+
+  function renderMessage(msg: Message) {
+    const isUser = msg.role === "user";
+    const isAssistant = msg.role === "assistant";
+    let providerModel: { provider_id?: string; model_name?: string } | null = null;
+    if (isAssistant && msg.metadata) {
+      try {
+        const meta =
+          typeof msg.metadata === "string" ? JSON.parse(msg.metadata) : msg.metadata;
+        if (meta?.provider_model) providerModel = meta.provider_model;
+      } catch {
+        providerModel = null;
+      }
+    }
+    return (
+      <div key={msg.id} className={`mb-4 flex ${isUser ? "justify-end" : "justify-start"}`}>
+        <div className="max-w-[85%]">
+          <div
+            className={`rounded-2xl px-4 py-3 ${
+              isUser
+                ? "bg-primary text-on-primary rounded-br-md"
+                : "neo-pressed text-on-surface rounded-bl-md"
+            }`}
+          >
+            <p className="text-sm whitespace-pre-wrap break-words">{msg.content}</p>
+            {isAssistant && providerModel && (
+              <div className="mt-2 flex items-center gap-2 text-[10px] text-on-surface-variant">
+                <Icon name="smart_toy" size={12} />
+                <span>
+                  {providerModel.model_name
+                    ? providerModel.model_name
+                    : providerModel.provider_id || "AI response"}
+                </span>
+              </div>
+            )}
+            {msg.mission_ref && (
+              <div className="mt-2 flex items-center gap-2 text-xs text-on-surface-variant">
+                <Icon name="terminal" size={12} />
+                <span>Mission: {msg.mission_ref}</span>
+                <button onClick={() => onOpenMission(msg.mission_ref!)} className="underline hover:opacity-80">
+                  View
+                </button>
+              </div>
             )}
           </div>
+          <p className="text-[10px] text-on-surface-variant mt-0.5 px-1">
+            {formatTime(msg.created_at_ms)}
+          </p>
+        </div>
+      </div>
+    );
+  }
 
-          {status === "no_mission" && (
-            <div className="neo-raised rounded-2xl p-8 flex flex-col items-center text-center">
-              <div className="w-14 h-14 rounded-2xl neo-raised mb-4 flex items-center justify-center text-primary">
-                <Icon name="design_services" size={28} />
-              </div>
-              <h3 className="text-xl font-semibold text-on-surface mb-2">No mission selected</h3>
-              <p className="text-sm text-on-surface-variant max-w-md mx-auto">
-                Start a mission from Home to populate this view with the real task plan,
-                dependencies, and verification state.
-              </p>
-            </div>
-          )}
+  if (status === "no_project") {
+    return (
+      <main className="flex-1 flex items-center justify-center">
+        <div className="text-center neo-pressed rounded-2xl p-8 max-w-sm">
+          <Icon name="design_services" size={40} className="text-primary mx-auto mb-4" />
+          <h3 className="text-lg font-semibold text-on-surface mb-2">Open a Project</h3>
+          <p className="text-sm text-on-surface-variant">
+            Select a project to design, preview, critique, and verify its interface.
+          </p>
+        </div>
+      </main>
+    );
+  }
 
-          {status === "daemon_unavailable" && (
-            <div className="neo-raised rounded-2xl p-8 flex flex-col items-center text-center">
-              <div className="w-14 h-14 rounded-2xl neo-raised mb-4 flex items-center justify-center text-red-600 dark:text-red-400">
-                <Icon name="dns_off" size={28} />
-              </div>
-              <h3 className="text-xl font-semibold text-on-surface mb-2">Daemon unavailable</h3>
-              <p className="text-sm text-on-surface-variant max-w-md mx-auto">
-                The AgentCode daemon is not responding. Start it, then reopen this view to reload
-                authoritative mission state.
-              </p>
-            </div>
-          )}
+  if (status === "daemon_unavailable") {
+    return (
+      <main className="flex-1 flex items-center justify-center">
+        <div className="text-center neo-pressed rounded-2xl p-8 max-w-sm">
+          <Icon name="dns_off" size={40} className="text-red-500 mx-auto mb-4" />
+          <h3 className="text-lg font-semibold text-on-surface mb-2">Daemon Unavailable</h3>
+          <p className="text-sm text-on-surface-variant">
+            The AgentCode daemon is not responding. Design conversations are persisted and will
+            be available when the daemon restarts.
+          </p>
+        </div>
+      </main>
+    );
+  }
 
-          {status === "loading" && (
-            <div className="neo-raised rounded-2xl p-8 flex items-center justify-center text-on-surface-variant gap-2">
-              <Icon name="autorenew" size={18} className="animate-spin" />
-              Loading plan…
-            </div>
-          )}
-
-          {status === "loaded" && details && (
-            <>
-              <div className="neo-raised rounded-2xl p-6 flex flex-col gap-4">
-                <div className="flex items-center gap-3 flex-wrap">
-                  <span className={`px-2 py-0.5 rounded text-xs font-bold uppercase tracking-wider neo-pressed ${stateColor(details.state)}`}>
-                    {stateLabel(details.state)}
-                  </span>
-                  {details.terminal && <span className="text-xs text-on-surface-variant">Final state</span>}
-                </div>
-                <h3 className="text-xl font-semibold text-on-surface">{details.goal || "Mission"}</h3>
-                {details.workspace_root && (
-                  <p className="text-xs text-on-surface-variant font-mono truncate">{details.workspace_root}</p>
-                )}
-                <div className="flex flex-wrap gap-x-6 gap-y-1 text-xs text-on-surface-variant">
-                  <span>{details.task_count} task{details.task_count !== 1 ? "s" : ""}</span>
-                  <span className="text-emerald-600 dark:text-emerald-400">{details.completed_task_count} completed</span>
-                  {details.failed_task_count > 0 && (
-                    <span className="text-red-600 dark:text-red-400">{details.failed_task_count} failed</span>
-                  )}
-                </div>
-              </div>
-
-              <div className="neo-raised rounded-2xl p-6 flex flex-col gap-3">
-                <h3 className="text-lg font-semibold text-on-surface mb-1 flex items-center gap-2">
-                  <Icon name="account_tree" size={20} className="text-primary" />
-                  Task Plan &amp; Dependencies
-                </h3>
-                {tasks.length === 0 ? (
-                  <p className="text-sm text-on-surface-variant">No plan has been recorded yet.</p>
-                ) : (
-                  <ol className="space-y-2">
-                    {tasks.map((t) => {
-                      const done = t.state === "completed" || t.state === "succeeded";
-                      const inProgress = t.state === "running";
-                      const failed = t.state === "failed";
-                      return (
-                        <li key={t.task_id} className={`rounded-xl neo-pressed p-3 ${done ? "opacity-70" : ""}`}>
-                          <div className="flex items-start gap-3">
-                            {done ? (
-                              <Icon name="check_circle" size={20} className="text-emerald-600 dark:text-emerald-400 mt-0.5" fill />
-                            ) : inProgress ? (
-                              <Icon name="autorenew" size={20} className="text-primary mt-0.5 animate-spin" />
-                            ) : failed ? (
-                              <Icon name="cancel" size={20} className="text-red-600 dark:text-red-400 mt-0.5" />
-                            ) : (
-                              <Icon name="radio_button_unchecked" size={20} className="text-outline mt-0.5" />
-                            )}
-                            <div className="flex-1 min-w-0">
-                              <div className="flex items-baseline justify-between gap-2 flex-wrap">
-                                <p className={`font-medium ${done ? "line-through text-on-surface" : inProgress ? "font-bold text-primary" : "text-on-surface"}`}>
-                                  {t.title || t.task_id}
-                                </p>
-                                <span className={`text-[11px] font-bold uppercase tracking-wide ${stateColor(t.state)}`}>{stateLabel(t.state)}</span>
-                              </div>
-                              {t.dependencies.length > 0 && (
-                                <p className="text-[11px] text-on-surface-variant mt-0.5">
-                                  Depends on {t.dependencies.length} task{t.dependencies.length !== 1 ? "s" : ""}
-                                </p>
-                              )}
-                              {t.retry_count > 0 && (
-                                <p className="text-[11px] text-amber-600 dark:text-amber-400 mt-0.5">
-                                  Retried {t.retry_count}× (max {t.max_retries})
-                                </p>
-                              )}
-                            </div>
-                          </div>
-                        </li>
-                      );
-                    })}
-                  </ol>
-                )}
-              </div>
-
-              <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
-                <div className="neo-raised rounded-2xl p-5 flex flex-col gap-3">
-                  <h4 className="text-sm font-bold text-on-surface-variant uppercase tracking-wider">Verification</h4>
-                  {verification && verification.verifications.length > 0 ? (
-                    <div className="space-y-2">
-                      {verification.verifications.map((run) => (
-                        <div key={run.verification_id} className="neo-pressed rounded-xl p-3">
-                          <div className="flex items-center justify-between gap-2">
-                            <span className="flex items-center gap-1.5 text-sm font-semibold text-on-surface">
-                              <Icon name={run.passed ? "verified_user" : "report_problem"} size={16} className={run.passed ? "text-emerald-600 dark:text-emerald-400" : "text-red-600 dark:text-red-400"} />
-                              {run.passed ? "Passed" : run.status}
-                            </span>
-                          </div>
-                          <p className="text-[11px] text-on-surface-variant mt-1 font-mono truncate">{run.command}</p>
-                        </div>
-                      ))}
-                    </div>
+  return (
+    <main className="flex-1 flex overflow-hidden">
+      {/* Conversation List */}
+      <aside className="w-60 shrink-0 flex flex-col border-r border-outline-variant/40 dark:border-white/5 bg-surface/50">
+        <div className="p-3 border-b border-outline-variant/40 dark:border-white/5">
+          <button
+            onClick={handleNewChat}
+            className="w-full neo-button rounded-xl py-2.5 flex items-center justify-center gap-2 text-sm font-medium text-primary"
+          >
+            <Icon name="add" size={18} />
+            New Design Chat
+          </button>
+        </div>
+        <div className="flex-1 overflow-y-auto p-2 space-y-1">
+          {conversations.map((conv) => (
+            <div key={conv.id}>
+              <button
+                onClick={() => setActiveConvId(conv.id)}
+                className={`w-full text-left rounded-xl px-3 py-2.5 transition-colors ${
+                  activeConvId === conv.id
+                    ? "neo-pressed text-primary"
+                    : "hover:bg-surface-variant/40 text-on-surface-variant"
+                }`}
+              >
+                <p className="text-sm font-medium truncate mt-0.5">
+                  {renameTarget === conv.id ? (
+                    <input
+                      className="neo-input rounded px-1.5 py-0.5 text-xs w-full"
+                      value={renameValue}
+                      onChange={(e) => setRenameValue(e.target.value)}
+                      onBlur={() => handleRename(conv.id)}
+                      onKeyDown={(e) => {
+                        if (e.key === "Enter") handleRename(conv.id);
+                        if (e.key === "Escape") setRenameTarget(null);
+                      }}
+                      autoFocus
+                      onClick={(e) => e.stopPropagation()}
+                    />
                   ) : (
-                    <p className="text-xs text-on-surface-variant">No verification runs recorded yet.</p>
+                    conv.title
                   )}
-                  {verification && verification.final_audits.length > 0 && (
-                    <div className="neo-pressed rounded-xl p-3 flex items-center justify-between">
-                      <span className="text-xs text-on-surface">Completion gate</span>
-                      <span className={`text-xs font-bold ${verification.final_audits[0].passed ? "text-emerald-600 dark:text-emerald-400" : "text-red-600 dark:text-red-400"}`}>
-                        {verification.final_audits[0].passed ? "Passed" : "Not passed"}
-                      </span>
-                    </div>
-                  )}
-                </div>
-
-                <div className="neo-raised rounded-2xl p-5 flex flex-col gap-3">
-                  <h4 className="text-sm font-bold text-on-surface-variant uppercase tracking-wider">Changes</h4>
-                  {changesets.length === 0 ? (
-                    <p className="text-xs text-on-surface-variant">No ChangeSet recorded yet.</p>
-                  ) : (
-                    <div className="space-y-2">
-                      {changesets.map((cs) => (
-                        <div key={cs.changeset_id} className="neo-pressed rounded-xl p-3">
-                          <div className="flex items-center justify-between gap-2">
-                            <span className={`text-[11px] font-bold uppercase tracking-wide ${cs.applied ? "text-emerald-600 dark:text-emerald-400" : "text-amber-600 dark:text-amber-400"}`}>
-                              {cs.state}
-                            </span>
-                          </div>
-                          {cs.files.map((f) => (
-                            <div key={f.path} className="flex items-center justify-between gap-2 mt-1.5">
-                              <span className="text-[11px] font-mono text-on-surface truncate">{f.path}</span>
-                              <span className="text-[10px] flex gap-1.5 shrink-0">
-                                <span className="text-emerald-600 dark:text-emerald-400">+{f.additions}</span>
-                                <span className="text-red-600 dark:text-red-400">-{f.removals}</span>
-                              </span>
-                            </div>
-                          ))}
-                        </div>
-                      ))}
-                    </div>
-                  )}
-                </div>
+                </p>
+                <p className="text-[10px] text-on-surface-variant mt-0.5">
+                  {formatTime(conv.updated_at_ms)}
+                </p>
+              </button>
+              <div className="flex gap-1 px-3 mb-1">
+                <button
+                  onClick={() => {
+                    setRenameTarget(conv.id);
+                    setRenameValue(conv.title);
+                  }}
+                  className="text-[10px] text-on-surface-variant hover:text-primary"
+                >
+                  Rename
+                </button>
+                <span className="text-on-surface-variant/30">·</span>
+                <button
+                  onClick={() => handleArchive(conv.id)}
+                  className="text-[10px] text-on-surface-variant hover:text-primary"
+                >
+                  Archive
+                </button>
+                <span className="text-on-surface-variant/30">·</span>
+                <button
+                  onClick={() => handleDelete(conv.id)}
+                  className="text-[10px] text-red-500 hover:text-red-600"
+                >
+                  Delete
+                </button>
               </div>
-            </>
+            </div>
+          ))}
+          {conversations.length === 0 && (
+            <div className="text-center text-xs text-on-surface-variant py-8">
+              No design chats yet. Start a new design chat.
+            </div>
           )}
+        </div>
+      </aside>
 
-          <div className="neo-pressed rounded-xl p-4 text-sm text-on-surface-variant flex items-start gap-2">
-            <Icon name="info" size={16} className="text-primary mt-0.5" />
-            <div>
-              <p className="text-on-surface font-medium mb-1">Design Studio sessions</p>
-              <p>
-                Persistent Design Studio session artifacts are not exposed by the daemon IPC in this
-                build. This view shows the real task plan, dependencies, verification, and change
-                state for the current mission instead of fabricated design documents.
+      {/* Chat Area */}
+      <div className="flex-1 flex flex-col overflow-hidden min-w-0">
+        {!activeConvId ? (
+          <div className="flex-1 flex items-center justify-center">
+            <div className="text-center neo-pressed rounded-2xl p-8 max-w-sm">
+              <Icon name="design_services" size={40} className="text-primary mx-auto mb-4" />
+              <h3 className="text-lg font-semibold text-on-surface mb-2">Select a Design Chat</h3>
+              <p className="text-sm text-on-surface-variant">
+                Choose a design chat from the sidebar or start a new one.
               </p>
             </div>
           </div>
-        </div>
+        ) : (
+          <>
+            <div className="shrink-0 px-6 py-3 border-b border-outline-variant/40 dark:border-white/5 flex items-center justify-between">
+              <div className="flex items-center gap-3 min-w-0">
+                <div className="min-w-0">
+                  <h2 className="text-lg font-semibold text-on-surface truncate">
+                    {convDetail?.title || "Loading..."}
+                  </h2>
+                  {convDetail && (
+                    <span className="text-xs font-bold uppercase text-primary">Design Studio</span>
+                  )}
+                </div>
+              </div>
+              <div className="flex items-center gap-2">
+                <button
+                  onClick={() => setRightOpen((v) => !v)}
+                  className="neo-button rounded-lg px-3 py-1.5 text-xs font-medium text-on-surface-variant flex items-center gap-1.5"
+                  title="Toggle design context panel"
+                  aria-label="Toggle design context panel"
+                >
+                  <Icon name={rightOpen ? "panel_close" : "panel_open"} size={16} />
+                  {rightOpen ? "Hide Context" : "Show Context"}
+                </button>
+                {daemonConnected ? (
+                  <span className="flex items-center gap-1.5 text-[10px] text-emerald-600 dark:text-emerald-400">
+                    <span className="w-1.5 h-1.5 rounded-full bg-emerald-500" />
+                    Connected
+                  </span>
+                ) : (
+                  <span className="flex items-center gap-1.5 text-[10px] text-red-600 dark:text-red-400">
+                    <span className="w-1.5 h-1.5 rounded-full bg-red-500" />
+                    Daemon unavailable
+                  </span>
+                )}
+              </div>
+            </div>
+
+            <div className="flex-1 overflow-y-auto px-6 py-4">
+              {convDetail?.messages?.map(renderMessage)}
+              {thinking && (
+                <div className="flex justify-start mb-4">
+                  <div className="neo-pressed rounded-2xl px-4 py-3 rounded-bl-md">
+                    <div className="flex items-center gap-2 text-sm text-on-surface-variant">
+                      <Icon name="autorenew" size={16} className="animate-spin" />
+                      <span>Thinking...</span>
+                    </div>
+                  </div>
+                </div>
+              )}
+              {(!convDetail || convDetail.messages.length === 0) && !thinking && (
+                <div className="text-center text-xs text-on-surface-variant py-10">
+                  Describe the interface you want to design — its purpose, users, and feel.
+                  AgentCode will understand the project, draft a brief and grammar, then
+                  implement, preview, critique, and repair.
+                </div>
+              )}
+              <div ref={messagesEndRef} />
+            </div>
+
+            {pendingAttachments.length > 0 && (
+              <div className="shrink-0 px-6 py-2 border-t border-outline-variant/40 dark:border-white/5">
+                <div className="flex flex-wrap gap-2">
+                  {pendingAttachments.map((a) => {
+                    const isImage = a.mime_type.startsWith("image/");
+                    return (
+                      <div
+                        key={a.id}
+                        className="neo-pressed rounded-xl p-2 flex items-center gap-2 text-xs"
+                      >
+                        <Icon name={isImage ? "image" : "description"} size={16} className="text-primary" />
+                        <span className="truncate max-w-[120px]">{a.filename}</span>
+                        <span className="text-on-surface-variant shrink-0">
+                          {a.size_bytes > 1024 ? `${(a.size_bytes / 1024).toFixed(0)}KB` : `${a.size_bytes}B`}
+                        </span>
+                        <button
+                          onClick={() => handleRemovePending(a.id)}
+                          className="text-red-500 hover:text-red-600 ml-auto"
+                        >
+                          <Icon name="close" size={14} />
+                        </button>
+                      </div>
+                    );
+                  })}
+                </div>
+              </div>
+            )}
+
+            <div className="shrink-0 px-6 py-4 border-t border-outline-variant/40 dark:border-white/5">
+              {error && (
+                <div className="flex items-center gap-2 text-xs text-red-600 dark:text-red-400 mb-2">
+                  <Icon name="error" size={14} fill /> {error}
+                </div>
+              )}
+              <div className="neo-raised rounded-[20px] p-2">
+                <div className="neo-pressed rounded-[16px] px-4 py-3 flex items-end gap-2">
+                  <textarea
+                    className="flex-1 bg-transparent border-none outline-none resize-none text-sm text-on-surface placeholder:text-on-surface-variant/50 max-h-[120px] focus:ring-0 p-0"
+                    placeholder='Describe what to design, e.g. "a technical, quiet, premium dashboard"…'
+                    value={input}
+                    disabled={sending || thinking}
+                    onChange={(e) => setInput(e.target.value)}
+                    onKeyDown={handleKeyDown}
+                    rows={1}
+                  />
+                  <button
+                    onClick={handleAttach}
+                    disabled={sending || thinking}
+                    className="w-9 h-9 rounded-full neo-button flex items-center justify-center text-on-surface-variant hover:text-primary"
+                    title="Attach reference image or spec"
+                    aria-label="Attach file"
+                  >
+                    <Icon name="attach_file" size={18} />
+                  </button>
+                  <button
+                    onClick={handleSend}
+                    disabled={sending || thinking || !input.trim()}
+                    className="w-9 h-9 rounded-full bg-primary flex items-center justify-center text-on-primary disabled:opacity-50 active:scale-95 transition-all"
+                    aria-label="Send design request"
+                  >
+                    <Icon
+                      name={sending || thinking ? "autorenew" : "send"}
+                      size={18}
+                      className={sending || thinking ? "animate-spin" : ""}
+                    />
+                  </button>
+                </div>
+              </div>
+              <div className="flex justify-end mt-2">
+                <button
+                  onClick={async () => {
+                    if (!activeConvId || !convDetail) return;
+                    const lastUserMsg = convDetail.messages
+                      .filter((m) => m.role === "user" && !m.mission_ref)
+                      .pop();
+                    const goal = input.trim() || lastUserMsg?.content || "";
+                    if (!goal) return;
+                    const result = await daemon.submitGoalFromConversation(activeConvId, goal, []);
+                    if (result.ok) {
+                      setInput("");
+                      await refreshActive();
+                      onOpenMission(result.mission_id);
+                    } else {
+                      setError(result.error || "Could not create mission");
+                    }
+                  }}
+                  disabled={
+                    sending ||
+                    thinking ||
+                    (!input.trim() &&
+                      !convDetail?.messages?.some((m) => m.role === "user" && !m.mission_ref))
+                  }
+                  className="neo-button rounded-xl px-4 py-2 text-sm font-medium text-primary flex items-center gap-2 disabled:opacity-50"
+                  aria-label="Create Implementation Mission from Design"
+                >
+                  <Icon name="terminal" size={16} />
+                  Implement via Mission
+                </button>
+              </div>
+            </div>
+          </>
+        )}
       </div>
+
+      {/* Right contextual design panel */}
+      {activeConvId && rightOpen && (
+        <aside className="w-80 shrink-0 border-l border-outline-variant/40 dark:border-white/5 bg-surface/50 overflow-y-auto p-4 space-y-4">
+          <div className="flex items-center justify-between">
+            <h3 className="text-xs font-bold uppercase tracking-wider text-on-surface-variant">
+              Design Workspace
+            </h3>
+            <div className="flex gap-1">
+              <button
+                onClick={handleUnderstand}
+                disabled={panelBusy}
+                className="neo-button rounded-lg px-2 py-1 text-[10px] font-medium text-on-surface-variant disabled:opacity-50"
+                title="Understand product structure"
+              >
+                Understand
+              </button>
+              <button
+                onClick={handlePreview}
+                disabled={panelBusy}
+                className="neo-button rounded-lg px-2 py-1 text-[10px] font-medium text-on-surface-variant disabled:opacity-50"
+                title="Start the real preview server"
+              >
+                Preview
+              </button>
+            </div>
+          </div>
+
+          <section className="neo-raised rounded-2xl p-4">
+            <div className="flex items-center justify-between mb-2">
+              <h4 className="text-sm font-semibold text-on-surface">Product Understanding</h4>
+              <button
+                onClick={handleUnderstand}
+                disabled={panelBusy}
+                className="text-[10px] text-primary hover:opacity-80 disabled:opacity-50"
+              >
+                Refresh
+              </button>
+            </div>
+            {analysis ? (
+              <div className="space-y-1.5 text-xs text-on-surface-variant">
+                <p>
+                  Framework:{" "}
+                  <span className="text-on-surface font-medium">
+                    {analysis.framework || "unknown"}
+                  </span>
+                </p>
+                <p>
+                  Routes: {analysis.routes.length} · Components: {analysis.components.length} ·
+                  Styles: {analysis.style_files.length}
+                </p>
+                {analysis.components.slice(0, 6).map((c) => (
+                  <p key={c} className="font-mono text-[10px] truncate">
+                    {c}
+                  </p>
+                ))}
+              </div>
+            ) : (
+              <p className="text-xs text-on-surface-variant">
+                Scan the project for routes, components, styles, tokens and assets.
+              </p>
+            )}
+          </section>
+
+          <section className="neo-raised rounded-2xl p-4">
+            <div className="flex items-center justify-between mb-2">
+              <h4 className="text-sm font-semibold text-on-surface">Design Brief</h4>
+              <button
+                onClick={handleBrief}
+                disabled={panelBusy}
+                className="text-[10px] text-primary hover:opacity-80 disabled:opacity-50"
+              >
+                Generate
+              </button>
+            </div>
+            {brief ? (
+              <div className="space-y-2">
+                <p className="text-xs text-on-surface">
+                  <span className="font-medium">{brief.product}</span> · {brief.audience}
+                </p>
+                <p className="text-xs text-on-surface-variant">
+                  Workflow: {brief.primary_workflow} · Density: {brief.density}
+                </p>
+                {listTags(brief.visual_goals)}
+                {brief.patterns_to_avoid.length > 0 && (
+                  <div>
+                    <p className="text-[10px] font-bold uppercase tracking-wide text-red-600 dark:text-red-400 mb-1">
+                      Avoid
+                    </p>
+                    {listTags(brief.patterns_to_avoid)}
+                  </div>
+                )}
+              </div>
+            ) : (
+              <p className="text-xs text-on-surface-variant">
+                Create the structured product brief: audience, workflows, visual direction,
+                hierarchy, accessibility and constraints.
+              </p>
+            )}
+          </section>
+
+          <section className="neo-raised rounded-2xl p-4">
+            <div className="flex items-center justify-between mb-2">
+              <h4 className="text-sm font-semibold text-on-surface">Design Grammar</h4>
+              <button
+                onClick={handleGrammar}
+                disabled={panelBusy}
+                className="text-[10px] text-primary hover:opacity-80 disabled:opacity-50"
+              >
+                Generate
+              </button>
+            </div>
+            {grammar ? (
+              <div className="space-y-2">
+                {grammar.color_roles.length > 0 && (
+                  <p className="text-xs text-on-surface-variant">
+                    Colors: {grammar.color_roles.join("; ")}
+                  </p>
+                )}
+                {listTags(grammar.type_scale)}
+                {listTags(grammar.spacing)}
+                {listTags(grammar.radii)}
+                {listTags(grammar.component_principles)}
+              </div>
+            ) : (
+              <p className="text-xs text-on-surface-variant">
+                Establish typography, spacing, surfaces, color roles and component patterns
+                specific to this product.
+              </p>
+            )}
+          </section>
+
+          <section className="neo-raised rounded-2xl p-4">
+            <div className="flex items-center justify-between mb-2">
+              <h4 className="text-sm font-semibold text-on-surface">Design State</h4>
+              <button
+                onClick={handleDesignState}
+                disabled={panelBusy}
+                className="text-[10px] text-primary hover:opacity-80 disabled:opacity-50"
+              >
+                Generate
+              </button>
+            </div>
+            {designState ? (
+              <pre className="text-[10px] text-on-surface-variant whitespace-pre-wrap font-mono max-h-40 overflow-y-auto">
+                {designState.content}
+              </pre>
+            ) : (
+              <p className="text-xs text-on-surface-variant">
+                Persist durable project design decisions as DESIGN_STATE.md.
+              </p>
+            )}
+          </section>
+
+          <section className="neo-raised rounded-2xl p-4">
+            <div className="flex items-center justify-between mb-2">
+              <h4 className="text-sm font-semibold text-on-surface">Browser / Screenshot</h4>
+              <button
+                onClick={handleBrowser}
+                disabled={panelBusy}
+                className="text-[10px] text-primary hover:opacity-80 disabled:opacity-50"
+              >
+                Inspect
+              </button>
+            </div>
+            {browser ? (
+              <div className="space-y-2">
+                <p className="text-xs text-on-surface-variant font-mono truncate">{browser.url}</p>
+                <p className="text-[10px] text-on-surface-variant">
+                  HTTP {browser.diagnostics.http_status} · console errors{" "}
+                  {browser.diagnostics.console_errors.length} · network failures{" "}
+                  {browser.diagnostics.network_failures.length}
+                </p>
+                <p className="text-[10px] font-mono text-on-surface-variant truncate">
+                  {browser.screenshot_uri}
+                </p>
+                {qa.responsive && (
+                  <p className="text-[10px] flex items-center gap-1">
+                    <Icon
+                      name={qa.responsive.passed ? "check_circle" : "cancel"}
+                      size={12}
+                      className={qa.responsive.passed ? "text-emerald-600" : "text-red-600"}
+                    />
+                    Responsive: {qa.responsive.passed ? "pass" : `${qa.responsive.issues.length} issue(s)`}
+                  </p>
+                )}
+                {qa.accessibility && (
+                  <p className="text-[10px] flex items-center gap-1">
+                    <Icon
+                      name={qa.accessibility.passed ? "check_circle" : "cancel"}
+                      size={12}
+                      className={qa.accessibility.passed ? "text-emerald-600" : "text-red-600"}
+                    />
+                    Accessibility: {qa.accessibility.passed ? "pass" : `${qa.accessibility.issues.length} issue(s)`}
+                  </p>
+                )}
+                {qa.functional && (
+                  <p className="text-[10px] flex items-center gap-1">
+                    <Icon
+                      name={qa.functional.passed ? "check_circle" : "cancel"}
+                      size={12}
+                      className={qa.functional.passed ? "text-emerald-600" : "text-red-600"}
+                    />
+                    Functional: {qa.functional.passed ? "pass" : `${qa.functional.issues.length} issue(s)`}
+                  </p>
+                )}
+              </div>
+            ) : (
+              <p className="text-xs text-on-surface-variant">
+                Inspect the running application: navigate, read the DOM, capture console and
+                network diagnostics, and produce screenshot evidence.
+              </p>
+            )}
+          </section>
+
+          <section className="neo-raised rounded-2xl p-4">
+            <div className="flex items-center justify-between mb-2">
+              <h4 className="text-sm font-semibold text-on-surface">Critique &amp; Repair</h4>
+              <div className="flex gap-1">
+                <button
+                  onClick={handleCritique}
+                  disabled={panelBusy}
+                  className="text-[10px] text-primary hover:opacity-80 disabled:opacity-50"
+                >
+                  Critique
+                </button>
+                <button
+                  onClick={handleRepair}
+                  disabled={panelBusy}
+                  className="text-[10px] text-amber-600 dark:text-amber-400 hover:opacity-80 disabled:opacity-50"
+                >
+                  Repair
+                </button>
+              </div>
+            </div>
+            {critique && (
+              <div className="space-y-2">
+                <p className="text-xs flex items-center gap-1.5">
+                  <Icon
+                    name={critique.passed ? "verified_user" : "report_problem"}
+                    size={14}
+                    className={critique.passed ? "text-emerald-600" : "text-red-600"}
+                  />
+                  <span className={critique.passed ? "text-emerald-600" : "text-red-600"}>
+                    {critique.passed ? "Critique passed" : "Issues found"}
+                  </span>
+                </p>
+                {critique.findings.map((f, i) => (
+                  <p key={i} className={`text-[10px] ${severityColor(f.severity)}`}>
+                    {f.rule} — {f.explanation}
+                  </p>
+                ))}
+              </div>
+            )}
+            {repair && repair.repairs.length > 0 && (
+              <div className="mt-3 space-y-2 border-t border-outline-variant/40 pt-2">
+                {repair.repairs.map((r, i) => (
+                  <p key={i} className="text-[10px] text-on-surface-variant">
+                    <span className="text-amber-600 dark:text-amber-400">{r.issue}:</span> {r.repair}
+                  </p>
+                ))}
+              </div>
+            )}
+            {!critique && !repair && (
+              <p className="text-xs text-on-surface-variant">
+                Critique the rendered application for generic-AI patterns, hierarchy, spacing,
+                accessibility, and functional preservation — then repair material issues.
+              </p>
+            )}
+          </section>
+
+          {panelBusy && (
+            <div className="flex items-center gap-2 text-xs text-on-surface-variant">
+              <Icon name="autorenew" size={14} className="animate-spin" />
+              Working…
+            </div>
+          )}
+        </aside>
+      )}
     </main>
   );
 }

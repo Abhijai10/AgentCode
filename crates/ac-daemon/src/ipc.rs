@@ -520,6 +520,120 @@ fn dispatch_request(request: &Value, daemon: &mut DaemonService) -> (Value, bool
                 Err(error) => error_response(correlation_id, error.code(), error.to_string()),
             }
         },
+        "DesignSend" => {
+            let conversation_id = request.get("conversation_id").and_then(Value::as_str).unwrap_or("");
+            let content = request.get("content").and_then(Value::as_str).unwrap_or("");
+            let attachment_ids = request.get("attachment_ids").and_then(Value::as_array).map(|arr| {
+                arr.iter().filter_map(Value::as_str).map(ToString::to_string).collect::<Vec<_>>()
+            }).unwrap_or_default();
+            match daemon.design_send(conversation_id, content, &attachment_ids) {
+                Ok(message) => json!({"id": correlation_id, "ok": true, "message": message_json(message)}),
+                Err(error) => error_response(correlation_id, error.code(), error.to_string()),
+            }
+        },
+        "DesignUnderstand" => {
+            let conversation_id = request.get("conversation_id").and_then(Value::as_str).unwrap_or("");
+            match daemon.design_understand(conversation_id) {
+                Ok(analysis) => json!({"id": correlation_id, "ok": true, "analysis": analysis}),
+                Err(error) => error_response(correlation_id, error.code(), error.to_string()),
+            }
+        },
+        "DesignBrief" => {
+            let conversation_id = request.get("conversation_id").and_then(Value::as_str).unwrap_or("");
+            let audience = request.get("audience").and_then(Value::as_str).unwrap_or("");
+            let workflow = request.get("workflow").and_then(Value::as_str).unwrap_or("");
+            match daemon.design_brief(conversation_id, audience, workflow) {
+                Ok(brief) => json!({"id": correlation_id, "ok": true, "brief": brief}),
+                Err(error) => error_response(correlation_id, error.code(), error.to_string()),
+            }
+        },
+        "DesignGrammar" => {
+            let conversation_id = request.get("conversation_id").and_then(Value::as_str).unwrap_or("");
+            match daemon.design_grammar(conversation_id) {
+                Ok(grammar) => json!({"id": correlation_id, "ok": true, "grammar": grammar}),
+                Err(error) => error_response(correlation_id, error.code(), error.to_string()),
+            }
+        },
+        "DesignState" => {
+            let conversation_id = request.get("conversation_id").and_then(Value::as_str).unwrap_or("");
+            match daemon.design_state(conversation_id) {
+                Ok(state) => json!({"id": correlation_id, "ok": true, "design_state": state}),
+                Err(error) => error_response(correlation_id, error.code(), error.to_string()),
+            }
+        },
+        "DesignCritique" => {
+            let conversation_id = request.get("conversation_id").and_then(Value::as_str).unwrap_or("");
+            let content = request.get("content").and_then(Value::as_str).unwrap_or("");
+            let doc_type = request.get("doc_type").and_then(Value::as_str).unwrap_or("default");
+            match daemon.design_critique(conversation_id, content, doc_type) {
+                Ok(critique) => json!({"id": correlation_id, "ok": true, "critique": critique}),
+                Err(error) => error_response(correlation_id, error.code(), error.to_string()),
+            }
+        },
+        "DesignPreviewStart" => {
+            let conversation_id = request.get("conversation_id").and_then(Value::as_str).unwrap_or("");
+            match daemon.design_preview_start(conversation_id) {
+                Ok(result) => json!({"id": correlation_id, "ok": true, "preview": result}),
+                Err(error) => error_response(correlation_id, error.code(), error.to_string()),
+            }
+        },
+        "DesignPreviewStatus" => {
+            let conversation_id = request.get("conversation_id").and_then(Value::as_str).unwrap_or("");
+            match daemon.design_preview_status(conversation_id) {
+                Ok(status) => json!({"id": correlation_id, "ok": true, "preview": status}),
+                Err(error) => error_response(correlation_id, error.code(), error.to_string()),
+            }
+        },
+        "DesignPreviewStop" => {
+            let conversation_id = request.get("conversation_id").and_then(Value::as_str).unwrap_or("");
+            match daemon.design_preview_stop(conversation_id) {
+                Ok(result) => json!({"id": correlation_id, "ok": true, "preview": result}),
+                Err(error) => error_response(correlation_id, error.code(), error.to_string()),
+            }
+        },
+        "DesignBrowser" => {
+            let conversation_id = request.get("conversation_id").and_then(Value::as_str).unwrap_or("");
+            let url = request.get("url").and_then(Value::as_str).unwrap_or("");
+            let html = request.get("html").and_then(Value::as_str).unwrap_or("");
+            let deterministic = request.get("deterministic").and_then(Value::as_bool).unwrap_or(false);
+            match daemon.design_browser(conversation_id, url, html, deterministic) {
+                Ok(result) => json!({"id": correlation_id, "ok": true, "browser": result}),
+                Err(error) => error_response(correlation_id, error.code(), error.to_string()),
+            }
+        },
+        "DesignQAResponsive" => {
+            let conversation_id = request.get("conversation_id").and_then(Value::as_str).unwrap_or("");
+            let content = request.get("content").and_then(Value::as_str).unwrap_or("");
+            match daemon.design_qa_responsive(conversation_id, content) {
+                Ok(result) => json!({"id": correlation_id, "ok": true, "qa": result}),
+                Err(error) => error_response(correlation_id, error.code(), error.to_string()),
+            }
+        },
+        "DesignQAAccessibility" => {
+            let conversation_id = request.get("conversation_id").and_then(Value::as_str).unwrap_or("");
+            let content = request.get("content").and_then(Value::as_str).unwrap_or("");
+            match daemon.design_qa_accessibility(conversation_id, content) {
+                Ok(result) => json!({"id": correlation_id, "ok": true, "qa": result}),
+                Err(error) => error_response(correlation_id, error.code(), error.to_string()),
+            }
+        },
+        "DesignQAFunctional" => {
+            let conversation_id = request.get("conversation_id").and_then(Value::as_str).unwrap_or("");
+            let content = request.get("content").and_then(Value::as_str).unwrap_or("");
+            match daemon.design_qa_functional(conversation_id, content) {
+                Ok(result) => json!({"id": correlation_id, "ok": true, "qa": result}),
+                Err(error) => error_response(correlation_id, error.code(), error.to_string()),
+            }
+        },
+        "DesignRepair" => {
+            let conversation_id = request.get("conversation_id").and_then(Value::as_str).unwrap_or("");
+            let content = request.get("content").and_then(Value::as_str).unwrap_or("");
+            let doc_type = request.get("doc_type").and_then(Value::as_str).unwrap_or("default");
+            match daemon.design_repair(conversation_id, content, doc_type) {
+                Ok(result) => json!({"id": correlation_id, "ok": true, "repair": result}),
+                Err(error) => error_response(correlation_id, error.code(), error.to_string()),
+            }
+        },
         "ConversationActivity" => {
             let conversation_id = request.get("conversation_id").and_then(Value::as_str).unwrap_or("");
             match daemon.conversation_activity(conversation_id) {
@@ -3372,6 +3486,648 @@ mod ipc_tests {
 
         server.cleanup();
         daemon.shutdown().unwrap();
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn design_send_creates_design_conversation_and_appends_messages() {
+        let _env_lock = crate::TEST_ENV_LOCK.lock().unwrap();
+        std::env::set_var("AGENTCODE_PROVIDER_MODE", "mock");
+        let (dir, db, lock, socket) = temp_paths("ipc-design");
+        let project_dir = dir.join("workspace");
+        fs::create_dir_all(&project_dir).unwrap();
+        let project_path = project_dir.to_string_lossy().to_string();
+
+        let mut daemon = DaemonService::open(&db, &lock).unwrap();
+        daemon.start().unwrap();
+        let Some((server, listener)) = bind_or_skip(&socket, None) else {
+            daemon.shutdown().unwrap();
+            std::env::remove_var("AGENTCODE_PROVIDER_MODE");
+            let _ = fs::remove_dir_all(dir);
+            return;
+        };
+
+        let create = request_via_ipc(
+            &server, &listener, &mut daemon,
+            json!({"id":"c1","command":"ConversationCreate","project_path": project_path, "mode":"DESIGN","title":"Design Test"}),
+        );
+        assert_eq!(create["ok"], true, "create: {create}");
+        let cid = create["conversation_id"].as_str().unwrap().to_string();
+
+        let get = request_via_ipc(
+            &server, &listener, &mut daemon,
+            json!({"id":"g1","command":"ConversationGet","conversation_id": cid}),
+        );
+        assert_eq!(get["ok"], true);
+        assert_eq!(get["conversation"]["mode"], "DESIGN");
+
+        let send = request_via_ipc(
+            &server, &listener, &mut daemon,
+            json!({"id":"d1","command":"DesignSend","conversation_id": cid, "content": "Design a modern dashboard for this project."}),
+        );
+        assert_eq!(send["ok"], true, "send: {send}");
+        let msg = &send["message"];
+        assert_eq!(msg["role"], "assistant");
+        assert_eq!(msg["conversation_id"], cid);
+
+        let get2 = request_via_ipc(
+            &server, &listener, &mut daemon,
+            json!({"id":"g2","command":"ConversationGet","conversation_id": cid}),
+        );
+        assert_eq!(get2["ok"], true);
+        let msgs = get2["conversation"]["messages"].as_array().unwrap();
+        assert_eq!(msgs.len(), 2, "should have 2 messages, got {msgs:?}");
+        assert_eq!(msgs[0]["role"], "user");
+        assert_eq!(msgs[1]["role"], "assistant");
+        let metadata = msgs[1]["metadata"].as_str().unwrap_or("");
+        assert!(metadata.contains("design"), "metadata must mark design mode: {metadata}");
+
+        server.cleanup();
+        daemon.shutdown().unwrap();
+        std::env::remove_var("AGENTCODE_PROVIDER_MODE");
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn design_send_requires_design_mode_and_rejects_other_modes() {
+        let _env_lock = crate::TEST_ENV_LOCK.lock().unwrap();
+        std::env::set_var("AGENTCODE_PROVIDER_MODE", "mock");
+        let (dir, db, lock, socket) = temp_paths("ipc-design-mode");
+        let project_dir = dir.join("workspace");
+        fs::create_dir_all(&project_dir).unwrap();
+        let project_path = project_dir.to_string_lossy().to_string();
+
+        let mut daemon = DaemonService::open(&db, &lock).unwrap();
+        daemon.start().unwrap();
+        let Some((server, listener)) = bind_or_skip(&socket, None) else {
+            daemon.shutdown().unwrap();
+            std::env::remove_var("AGENTCODE_PROVIDER_MODE");
+            let _ = fs::remove_dir_all(dir);
+            return;
+        };
+
+        let create = request_via_ipc(
+            &server, &listener, &mut daemon,
+            json!({"id":"c1","command":"ConversationCreate","project_path": project_path, "mode":"GOAL","title":"Goal Chat"}),
+        );
+        let cid = create["conversation_id"].as_str().unwrap().to_string();
+
+        let send = request_via_ipc(
+            &server, &listener, &mut daemon,
+            json!({"id":"d1","command":"DesignSend","conversation_id": cid, "content": "test"}),
+        );
+        assert_eq!(send["ok"], false, "should reject GOAL mode");
+        assert_eq!(send["error"]["code"], "CONVERSATION-WRONG_MODE");
+
+        let create2 = request_via_ipc(
+            &server, &listener, &mut daemon,
+            json!({"id":"c2","command":"ConversationCreate","project_path": project_path, "mode":"DESIGN","title":"Design Chat"}),
+        );
+        assert_eq!(create2["ok"], true);
+        let cid2 = create2["conversation_id"].as_str().unwrap().to_string();
+
+        let send2 = request_via_ipc(
+            &server, &listener, &mut daemon,
+            json!({"id":"d2","command":"DesignSend","conversation_id": cid2, "content": "Design the authentication experience."}),
+        );
+        assert_eq!(send2["ok"], true, "DESIGN mode should work: {send2}");
+
+        server.cleanup();
+        daemon.shutdown().unwrap();
+        std::env::remove_var("AGENTCODE_PROVIDER_MODE");
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn design_conversation_persists_after_daemon_restart() {
+        let _env_lock = crate::TEST_ENV_LOCK.lock().unwrap();
+        std::env::set_var("AGENTCODE_PROVIDER_MODE", "mock");
+        let (dir, db, lock, socket) = temp_paths("ipc-design-restart");
+        let project_dir = dir.join("workspace");
+        fs::create_dir_all(&project_dir).unwrap();
+        let project_path = project_dir.to_string_lossy().to_string();
+
+        let mut daemon = DaemonService::open(&db, &lock).unwrap();
+        daemon.start().unwrap();
+        let Some((server, listener)) = bind_or_skip(&socket, None) else {
+            daemon.shutdown().unwrap();
+            std::env::remove_var("AGENTCODE_PROVIDER_MODE");
+            let _ = fs::remove_dir_all(dir);
+            return;
+        };
+
+        let create = request_via_ipc(
+            &server, &listener, &mut daemon,
+            json!({"id":"c1","command":"ConversationCreate","project_path": project_path, "mode":"DESIGN","title":"Restart Test"}),
+        );
+        let cid = create["conversation_id"].as_str().unwrap().to_string();
+
+        let send = request_via_ipc(
+            &server, &listener, &mut daemon,
+            json!({"id":"d1","command":"DesignSend","conversation_id": cid, "content": "Let's design the dashboard layout."}),
+        );
+        assert_eq!(send["ok"], true);
+
+        server.cleanup();
+        daemon.shutdown().unwrap();
+
+        let mut daemon2 = DaemonService::open(&db, &lock).unwrap();
+        daemon2.start().unwrap();
+        let Some((server2, listener2)) = bind_or_skip(&socket, None) else {
+            daemon2.shutdown().unwrap();
+            std::env::remove_var("AGENTCODE_PROVIDER_MODE");
+            let _ = fs::remove_dir_all(dir);
+            return;
+        };
+
+        let get = request_via_ipc(
+            &server2, &listener2, &mut daemon2,
+            json!({"id":"g1","command":"ConversationGet","conversation_id": cid}),
+        );
+        assert_eq!(get["ok"], true);
+        assert_eq!(get["conversation"]["mode"], "DESIGN");
+        let msgs = get["conversation"]["messages"].as_array().unwrap();
+        assert!(!msgs.is_empty(), "messages must survive restart, got {}", msgs.len());
+
+        let send2 = request_via_ipc(
+            &server2, &listener2, &mut daemon2,
+            json!({"id":"d2","command":"DesignSend","conversation_id": cid, "content": "Continue after restart"}),
+        );
+        assert_eq!(send2["ok"], true);
+
+        let get2 = request_via_ipc(
+            &server2, &listener2, &mut daemon2,
+            json!({"id":"g2","command":"ConversationGet","conversation_id": cid}),
+        );
+        let msgs2 = get2["conversation"]["messages"].as_array().unwrap();
+        assert!(msgs2.len() > 1, "messages must grow after restart, got {}", msgs2.len());
+
+        server2.cleanup();
+        daemon2.shutdown().unwrap();
+        std::env::remove_var("AGENTCODE_PROVIDER_MODE");
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn design_three_chats_switch_restart_and_restore_all() {
+        let _env_lock = crate::TEST_ENV_LOCK.lock().unwrap();
+        std::env::set_var("AGENTCODE_PROVIDER_MODE", "mock");
+        let (dir, db, lock, socket) = temp_paths("ipc-design-3chat");
+        let project_dir = dir.join("workspace");
+        fs::create_dir_all(&project_dir).unwrap();
+        let project_path = project_dir.to_string_lossy().to_string();
+
+        let mut daemon = DaemonService::open(&db, &lock).unwrap();
+        daemon.start().unwrap();
+        let Some((server, listener)) = bind_or_skip(&socket, None) else {
+            daemon.shutdown().unwrap();
+            std::env::remove_var("AGENTCODE_PROVIDER_MODE");
+            let _ = fs::remove_dir_all(dir);
+            return;
+        };
+
+        let mut cids = Vec::new();
+        for (i, title) in ["Design A", "Design B", "Design C"].iter().enumerate() {
+            let create = request_via_ipc(
+                &server, &listener, &mut daemon,
+                json!({"id": format!("c{i}"), "command":"ConversationCreate","project_path": project_path, "mode":"DESIGN","title": title}),
+            );
+            assert_eq!(create["ok"], true, "create {title}: {create}");
+            cids.push(create["conversation_id"].as_str().unwrap().to_string());
+        }
+        assert_ne!(cids[0], cids[1]);
+        assert_ne!(cids[1], cids[2]);
+
+        let topics = [
+            "Design the authentication experience.",
+            "Redesign the dashboard.",
+            "Explore mobile navigation.",
+        ];
+        for (i, (cid, topic)) in cids.iter().zip(topics.iter()).enumerate() {
+            let send = request_via_ipc(
+                &server, &listener, &mut daemon,
+                json!({"id": format!("d{i}"), "command":"DesignSend","conversation_id": cid, "content": topic}),
+            );
+            assert_eq!(send["ok"], true, "send to {cid}: {send}");
+        }
+
+        for (cid, topic) in cids.iter().zip(topics.iter()) {
+            let get = request_via_ipc(
+                &server, &listener, &mut daemon,
+                json!({"id":"gx","command":"ConversationGet","conversation_id": cid}),
+            );
+            assert_eq!(get["ok"], true);
+            let msgs = get["conversation"]["messages"].as_array().unwrap();
+            assert!(
+                msgs.iter().any(|m| m["content"].as_str() == Some(topic)),
+                "wrong history for {cid}"
+            );
+        }
+
+        server.cleanup();
+        daemon.shutdown().unwrap();
+
+        let mut daemon2 = DaemonService::open(&db, &lock).unwrap();
+        daemon2.start().unwrap();
+        let Some((server2, listener2)) = bind_or_skip(&socket, None) else {
+            daemon2.shutdown().unwrap();
+            std::env::remove_var("AGENTCODE_PROVIDER_MODE");
+            let _ = fs::remove_dir_all(dir);
+            return;
+        };
+
+        let list = request_via_ipc(
+            &server2, &listener2, &mut daemon2,
+            json!({"id":"l1","command":"ConversationList","project_path": project_path}),
+        );
+        assert_eq!(list["ok"], true);
+        let convs = list["conversations"].as_array().unwrap();
+        let design_convs = convs.iter().filter(|c| c["mode"] == "DESIGN").count();
+        assert_eq!(design_convs, 3, "all three design chats must survive restart");
+
+        for (cid, topic) in cids.iter().zip(topics.iter()) {
+            let get = request_via_ipc(
+                &server2, &listener2, &mut daemon2,
+                json!({"id":"gx","command":"ConversationGet","conversation_id": cid}),
+            );
+            assert_eq!(get["ok"], true);
+            let msgs = get["conversation"]["messages"].as_array().unwrap();
+            assert!(
+                msgs.iter().any(|m| m["content"].as_str() == Some(topic)),
+                "restored history wrong for {cid}"
+            );
+            assert_eq!(get["conversation"]["mode"], "DESIGN");
+        }
+
+        server2.cleanup();
+        daemon2.shutdown().unwrap();
+        std::env::remove_var("AGENTCODE_PROVIDER_MODE");
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn design_project_isolation_multiple_conversations() {
+        let _env_lock = crate::TEST_ENV_LOCK.lock().unwrap();
+        std::env::set_var("AGENTCODE_PROVIDER_MODE", "mock");
+        let (dir, db, lock, socket) = temp_paths("ipc-design-isolation");
+        let project_a = dir.join("proj-a");
+        let project_b = dir.join("proj-b");
+        fs::create_dir_all(&project_a).unwrap();
+        fs::create_dir_all(&project_b).unwrap();
+        let path_a = project_a.to_string_lossy().to_string();
+        let path_b = project_b.to_string_lossy().to_string();
+
+        let mut daemon = DaemonService::open(&db, &lock).unwrap();
+        daemon.start().unwrap();
+        let Some((server, listener)) = bind_or_skip(&socket, None) else {
+            daemon.shutdown().unwrap();
+            std::env::remove_var("AGENTCODE_PROVIDER_MODE");
+            let _ = fs::remove_dir_all(dir);
+            return;
+        };
+
+        let ca = request_via_ipc(
+            &server, &listener, &mut daemon,
+            json!({"id":"c1","command":"ConversationCreate","project_path": path_a, "mode":"DESIGN","title":"Proj A Design"}),
+        );
+        let cid_a = ca["conversation_id"].as_str().unwrap().to_string();
+
+        let cb = request_via_ipc(
+            &server, &listener, &mut daemon,
+            json!({"id":"c2","command":"ConversationCreate","project_path": path_b, "mode":"DESIGN","title":"Proj B Design"}),
+        );
+        let cid_b = cb["conversation_id"].as_str().unwrap().to_string();
+
+        let send_a = request_via_ipc(
+            &server, &listener, &mut daemon,
+            json!({"id":"d1","command":"DesignSend","conversation_id": cid_a, "content": "Design for project A"}),
+        );
+        assert_eq!(send_a["ok"], true);
+
+        let send_b = request_via_ipc(
+            &server, &listener, &mut daemon,
+            json!({"id":"d2","command":"DesignSend","conversation_id": cid_b, "content": "Design for project B"}),
+        );
+        assert_eq!(send_b["ok"], true);
+
+        let list_a = request_via_ipc(
+            &server, &listener, &mut daemon,
+            json!({"id":"l1","command":"ConversationList","project_path": path_a}),
+        );
+        let convs_a = list_a["conversations"].as_array().unwrap();
+        assert_eq!(convs_a.len(), 1);
+        assert_eq!(convs_a[0]["id"], cid_a);
+
+        let list_b = request_via_ipc(
+            &server, &listener, &mut daemon,
+            json!({"id":"l2","command":"ConversationList","project_path": path_b}),
+        );
+        let convs_b = list_b["conversations"].as_array().unwrap();
+        assert_eq!(convs_b.len(), 1);
+        assert_eq!(convs_b[0]["id"], cid_b);
+
+        let get_a = request_via_ipc(
+            &server, &listener, &mut daemon,
+            json!({"id":"g1","command":"ConversationGet","conversation_id": cid_a}),
+        );
+        let msgs_a = get_a["conversation"]["messages"].as_array().unwrap();
+        assert!(msgs_a[0]["content"].as_str().unwrap().contains("project A"));
+
+        server.cleanup();
+        daemon.shutdown().unwrap();
+        std::env::remove_var("AGENTCODE_PROVIDER_MODE");
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn design_brief_grammar_state_and_critique_roundtrip() {
+        let _env_lock = crate::TEST_ENV_LOCK.lock().unwrap();
+        std::env::set_var("AGENTCODE_PROVIDER_MODE", "mock");
+        let (dir, db, lock, socket) = temp_paths("ipc-design-brief");
+        let project_dir = dir.join("workspace");
+        fs::create_dir_all(&project_dir).unwrap();
+        // A realistic web project so product understanding has something to scan
+        fs::write(
+            project_dir.join("package.json"),
+            r#"{"name":"dashboard-app","scripts":{"dev":"vite"}}"#,
+        )
+        .unwrap();
+        fs::create_dir_all(project_dir.join("src/components")).unwrap();
+        fs::write(project_dir.join("src/App.tsx"), "export function App() { return <main /> }").unwrap();
+        fs::write(
+            project_dir.join("src/styles.css"),
+            "--color-primary: #1a1a2e; --radius-md: 6px;",
+        )
+        .unwrap();
+        let project_path = project_dir.to_string_lossy().to_string();
+
+        let mut daemon = DaemonService::open(&db, &lock).unwrap();
+        daemon.start().unwrap();
+        let Some((server, listener)) = bind_or_skip(&socket, None) else {
+            daemon.shutdown().unwrap();
+            std::env::remove_var("AGENTCODE_PROVIDER_MODE");
+            let _ = fs::remove_dir_all(dir);
+            return;
+        };
+
+        let create = request_via_ipc(
+            &server, &listener, &mut daemon,
+            json!({"id":"c1","command":"ConversationCreate","project_path": project_path, "mode":"DESIGN","title":"Dashboard Redesign"}),
+        );
+        assert_eq!(create["ok"], true, "create: {create}");
+        let cid = create["conversation_id"].as_str().unwrap().to_string();
+
+        // Product understanding must detect the framework and components
+        let understand = request_via_ipc(
+            &server, &listener, &mut daemon,
+            json!({"id":"u1","command":"DesignUnderstand","conversation_id": cid}),
+        );
+        assert_eq!(understand["ok"], true, "understand: {understand}");
+        let analysis = &understand["analysis"];
+        assert_eq!(analysis["framework"], "Vite", "framework detection: {analysis}");
+        assert!(
+            !analysis["components"].as_array().unwrap().is_empty(),
+            "components must be discovered: {analysis}"
+        );
+
+        // Design Brief is structured and persisted
+        let brief = request_via_ipc(
+            &server, &listener, &mut daemon,
+            json!({"id":"b1","command":"DesignBrief","conversation_id": cid, "audience": "data analysts", "workflow": "review metrics"}),
+        );
+        assert_eq!(brief["ok"], true, "brief: {brief}");
+        let brief_val = &brief["brief"];
+        assert_eq!(brief_val["product"], "Dashboard Redesign");
+        assert_eq!(brief_val["audience"], "data analysts");
+        assert!(!brief_val["patterns_to_avoid"].as_array().unwrap().is_empty());
+
+        // Grammar is structured and product-anchored
+        let grammar = request_via_ipc(
+            &server, &listener, &mut daemon,
+            json!({"id":"gm1","command":"DesignGrammar","conversation_id": cid}),
+        );
+        assert_eq!(grammar["ok"], true, "grammar: {grammar}");
+        let grammar_val = &grammar["grammar"];
+        assert!(
+            grammar_val["color_roles"][0].as_str().unwrap().contains("Dashboard Redesign"),
+            "grammar must be product-specific: {grammar_val}"
+        );
+
+        // Design state persists durable project decisions
+        let state = request_via_ipc(
+            &server, &listener, &mut daemon,
+            json!({"id":"s1","command":"DesignState","conversation_id": cid}),
+        );
+        assert_eq!(state["ok"], true, "state: {state}");
+        let state_val = &state["design_state"];
+        assert!(
+            state_val["content"].as_str().unwrap().contains("DESIGN_STATE.md"),
+            "state must reference DESIGN_STATE.md: {state_val}"
+        );
+
+        // Critique flags generic patterns instead of approving slop
+        let slop = r#"
+            <div class="hero" style="background: linear-gradient(180deg, #667eea, #764ba2); height: 100vh;">
+              <h1>Welcome to the future of AI</h1>
+            </div>
+            <div class="card">Feature A</div>
+            <div class="card">Feature B</div>
+            <div class="card">Feature C</div>
+        "#;
+        let critique = request_via_ipc(
+            &server, &listener, &mut daemon,
+            json!({"id":"cr1","command":"DesignCritique","conversation_id": cid, "content": slop, "doc_type":"implementation"}),
+        );
+        assert_eq!(critique["ok"], true, "critique: {critique}");
+        let critique_val = &critique["critique"];
+        assert_eq!(critique_val["passed"], false, "slop must not pass: {critique_val}");
+        assert_eq!(critique_val["improvement_required"], true);
+        let findings = critique_val["findings"].as_array().unwrap();
+        let rules: Vec<&str> = findings
+            .iter()
+            .filter_map(|f| f["rule"].as_str())
+            .collect();
+        assert!(rules.contains(&"oversized_gradient_hero"), "rules: {rules:?}");
+        assert!(rules.contains(&"identical_generic_cards"), "rules: {rules:?}");
+        assert!(rules.contains(&"generic_placeholder"), "rules: {rules:?}");
+
+        // The same critique engine accepts a product-specific implementation
+        let clean = r#"
+            <header class="panel" style="background: var(--color-primary);">
+              <h1>Metrics Review</h1>
+            </header>
+            <button role="button">Refresh</button>
+        "#;
+        let critique2 = request_via_ipc(
+            &server, &listener, &mut daemon,
+            json!({"id":"cr2","command":"DesignCritique","conversation_id": cid, "content": clean, "doc_type":"implementation"}),
+        );
+        assert_eq!(critique2["ok"], true);
+        assert_eq!(critique2["critique"]["passed"], true, "clean design must pass: {critique2}");
+
+        // Repair loop turns material findings into actionable repairs
+        let repair = request_via_ipc(
+            &server, &listener, &mut daemon,
+            json!({"id":"r1","command":"DesignRepair","conversation_id": cid, "content": slop, "doc_type":"implementation"}),
+        );
+        assert_eq!(repair["ok"], true, "repair: {repair}");
+        let repair_val = &repair["repair"];
+        assert_eq!(repair_val["improvement_required"], true);
+        assert!(!repair_val["repairs"].as_array().unwrap().is_empty());
+
+        // QA reports ground functional and a11y checks on real content
+        let functional = request_via_ipc(
+            &server, &listener, &mut daemon,
+            json!({"id":"f1","command":"DesignQAFunctional","conversation_id": cid, "content": clean}),
+        );
+        assert_eq!(functional["ok"], true);
+        assert_eq!(functional["qa"]["passed"], true);
+
+        server.cleanup();
+        daemon.shutdown().unwrap();
+        std::env::remove_var("AGENTCODE_PROVIDER_MODE");
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn design_documents_survive_daemon_restart() {
+        let _env_lock = crate::TEST_ENV_LOCK.lock().unwrap();
+        std::env::set_var("AGENTCODE_PROVIDER_MODE", "mock");
+        let (dir, db, lock, socket) = temp_paths("ipc-design-docs-restart");
+        let project_dir = dir.join("workspace");
+        fs::create_dir_all(&project_dir).unwrap();
+        fs::write(
+            project_dir.join("package.json"),
+            r#"{"name":"app","scripts":{"dev":"vite"}}"#,
+        )
+        .unwrap();
+        let project_path = project_dir.to_string_lossy().to_string();
+
+        let mut daemon = DaemonService::open(&db, &lock).unwrap();
+        daemon.start().unwrap();
+        let Some((server, listener)) = bind_or_skip(&socket, None) else {
+            daemon.shutdown().unwrap();
+            std::env::remove_var("AGENTCODE_PROVIDER_MODE");
+            let _ = fs::remove_dir_all(dir);
+            return;
+        };
+
+        let create = request_via_ipc(
+            &server, &listener, &mut daemon,
+            json!({"id":"c1","command":"ConversationCreate","project_path": project_path, "mode":"DESIGN","title":"Docs Restart"}),
+        );
+        let cid = create["conversation_id"].as_str().unwrap().to_string();
+
+        let understand = request_via_ipc(
+            &server, &listener, &mut daemon,
+            json!({"id":"u1","command":"DesignUnderstand","conversation_id": cid}),
+        );
+        assert_eq!(understand["ok"], true);
+        let brief = request_via_ipc(
+            &server, &listener, &mut daemon,
+            json!({"id":"b1","command":"DesignBrief","conversation_id": cid, "audience": "developers", "workflow": "configure pipelines"}),
+        );
+        assert_eq!(brief["ok"], true);
+
+        server.cleanup();
+        daemon.shutdown().unwrap();
+
+        let mut daemon2 = DaemonService::open(&db, &lock).unwrap();
+        daemon2.start().unwrap();
+        let Some((server2, listener2)) = bind_or_skip(&socket, None) else {
+            daemon2.shutdown().unwrap();
+            std::env::remove_var("AGENTCODE_PROVIDER_MODE");
+            let _ = fs::remove_dir_all(dir);
+            return;
+        };
+
+        // Regenerating brief must pick up the persisted analysis doc
+        let brief2 = request_via_ipc(
+            &server2, &listener2, &mut daemon2,
+            json!({"id":"b2","command":"DesignBrief","conversation_id": cid, "audience": "developers", "workflow": "configure pipelines"}),
+        );
+        assert_eq!(brief2["ok"], true, "brief after restart: {brief2}");
+        assert_eq!(brief2["brief"]["framework"], "Vite", "persisted analysis must feed brief");
+
+        // Design state regenerates from the persisted brief/grammar documents
+        let state = request_via_ipc(
+            &server2, &listener2, &mut daemon2,
+            json!({"id":"s1","command":"DesignState","conversation_id": cid}),
+        );
+        assert_eq!(state["ok"], true);
+        assert!(state["design_state"]["content"].as_str().unwrap().contains("DESIGN_STATE.md"));
+
+        server2.cleanup();
+        daemon2.shutdown().unwrap();
+        std::env::remove_var("AGENTCODE_PROVIDER_MODE");
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn design_browser_deterministic_inspects_dom_and_captures_evidence() {
+        let _env_lock = crate::TEST_ENV_LOCK.lock().unwrap();
+        std::env::set_var("AGENTCODE_PROVIDER_MODE", "mock");
+        let (dir, db, lock, socket) = temp_paths("ipc-design-browser");
+        let project_dir = dir.join("workspace");
+        fs::create_dir_all(&project_dir).unwrap();
+        let project_path = project_dir.to_string_lossy().to_string();
+
+        let mut daemon = DaemonService::open(&db, &lock).unwrap();
+        daemon.start().unwrap();
+        let Some((server, listener)) = bind_or_skip(&socket, None) else {
+            daemon.shutdown().unwrap();
+            std::env::remove_var("AGENTCODE_PROVIDER_MODE");
+            let _ = fs::remove_dir_all(dir);
+            return;
+        };
+
+        let create = request_via_ipc(
+            &server, &listener, &mut daemon,
+            json!({"id":"c1","command":"ConversationCreate","project_path": project_path, "mode":"DESIGN","title":"Browser Check"}),
+        );
+        assert_eq!(create["ok"], true);
+        let cid = create["conversation_id"].as_str().unwrap().to_string();
+
+        let html = r#"
+            <html><body>
+              <nav><a href="/">Home</a></nav>
+              <h1>Metrics Review</h1>
+              <button role="button">Refresh</button>
+              <form><label>Query</label><input name="q" /></form>
+            </body></html>
+        "#;
+        let browser = request_via_ipc(
+            &server, &listener, &mut daemon,
+            json!({"id":"br1","command":"DesignBrowser","conversation_id": cid, "url":"http://127.0.0.1:5173", "html": html, "deterministic": true}),
+        );
+        assert_eq!(browser["ok"], true, "browser: {browser}");
+        let browser_val = &browser["browser"];
+        assert_eq!(browser_val["url"], "http://127.0.0.1:5173");
+        assert!(
+            browser_val["visible_text"].as_str().unwrap().contains("Metrics Review"),
+            "DOM must contain rendered text: {browser_val}"
+        );
+        let controls = browser_val["controls"].as_array().unwrap();
+        assert!(
+            controls.iter().any(|c| c.as_str().unwrap().contains("button")),
+            "controls must be discovered: {controls:?}"
+        );
+        assert!(
+            browser_val["screenshot_uri"].as_str().unwrap().contains("screenshot:"),
+            "screenshot evidence must be produced: {browser_val}"
+        );
+
+        // Accessibility QA on the inspected DOM
+        let a11y = request_via_ipc(
+            &server, &listener, &mut daemon,
+            json!({"id":"a1","command":"DesignQAAccessibility","conversation_id": cid, "content": html}),
+        );
+        assert_eq!(a11y["ok"], true);
+        assert_eq!(a11y["qa"]["passed"], true, "semantic DOM must pass a11y: {a11y}");
+
+        server.cleanup();
+        daemon.shutdown().unwrap();
+        std::env::remove_var("AGENTCODE_PROVIDER_MODE");
         let _ = fs::remove_dir_all(dir);
     }
 }

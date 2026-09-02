@@ -25,6 +25,7 @@ include!("verification.rs");
 include!("security.rs");
 include!("agent.rs");
 include!("discuss_design.rs");
+include!("design_studio.rs");
 include!("desktop_optimization.rs");
 include!("conversations.rs");
 include!("chaos_dogfood.rs");

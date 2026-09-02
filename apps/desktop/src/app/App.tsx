@@ -187,6 +187,7 @@ function AppShell() {
             <DesignView
               project={project}
               missionId={activeMission}
+              daemonConnected={daemonConnected}
               onOpenMission={(missionId) => {
                 setActiveMission(missionId);
                 setView("mission");

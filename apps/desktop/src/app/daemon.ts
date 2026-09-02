@@ -27,6 +27,16 @@ import type {
   Message,
   Attachment,
   ConversationActivity,
+  ProductAnalysis,
+  DesignBrief,
+  DesignGrammar,
+  DesignState,
+  DesignCritique,
+  DesignRepair,
+  DesignPreview,
+  DesignPreviewStatus,
+  DesignBrowserResult,
+  DesignQaReport,
 } from "./types";
 
 function toDaemonStatus(h: DaemonHealth): DaemonStatus {
@@ -636,6 +646,219 @@ export const daemon = {
       });
     } catch {
       return null;
+    }
+  },
+
+  // ── Design Studio (G4) ────────────────────────────────────────────────
+
+  async designSend(
+    conversationId: string,
+    content: string,
+    attachmentIds?: string[]
+  ): Promise<{ ok: boolean; message?: Message; error?: string }> {
+    try {
+      const res = await invoke<{ message: Message }>("daemon_design_send", {
+        conversationId,
+        content,
+        attachmentIds: attachmentIds ?? [],
+      });
+      return { ok: true, message: res.message };
+    } catch (e: unknown) {
+      const message = e instanceof Error ? e.message : String(e);
+      const cleaned = message.replace(/^[A-Z0-9_-]+:\s*/, "");
+      return { ok: false, error: cleaned || message };
+    }
+  },
+
+  async designUnderstand(
+    conversationId: string
+  ): Promise<{ ok: boolean; analysis?: ProductAnalysis; error?: string }> {
+    try {
+      const res = await invoke<{ analysis: ProductAnalysis }>(
+        "daemon_design_understand",
+        { conversationId }
+      );
+      return { ok: true, analysis: res.analysis };
+    } catch (e: unknown) {
+      const message = e instanceof Error ? e.message : String(e);
+      const cleaned = message.replace(/^[A-Z0-9_-]+:\s*/, "");
+      return { ok: false, error: cleaned || message };
+    }
+  },
+
+  async designBrief(
+    conversationId: string,
+    audience: string,
+    workflow: string
+  ): Promise<{ ok: boolean; brief?: DesignBrief; error?: string }> {
+    try {
+      const res = await invoke<{ brief: DesignBrief }>("daemon_design_brief", {
+        conversationId,
+        audience,
+        workflow,
+      });
+      return { ok: true, brief: res.brief };
+    } catch (e: unknown) {
+      const message = e instanceof Error ? e.message : String(e);
+      const cleaned = message.replace(/^[A-Z0-9_-]+:\s*/, "");
+      return { ok: false, error: cleaned || message };
+    }
+  },
+
+  async designGrammar(
+    conversationId: string
+  ): Promise<{ ok: boolean; grammar?: DesignGrammar; error?: string }> {
+    try {
+      const res = await invoke<{ grammar: DesignGrammar }>("daemon_design_grammar", {
+        conversationId,
+      });
+      return { ok: true, grammar: res.grammar };
+    } catch (e: unknown) {
+      const message = e instanceof Error ? e.message : String(e);
+      const cleaned = message.replace(/^[A-Z0-9_-]+:\s*/, "");
+      return { ok: false, error: cleaned || message };
+    }
+  },
+
+  async designState(
+    conversationId: string
+  ): Promise<{ ok: boolean; state?: DesignState; error?: string }> {
+    try {
+      const res = await invoke<{ design_state: DesignState }>("daemon_design_state", {
+        conversationId,
+      });
+      return { ok: true, state: res.design_state };
+    } catch (e: unknown) {
+      const message = e instanceof Error ? e.message : String(e);
+      const cleaned = message.replace(/^[A-Z0-9_-]+:\s*/, "");
+      return { ok: false, error: cleaned || message };
+    }
+  },
+
+  async designCritique(
+    conversationId: string,
+    content: string,
+    docType?: string
+  ): Promise<{ ok: boolean; critique?: DesignCritique; error?: string }> {
+    try {
+      const res = await invoke<{ critique: DesignCritique }>("daemon_design_critique", {
+        conversationId,
+        content,
+        docType: docType ?? "implementation",
+      });
+      return { ok: true, critique: res.critique };
+    } catch (e: unknown) {
+      const message = e instanceof Error ? e.message : String(e);
+      const cleaned = message.replace(/^[A-Z0-9_-]+:\s*/, "");
+      return { ok: false, error: cleaned || message };
+    }
+  },
+
+  async designRepair(
+    conversationId: string,
+    content: string,
+    docType?: string
+  ): Promise<{ ok: boolean; repair?: DesignRepair; error?: string }> {
+    try {
+      const res = await invoke<{ repair: DesignRepair }>("daemon_design_repair", {
+        conversationId,
+        content,
+        docType: docType ?? "implementation",
+      });
+      return { ok: true, repair: res.repair };
+    } catch (e: unknown) {
+      const message = e instanceof Error ? e.message : String(e);
+      const cleaned = message.replace(/^[A-Z0-9_-]+:\s*/, "");
+      return { ok: false, error: cleaned || message };
+    }
+  },
+
+  async designPreviewStart(
+    conversationId: string
+  ): Promise<{ ok: boolean; preview?: DesignPreview; error?: string }> {
+    try {
+      const res = await invoke<{ preview: DesignPreview }>("daemon_design_preview_start", {
+        conversationId,
+      });
+      return { ok: true, preview: res.preview };
+    } catch (e: unknown) {
+      const message = e instanceof Error ? e.message : String(e);
+      const cleaned = message.replace(/^[A-Z0-9_-]+:\s*/, "");
+      return { ok: false, error: cleaned || message };
+    }
+  },
+
+  async designPreviewStatus(
+    conversationId: string
+  ): Promise<{ ok: boolean; preview?: DesignPreviewStatus; error?: string }> {
+    try {
+      const res = await invoke<{ preview: DesignPreviewStatus }>(
+        "daemon_design_preview_status",
+        { conversationId }
+      );
+      return { ok: true, preview: res.preview };
+    } catch (e: unknown) {
+      const message = e instanceof Error ? e.message : String(e);
+      const cleaned = message.replace(/^[A-Z0-9_-]+:\s*/, "");
+      return { ok: false, error: cleaned || message };
+    }
+  },
+
+  async designPreviewStop(
+    conversationId: string
+  ): Promise<{ ok: boolean; error?: string }> {
+    try {
+      await invoke("daemon_design_preview_stop", { conversationId });
+      return { ok: true };
+    } catch (e: unknown) {
+      const message = e instanceof Error ? e.message : String(e);
+      const cleaned = message.replace(/^[A-Z0-9_-]+:\s*/, "");
+      return { ok: false, error: cleaned || message };
+    }
+  },
+
+  async designBrowser(
+    conversationId: string,
+    url?: string,
+    html?: string,
+    deterministic?: boolean
+  ): Promise<{ ok: boolean; browser?: DesignBrowserResult; error?: string }> {
+    try {
+      const res = await invoke<{ browser: DesignBrowserResult }>("daemon_design_browser", {
+        conversationId,
+        url: url ?? "",
+        html: html ?? "",
+        deterministic: deterministic ?? false,
+      });
+      return { ok: true, browser: res.browser };
+    } catch (e: unknown) {
+      const message = e instanceof Error ? e.message : String(e);
+      const cleaned = message.replace(/^[A-Z0-9_-]+:\s*/, "");
+      return { ok: false, error: cleaned || message };
+    }
+  },
+
+  async designQa(
+    conversationId: string,
+    kind: "responsive" | "accessibility" | "functional",
+    content: string
+  ): Promise<{ ok: boolean; qa?: DesignQaReport; error?: string }> {
+    try {
+      const command =
+        kind === "responsive"
+          ? "daemon_design_qa_responsive"
+          : kind === "accessibility"
+            ? "daemon_design_qa_accessibility"
+            : "daemon_design_qa_functional";
+      const res = await invoke<{ qa: DesignQaReport }>(command, {
+        conversationId,
+        content,
+      });
+      return { ok: true, qa: res.qa };
+    } catch (e: unknown) {
+      const message = e instanceof Error ? e.message : String(e);
+      const cleaned = message.replace(/^[A-Z0-9_-]+:\s*/, "");
+      return { ok: false, error: cleaned || message };
     }
   },
 };

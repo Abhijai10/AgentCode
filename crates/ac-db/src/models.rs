@@ -312,6 +312,44 @@ pub struct DesignVisualEvaluationRow {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DesignDocumentRow {
+    pub id: String,
+    pub conversation_id: String,
+    pub doc_type: String,
+    pub content_json: String,
+    pub version: i64,
+    pub evidence_refs: String,
+    pub created_at_ms: i64,
+    pub updated_at_ms: i64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DesignPreviewRow {
+    pub id: String,
+    pub conversation_id: String,
+    pub port: Option<i64>,
+    pub ready_url: Option<String>,
+    pub process_id: Option<String>,
+    pub process_alive: bool,
+    pub http_ready: bool,
+    pub browser_session_id: Option<String>,
+    pub created_at_ms: i64,
+    pub updated_at_ms: i64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DesignCritiqueRow {
+    pub id: String,
+    pub conversation_id: String,
+    pub doc_type: Option<String>,
+    pub passed: bool,
+    pub findings_json: String,
+    pub improvement_required: bool,
+    pub evidence_refs: String,
+    pub created_at_ms: i64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DesktopSessionRow {
     pub id: String,
     pub active_project_id: Option<String>,
