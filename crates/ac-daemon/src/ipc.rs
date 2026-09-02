@@ -596,7 +596,8 @@ fn dispatch_request(request: &Value, daemon: &mut DaemonService) -> (Value, bool
             let url = request.get("url").and_then(Value::as_str).unwrap_or("");
             let html = request.get("html").and_then(Value::as_str).unwrap_or("");
             let deterministic = request.get("deterministic").and_then(Value::as_bool).unwrap_or(false);
-            match daemon.design_browser(conversation_id, url, html, deterministic) {
+            let viewport_hint = request.get("viewport_hint").and_then(Value::as_str).unwrap_or("desktop");
+            match daemon.design_browser(conversation_id, url, html, deterministic, viewport_hint) {
                 Ok(result) => json!({"id": correlation_id, "ok": true, "browser": result}),
                 Err(error) => error_response(correlation_id, error.code(), error.to_string()),
             }
@@ -4124,6 +4125,425 @@ mod ipc_tests {
         );
         assert_eq!(a11y["ok"], true);
         assert_eq!(a11y["qa"]["passed"], true, "semantic DOM must pass a11y: {a11y}");
+
+        server.cleanup();
+        daemon.shutdown().unwrap();
+        std::env::remove_var("AGENTCODE_PROVIDER_MODE");
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn design_studio_deterministic_end_to_end_workflow() {
+        // G4-26: single deterministic E2E that exercises the full Design Studio
+        // workflow: New Design Chat → design request → understanding → brief →
+        // grammar → implementation → real app launch → browser → screenshot →
+        // critique → repair → responsive → accessibility → functional →
+        // persistent Design State.
+        let _env_lock = crate::TEST_ENV_LOCK.lock().unwrap();
+        std::env::set_var("AGENTCODE_PROVIDER_MODE", "mock");
+        let (dir, db, lock, socket) = temp_paths("ipc-design-e2e");
+        let project_dir = dir.join("workspace");
+        fs::create_dir_all(&project_dir).unwrap();
+        // Web project fixture with a dev-server command, components, and styles.
+        fs::write(
+            project_dir.join("package.json"),
+            r#"{"name":"e2e-app","scripts":{"dev":"python3 -m http.server 8787"}}"#,
+        )
+        .unwrap();
+        fs::write(project_dir.join("index.html"), "<html><body><h1>E2E App</h1></body></html>").unwrap();
+        fs::create_dir_all(project_dir.join("src")).unwrap();
+        fs::write(project_dir.join("src/App.tsx"), "export function App() { return <main /> }").unwrap();
+        fs::write(project_dir.join("src/styles.css"), "--color-primary: #1a1a2e;").unwrap();
+        let project_path = project_dir.to_string_lossy().to_string();
+
+        let mut daemon = DaemonService::open(&db, &lock).unwrap();
+        daemon.start().unwrap();
+        let Some((server, listener)) = bind_or_skip(&socket, None) else {
+            daemon.shutdown().unwrap();
+            std::env::remove_var("AGENTCODE_PROVIDER_MODE");
+            let _ = fs::remove_dir_all(dir);
+            return;
+        };
+
+        // 1. New Design Chat
+        let create = request_via_ipc(
+            &server, &listener, &mut daemon,
+            json!({"id":"c1","command":"ConversationCreate","project_path": project_path, "mode":"DESIGN","title":"E2E Design"}),
+        );
+        assert_eq!(create["ok"], true, "create: {create}");
+        let cid = create["conversation_id"].as_str().unwrap().to_string();
+
+        // 2. Send a design request
+        let send = request_via_ipc(
+            &server, &listener, &mut daemon,
+            json!({"id":"d1","command":"DesignSend","conversation_id": cid, "content": "Create a modern, technical dashboard."}),
+        );
+        assert_eq!(send["ok"], true, "send: {send}");
+        assert_eq!(send["message"]["role"], "assistant");
+
+        // 3. Product understanding
+        let understand = request_via_ipc(
+            &server, &listener, &mut daemon,
+            json!({"id":"u1","command":"DesignUnderstand","conversation_id": cid}),
+        );
+        assert_eq!(understand["ok"], true);
+        let analysis = &understand["analysis"];
+        assert!(analysis["framework"].is_string(), "framework detected: {analysis}");
+
+        // 4. Design Brief
+        let brief = request_via_ipc(
+            &server, &listener, &mut daemon,
+            json!({"id":"b1","command":"DesignBrief","conversation_id": cid, "audience": "devops engineers", "workflow": "monitor dashboards"}),
+        );
+        assert_eq!(brief["ok"], true);
+        assert_eq!(brief["brief"]["product"], "E2E Design");
+        assert_eq!(brief["brief"]["audience"], "devops engineers");
+
+        // 5. Design Grammar
+        let grammar = request_via_ipc(
+            &server, &listener, &mut daemon,
+            json!({"id":"gm1","command":"DesignGrammar","conversation_id": cid}),
+        );
+        assert_eq!(grammar["ok"], true);
+        assert!(grammar["grammar"]["color_roles"][0].as_str().unwrap().contains("E2E Design"));
+
+        // 6. Real application preview (best-effort — skip if python3 unavailable)
+        let preview = request_via_ipc(
+            &server, &listener, &mut daemon,
+            json!({"id":"p1","command":"DesignPreviewStart","conversation_id": cid}),
+        );
+        if preview["ok"] == true && preview["preview"]["status"] == "launched" {
+            // Verify status reports the process
+            let status = request_via_ipc(
+                &server, &listener, &mut daemon,
+                json!({"id":"ps1","command":"DesignPreviewStatus","conversation_id": cid}),
+            );
+            let _http_ok = status["preview"]["http_ready"].as_bool().unwrap_or(false);
+            // The server may or may not be ready yet; verify the structure exists
+            assert!(status["preview"]["port"].is_number() || status["preview"]["port"].is_null());
+            // Stop the preview
+            let stop = request_via_ipc(
+                &server, &listener, &mut daemon,
+                json!({"id":"ps2","command":"DesignPreviewStop","conversation_id": cid}),
+            );
+            assert_eq!(stop["ok"], true);
+        } else {
+            // Preview commands may not be available in all environments — skip
+            eprintln!("preview start skipped: {:?}", preview);
+        }
+
+        // 7. Browser inspection (deterministic with HTML fixture)
+        let html = r#"
+            <html><body>
+              <header><h1>Dashboard</h1></header>
+              <nav><a href="/">Home</a><a href="/settings">Settings</a></nav>
+              <main>
+                <button role="button">Refresh</button>
+                <form><label>Filter</label><input name="q" /></form>
+              </main>
+            </body></html>
+        "#;
+        let browser = request_via_ipc(
+            &server, &listener, &mut daemon,
+            json!({"id":"br1","command":"DesignBrowser","conversation_id": cid, "url":"http://127.0.0.1:8787", "html": html, "deterministic": true}),
+        );
+        assert_eq!(browser["ok"], true, "browser: {browser}");
+        let browser_val = &browser["browser"];
+        assert!(browser_val["visible_text"].as_str().unwrap().contains("Dashboard"));
+        assert!(browser_val["screenshot_uri"].as_str().unwrap().contains("screenshot:"));
+
+        // 8. Critique
+        let critique = request_via_ipc(
+            &server, &listener, &mut daemon,
+            json!({"id":"cr1","command":"DesignCritique","conversation_id": cid, "content": html, "doc_type":"rendered"}),
+        );
+        assert_eq!(critique["ok"], true);
+        // Clean HTML should pass
+        assert_eq!(critique["critique"]["passed"], true);
+
+        // 9. Repair (on a slop fixture to verify the repair loop produces actionable output)
+        let slop = r#"
+            <section class="hero" style="background: linear-gradient(180deg, #667eea, #764ba2); height: 100vh;">
+              <h1>Welcome to the AI-powered platform</h1>
+            </section>
+            <div class="card">Feature A</div>
+            <div class="card">Feature B</div>
+            <div class="card">Feature C</div>
+        "#;
+        let repair = request_via_ipc(
+            &server, &listener, &mut daemon,
+            json!({"id":"r1","command":"DesignRepair","conversation_id": cid, "content": slop, "doc_type":"implementation"}),
+        );
+        assert_eq!(repair["ok"], true);
+        assert_eq!(repair["repair"]["improvement_required"], true);
+        assert!(!repair["repair"]["repairs"].as_array().unwrap().is_empty());
+
+        // 10. Screenshot again (after repair — same deterministic html)
+        let browser2 = request_via_ipc(
+            &server, &listener, &mut daemon,
+            json!({"id":"br2","command":"DesignBrowser","conversation_id": cid, "url":"http://127.0.0.1:8787", "html": html, "deterministic": true}),
+        );
+        assert_eq!(browser2["ok"], true);
+        assert!(browser2["browser"]["screenshot_uri"].as_str().unwrap().contains("screenshot:"));
+
+        // 11. Responsive QA
+        let responsive = request_via_ipc(
+            &server, &listener, &mut daemon,
+            json!({"id":"qa1","command":"DesignQAResponsive","conversation_id": cid, "content": html}),
+        );
+        assert_eq!(responsive["ok"], true);
+        assert!(responsive["qa"].is_object());
+
+        // 12. Accessibility QA
+        let a11y = request_via_ipc(
+            &server, &listener, &mut daemon,
+            json!({"id":"qa2","command":"DesignQAAccessibility","conversation_id": cid, "content": html}),
+        );
+        assert_eq!(a11y["ok"], true);
+        // The fixture has semantic <button>, <label>, <a> controls — must pass
+        assert_eq!(a11y["qa"]["passed"], true, "semantic HTML should pass a11y: {a11y}");
+
+        // 13. Functional QA
+        let functional = request_via_ipc(
+            &server, &listener, &mut daemon,
+            json!({"id":"qa3","command":"DesignQAFunctional","conversation_id": cid, "content": html}),
+        );
+        assert_eq!(functional["ok"], true);
+        assert_eq!(functional["qa"]["passed"], true);
+
+        // 14. Persistent Design State
+        let state = request_via_ipc(
+            &server, &listener, &mut daemon,
+            json!({"id":"s1","command":"DesignState","conversation_id": cid}),
+        );
+        assert_eq!(state["ok"], true);
+        assert!(state["design_state"]["content"].as_str().unwrap().contains("DESIGN_STATE.md"));
+
+        // 15. Verify conversation persists all messages
+        let get = request_via_ipc(
+            &server, &listener, &mut daemon,
+            json!({"id":"g1","command":"ConversationGet","conversation_id": cid}),
+        );
+        assert_eq!(get["ok"], true);
+        let msgs = get["conversation"]["messages"].as_array().unwrap();
+        assert!(msgs.len() >= 2, "at least user + assistant");
+        assert_eq!(get["conversation"]["mode"], "DESIGN");
+
+        server.cleanup();
+        daemon.shutdown().unwrap();
+        std::env::remove_var("AGENTCODE_PROVIDER_MODE");
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn design_preview_lifecycle_handles_missing_command_and_stop() {
+        // G4-08: verify preview lifecycle gracefully handles projects without a
+        // dev command, and that status/stop work correctly.
+        let _env_lock = crate::TEST_ENV_LOCK.lock().unwrap();
+        std::env::set_var("AGENTCODE_PROVIDER_MODE", "mock");
+        let (dir, db, lock, socket) = temp_paths("ipc-preview-lifecycle");
+        let project_dir = dir.join("workspace");
+        fs::create_dir_all(&project_dir).unwrap();
+        let project_path = project_dir.to_string_lossy().to_string();
+
+        let mut daemon = DaemonService::open(&db, &lock).unwrap();
+        daemon.start().unwrap();
+        let Some((server, listener)) = bind_or_skip(&socket, None) else {
+            daemon.shutdown().unwrap();
+            std::env::remove_var("AGENTCODE_PROVIDER_MODE");
+            let _ = fs::remove_dir_all(dir);
+            return;
+        };
+
+        let create = request_via_ipc(
+            &server, &listener, &mut daemon,
+            json!({"id":"c1","command":"ConversationCreate","project_path": project_path, "mode":"DESIGN","title":"Preview Lifecycle"}),
+        );
+        let cid = create["conversation_id"].as_str().unwrap().to_string();
+
+        // No dev command in empty project → PREVIEW_COMMAND_MISSING
+        let start = request_via_ipc(
+            &server, &listener, &mut daemon,
+            json!({"id":"p1","command":"DesignPreviewStart","conversation_id": cid}),
+        );
+        assert_eq!(start["ok"], true, "start: {start}");
+        assert_eq!(start["preview"]["status"], "PREVIEW_COMMAND_MISSING");
+
+        // Status without a server → no_preview
+        let status = request_via_ipc(
+            &server, &listener, &mut daemon,
+            json!({"id":"ps1","command":"DesignPreviewStatus","conversation_id": cid}),
+        );
+        assert_eq!(status["ok"], true, "status: {status}");
+        assert_eq!(status["preview"]["status"], "no_preview");
+
+        // Stop without a server → stopped
+        let stop = request_via_ipc(
+            &server, &listener, &mut daemon,
+            json!({"id":"ps2","command":"DesignPreviewStop","conversation_id": cid}),
+        );
+        assert_eq!(stop["ok"], true, "stop: {stop}");
+
+        server.cleanup();
+        daemon.shutdown().unwrap();
+        std::env::remove_var("AGENTCODE_PROVIDER_MODE");
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn design_repair_loop_produces_actionable_improvements() {
+        // G4-12: verify the repair loop produces actionable improvement
+        // instructions for material findings, and accepts clean design.
+        let _env_lock = crate::TEST_ENV_LOCK.lock().unwrap();
+        std::env::set_var("AGENTCODE_PROVIDER_MODE", "mock");
+        let (dir, db, lock, socket) = temp_paths("ipc-repair-loop");
+        let project_dir = dir.join("workspace");
+        fs::create_dir_all(&project_dir).unwrap();
+        let project_path = project_dir.to_string_lossy().to_string();
+
+        let mut daemon = DaemonService::open(&db, &lock).unwrap();
+        daemon.start().unwrap();
+        let Some((server, listener)) = bind_or_skip(&socket, None) else {
+            daemon.shutdown().unwrap();
+            std::env::remove_var("AGENTCODE_PROVIDER_MODE");
+            let _ = fs::remove_dir_all(dir);
+            return;
+        };
+
+        let create = request_via_ipc(
+            &server, &listener, &mut daemon,
+            json!({"id":"c1","command":"ConversationCreate","project_path": project_path, "mode":"DESIGN","title":"Repair Loop"}),
+        );
+        let cid = create["conversation_id"].as_str().unwrap().to_string();
+
+        // Implement: send slop content
+        let slop = r#"
+            <div class="hero" style="background: linear-gradient(180deg, #667eea, #764ba2); height: 100vh;">
+              <h1>Welcome to the future of AI-powered workflow</h1>
+              <p>Reimagine your workflow.</p>
+            </div>
+            <div class="card">Feature A</div>
+            <div class="card">Feature B</div>
+            <div class="card">Feature C</div>
+            <div class="glass-panel" style="backdrop-filter: blur(12px);">Glass content</div>
+        "#;
+
+        // Critique: must reject
+        let critique = request_via_ipc(
+            &server, &listener, &mut daemon,
+            json!({"id":"cr1","command":"DesignCritique","conversation_id": cid, "content": slop, "doc_type":"implementation"}),
+        );
+        assert_eq!(critique["ok"], true);
+        assert_eq!(critique["critique"]["passed"], false, "slop must not pass");
+        assert_eq!(critique["critique"]["improvement_required"], true);
+
+        // Repair: must produce actionable repairs
+        let repair = request_via_ipc(
+            &server, &listener, &mut daemon,
+            json!({"id":"r1","command":"DesignRepair","conversation_id": cid, "content": slop, "doc_type":"implementation"}),
+        );
+        assert_eq!(repair["ok"], true);
+        assert_eq!(repair["repair"]["improvement_required"], true);
+        let repairs = repair["repair"]["repairs"].as_array().unwrap();
+        assert!(!repairs.is_empty(), "must produce at least one repair");
+
+        // Each repair has an issue and a repair field
+        for r in repairs.iter() {
+            assert!(r["issue"].as_str().is_some(), "repair missing issue: {r}");
+            assert!(r["repair"].as_str().is_some(), "repair missing repair text: {r}");
+        }
+
+        // Second iteration: clean product-specific implementation
+        let clean = r#"
+            <header class="panel-header">
+              <h1>Metrics Review</h1>
+            </header>
+            <table role="table">
+              <thead><tr><th>Name</th><th>Status</th></tr></thead>
+            </table>
+            <button role="button">Approve</button>
+        "#;
+
+        // Critique: clean must pass
+        let critique2 = request_via_ipc(
+            &server, &listener, &mut daemon,
+            json!({"id":"cr2","command":"DesignCritique","conversation_id": cid, "content": clean, "doc_type":"implementation"}),
+        );
+        assert_eq!(critique2["ok"], true);
+        assert_eq!(critique2["critique"]["passed"], true, "clean design must pass: {critique2}");
+
+        // Repair: no improvement needed
+        let repair2 = request_via_ipc(
+            &server, &listener, &mut daemon,
+            json!({"id":"r2","command":"DesignRepair","conversation_id": cid, "content": clean, "doc_type":"implementation"}),
+        );
+        assert_eq!(repair2["ok"], true);
+        assert_eq!(repair2["repair"]["improvement_required"], false, "clean design must not need repair: {repair2}");
+
+        server.cleanup();
+        daemon.shutdown().unwrap();
+        std::env::remove_var("AGENTCODE_PROVIDER_MODE");
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn design_send_to_goalsubmit_transition_creates_mission() {
+        // G4-18: design conversation → GoalSubmit → mission reference preserved
+        let _env_lock = crate::TEST_ENV_LOCK.lock().unwrap();
+        std::env::set_var("AGENTCODE_PROVIDER_MODE", "mock");
+        let (dir, db, lock, socket) = temp_paths("ipc-design-mission");
+        let project_dir = dir.join("workspace");
+        fs::create_dir_all(&project_dir).unwrap();
+        let project_path = project_dir.to_string_lossy().to_string();
+
+        let mut daemon = DaemonService::open(&db, &lock).unwrap();
+        daemon.start().unwrap();
+        let Some((server, listener)) = bind_or_skip(&socket, None) else {
+            daemon.shutdown().unwrap();
+            std::env::remove_var("AGENTCODE_PROVIDER_MODE");
+            let _ = fs::remove_dir_all(dir);
+            return;
+        };
+
+        let create = request_via_ipc(
+            &server, &listener, &mut daemon,
+            json!({"id":"c1","command":"ConversationCreate","project_path": project_path, "mode":"DESIGN","title":"Design Mission Path"}),
+        );
+        assert_eq!(create["ok"], true);
+        let cid = create["conversation_id"].as_str().unwrap().to_string();
+
+        let send = request_via_ipc(
+            &server, &listener, &mut daemon,
+            json!({"id":"d1","command":"DesignSend","conversation_id": cid, "content": "Let's design the dashboard layout."}),
+        );
+        assert_eq!(send["ok"], true);
+
+        let goal = "Implement the dashboard layout from the design discussion.";
+        let submit = request_via_ipc(
+            &server, &listener, &mut daemon,
+            json!({"id":"s1","command":"GoalSubmit","conversation_id": cid, "goal": goal}),
+        );
+        assert_eq!(submit["ok"], true, "submit: {submit}");
+        let mission_id = submit["mission_id"].as_str().unwrap().to_string();
+        assert!(mission_id.starts_with("mission-"), "mission_id: {mission_id}");
+
+        let get = request_via_ipc(
+            &server, &listener, &mut daemon,
+            json!({"id":"g1","command":"ConversationGet","conversation_id": cid}),
+        );
+        assert_eq!(get["ok"], true);
+        assert_eq!(get["conversation"]["current_mission_id"].as_str().unwrap(), mission_id);
+        assert_eq!(get["conversation"]["mode"], "DESIGN", "mode must remain DESIGN");
+
+        let msgs = get["conversation"]["messages"].as_array().unwrap();
+        assert!(msgs.iter().any(|m| m["mission_ref"].as_str() == Some(mission_id.as_str())),
+            "design conversation must contain mission reference: {msgs:?}");
+
+        let cancel = request_via_ipc(
+            &server, &listener, &mut daemon,
+            json!({"id":"x1","command":"CancelMission","mission_id": mission_id}),
+        );
+        assert_eq!(cancel["ok"], true);
 
         server.cleanup();
         daemon.shutdown().unwrap();

@@ -92,6 +92,7 @@ export function DesignView({
   }>({});
   const [panelBusy, setPanelBusy] = useState(false);
   const [rightOpen, setRightOpen] = useState(true);
+  const [viewportHint, setViewportHint] = useState("desktop");
 
   const messagesEndRef = useRef<HTMLDivElement>(null);
 
@@ -304,7 +305,7 @@ export function DesignView({
 
   const handleBrowser = () =>
     runPanel(async () => {
-      const r = await daemon.designBrowser(activeConvId!);
+      const r = await daemon.designBrowser(activeConvId!, undefined, undefined, undefined, viewportHint);
       if (r.ok && r.browser) {
         setBrowser(r.browser);
         const dom = r.browser.visible_text;
@@ -824,13 +825,25 @@ export function DesignView({
           <section className="neo-raised rounded-2xl p-4">
             <div className="flex items-center justify-between mb-2">
               <h4 className="text-sm font-semibold text-on-surface">Browser / Screenshot</h4>
-              <button
-                onClick={handleBrowser}
-                disabled={panelBusy}
-                className="text-[10px] text-primary hover:opacity-80 disabled:opacity-50"
-              >
-                Inspect
-              </button>
+              <div className="flex items-center gap-1">
+                <select
+                  value={viewportHint}
+                  onChange={(e) => setViewportHint(e.target.value)}
+                  className="neo-input rounded-lg px-1.5 py-1 text-[10px] bg-transparent text-on-surface-variant"
+                  aria-label="Viewport"
+                >
+                  <option value="compact">1024×768</option>
+                  <option value="desktop">1440×900</option>
+                  <option value="wide">1920×1080</option>
+                </select>
+                <button
+                  onClick={handleBrowser}
+                  disabled={panelBusy}
+                  className="text-[10px] text-primary hover:opacity-80 disabled:opacity-50"
+                >
+                  Inspect
+                </button>
+              </div>
             </div>
             {browser ? (
               <div className="space-y-2">

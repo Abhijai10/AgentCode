@@ -699,12 +699,15 @@ port: port.map(|p| p as i64),
     /// the preview URL.  When `deterministic` is true (tests / no Chrome),
     /// `html` is used as the rendered page so the deterministic harness can
     /// exercise DOM/diagnostics/screenshot without a live server.
+    /// `viewport_hint` selects a ViewportProfile:
+    ///   "compact" (1024x768), "desktop" (1440x900), "wide" (1920x1080).
     pub fn design_browser(
         &self,
         conversation_id: &str,
         url: &str,
         html: &str,
         deterministic: bool,
+        viewport_hint: &str,
     ) -> AcResult<Value> {
         let preview = self.db.design_preview(conversation_id)?;
         let target_url = if url.is_empty() {
@@ -749,10 +752,22 @@ port: port.map(|p| p as i64),
         let dom = browser.inspect_dom(&session.id, &mut evidence_store)?;
         let diag = browser.diagnostics(&session.id, &mut evidence_store)?;
 
-        let viewport = ac_verification::ViewportProfile {
-            name: "desktop",
-            width: 1440,
-            height: 900,
+        let viewport = match viewport_hint {
+            "compact" => ac_verification::ViewportProfile {
+                name: "compact",
+                width: 1024,
+                height: 768,
+            },
+            "wide" => ac_verification::ViewportProfile {
+                name: "wide",
+                width: 1920,
+                height: 1080,
+            },
+            _ => ac_verification::ViewportProfile {
+                name: "desktop",
+                width: 1440,
+                height: 900,
+            },
         };
         let screenshot = browser.capture_screenshot(
             &session.id,
@@ -771,6 +786,7 @@ port: port.map(|p| p as i64),
 
         let result = json!({
             "url": target_url,
+            "viewport": {"name": viewport.name, "width": viewport.width, "height": viewport.height},
             "visible_text": dom.visible_text,
             "controls": dom.controls,
             "accessibility_tree": dom.accessibility_tree,

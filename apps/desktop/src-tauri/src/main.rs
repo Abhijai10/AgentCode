@@ -1319,6 +1319,7 @@ fn daemon_design_browser(
     url: String,
     html: String,
     deterministic: bool,
+    viewport_hint: String,
 ) -> Result<Value, String> {
     request(
         &state.0,
@@ -1329,6 +1330,7 @@ fn daemon_design_browser(
             "url": url,
             "html": html,
             "deterministic": deterministic,
+            "viewport_hint": viewport_hint,
         }),
     )
 }

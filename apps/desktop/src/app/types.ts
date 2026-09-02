@@ -478,6 +478,11 @@ export interface DesignPreviewStatus {
 
 export interface DesignBrowserResult {
   url: string;
+  viewport?: {
+    name: string;
+    width: number;
+    height: number;
+  };
   visible_text: string;
   controls: string[];
   accessibility_tree: string[];

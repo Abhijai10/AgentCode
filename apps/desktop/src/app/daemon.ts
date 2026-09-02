@@ -821,7 +821,8 @@ export const daemon = {
     conversationId: string,
     url?: string,
     html?: string,
-    deterministic?: boolean
+    deterministic?: boolean,
+    viewportHint?: string
   ): Promise<{ ok: boolean; browser?: DesignBrowserResult; error?: string }> {
     try {
       const res = await invoke<{ browser: DesignBrowserResult }>("daemon_design_browser", {
@@ -829,6 +830,7 @@ export const daemon = {
         url: url ?? "",
         html: html ?? "",
         deterministic: deterministic ?? false,
+        viewportHint: viewportHint ?? "desktop",
       });
       return { ok: true, browser: res.browser };
     } catch (e: unknown) {
