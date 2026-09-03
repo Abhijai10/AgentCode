@@ -30,6 +30,7 @@ include!("desktop_optimization.rs");
 include!("conversations.rs");
 include!("chaos_dogfood.rs");
 include!("security_release.rs");
+include!("security_mode.rs");
 include!("git.rs");
 include!("provider.rs");
 include!("observability.rs");

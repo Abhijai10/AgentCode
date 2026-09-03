@@ -340,7 +340,7 @@ mod tests {
         assert!(report
             .findings
             .iter()
-            .any(|finding| finding.status == FindingStatus::Confirmed));
+            .any(|finding| finding.status == FindingStatus::NeedsValidation));
     }
 
     #[test]
@@ -378,9 +378,25 @@ mod tests {
             .iter()
             .find(|finding| finding.root_cause == "builtin-suspicious-sink")
             .unwrap();
-        assert_eq!(suspicious.status, FindingStatus::Confirmed);
-        let repair = orchestrator.create_repair_task(secret_group).unwrap();
-        assert_eq!(repair.finding_id, secret_group.id);
+        // A scanner finding must NEVER be auto-confirmed: it is triaged into
+        // the validation pipeline and only becomes Confirmed after explicit
+        // human/validation authority (G5-09 / PRD H23).
+        assert_eq!(suspicious.status, FindingStatus::NeedsValidation);
+        assert_eq!(secret_group.status, FindingStatus::NeedsValidation);
+        // The Security Mode engine performs the controlled transition.
+        use super::{transition_security_finding, SecurityFindingState};
+        assert_eq!(
+            transition_security_finding(
+                SecurityFindingState::Triaged,
+                SecurityFindingState::Validating,
+            )
+            .unwrap(),
+            SecurityFindingState::Validating
+        );
+        let mut confirmed = secret_group.clone();
+        confirmed.status = FindingStatus::Confirmed;
+        let repair = orchestrator.create_repair_task(&confirmed).unwrap();
+        assert_eq!(repair.finding_id, confirmed.id);
         let clean_rescan = orchestrator
             .run(&SecurityScanInput {
                 repository_id: StableId::new("repo"),
@@ -390,7 +406,7 @@ mod tests {
                 include_iac: false,
             })
             .unwrap();
-        let regression = orchestrator.regression(secret_group, &clean_rescan);
+        let regression = orchestrator.regression(&confirmed, &clean_rescan);
         assert!(regression.passed);
         let manual = orchestrator
             .manual_business_logic_finding("src/admin.rs", "admin action lacks ownership check");

@@ -906,6 +906,7 @@ include!("observability.rs");
 include!("ipc.rs");
 include!("conversation.rs");
 include!("design.rs");
+include!("security.rs");
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum DaemonLifecycle {

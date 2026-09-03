@@ -11,4 +11,5 @@ include!("scanner.rs");
 include!("active.rs");
 include!("ai.rs");
 include!("hardening.rs");
+include!("mode.rs");
 include!("tests.rs");

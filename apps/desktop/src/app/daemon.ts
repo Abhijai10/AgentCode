@@ -15,6 +15,15 @@ import type {
   ScannerInfo,
   MemoryInfo,
   SecurityFinding,
+  SecurityScope,
+  SecurityAuditResult,
+  SecurityModeFinding,
+  SecurityValidation,
+  SecurityAttackPath,
+  SecuritySuppression,
+  SecurityRiskAcceptance,
+  SecurityReportData,
+  SecurityStatus,
   ChangeSet,
   MissionDetails,
   TaskDetail,
@@ -857,6 +866,278 @@ export const daemon = {
         content,
       });
       return { ok: true, qa: res.qa };
+    } catch (e: unknown) {
+      const message = e instanceof Error ? e.message : String(e);
+      const cleaned = message.replace(/^[A-Z0-9_-]+:\s*/, "");
+      return { ok: false, error: cleaned || message };
+    }
+  },
+
+  // ── Security Mode (G5) ──────────────────────────────────────────────────
+
+  async securitySend(
+    conversationId: string,
+    content: string,
+    attachmentIds?: string[]
+  ): Promise<{ ok: boolean; message?: Message; error?: string }> {
+    try {
+      const res = await invoke<{ message: Message }>("daemon_security_send", {
+        conversationId,
+        content,
+        attachmentIds: attachmentIds ?? [],
+      });
+      return { ok: true, message: res.message };
+    } catch (e: unknown) {
+      const message = e instanceof Error ? e.message : String(e);
+      const cleaned = message.replace(/^[A-Z0-9_-]+:\s*/, "");
+      return { ok: false, error: cleaned || message };
+    }
+  },
+
+  async securitySetScope(
+    conversationId: string,
+    target: string,
+    scopeKind: string,
+    authState: string,
+    allowedHosts?: string[],
+    allowedPorts?: number[],
+    allowedTechniques?: string[]
+  ): Promise<{ ok: boolean; scope?: SecurityScope; error?: string }> {
+    try {
+      const res = await invoke<{ scope: SecurityScope }>(
+        "daemon_security_scope_set",
+        {
+          conversationId,
+          target,
+          scopeKind,
+          authState,
+          allowedHosts: allowedHosts ?? [],
+          allowedPorts: allowedPorts ?? [],
+          allowedTechniques: allowedTechniques ?? [],
+        }
+      );
+      return { ok: true, scope: res.scope };
+    } catch (e: unknown) {
+      const message = e instanceof Error ? e.message : String(e);
+      const cleaned = message.replace(/^[A-Z0-9_-]+:\s*/, "");
+      return { ok: false, error: cleaned || message };
+    }
+  },
+
+  async securityAudit(
+    conversationId: string
+  ): Promise<{ ok: boolean; audit?: SecurityAuditResult; error?: string }> {
+    try {
+      const res = await invoke<{ audit: SecurityAuditResult }>(
+        "daemon_security_audit",
+        { conversationId }
+      );
+      return { ok: true, audit: res.audit };
+    } catch (e: unknown) {
+      const message = e instanceof Error ? e.message : String(e);
+      const cleaned = message.replace(/^[A-Z0-9_-]+:\s*/, "");
+      return { ok: false, error: cleaned || message };
+    }
+  },
+
+  async securityFindings(
+    conversationId: string
+  ): Promise<{ ok: boolean; findings?: SecurityModeFinding[]; error?: string }> {
+    try {
+      const res = await invoke<{ result: { findings: SecurityModeFinding[] } }>(
+        "daemon_security_findings",
+        { conversationId }
+      );
+      return { ok: true, findings: res.result?.findings ?? [] };
+    } catch (e: unknown) {
+      const message = e instanceof Error ? e.message : String(e);
+      const cleaned = message.replace(/^[A-Z0-9_-]+:\s*/, "");
+      return { ok: false, error: cleaned || message };
+    }
+  },
+
+  async securityFindingDetail(
+    conversationId: string,
+    findingId: string
+  ): Promise<{ ok: boolean; finding?: SecurityModeFinding; error?: string }> {
+    try {
+      const res = await invoke<{ finding: SecurityModeFinding }>(
+        "daemon_security_finding_detail",
+        { conversationId, findingId }
+      );
+      return { ok: true, finding: res.finding };
+    } catch (e: unknown) {
+      const message = e instanceof Error ? e.message : String(e);
+      const cleaned = message.replace(/^[A-Z0-9_-]+:\s*/, "");
+      return { ok: false, error: cleaned || message };
+    }
+  },
+
+  async securityFindingTransition(
+    conversationId: string,
+    findingId: string,
+    targetState: string
+  ): Promise<{ ok: boolean; finding?: SecurityModeFinding; error?: string }> {
+    try {
+      const res = await invoke<{ finding: SecurityModeFinding }>(
+        "daemon_security_finding_transition",
+        { conversationId, findingId, targetState }
+      );
+      return { ok: true, finding: res.finding };
+    } catch (e: unknown) {
+      const message = e instanceof Error ? e.message : String(e);
+      const cleaned = message.replace(/^[A-Z0-9_-]+:\s*/, "");
+      return { ok: false, error: cleaned || message };
+    }
+  },
+
+  async securityValidate(
+    conversationId: string,
+    findingId: string,
+    canary?: string
+  ): Promise<{ ok: boolean; validation?: SecurityValidation; error?: string }> {
+    try {
+      const res = await invoke<{ validation: SecurityValidation }>(
+        "daemon_security_validate",
+        { conversationId, findingId, canary: canary ?? null }
+      );
+      return { ok: true, validation: res.validation };
+    } catch (e: unknown) {
+      const message = e instanceof Error ? e.message : String(e);
+      const cleaned = message.replace(/^[A-Z0-9_-]+:\s*/, "");
+      return { ok: false, error: cleaned || message };
+    }
+  },
+
+  async securityAttackPaths(
+    conversationId: string
+  ): Promise<{ ok: boolean; attackPaths?: SecurityAttackPath[]; error?: string }> {
+    try {
+      const res = await invoke<{ result: { attack_paths: SecurityAttackPath[] } }>(
+        "daemon_security_attack_paths",
+        { conversationId }
+      );
+      return { ok: true, attackPaths: res.result?.attack_paths ?? [] };
+    } catch (e: unknown) {
+      const message = e instanceof Error ? e.message : String(e);
+      const cleaned = message.replace(/^[A-Z0-9_-]+:\s*/, "");
+      return { ok: false, error: cleaned || message };
+    }
+  },
+
+  async securityRemediate(
+    conversationId: string,
+    findingId: string,
+    approved: boolean
+  ): Promise<{ ok: boolean; remediation?: { mission_id: string; finding_state: string; conversation_id: string }; error?: string }> {
+    try {
+      const res = await invoke<{ remediation: { mission_id: string; finding_state: string; conversation_id: string } }>(
+        "daemon_security_remediate",
+        { conversationId, findingId, approved }
+      );
+      return { ok: true, remediation: res.remediation };
+    } catch (e: unknown) {
+      const message = e instanceof Error ? e.message : String(e);
+      const cleaned = message.replace(/^[A-Z0-9_-]+:\s*/, "");
+      return { ok: false, error: cleaned || message };
+    }
+  },
+
+  async securityRetest(
+    conversationId: string
+  ): Promise<{ ok: boolean; retest?: { closed: string[]; reopened: string[]; retesting: string[]; source_commit: string }; error?: string }> {
+    try {
+      const res = await invoke<{ retest: { closed: string[]; reopened: string[]; retesting: string[]; source_commit: string } }>(
+        "daemon_security_retest",
+        { conversationId }
+      );
+      return { ok: true, retest: res.retest };
+    } catch (e: unknown) {
+      const message = e instanceof Error ? e.message : String(e);
+      const cleaned = message.replace(/^[A-Z0-9_-]+:\s*/, "");
+      return { ok: false, error: cleaned || message };
+    }
+  },
+
+  async securitySuppress(
+    conversationId: string,
+    findingId: string,
+    reason: string,
+    expiresAtMs?: number,
+    applicability?: string,
+    compensatingControls?: string
+  ): Promise<{ ok: boolean; suppression?: SecuritySuppression; error?: string }> {
+    try {
+      const res = await invoke<{ suppression: SecuritySuppression }>(
+        "daemon_security_suppress",
+        {
+          conversationId,
+          findingId,
+          reason,
+          expiresAtMs: expiresAtMs ?? null,
+          applicability: applicability ?? "",
+          compensatingControls: compensatingControls ?? "",
+        }
+      );
+      return { ok: true, suppression: res.suppression };
+    } catch (e: unknown) {
+      const message = e instanceof Error ? e.message : String(e);
+      const cleaned = message.replace(/^[A-Z0-9_-]+:\s*/, "");
+      return { ok: false, error: cleaned || message };
+    }
+  },
+
+  async securityAcceptRisk(
+    conversationId: string,
+    findingId: string,
+    rationale: string,
+    approver: string,
+    expiresAtMs?: number
+  ): Promise<{ ok: boolean; riskAcceptance?: SecurityRiskAcceptance; error?: string }> {
+    try {
+      const res = await invoke<{ risk_acceptance: SecurityRiskAcceptance }>(
+        "daemon_security_accept_risk",
+        {
+          conversationId,
+          findingId,
+          rationale,
+          approver,
+          expiresAtMs: expiresAtMs ?? null,
+        }
+      );
+      return { ok: true, riskAcceptance: res.risk_acceptance };
+    } catch (e: unknown) {
+      const message = e instanceof Error ? e.message : String(e);
+      const cleaned = message.replace(/^[A-Z0-9_-]+:\s*/, "");
+      return { ok: false, error: cleaned || message };
+    }
+  },
+
+  async securityReport(
+    conversationId: string
+  ): Promise<{ ok: boolean; report?: SecurityReportData; error?: string }> {
+    try {
+      const res = await invoke<{ report: SecurityReportData }>(
+        "daemon_security_report",
+        { conversationId }
+      );
+      return { ok: true, report: res.report };
+    } catch (e: unknown) {
+      const message = e instanceof Error ? e.message : String(e);
+      const cleaned = message.replace(/^[A-Z0-9_-]+:\s*/, "");
+      return { ok: false, error: cleaned || message };
+    }
+  },
+
+  async securityStatus(
+    conversationId: string
+  ): Promise<{ ok: boolean; status?: SecurityStatus; error?: string }> {
+    try {
+      const res = await invoke<{ status: SecurityStatus }>(
+        "daemon_security_status",
+        { conversationId }
+      );
+      return { ok: true, status: res.status };
     } catch (e: unknown) {
       const message = e instanceof Error ? e.message : String(e);
       const cleaned = message.replace(/^[A-Z0-9_-]+:\s*/, "");

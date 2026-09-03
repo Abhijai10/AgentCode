@@ -194,7 +194,17 @@ function AppShell() {
               }}
             />
           )}
-          {view === "security" && <SecurityView project={project} onOpenSettings={() => setView("settings")} />}
+          {view === "security" && (
+            <SecurityView
+              project={project}
+              daemonConnected={daemonConnected}
+              onOpenMission={(missionId) => {
+                setActiveMission(missionId);
+                setView("mission");
+              }}
+              onOpenSettings={() => setView("settings")}
+            />
+          )}
           {view === "settings" && <SettingsView />}
           <Footer
             daemonConnected={daemonConnected}

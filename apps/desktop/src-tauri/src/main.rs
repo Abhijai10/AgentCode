@@ -914,9 +914,236 @@ fn daemon_list_memory(state: tauri::State<DaemonClient>) -> Result<Value, String
 }
 
 #[tauri::command]
-fn daemon_security_findings(state: tauri::State<DaemonClient>) -> Result<Value, String> {
-    let _ = &state.0;
-    Ok(json!([]))
+fn daemon_security_findings(
+    state: tauri::State<DaemonClient>,
+    conversation_id: String,
+) -> Result<Value, String> {
+    request(
+        &state.0,
+        "ui",
+        "SecurityFindings",
+        json!({ "conversation_id": conversation_id }),
+    )
+}
+
+#[tauri::command]
+fn daemon_security_send(
+    state: tauri::State<DaemonClient>,
+    conversation_id: String,
+    content: String,
+    attachment_ids: Option<Vec<String>>,
+) -> Result<Value, String> {
+    let mut payload = json!({
+        "conversation_id": conversation_id,
+        "content": content,
+        "attachment_ids": attachment_ids.unwrap_or_default(),
+    });
+    if payload["attachment_ids"] == Value::Null {
+        payload["attachment_ids"] = json!([]);
+    }
+    request(&state.0, "ui", "SecuritySend", payload)
+}
+
+#[tauri::command]
+#[allow(clippy::too_many_arguments)]
+fn daemon_security_scope_set(
+    state: tauri::State<DaemonClient>,
+    conversation_id: String,
+    target: String,
+    scope_kind: String,
+    auth_state: String,
+    allowed_hosts: Vec<String>,
+    allowed_ports: Vec<u16>,
+    allowed_techniques: Vec<String>,
+) -> Result<Value, String> {
+    request(
+        &state.0,
+        "ui",
+        "SecurityScopeSet",
+        json!({
+            "conversation_id": conversation_id,
+            "target": target,
+            "scope_kind": scope_kind,
+            "auth_state": auth_state,
+            "allowed_hosts": allowed_hosts,
+            "allowed_ports": allowed_ports,
+            "allowed_techniques": allowed_techniques,
+        }),
+    )
+}
+
+#[tauri::command]
+fn daemon_security_audit(
+    state: tauri::State<DaemonClient>,
+    conversation_id: String,
+) -> Result<Value, String> {
+    request(
+        &state.0,
+        "ui",
+        "SecurityAudit",
+        json!({ "conversation_id": conversation_id }),
+    )
+}
+
+#[tauri::command]
+fn daemon_security_finding_detail(
+    state: tauri::State<DaemonClient>,
+    conversation_id: String,
+    finding_id: String,
+) -> Result<Value, String> {
+    request(
+        &state.0,
+        "ui",
+        "SecurityFindingDetail",
+        json!({ "conversation_id": conversation_id, "finding_id": finding_id }),
+    )
+}
+
+#[tauri::command]
+fn daemon_security_finding_transition(
+    state: tauri::State<DaemonClient>,
+    conversation_id: String,
+    finding_id: String,
+    target_state: String,
+) -> Result<Value, String> {
+    request(
+        &state.0,
+        "ui",
+        "SecurityFindingTransition",
+        json!({ "conversation_id": conversation_id, "finding_id": finding_id, "target_state": target_state }),
+    )
+}
+
+#[tauri::command]
+fn daemon_security_validate(
+    state: tauri::State<DaemonClient>,
+    conversation_id: String,
+    finding_id: String,
+    canary: Option<String>,
+) -> Result<Value, String> {
+    let mut payload = json!({
+        "conversation_id": conversation_id,
+        "finding_id": finding_id,
+    });
+    if let Some(canary) = canary {
+        payload["canary"] = json!(canary);
+    }
+    request(&state.0, "ui", "SecurityValidate", payload)
+}
+
+#[tauri::command]
+fn daemon_security_attack_paths(
+    state: tauri::State<DaemonClient>,
+    conversation_id: String,
+) -> Result<Value, String> {
+    request(
+        &state.0,
+        "ui",
+        "SecurityAttackPaths",
+        json!({ "conversation_id": conversation_id }),
+    )
+}
+
+#[tauri::command]
+fn daemon_security_remediate(
+    state: tauri::State<DaemonClient>,
+    conversation_id: String,
+    finding_id: String,
+    approved: bool,
+) -> Result<Value, String> {
+    request(
+        &state.0,
+        "ui",
+        "SecurityRemediate",
+        json!({ "conversation_id": conversation_id, "finding_id": finding_id, "approved": approved }),
+    )
+}
+
+#[tauri::command]
+fn daemon_security_retest(
+    state: tauri::State<DaemonClient>,
+    conversation_id: String,
+) -> Result<Value, String> {
+    request(
+        &state.0,
+        "ui",
+        "SecurityRetest",
+        json!({ "conversation_id": conversation_id }),
+    )
+}
+
+#[tauri::command]
+fn daemon_security_suppress(
+    state: tauri::State<DaemonClient>,
+    conversation_id: String,
+    finding_id: String,
+    reason: String,
+    expires_at_ms: Option<i64>,
+    applicability: Option<String>,
+    compensating_controls: Option<String>,
+) -> Result<Value, String> {
+    request(
+        &state.0,
+        "ui",
+        "SecuritySuppress",
+        json!({
+            "conversation_id": conversation_id,
+            "finding_id": finding_id,
+            "reason": reason,
+            "expires_at_ms": expires_at_ms,
+            "applicability": applicability.unwrap_or_default(),
+            "compensating_controls": compensating_controls.unwrap_or_default(),
+        }),
+    )
+}
+
+#[tauri::command]
+fn daemon_security_accept_risk(
+    state: tauri::State<DaemonClient>,
+    conversation_id: String,
+    finding_id: String,
+    rationale: String,
+    approver: String,
+    expires_at_ms: Option<i64>,
+) -> Result<Value, String> {
+    request(
+        &state.0,
+        "ui",
+        "SecurityAcceptRisk",
+        json!({
+            "conversation_id": conversation_id,
+            "finding_id": finding_id,
+            "rationale": rationale,
+            "approver": approver,
+            "expires_at_ms": expires_at_ms,
+        }),
+    )
+}
+
+#[tauri::command]
+fn daemon_security_report(
+    state: tauri::State<DaemonClient>,
+    conversation_id: String,
+) -> Result<Value, String> {
+    request(
+        &state.0,
+        "ui",
+        "SecurityReport",
+        json!({ "conversation_id": conversation_id }),
+    )
+}
+
+#[tauri::command]
+fn daemon_security_status(
+    state: tauri::State<DaemonClient>,
+    conversation_id: String,
+) -> Result<Value, String> {
+    request(
+        &state.0,
+        "ui",
+        "SecurityStatus",
+        json!({ "conversation_id": conversation_id }),
+    )
 }
 
 #[tauri::command]
@@ -1501,6 +1728,19 @@ fn main() {
             daemon_design_qa_responsive,
             daemon_design_qa_accessibility,
             daemon_design_qa_functional,
+            daemon_security_send,
+            daemon_security_scope_set,
+            daemon_security_audit,
+            daemon_security_finding_detail,
+            daemon_security_finding_transition,
+            daemon_security_validate,
+            daemon_security_attack_paths,
+            daemon_security_remediate,
+            daemon_security_retest,
+            daemon_security_suppress,
+            daemon_security_accept_risk,
+            daemon_security_report,
+            daemon_security_status,
         ])
         .run(tauri::generate_context!())
         .expect("error while running AgentCode desktop application");

@@ -635,6 +635,136 @@ fn dispatch_request(request: &Value, daemon: &mut DaemonService) -> (Value, bool
                 Err(error) => error_response(correlation_id, error.code(), error.to_string()),
             }
         },
+        "SecuritySend" => {
+            let conversation_id = request.get("conversation_id").and_then(Value::as_str).unwrap_or("");
+            let content = request.get("content").and_then(Value::as_str).unwrap_or("");
+            let attachment_ids = request.get("attachment_ids").and_then(Value::as_array).map(|arr| {
+                arr.iter().filter_map(Value::as_str).map(ToString::to_string).collect::<Vec<_>>()
+            }).unwrap_or_default();
+            match daemon.security_send(conversation_id, content, &attachment_ids) {
+                Ok(message) => json!({"id": correlation_id, "ok": true, "message": message_json(message)}),
+                Err(error) => error_response(correlation_id, error.code(), error.to_string()),
+            }
+        },
+        "SecurityScopeSet" => {
+            let conversation_id = request.get("conversation_id").and_then(Value::as_str).unwrap_or("");
+            let target = request.get("target").and_then(Value::as_str).unwrap_or("");
+            let scope_kind = request.get("scope_kind").and_then(Value::as_str).unwrap_or("repository");
+            let auth_state = request.get("auth_state").and_then(Value::as_str).unwrap_or("read-only");
+            let allowed_hosts = request.get("allowed_hosts").and_then(Value::as_array).map(|arr| {
+                arr.iter().filter_map(Value::as_str).map(ToString::to_string).collect::<Vec<_>>()
+            }).unwrap_or_default();
+            let allowed_ports = request.get("allowed_ports").and_then(Value::as_array).map(|arr| {
+                arr.iter().filter_map(Value::as_u64).map(|p| p as u16).collect::<Vec<_>>()
+            }).unwrap_or_default();
+            let allowed_techniques = request.get("allowed_techniques").and_then(Value::as_array).map(|arr| {
+                arr.iter().filter_map(Value::as_str).map(ToString::to_string).collect::<Vec<_>>()
+            }).unwrap_or_default();
+            match daemon.security_set_scope(conversation_id, target, scope_kind, auth_state, &allowed_hosts, &allowed_ports, &allowed_techniques) {
+                Ok(scope) => json!({"id": correlation_id, "ok": true, "scope": scope}),
+                Err(error) => error_response(correlation_id, error.code(), error.to_string()),
+            }
+        },
+        "SecurityAudit" => {
+            let conversation_id = request.get("conversation_id").and_then(Value::as_str).unwrap_or("");
+            match daemon.security_audit(conversation_id) {
+                Ok(result) => json!({"id": correlation_id, "ok": true, "audit": result}),
+                Err(error) => error_response(correlation_id, error.code(), error.to_string()),
+            }
+        },
+        "SecurityFindings" => {
+            let conversation_id = request.get("conversation_id").and_then(Value::as_str).unwrap_or("");
+            match daemon.security_findings(conversation_id) {
+                Ok(result) => json!({"id": correlation_id, "ok": true, "result": result}),
+                Err(error) => error_response(correlation_id, error.code(), error.to_string()),
+            }
+        },
+        "SecurityFindingDetail" => {
+            let conversation_id = request.get("conversation_id").and_then(Value::as_str).unwrap_or("");
+            let finding_id = request.get("finding_id").and_then(Value::as_str).unwrap_or("");
+            match daemon.security_finding_detail(conversation_id, finding_id) {
+                Ok(result) => json!({"id": correlation_id, "ok": true, "finding": result}),
+                Err(error) => error_response(correlation_id, error.code(), error.to_string()),
+            }
+        },
+        "SecurityFindingTransition" => {
+            let conversation_id = request.get("conversation_id").and_then(Value::as_str).unwrap_or("");
+            let finding_id = request.get("finding_id").and_then(Value::as_str).unwrap_or("");
+            let target = request.get("target_state").and_then(Value::as_str).unwrap_or("");
+            match daemon.security_finding_transition(conversation_id, finding_id, target) {
+                Ok(finding) => json!({"id": correlation_id, "ok": true, "finding": finding}),
+                Err(error) => error_response(correlation_id, error.code(), error.to_string()),
+            }
+        },
+        "SecurityValidate" => {
+            let conversation_id = request.get("conversation_id").and_then(Value::as_str).unwrap_or("");
+            let finding_id = request.get("finding_id").and_then(Value::as_str).unwrap_or("");
+            let canary = request.get("canary").and_then(Value::as_str);
+            match daemon.security_validate(conversation_id, finding_id, canary) {
+                Ok(result) => json!({"id": correlation_id, "ok": true, "validation": result}),
+                Err(error) => error_response(correlation_id, error.code(), error.to_string()),
+            }
+        },
+        "SecurityAttackPaths" => {
+            let conversation_id = request.get("conversation_id").and_then(Value::as_str).unwrap_or("");
+            match daemon.security_attack_paths(conversation_id) {
+                Ok(result) => json!({"id": correlation_id, "ok": true, "result": result}),
+                Err(error) => error_response(correlation_id, error.code(), error.to_string()),
+            }
+        },
+        "SecurityRemediate" => {
+            let conversation_id = request.get("conversation_id").and_then(Value::as_str).unwrap_or("");
+            let finding_id = request.get("finding_id").and_then(Value::as_str).unwrap_or("");
+            let approved = request.get("approved").and_then(Value::as_bool).unwrap_or(false);
+            match daemon.security_remediate(conversation_id, finding_id, approved) {
+                Ok(result) => json!({"id": correlation_id, "ok": true, "remediation": result}),
+                Err(error) => error_response(correlation_id, error.code(), error.to_string()),
+            }
+        },
+        "SecurityRetest" => {
+            let conversation_id = request.get("conversation_id").and_then(Value::as_str).unwrap_or("");
+            match daemon.security_retest(conversation_id) {
+                Ok(result) => json!({"id": correlation_id, "ok": true, "retest": result}),
+                Err(error) => error_response(correlation_id, error.code(), error.to_string()),
+            }
+        },
+        "SecuritySuppress" => {
+            let conversation_id = request.get("conversation_id").and_then(Value::as_str).unwrap_or("");
+            let finding_id = request.get("finding_id").and_then(Value::as_str).unwrap_or("");
+            let reason = request.get("reason").and_then(Value::as_str).unwrap_or("");
+            let expires_at_ms = request.get("expires_at_ms").and_then(Value::as_i64);
+            let applicability = request.get("applicability").and_then(Value::as_str).unwrap_or("");
+            let compensating = request.get("compensating_controls").and_then(Value::as_str).unwrap_or("");
+            match daemon.security_suppress(conversation_id, finding_id, reason, expires_at_ms, applicability, compensating) {
+                Ok(suppression) => json!({"id": correlation_id, "ok": true, "suppression": suppression}),
+                Err(error) => error_response(correlation_id, error.code(), error.to_string()),
+            }
+        },
+        "SecurityAcceptRisk" => {
+            let conversation_id = request.get("conversation_id").and_then(Value::as_str).unwrap_or("");
+            let finding_id = request.get("finding_id").and_then(Value::as_str).unwrap_or("");
+            let rationale = request.get("rationale").and_then(Value::as_str).unwrap_or("");
+            let approver = request.get("approver").and_then(Value::as_str).unwrap_or("");
+            let expires_at_ms = request.get("expires_at_ms").and_then(Value::as_i64);
+            match daemon.security_accept_risk(conversation_id, finding_id, rationale, approver, expires_at_ms) {
+                Ok(risk) => json!({"id": correlation_id, "ok": true, "risk_acceptance": risk}),
+                Err(error) => error_response(correlation_id, error.code(), error.to_string()),
+            }
+        },
+        "SecurityReport" => {
+            let conversation_id = request.get("conversation_id").and_then(Value::as_str).unwrap_or("");
+            match daemon.security_report(conversation_id) {
+                Ok(report) => json!({"id": correlation_id, "ok": true, "report": report}),
+                Err(error) => error_response(correlation_id, error.code(), error.to_string()),
+            }
+        },
+        "SecurityStatus" => {
+            let conversation_id = request.get("conversation_id").and_then(Value::as_str).unwrap_or("");
+            match daemon.security_status(conversation_id) {
+                Ok(status) => json!({"id": correlation_id, "ok": true, "status": status}),
+                Err(error) => error_response(correlation_id, error.code(), error.to_string()),
+            }
+        },
         "ConversationActivity" => {
             let conversation_id = request.get("conversation_id").and_then(Value::as_str).unwrap_or("");
             match daemon.conversation_activity(conversation_id) {

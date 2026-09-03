@@ -501,3 +501,178 @@ export interface DesignQaReport {
   issues: string[];
   [key: string]: unknown;
 }
+
+// ── Security Mode (G5) ────────────────────────────────────────────────────
+// Real Security workspace contract from the daemon IPC. Security conversations
+// are SECURITY-mode conversations; the structured scope, findings, attack
+// paths, validations, remediation and report are exposed by Security* IPC
+// commands. Nothing here is fabricated by the UI.
+
+export interface SecurityScope {
+  id: string;
+  target: string;
+  kind: "RepositoryOnly" | "LocalOnly" | "StagingAuthorized" | "ProductionReadOnly" | "ProductionActiveApproved" | "CloudLabAuthorized";
+  authorization: "ReadOnlyAudit" | "ActiveValidation" | "AuthorizedAdversarial";
+  allowed_hosts: string[];
+  allowed_ports: number[];
+  allowed_paths: string[];
+  allowed_techniques: string[];
+  forbidden_actions: string[];
+  created_at_ms: number;
+  active_testing_allowed: boolean;
+  adversarial_allowed: boolean;
+}
+
+export type SecurityFindingState =
+  | "New" | "Triaged" | "Validating" | "Confirmed" | "Dismissed"
+  | "NeedsManualReview" | "Fixed" | "Retesting" | "Closed";
+
+export interface SecurityModeFinding {
+  id: string;
+  fingerprint: string;
+  root_cause: string;
+  category: string;
+  severity: "Low" | "Medium" | "High" | "Critical";
+  confidence: number;
+  exploitability: number;
+  state: SecurityFindingState;
+  affected_code: string;
+  affected_asset: string;
+  entry_point?: string | null;
+  evidence_refs: string;
+  scanner_refs: string;
+  remediation: string;
+  source_commit: string;
+  environment: string;
+  mission_ref?: string | null;
+  created_at_ms: number;
+  updated_at_ms: number;
+  validations?: SecurityValidation[];
+  regressions?: SecurityRegression[];
+  suppressions?: SecuritySuppression[];
+}
+
+export interface SecurityValidation {
+  id: string;
+  finding_id: string;
+  plan_id: string;
+  state: "NotAttempted" | "CanaryRetrieved" | "CanaryProtected" | "CanaryNotFound" | "Blocked";
+  detail: string;
+  evidence_ref: string;
+  created_at_ms: number;
+}
+
+export interface SecurityRegression {
+  id: string;
+  finding_id: string;
+  regression_type: string;
+  target_refs: string;
+  evidence_ref: string;
+  last_verified_commit: string;
+  state: "Active" | "Stale" | "Broken" | "Retired";
+  created_at_ms: number;
+}
+
+export interface SecuritySuppression {
+  id: string;
+  finding_id: string;
+  scope_ref: string;
+  reason: string;
+  source_actor: string;
+  created_at_ms: number;
+  expires_at_ms?: number | null;
+  state: "Active" | "Expired" | "Revoked";
+  applicability: string;
+  compensating_controls: string;
+  evidence_ref: string;
+}
+
+export interface SecurityRiskAcceptance {
+  id: string;
+  finding_id: string;
+  scope_ref: string;
+  severity: string;
+  rationale: string;
+  approver: string;
+  accepted_at_ms: number;
+  expires_at_ms?: number | null;
+  completion_allowed: boolean;
+  state: "Active" | "Expired" | "Revoked";
+  created_at_ms: number;
+}
+
+export interface SecurityAttackStep {
+  label: string;
+  step_kind: string;
+  finding_id?: string | null;
+  evidence_ref?: string | null;
+}
+
+export interface SecurityAttackPath {
+  id: string;
+  entry_point: string;
+  steps: SecurityAttackStep[];
+  privilege_required: string;
+  affected_assets: string[];
+  impact: string;
+  evidence_refs: string[];
+  validation_state: string;
+}
+
+export interface SecurityAuditResult {
+  audit_status: string;
+  source_commit: string;
+  threat_model: {
+    entry_points: string[];
+    auth_boundaries: string[];
+    data_stores: string[];
+    admin_operations: string[];
+    cloud_configuration: string[];
+    sensitive_assets: string[];
+  };
+  findings: SecurityModeFinding[];
+  attack_paths: number;
+  ai_security_applicable: boolean;
+  scanner_availability: {
+    adapter: string;
+    availability: string;
+    version?: string | null;
+    source_commit: string;
+    failure?: string | null;
+  }[];
+  unavailable_scanners: string[];
+  state_counts: Record<string, number>;
+}
+
+export interface SecurityReportData {
+  final_status: string;
+  markdown: string;
+  differential: {
+    new_findings: number;
+    resolved_findings: number;
+    reopened_findings: number;
+    severity_upgraded: number;
+    severity_downgraded: number;
+    new_attack_paths: number;
+    removed_attack_paths: number;
+    accepted_risk_changed: boolean;
+    summary: string[];
+  };
+  attack_paths: SecurityAttackPath[];
+}
+
+export interface SecurityStatus {
+  conversation_id: string;
+  project_path: string;
+  audit_status: string;
+  final_status: string;
+  source_commit: string;
+  scope: SecurityScope;
+  active_testing_allowed: boolean;
+  findings_total: number;
+  findings_confirmed: number;
+  state_counts: Record<string, number>;
+  attack_path_count: number;
+  validation_count: number;
+  regression_count: number;
+}

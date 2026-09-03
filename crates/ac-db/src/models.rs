@@ -1111,3 +1111,125 @@ pub struct ProviderHealthObservationRow {
     pub failure_message: String,
     pub observed_at_ms: i64,
 }
+
+// ── Security Mode (G5) ──────────────────────────────────────────────────────
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SecurityModeSessionRow {
+    pub conversation_id: String,
+    pub project_path: String,
+    pub scope_json: String,
+    pub threat_model_json: String,
+    pub audit_status: String,
+    pub final_status: String,
+    pub source_commit: String,
+    pub baseline_commit: Option<String>,
+    pub baseline_roots: String,
+    pub baseline_attack_paths: i64,
+    pub baseline_accepted_risk: i64,
+    pub created_at_ms: i64,
+    pub updated_at_ms: i64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SecurityModeFindingRow {
+    pub id: String,
+    pub conversation_id: String,
+    pub fingerprint: String,
+    pub root_cause: String,
+    pub category: String,
+    pub severity: String,
+    pub confidence: i64,
+    pub exploitability: i64,
+    pub state: String,
+    pub affected_code: String,
+    pub affected_asset: String,
+    pub entry_point: Option<String>,
+    pub attack_path_refs: String,
+    pub evidence_refs: String,
+    pub scanner_refs: String,
+    pub remediation: String,
+    pub regression_refs: String,
+    pub source_commit: String,
+    pub environment: String,
+    pub scope_ref: String,
+    pub mission_ref: Option<String>,
+    pub created_at_ms: i64,
+    pub updated_at_ms: i64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SecurityModeAttackPathRow {
+    pub id: String,
+    pub conversation_id: String,
+    pub path_json: String,
+    pub created_at_ms: i64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SecurityModeValidationRow {
+    pub id: String,
+    pub conversation_id: String,
+    pub finding_id: String,
+    pub plan_id: String,
+    pub state: String,
+    pub detail: String,
+    pub evidence_ref: String,
+    pub created_at_ms: i64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SecurityModeRegressionRow {
+    pub id: String,
+    pub conversation_id: String,
+    pub finding_id: String,
+    pub regression_type: String,
+    pub target_refs: String,
+    pub evidence_ref: String,
+    pub last_verified_commit: String,
+    pub state: String,
+    pub created_at_ms: i64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SecurityModeSuppressionRow {
+    pub id: String,
+    pub conversation_id: String,
+    pub finding_id: String,
+    pub scope_ref: String,
+    pub reason: String,
+    pub source_actor: String,
+    pub created_at_ms: i64,
+    pub expires_at_ms: Option<i64>,
+    pub state: String,
+    pub applicability: String,
+    pub compensating_controls: String,
+    pub evidence_ref: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SecurityModeRiskAcceptanceRow {
+    pub id: String,
+    pub conversation_id: String,
+    pub finding_id: String,
+    pub scope_ref: String,
+    pub severity: String,
+    pub rationale: String,
+    pub approver: String,
+    pub accepted_at_ms: i64,
+    pub review_at_ms: Option<i64>,
+    pub expires_at_ms: Option<i64>,
+    pub completion_allowed: i64,
+    pub evidence_ref: String,
+    pub state: String,
+    pub created_at_ms: i64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SecurityModeReportRow {
+    pub id: String,
+    pub conversation_id: String,
+    pub report_markdown: String,
+    pub final_status: String,
+    pub created_at_ms: i64,
+}
