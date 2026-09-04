@@ -7,7 +7,29 @@ use std::time::Duration;
 const MAX_FRAME_BYTES: usize = 1024 * 1024;
 const MAX_CLIENTS: usize = 8;
 const FRAME_TIMEOUT: Duration = Duration::from_secs(5);
+/// Provider-backed commands block on a real model round trip (model load can
+/// take tens of seconds for a local <=4B model).  A 5-second response budget
+/// silently drops every real-model conversation send — the response is
+/// computed but the client never receives it.  These commands get an explicit
+/// long budget instead; all other commands keep the fast frame timeout.
+const PROVIDER_COMMAND_TIMEOUT: Duration = Duration::from_secs(300);
 pub const IPC_PROTOCOL_VERSION: u32 = 1;
+
+/// Response budget for a command.  Fast commands keep FRAME_TIMEOUT;
+/// commands whose handler calls a real model provider get
+/// PROVIDER_COMMAND_TIMEOUT.
+fn command_response_timeout(command: &str) -> Duration {
+    match command {
+        "DiscussSend"
+        | "DesignSend"
+        | "DesignAnalyzeReference"
+        | "DesignCritique"
+        | "DesignRepair"
+        | "SecuritySend"
+        | "SecurityAudit" => PROVIDER_COMMAND_TIMEOUT,
+        _ => FRAME_TIMEOUT,
+    }
+}
 
 #[derive(Clone)]
 pub struct UnixIpcServer {
@@ -146,6 +168,13 @@ struct UnixPeerCredentialProvider;
 
 impl PeerCredentialProvider for UnixPeerCredentialProvider {
     fn peer_euid(&self, stream: &UnixStream) -> io::Result<u32> {
+        // tokio requires a non-blocking stream, but the flag lives on the
+        // open file description shared with the server's copy of this
+        // connection.  Leaving it non-blocking silently breaks every later
+        // read/write on the server side: a response larger than the socket
+        // send buffer fails mid-frame with EAGAIN and the client sees a
+        // truncated frame.  Restore blocking mode on the way out so the
+        // server's stream keeps its original semantics.
         let cloned = stream.try_clone()?;
         cloned.set_nonblocking(true)?;
         let runtime = tokio::runtime::Builder::new_current_thread()
@@ -153,7 +182,12 @@ impl PeerCredentialProvider for UnixPeerCredentialProvider {
             .build()?;
         let _guard = runtime.enter();
         let tokio_stream = tokio::net::UnixStream::from_std(cloned)?;
-        Ok(tokio_stream.peer_cred()?.uid())
+        let uid = tokio_stream.peer_cred()?.uid();
+        drop(tokio_stream);
+        // The shared file description is non-blocking right now; flip it
+        // back before the connection is used for request/response frames.
+        stream.set_nonblocking(false)?;
+        Ok(uid)
     }
 }
 
@@ -199,12 +233,25 @@ fn serve_client(
         Err(error) => { let _ = write_frame(&mut stream, &error_response("unknown", error.code(), error.to_string())); return Ok(()); }
     };
     let (response_tx, response_rx) = mpsc::sync_channel(1);
+    let response_timeout =
+        command_response_timeout(request.get("command").and_then(Value::as_str).unwrap_or(""));
+    let traced_command = request.get("command").and_then(Value::as_str).unwrap_or("?").to_string();
     if request_tx.try_send(IpcDispatchRequest { payload: request, response_tx }).is_err() {
         let _ = write_frame(&mut stream, &error_response("unknown", "DAEMON-IPC_BACKPRESSURE", "daemon IPC request queue is full".to_string()));
         return Ok(());
     }
-    if let Ok(response) = response_rx.recv_timeout(FRAME_TIMEOUT) {
-        let _ = write_frame(&mut stream, &response);
+    if let Ok(response) = response_rx.recv_timeout(response_timeout) {
+        if std::env::var_os("AGENTCODE_TRACE_IPC_FRAMES").is_some() {
+            eprintln!(
+                "IPC-FRAME: responding to {traced_command} with {} bytes",
+                serde_json::to_vec(&response).map(|v| v.len()).unwrap_or(0)
+            );
+        }
+        if let Err(error) = write_frame(&mut stream, &response) {
+            if std::env::var_os("AGENTCODE_TRACE_IPC_FRAMES").is_some() {
+                eprintln!("IPC-FRAME: write_frame failed for {traced_command}: {error:?}");
+            }
+        }
     }
     Ok(())
 }
@@ -534,6 +581,14 @@ fn dispatch_request(request: &Value, daemon: &mut DaemonService) -> (Value, bool
         "DesignUnderstand" => {
             let conversation_id = request.get("conversation_id").and_then(Value::as_str).unwrap_or("");
             match daemon.design_understand(conversation_id) {
+                Ok(analysis) => json!({"id": correlation_id, "ok": true, "analysis": analysis}),
+                Err(error) => error_response(correlation_id, error.code(), error.to_string()),
+            }
+        },
+        "DesignAnalyzeReference" => {
+            let conversation_id = request.get("conversation_id").and_then(Value::as_str).unwrap_or("");
+            let attachment_id = request.get("attachment_id").and_then(Value::as_str).unwrap_or("");
+            match daemon.design_analyze_reference(conversation_id, attachment_id) {
                 Ok(analysis) => json!({"id": correlation_id, "ok": true, "analysis": analysis}),
                 Err(error) => error_response(correlation_id, error.code(), error.to_string()),
             }
@@ -974,6 +1029,26 @@ mod ipc_tests {
         assert!(authorize_peer_credential(&PeerCredential { peer_euid: 501, daemon_euid: 501 }).is_ok());
         let err = authorize_peer_credential(&PeerCredential { peer_euid: 502, daemon_euid: 501 }).unwrap_err();
         assert_eq!(err.code(), "DAEMON-IPC_PEER_UID_DENIED");
+    }
+
+    #[test]
+    fn provider_backed_commands_get_a_long_response_budget() {
+        // Provider-backed handlers block on a real local model round trip
+        // (tens of seconds including model load).  With the default 5-second
+        // frame budget every real-model DiscussSend/DesignSend response was
+        // silently dropped.  These commands must keep the long budget; fast
+        // commands must keep the default.
+        assert_eq!(command_response_timeout("DiscussSend"), PROVIDER_COMMAND_TIMEOUT);
+        assert_eq!(command_response_timeout("DesignSend"), PROVIDER_COMMAND_TIMEOUT);
+        assert_eq!(command_response_timeout("DesignAnalyzeReference"), PROVIDER_COMMAND_TIMEOUT);
+        assert_eq!(command_response_timeout("DesignCritique"), PROVIDER_COMMAND_TIMEOUT);
+        assert_eq!(command_response_timeout("DesignRepair"), PROVIDER_COMMAND_TIMEOUT);
+        assert_eq!(command_response_timeout("SecuritySend"), PROVIDER_COMMAND_TIMEOUT);
+        assert_eq!(command_response_timeout("SecurityAudit"), PROVIDER_COMMAND_TIMEOUT);
+        assert_eq!(command_response_timeout("Ping"), FRAME_TIMEOUT);
+        assert_eq!(command_response_timeout("ConversationList"), FRAME_TIMEOUT);
+        assert_eq!(command_response_timeout("Unknown"), FRAME_TIMEOUT);
+        assert!(PROVIDER_COMMAND_TIMEOUT > FRAME_TIMEOUT);
     }
 
     #[test]
