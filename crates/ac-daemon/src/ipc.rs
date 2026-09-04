@@ -765,6 +765,21 @@ fn dispatch_request(request: &Value, daemon: &mut DaemonService) -> (Value, bool
                 Err(error) => error_response(correlation_id, error.code(), error.to_string()),
             }
         },
+        "SecuritySecretLifecycle" => {
+            let conversation_id = request.get("conversation_id").and_then(Value::as_str).unwrap_or("");
+            let finding_id = request.get("finding_id").and_then(Value::as_str).unwrap_or("");
+            match daemon.security_secret_lifecycle(conversation_id, finding_id) {
+                Ok(lifecycle) => json!({"id": correlation_id, "ok": true, "lifecycle": lifecycle}),
+                Err(error) => error_response(correlation_id, error.code(), error.to_string()),
+            }
+        },
+        "SecurityQualityMetrics" => {
+            let conversation_id = request.get("conversation_id").and_then(Value::as_str).unwrap_or("");
+            match daemon.security_quality_metrics(conversation_id) {
+                Ok(metrics) => json!({"id": correlation_id, "ok": true, "metrics": metrics}),
+                Err(error) => error_response(correlation_id, error.code(), error.to_string()),
+            }
+        },
         "ConversationActivity" => {
             let conversation_id = request.get("conversation_id").and_then(Value::as_str).unwrap_or("");
             match daemon.conversation_activity(conversation_id) {

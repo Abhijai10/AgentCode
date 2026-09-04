@@ -8,9 +8,20 @@ impl ControlPlaneDb {
     // ── Security Mode Sessions ──────────────────────────────────────────────
 
     pub fn save_security_mode_session(&self, row: &SecurityModeSessionRow) -> AcResult<()> {
+        // Explicit column list: databases upgraded from schema 27 have the
+        // scanner-coverage columns APPENDED at the end (ALTER TABLE ADD
+        // COLUMN), so the physical column order differs from fresh schema-28
+        // databases.  A positional INSERT would silently write values into
+        // the wrong columns on upgraded databases.
         self.connection
             .execute(
-                "INSERT INTO security_mode_sessions VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
+                "INSERT INTO security_mode_sessions (
+                    conversation_id, project_path, scope_json, threat_model_json,
+                    audit_status, final_status, source_commit, baseline_commit,
+                    baseline_roots, baseline_attack_paths, baseline_accepted_risk,
+                    scanners_unavailable, available_scanners, unavailable_scanners,
+                    created_at_ms, updated_at_ms
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)
                  ON CONFLICT(conversation_id) DO UPDATE SET
                    scope_json=excluded.scope_json,
                    threat_model_json=excluded.threat_model_json,
@@ -21,6 +32,9 @@ impl ControlPlaneDb {
                    baseline_roots=excluded.baseline_roots,
                    baseline_attack_paths=excluded.baseline_attack_paths,
                    baseline_accepted_risk=excluded.baseline_accepted_risk,
+                   scanners_unavailable=excluded.scanners_unavailable,
+                   available_scanners=excluded.available_scanners,
+                   unavailable_scanners=excluded.unavailable_scanners,
                    updated_at_ms=excluded.updated_at_ms",
                 params![
                     row.conversation_id,
@@ -34,6 +48,9 @@ impl ControlPlaneDb {
                     row.baseline_roots,
                     row.baseline_attack_paths,
                     row.baseline_accepted_risk,
+                    row.scanners_unavailable,
+                    row.available_scanners,
+                    row.unavailable_scanners,
                     row.created_at_ms,
                     row.updated_at_ms
                 ],
@@ -51,6 +68,7 @@ impl ControlPlaneDb {
                 "SELECT conversation_id, project_path, scope_json, threat_model_json,
                  audit_status, final_status, source_commit, baseline_commit,
                  baseline_roots, baseline_attack_paths, baseline_accepted_risk,
+                 scanners_unavailable, available_scanners, unavailable_scanners,
                  created_at_ms, updated_at_ms
                  FROM security_mode_sessions WHERE conversation_id=?1",
                 [conversation_id],
@@ -67,8 +85,11 @@ impl ControlPlaneDb {
                         baseline_roots: row.get(8)?,
                         baseline_attack_paths: row.get(9)?,
                         baseline_accepted_risk: row.get(10)?,
-                        created_at_ms: row.get(11)?,
-                        updated_at_ms: row.get(12)?,
+                        scanners_unavailable: row.get(11)?,
+                        available_scanners: row.get(12)?,
+                        unavailable_scanners: row.get(13)?,
+                        created_at_ms: row.get(14)?,
+                        updated_at_ms: row.get(15)?,
                     })
                 },
             )
@@ -86,6 +107,7 @@ impl ControlPlaneDb {
                 "SELECT conversation_id, project_path, scope_json, threat_model_json,
                  audit_status, final_status, source_commit, baseline_commit,
                  baseline_roots, baseline_attack_paths, baseline_accepted_risk,
+                 scanners_unavailable, available_scanners, unavailable_scanners,
                  created_at_ms, updated_at_ms
                  FROM security_mode_sessions WHERE project_path=?1 ORDER BY updated_at_ms DESC",
             )
@@ -104,8 +126,11 @@ impl ControlPlaneDb {
                     baseline_roots: row.get(8)?,
                     baseline_attack_paths: row.get(9)?,
                     baseline_accepted_risk: row.get(10)?,
-                    created_at_ms: row.get(11)?,
-                    updated_at_ms: row.get(12)?,
+                    scanners_unavailable: row.get(11)?,
+                    available_scanners: row.get(12)?,
+                    unavailable_scanners: row.get(13)?,
+                    created_at_ms: row.get(14)?,
+                    updated_at_ms: row.get(15)?,
                 })
             })
             .map_err(db_error)?;

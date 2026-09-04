@@ -1127,6 +1127,9 @@ pub struct SecurityModeSessionRow {
     pub baseline_roots: String,
     pub baseline_attack_paths: i64,
     pub baseline_accepted_risk: i64,
+    pub scanners_unavailable: i64,
+    pub available_scanners: String,
+    pub unavailable_scanners: String,
     pub created_at_ms: i64,
     pub updated_at_ms: i64,
 }

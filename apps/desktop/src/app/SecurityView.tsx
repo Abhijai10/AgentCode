@@ -13,6 +13,8 @@ import type {
   SecurityAuditResult,
   SecurityReportData,
   SecurityValidation,
+  SecuritySecretLifecycle,
+  SecurityQualityMetrics,
 } from "./types";
 
 function formatTime(ms: number): string {
@@ -108,6 +110,10 @@ export function SecurityView({
     "scope" | "findings" | "paths" | "report" | "status"
   >("scope");
   const [expandedFinding, setExpandedFinding] = useState<string | null>(null);
+  // G5-35 quality metrics + G5-26 credential lifecycle, loaded from the same
+  // daemon control plane as every other security surface.
+  const [metrics, setMetrics] = useState<SecurityQualityMetrics | null>(null);
+  const [secretLifecycle, setSecretLifecycle] = useState<SecuritySecretLifecycle | null>(null);
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLTextAreaElement>(null);
 
@@ -161,6 +167,8 @@ export function SecurityView({
       setAudit(null);
       setReport(null);
       setSelectedFinding(null);
+      setMetrics(null);
+      setSecretLifecycle(null);
       return;
     }
     let cancelled = false;
@@ -198,14 +206,16 @@ export function SecurityView({
 
   const refreshSecurity = useCallback(async () => {
     if (!activeConvId) return;
-    const [s, f, p] = await Promise.all([
+    const [s, f, p, q] = await Promise.all([
       daemon.securityStatus(activeConvId),
       daemon.securityFindings(activeConvId),
       daemon.securityAttackPaths(activeConvId),
+      daemon.securityQualityMetrics(activeConvId),
     ]);
     if (s.ok) setSecStatus(s.status ?? null);
     if (f.ok) setFindings(f.findings ?? []);
     if (p.ok) setAttackPaths(p.attackPaths ?? []);
+    if (q.ok) setMetrics(q.metrics ?? null);
   }, [activeConvId]);
 
   const handleNewChat = async () => {
@@ -298,10 +308,17 @@ export function SecurityView({
     if (!activeConvId) return;
     setDetailLoading(true);
     setError(null);
+    setSecretLifecycle(null);
     const result = await daemon.securityFindingDetail(activeConvId, findingId);
     if (result.ok) {
       setSelectedFinding(result.finding ?? null);
       setExpandedFinding(findingId);
+      // Credential lifecycle (G5-26): secret-exposure findings carry a
+      // rotation/revocation workflow that requires explicit human approval.
+      if (result.finding?.category === "secret") {
+        const lifecycle = await daemon.securitySecretLifecycle(activeConvId, findingId);
+        if (lifecycle.ok) setSecretLifecycle(lifecycle.lifecycle ?? null);
+      }
     } else {
       setError(result.error || "Could not load finding detail");
     }
@@ -550,6 +567,22 @@ export function SecurityView({
                 <span className="text-on-surface font-medium">Regression protection:</span>{" "}
                 {selectedFinding.regressions.map((r) => `${r.regression_type}:${r.state}`).join(", ")}
               </p>
+            )}
+            {selectedFinding.category === "secret" && secretLifecycle && (
+              <div className="rounded-lg bg-amber-500/5 px-3 py-2 space-y-1">
+                <p className="text-xs text-on-surface font-medium">
+                  Credential lifecycle — removal alone is not closure
+                </p>
+                <ol className="list-decimal list-inside ml-1 text-xs text-on-surface-variant">
+                  {secretLifecycle.steps.map((step) => (
+                    <li key={step.step} className={step.requires_human_approval ? "text-amber-600 dark:text-amber-400" : ""}>
+                      {step.step.replace(/_/g, " ").toLowerCase()}
+                      {step.requires_human_approval && " (requires your approval)"}
+                    </li>
+                  ))}
+                </ol>
+                <p className="text-[10px] text-on-surface-variant">{secretLifecycle.note}</p>
+              </div>
             )}
             <div className="flex flex-wrap gap-2 pt-1">
               {["Triaged", "Validating", "Dismissed", "NeedsManualReview"].map((target) => (
@@ -947,6 +980,11 @@ export function SecurityView({
                           <p>Findings: {secStatus.findings_total} · Confirmed: {secStatus.findings_confirmed}</p>
                           <p>Attack paths: {secStatus.attack_path_count} · Validations: {secStatus.validation_count}</p>
                           <p>Regression protections: {secStatus.regression_count}</p>
+                          {secStatus.scanners_unavailable > 0 && (
+                            <p className="text-amber-600 dark:text-amber-400">
+                              Scanners unavailable in last audit: {secStatus.scanners_unavailable}
+                            </p>
+                          )}
                           {Object.entries(secStatus.state_counts ?? {}).map(([state, count]) => (
                             <p key={state}>
                               {state}: <span className="text-on-surface">{count}</span>
@@ -975,6 +1013,38 @@ export function SecurityView({
                                   </span>
                                 </p>
                               ))}
+                            </div>
+                          )}
+                          {metrics && (
+                            <div className="pt-1 border-t border-outline-variant/30 space-y-1">
+                              <p className="text-on-surface font-medium">Quality</p>
+                              <p>
+                                Confirmed rate:{" "}
+                                <span className="text-on-surface">
+                                  {(metrics.confirmed_rate * 100).toFixed(0)}%
+                                </span>
+                              </p>
+                              <p>
+                                False-positive dismissal rate:{" "}
+                                <span className="text-on-surface">
+                                  {(metrics.false_positive_dismissal_rate * 100).toFixed(0)}%
+                                </span>
+                              </p>
+                              <p>
+                                Canary proofs: <span className="text-on-surface">{metrics.validation_success}</span>
+                                {" · "}
+                                Blocked attempts:{" "}
+                                <span className="text-on-surface">{metrics.validation_blocked}</span>
+                              </p>
+                              <p>
+                                Regression protections:{" "}
+                                <span className="text-on-surface">{metrics.regression_protections_active}</span>
+                                {metrics.regression_protections_broken > 0 && (
+                                  <span className="text-red-600 dark:text-red-400">
+                                    {" "}· {metrics.regression_protections_broken} broken
+                                  </span>
+                                )}
+                              </p>
                             </div>
                           )}
                         </div>

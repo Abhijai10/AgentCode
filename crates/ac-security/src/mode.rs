@@ -128,8 +128,16 @@ impl SecurityScope {
     }
 
     pub fn adversarial_allowed(&self) -> bool {
-        matches!(self.kind, SecurityScopeKind::ProductionActiveApproved | SecurityScopeKind::CloudLabAuthorized)
-            && self.authorization == AuthorizationState::AuthorizedAdversarial
+        // Authorized adversarial validation requires BOTH an adversarial
+        // authorization state and a scope classification that can carry it.
+        // Production read-only never qualifies; repository-only is read-only.
+        matches!(
+            self.kind,
+            SecurityScopeKind::LocalOnly
+                | SecurityScopeKind::StagingAuthorized
+                | SecurityScopeKind::ProductionActiveApproved
+                | SecurityScopeKind::CloudLabAuthorized
+        ) && self.authorization == AuthorizationState::AuthorizedAdversarial
     }
 
     pub fn production_blocks_active_effects(&self) -> bool {
@@ -215,6 +223,136 @@ pub fn can_auto_repair(state: SecurityFindingState) -> bool {
         state,
         SecurityFindingState::Confirmed | SecurityFindingState::Fixed | SecurityFindingState::Retesting
     )
+}
+
+/// Post-confirmation credential lifecycle for secret-exposure findings
+/// (G5-26).  Removal of the source exposure is only the first step; rotation
+/// or revocation and verification of the replacement configuration must be
+/// tracked separately, and rotation requires explicit human approval.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SecretExposureStep {
+    RemoveSourceExposure,
+    AssessHistoryOrDistribution,
+    RotateOrRevoke,
+    VerifyReplacementConfiguration,
+    Rescan,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SecretExposureLifecycle {
+    pub finding_id: StableId,
+    pub steps: Vec<(SecretExposureStep, bool)>,
+}
+
+impl SecretExposureLifecycle {
+    pub fn new(finding_id: StableId) -> Self {
+        Self {
+            finding_id,
+            steps: SECRET_EXPOSURE_STEPS
+                .iter()
+                .map(|step| (*step, false))
+                .collect(),
+        }
+    }
+
+    pub fn is_complete(&self) -> bool {
+        self.steps.iter().all(|(_, done)| *done)
+    }
+
+    /// Rotation/revocation always requires explicit human approval — the
+    /// agent may recommend it but never performs it autonomously.
+    pub fn requires_human_approval(step: SecretExposureStep) -> bool {
+        matches!(
+            step,
+            SecretExposureStep::RotateOrRevoke | SecretExposureStep::AssessHistoryOrDistribution
+        )
+    }
+}
+
+pub const SECRET_EXPOSURE_STEPS: &[SecretExposureStep] = &[
+    SecretExposureStep::RemoveSourceExposure,
+    SecretExposureStep::AssessHistoryOrDistribution,
+    SecretExposureStep::RotateOrRevoke,
+    SecretExposureStep::VerifyReplacementConfiguration,
+    SecretExposureStep::Rescan,
+];
+
+/// Final security status for a Security conversation (G5-52).  Never collapses
+/// to PASS/FAIL — every state explains why.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum FinalSecurityStatus {
+    SecureForScope,
+    SecurityFindingsRemain,
+    BlockedByScope,
+    NeedsManualReview,
+    ScannerCoverageIncomplete,
+    RetestFailed,
+    SecurityValidationIncomplete,
+}
+
+impl FinalSecurityStatus {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::SecureForScope => "SECURE_FOR_SCOPE",
+            Self::SecurityFindingsRemain => "SECURITY_FINDINGS_REMAIN",
+            Self::BlockedByScope => "BLOCKED_BY_SCOPE",
+            Self::NeedsManualReview => "NEEDS_MANUAL_REVIEW",
+            Self::ScannerCoverageIncomplete => "SCANNER_COVERAGE_INCOMPLETE",
+            Self::RetestFailed => "RETEST_FAILED",
+            Self::SecurityValidationIncomplete => "SECURITY_VALIDATION_INCOMPLETE",
+        }
+    }
+
+    /// Canonical decision logic: retest failure wins, then confirmed
+    /// findings, then manual review, then scope blocking, then incomplete
+    /// validation, then scanner coverage.
+    pub fn derive(
+        retest_failed: bool,
+        confirmed_findings: usize,
+        needs_manual_review: usize,
+        active_testing_allowed: bool,
+        audit_status: &str,
+        scanners_unavailable: usize,
+    ) -> Self {
+        if retest_failed {
+            return Self::RetestFailed;
+        }
+        if confirmed_findings > 0 {
+            return Self::SecurityFindingsRemain;
+        }
+        if needs_manual_review > 0 {
+            return Self::NeedsManualReview;
+        }
+        if !active_testing_allowed && audit_status == "SCOPE_SET" {
+            // Read-only scope with no findings still counts as incomplete
+            // coverage when configured scanners were unavailable.
+            if scanners_unavailable > 0 {
+                return Self::ScannerCoverageIncomplete;
+            }
+            return Self::SecureForScope;
+        }
+        if audit_status != "REPORTED" {
+            return Self::SecurityValidationIncomplete;
+        }
+        Self::SecureForScope
+    }
+}
+
+/// Regression freshness (G5-24): a regression obligation recorded against an
+/// old commit is Stale; a finding that reappeared after closure means the
+/// obligation is Broken and the finding must reopen.
+pub fn regression_state_after_retest(
+    last_verified_commit: &str,
+    current_commit: &str,
+    finding_reappeared: bool,
+) -> SecurityRegressionState {
+    if finding_reappeared {
+        return SecurityRegressionState::Broken;
+    }
+    if last_verified_commit != current_commit {
+        return SecurityRegressionState::Stale;
+    }
+    SecurityRegressionState::Active
 }
 
 /// Threat model for Security Mode: a bounded model built from the repository.
@@ -600,6 +738,7 @@ pub fn build_security_mode_report(
     differential: Option<DifferentialSecurityReview>,
     scanner_availability: &[String],
     unavailable_scanners: &[String],
+    manual_review_count: usize,
 ) -> SecurityModeReport {
     let open_findings = findings
         .iter()
@@ -614,21 +753,33 @@ pub fn build_security_mode_report(
         .iter()
         .filter(|f| f.status == FindingStatus::Confirmed)
         .count();
-    let final_status = if confirmed > 0 {
-        "SECURITY_FINDINGS_REMAIN".to_string()
-    } else if open_findings == 0 {
-        "SECURE_FOR_SCOPE".to_string()
-    } else if !scope.active_testing_allowed() {
-        "BLOCKED_BY_SCOPE".to_string()
-    } else {
-        "SCANNER_COVERAGE_INCOMPLETE".to_string()
-    };
+    // `manual_review_count` is the authoritative count of findings parked in
+    // the NeedsManualReview lifecycle state; the normalized FindingStatus
+    // enum has no such variant, so the daemon passes the row-level count.
+    let needs_manual_review = manual_review_count;
+    let retest_failed = regressions
+        .iter()
+        .any(|(_, state)| matches!(state, SecurityRegressionState::Broken));
+    // Canonical final-status matrix (G5-52): the report and the live status
+    // snapshot MUST derive the same value from the same persisted state, so
+    // they can never disagree.  Never a bare PASS/FAIL — every state explains
+    // why.
+    let final_status = FinalSecurityStatus::derive(
+        retest_failed,
+        confirmed,
+        needs_manual_review,
+        scope.active_testing_allowed(),
+        "REPORTED",
+        unavailable_scanners.len(),
+    )
+    .as_str()
+    .to_string();
 
     let mut markdown = String::new();
     markdown.push_str("# Security Report\n\n");
     markdown.push_str("## Executive Summary\n\n");
     markdown.push_str(&format!(
-        "Final status: **{final_status}**\n\nFindings: {} (confirmed: {confirmed})\n",
+        "Final status: **{final_status}**\n\nFindings: {} total, {open_findings} open (confirmed: {confirmed}, awaiting manual review: {needs_manual_review})\n",
         findings.len()
     ));
     markdown.push_str(&format!("Attack paths: {}\n", attack_paths.len()));
@@ -798,6 +949,27 @@ pub fn is_privileged_instruction_attempt(content: &str) -> bool {
     (lower.contains("ignore all") && lower.contains("instruction"))
         || (lower.contains("read") && lower.contains("~/.ssh/id_rsa"))
         || lower.contains("ignore previous instructions")
+}
+
+/// Scan repository-controlled files for attempts to become privileged
+/// AgentCode instructions (G5-20 self-security gate).  Returns (path, line)
+/// pairs for each attempt — the content stays DATA and never gains privilege.
+/// Evidence is bounded to the matching line, never the whole file.
+pub fn scan_repository_instruction_attempts(
+    files: &[(String, String)],
+) -> Vec<(String, String)> {
+    let mut attempts = Vec::new();
+    for (path, content) in files {
+        for line in content.lines() {
+            if is_privileged_instruction_attempt(line) {
+                // Bound the evidence to 200 chars of the offending line.
+                let bounded: String = line.chars().take(200).collect();
+                attempts.push((path.clone(), bounded));
+                break;
+            }
+        }
+    }
+    attempts
 }
 
 #[cfg(test)]

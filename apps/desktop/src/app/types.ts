@@ -669,10 +669,42 @@ export interface SecurityStatus {
   source_commit: string;
   scope: SecurityScope;
   active_testing_allowed: boolean;
+  scanners_unavailable: number;
   findings_total: number;
   findings_confirmed: number;
   state_counts: Record<string, number>;
   attack_path_count: number;
   validation_count: number;
   regression_count: number;
+}
+
+export interface SecuritySecretLifecycleStep {
+  step:
+    | "REMOVE_SOURCE_EXPOSURE"
+    | "ASSESS_HISTORY_OR_DISTRIBUTION"
+    | "ROTATE_OR_REVOKE"
+    | "VERIFY_REPLACEMENT_CONFIGURATION"
+    | "RESCAN";
+  done: boolean;
+  requires_human_approval: boolean;
+}
+
+export interface SecuritySecretLifecycle {
+  finding_id: string;
+  steps: SecuritySecretLifecycleStep[];
+  complete: boolean;
+  note: string;
+}
+
+export interface SecurityQualityMetrics {
+  findings_total: number;
+  confirmed_findings: number;
+  dismissed_findings: number;
+  confirmed_rate: number;
+  false_positive_dismissal_rate: number;
+  validation_success: number;
+  validation_blocked: number;
+  regression_protections_active: number;
+  regression_protections_broken: number;
+  reports_generated: number;
 }

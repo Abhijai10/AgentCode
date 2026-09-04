@@ -20,6 +20,9 @@ CREATE TABLE IF NOT EXISTS security_mode_sessions (
   baseline_roots TEXT NOT NULL DEFAULT '[]',
   baseline_attack_paths INTEGER NOT NULL DEFAULT 0,
   baseline_accepted_risk INTEGER NOT NULL DEFAULT 0,
+  scanners_unavailable INTEGER NOT NULL DEFAULT 0,
+  available_scanners TEXT NOT NULL DEFAULT '[]',
+  unavailable_scanners TEXT NOT NULL DEFAULT '[]',
   created_at_ms INTEGER NOT NULL,
   updated_at_ms INTEGER NOT NULL
 );

@@ -1147,6 +1147,33 @@ fn daemon_security_status(
 }
 
 #[tauri::command]
+fn daemon_security_secret_lifecycle(
+    state: tauri::State<DaemonClient>,
+    conversation_id: String,
+    finding_id: String,
+) -> Result<Value, String> {
+    request(
+        &state.0,
+        "ui",
+        "SecuritySecretLifecycle",
+        json!({ "conversation_id": conversation_id, "finding_id": finding_id }),
+    )
+}
+
+#[tauri::command]
+fn daemon_security_quality_metrics(
+    state: tauri::State<DaemonClient>,
+    conversation_id: String,
+) -> Result<Value, String> {
+    request(
+        &state.0,
+        "ui",
+        "SecurityQualityMetrics",
+        json!({ "conversation_id": conversation_id }),
+    )
+}
+
+#[tauri::command]
 fn daemon_conversation_create(
     state: tauri::State<DaemonClient>,
     project_path: String,
@@ -1741,6 +1768,8 @@ fn main() {
             daemon_security_accept_risk,
             daemon_security_report,
             daemon_security_status,
+            daemon_security_secret_lifecycle,
+            daemon_security_quality_metrics,
         ])
         .run(tauri::generate_context!())
         .expect("error while running AgentCode desktop application");

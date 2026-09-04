@@ -2041,6 +2041,141 @@ mod tests {
     }
 
     #[test]
+    fn schema_28_upgrades_security_mode_sessions_from_version_27_without_losing_data() {
+        let path = std::env::temp_dir().join(format!(
+            "agentcode-schema27-secmode-{}.sqlite",
+            StableId::new("db")
+        ));
+        {
+            // Recreate a database exactly as the pre-gap G5 commit (94b8ca1)
+            // would have: all migrations through 0026 applied, version 27,
+            // security_mode_sessions WITHOUT the scanner-coverage columns.
+            let connection = rusqlite::Connection::open(&path).unwrap();
+            for sql in [
+                include_str!("../../../migrations/0001_kernel_schema.sql"),
+                include_str!("../../../migrations/0002_git_worktree_hardening.sql"),
+                include_str!("../../../migrations/0003_code_intelligence.sql"),
+                include_str!("../../../migrations/0004_semantic_repository_graph.sql"),
+                include_str!("../../../migrations/0005_persistent_memory.sql"),
+                include_str!("../../../migrations/0006_context_engine.sql"),
+                include_str!("../../../migrations/0007_full_autonomy_kernel.sql"),
+                include_str!("../../../migrations/0008_advanced_edit_engine.sql"),
+                include_str!("../../../migrations/0009_verification_evidence_engine.sql"),
+                include_str!("../../../migrations/0010_browser_runtime.sql"),
+                include_str!("../../../migrations/0011_extensions_skills_hooks_mcp.sql"),
+                include_str!("../../../migrations/0012_baseline_security.sql"),
+                include_str!("../../../migrations/0013_advanced_ai_security.sql"),
+                include_str!("../../../migrations/0014_discuss_design_modes.sql"),
+                include_str!("../../../migrations/0015_desktop_optimization.sql"),
+                include_str!("../../../migrations/0016_chaos_dogfood.sql"),
+                include_str!("../../../migrations/0017_security_release.sql"),
+                include_str!("../../../migrations/0018_release_candidate_v1.sql"),
+                include_str!("../../../migrations/0019_daemon_semantic_memory.sql"),
+                include_str!("../../../migrations/0020_task_acceptance_criteria.sql"),
+                include_str!("../../../migrations/0021_provider_catalog.sql"),
+                include_str!("../../../migrations/0023_conversations.sql"),
+                include_str!("../../../migrations/0024_provider_model_and_uncertainty.sql"),
+                include_str!("../../../migrations/0025_design_studio.sql"),
+                include_str!("../../../migrations/0026_security_mode.sql"),
+            ] {
+                connection.execute_batch(sql).unwrap();
+            }
+            // Strip the scanner-coverage columns to model a real version-27
+            // database created before schema 28 existed.
+            {
+                let mut has_scanners = false;
+                let mut stmt = connection
+                    .prepare("SELECT name FROM pragma_table_info('security_mode_sessions')")
+                    .unwrap();
+                for name in stmt
+                    .query_map([], |row| row.get::<_, String>(0))
+                    .unwrap()
+                    .map(Result::unwrap)
+                {
+                    if name == "scanners_unavailable" {
+                        has_scanners = true;
+                    }
+                }
+                if has_scanners {
+                    // The migration SQL file already carries the new columns
+                    // for fresh databases; emulate the old shape by rebuilding
+                    // the table without them.
+                    connection
+                        .execute_batch(
+                            "CREATE TABLE security_mode_sessions_v27 (
+                               conversation_id TEXT PRIMARY KEY,
+                               project_path TEXT NOT NULL,
+                               scope_json TEXT NOT NULL DEFAULT '{}',
+                               threat_model_json TEXT NOT NULL DEFAULT '{}',
+                               audit_status TEXT NOT NULL DEFAULT 'SCOPE_REQUIRED',
+                               final_status TEXT NOT NULL DEFAULT 'SECURITY_VALIDATION_INCOMPLETE',
+                               source_commit TEXT NOT NULL DEFAULT 'unknown',
+                               baseline_commit TEXT,
+                               baseline_roots TEXT NOT NULL DEFAULT '[]',
+                               baseline_attack_paths INTEGER NOT NULL DEFAULT 0,
+                               baseline_accepted_risk INTEGER NOT NULL DEFAULT 0,
+                               created_at_ms INTEGER NOT NULL,
+                               updated_at_ms INTEGER NOT NULL
+                             );
+                             INSERT INTO security_mode_sessions_v27 SELECT
+                               conversation_id, project_path, scope_json, threat_model_json,
+                               audit_status, final_status, source_commit, baseline_commit,
+                               baseline_roots, baseline_attack_paths, baseline_accepted_risk,
+                               created_at_ms, updated_at_ms
+                             FROM security_mode_sessions;
+                             DROP TABLE security_mode_sessions;
+                             ALTER TABLE security_mode_sessions_v27 RENAME TO security_mode_sessions;",
+                        )
+                        .unwrap();
+                }
+            }
+            connection.execute(
+                "INSERT INTO security_mode_sessions VALUES ('conv-27', '/proj', '{}', '{}',
+                 'FINDINGS_TRIAGED', 'SCANNER_COVERAGE_INCOMPLETE', 'abc123', NULL, '[]', 2, 0,
+                 111, 222)",
+                [],
+            )
+            .unwrap();
+            connection.pragma_update(None, "user_version", 27).unwrap();
+        }
+        {
+            let mut db = ControlPlaneDb::open(&path).unwrap();
+            db.migrate().unwrap();
+            assert_eq!(db.user_version().unwrap(), CURRENT_SCHEMA_VERSION);
+            // The pre-existing session row survived the upgrade with its data.
+            let session = db.security_mode_session("conv-27").unwrap().unwrap();
+            assert_eq!(session.audit_status, "FINDINGS_TRIAGED");
+            assert_eq!(session.source_commit, "abc123");
+            assert_eq!(session.baseline_attack_paths, 2);
+            assert_eq!(session.created_at_ms, 111);
+            assert_eq!(session.updated_at_ms, 222);
+            // New columns exist and default honestly.
+            assert_eq!(session.scanners_unavailable, 0);
+            assert_eq!(session.available_scanners, "[]");
+            assert_eq!(session.unavailable_scanners, "[]");
+            // And a save with the new fields round-trips after upgrade.
+            let updated = SecurityModeSessionRow {
+                scanners_unavailable: 1,
+                available_scanners: "[\"Builtin\"]".to_string(),
+                unavailable_scanners: "[\"Semgrep\"]".to_string(),
+                updated_at_ms: 333,
+                ..session
+            };
+            db.save_security_mode_session(&updated).unwrap();
+            let reloaded = db.security_mode_session("conv-27").unwrap().unwrap();
+            assert_eq!(reloaded.scanners_unavailable, 1);
+            assert_eq!(reloaded.available_scanners, "[\"Builtin\"]");
+            assert_eq!(reloaded.unavailable_scanners, "[\"Semgrep\"]");
+            assert_eq!(reloaded.updated_at_ms, 333);
+            let columns = table_columns(&db, "security_mode_sessions");
+            assert!(columns.contains(&"scanners_unavailable".to_string()));
+            assert!(columns.contains(&"available_scanners".to_string()));
+            assert!(columns.contains(&"unavailable_scanners".to_string()));
+        }
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
     fn schema_21_repairs_schema_20_acceptance_columns_without_losing_rows() {
         let path = std::env::temp_dir().join(format!(
             "agentcode-schema20-repair-{}.sqlite",

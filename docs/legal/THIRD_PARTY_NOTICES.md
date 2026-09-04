@@ -28,6 +28,11 @@ This backend closure also admits direct ac-daemon use of the already locked toki
 authentication. See
 `docs/policy/dependency-admissions/DEP-ADM-006-tokio-peer-cred.md`.
 
+Security Mode (G5) admits direct ac-daemon use of the already locked url 2.5.8
+crate (MIT OR Apache-2.0) for URL parsing in network-scope allowlist
+enforcement. See
+`docs/policy/dependency-admissions/DEP-ADM-007-url.md`.
+
 Required fields per shipped component:
 
 - Name

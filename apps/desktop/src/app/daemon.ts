@@ -24,6 +24,8 @@ import type {
   SecurityRiskAcceptance,
   SecurityReportData,
   SecurityStatus,
+  SecuritySecretLifecycle,
+  SecurityQualityMetrics,
   ChangeSet,
   MissionDetails,
   TaskDetail,
@@ -1138,6 +1140,39 @@ export const daemon = {
         { conversationId }
       );
       return { ok: true, status: res.status };
+    } catch (e: unknown) {
+      const message = e instanceof Error ? e.message : String(e);
+      const cleaned = message.replace(/^[A-Z0-9_-]+:\s*/, "");
+      return { ok: false, error: cleaned || message };
+    }
+  },
+
+  async securitySecretLifecycle(
+    conversationId: string,
+    findingId: string
+  ): Promise<{ ok: boolean; lifecycle?: SecuritySecretLifecycle; error?: string }> {
+    try {
+      const res = await invoke<{ lifecycle: SecuritySecretLifecycle }>(
+        "daemon_security_secret_lifecycle",
+        { conversationId, findingId }
+      );
+      return { ok: true, lifecycle: res.lifecycle };
+    } catch (e: unknown) {
+      const message = e instanceof Error ? e.message : String(e);
+      const cleaned = message.replace(/^[A-Z0-9_-]+:\s*/, "");
+      return { ok: false, error: cleaned || message };
+    }
+  },
+
+  async securityQualityMetrics(
+    conversationId: string
+  ): Promise<{ ok: boolean; metrics?: SecurityQualityMetrics; error?: string }> {
+    try {
+      const res = await invoke<{ metrics: SecurityQualityMetrics }>(
+        "daemon_security_quality_metrics",
+        { conversationId }
+      );
+      return { ok: true, metrics: res.metrics };
     } catch (e: unknown) {
       const message = e instanceof Error ? e.message : String(e);
       const cleaned = message.replace(/^[A-Z0-9_-]+:\s*/, "");

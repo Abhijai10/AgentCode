@@ -452,8 +452,24 @@
       "admission_record": "docs/policy/dependency-admissions/DEP-ADM-006-tokio-peer-cred.md",
       "adopting_phase": "Final backend runtime/capability closure",
       "notes": "Already present in Cargo.lock; ac-daemon enables only net and rt for UnixStream::peer_cred"
+    },
+    {
+      "id": "CAND-0029",
+      "name": "url",
+      "status": "ACTUAL",
+      "resolved_version": "2.5.8",
+      "declared_license": "MIT OR Apache-2.0",
+      "license_review": "INSPECTED",
+      "license_file": "~/.cargo/registry/src/index.crates.io-*/url-2.5.8/LICENSE-APACHE",
+      "classification": "DIRECT_RUNTIME_DEPENDENCY",
+      "source": "https://github.com/servo/rust-url",
+      "usage": "URL parsing for Security Mode network-scope allowlist enforcement (G5)",
+      "attribution_required": true,
+      "admission_record": "docs/policy/dependency-admissions/DEP-ADM-007-url.md",
+      "adopting_phase": "G5 (Security Mode)",
+      "notes": "pinned in Cargo.lock; already a transitive dependency; admitted for ac-daemon"
     }
   ],
   "reference_research_entries": "see docs/reference/LICENSE_PROVENANCE_MATRIX.md (P01-WP02) — reference-library repos are research input only, never admitted as dependencies",
-  "last_updated": "2026-08-25"
+  "last_updated": "2026-09-04"
 }

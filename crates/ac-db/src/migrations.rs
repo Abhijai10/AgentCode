@@ -1,4 +1,4 @@
-pub const CURRENT_SCHEMA_VERSION: u32 = 27;
+pub const CURRENT_SCHEMA_VERSION: u32 = 28;
 
 impl ControlPlaneDb {
     pub fn open(path: impl AsRef<Path>) -> AcResult<Self> {
@@ -178,6 +178,31 @@ impl ControlPlaneDb {
         if current_version < 27 {
             tx.execute_batch(include_str!("../../../migrations/0026_security_mode.sql"))
                 .map_err(db_error)?;
+        }
+        // Security Mode gap closure (G5-52): persist the count of scanners
+        // that were configured but unavailable in the latest audit so the
+        // final-status matrix derives from real execution state, never a
+        // placeholder. Applied via add_column_if_missing because databases
+        // already at version 27 were created before this column existed.
+        if current_version < 28 {
+            add_column_if_missing(
+                &tx,
+                "security_mode_sessions",
+                "scanners_unavailable",
+                "INTEGER NOT NULL DEFAULT 0",
+            )?;
+            add_column_if_missing(
+                &tx,
+                "security_mode_sessions",
+                "available_scanners",
+                "TEXT NOT NULL DEFAULT '[]'",
+            )?;
+            add_column_if_missing(
+                &tx,
+                "security_mode_sessions",
+                "unavailable_scanners",
+                "TEXT NOT NULL DEFAULT '[]'",
+            )?;
         }
         tx.pragma_update(None, "user_version", CURRENT_SCHEMA_VERSION)
             .map_err(db_error)?;
