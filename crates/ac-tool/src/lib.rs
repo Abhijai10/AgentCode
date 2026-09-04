@@ -1497,8 +1497,9 @@ fn local_hash(value: &str) -> String {
 
 fn format_process_observation(result: &NativeProcessResult) -> String {
     format!(
-        "sandbox_backend:{}\nachieved_isolation:{:?}\nnetwork_policy:{:?}\nworkspace_roots:{}\ntimeout_ms:{}\nmax_output_bytes:{}\nstdout_truncated:{}\nstderr_truncated:{}\nstatus:{}\nstdout:{}\nstderr:{}",
+        "sandbox_backend:{}\nrequested_isolation:{:?}\nachieved_isolation:{:?}\nnetwork_policy:{:?}\nworkspace_roots:{}\ntimeout_ms:{}\nmax_output_bytes:{}\nstdout_truncated:{}\nstderr_truncated:{}\nstatus:{}\nstdout:{}\nstderr:{}",
         result.record.sandbox.backend_name,
+        result.record.sandbox.requested_isolation,
         result.record.sandbox.achieved_isolation,
         result.record.sandbox.network_policy,
         result
