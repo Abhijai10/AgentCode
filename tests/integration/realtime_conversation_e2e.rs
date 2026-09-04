@@ -188,6 +188,34 @@ fn realtime_conversation_and_mission_activity_projection() {
     // ── Wait for terminal state ───────────────────────────────────────────────
     let final_state = poll_mission(&server, &listener, &mut daemon, &mission_id);
     eprintln!("E2E: mission completed: state={}", final_state["state"]);
+    // Real-model E2E must actually COMPLETE the mission: a real provider
+    // (qwen2.5-coder:3b, ≤4B constraint) plans, edits, and verifies the fix.
+    // A failure here is a regression, not a tolerated outcome.
+    assert_eq!(
+        final_state["state"].as_str().unwrap_or(""),
+        "completed",
+        "real-model mission must complete: {}",
+        final_state
+    );
+    // The goal requires the fix to be verified: the answer function must now
+    // be 42 in the mission worktree (the kernel only completes missions whose
+    // verification passed).
+    let worktree_root = project.join(".agentcode-worktrees");
+    let mut fixed_src = None;
+    if let Ok(read) = fs::read_dir(&worktree_root) {
+        for entry in read.flatten() {
+            let lib = entry.path().join("src").join("lib.rs");
+            if let Ok(content) = fs::read_to_string(&lib) {
+                if content.contains("42") {
+                    fixed_src = Some(content);
+                }
+            }
+        }
+    }
+    assert!(
+        fixed_src.is_some(),
+        "the worktree must contain the fixed answer function (42)"
+    );
 
     // ── Verify conversation activity projection ───────────────────────────────
     let activity = request_via_ipc(

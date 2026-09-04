@@ -1457,6 +1457,20 @@ fn daemon_design_understand(
 }
 
 #[tauri::command]
+fn daemon_design_analyze_reference(
+    state: tauri::State<DaemonClient>,
+    conversation_id: String,
+    attachment_id: String,
+) -> Result<Value, String> {
+    request(
+        &state.0,
+        "ui",
+        "DesignAnalyzeReference",
+        json!({ "conversation_id": conversation_id, "attachment_id": attachment_id }),
+    )
+}
+
+#[tauri::command]
 fn daemon_design_brief(
     state: tauri::State<DaemonClient>,
     conversation_id: String,
@@ -1743,6 +1757,7 @@ fn main() {
             daemon_discuss_send,
             daemon_design_send,
             daemon_design_understand,
+            daemon_design_analyze_reference,
             daemon_design_brief,
             daemon_design_grammar,
             daemon_design_state,

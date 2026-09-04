@@ -39,6 +39,7 @@ import type {
   Attachment,
   ConversationActivity,
   ProductAnalysis,
+  ReferenceAnalysis,
   DesignBrief,
   DesignGrammar,
   DesignState,
@@ -688,6 +689,23 @@ export const daemon = {
       const res = await invoke<{ analysis: ProductAnalysis }>(
         "daemon_design_understand",
         { conversationId }
+      );
+      return { ok: true, analysis: res.analysis };
+    } catch (e: unknown) {
+      const message = e instanceof Error ? e.message : String(e);
+      const cleaned = message.replace(/^[A-Z0-9_-]+:\s*/, "");
+      return { ok: false, error: cleaned || message };
+    }
+  },
+
+  async designAnalyzeReference(
+    conversationId: string,
+    attachmentId: string
+  ): Promise<{ ok: boolean; analysis?: ReferenceAnalysis; error?: string }> {
+    try {
+      const res = await invoke<{ analysis: ReferenceAnalysis }>(
+        "daemon_design_analyze_reference",
+        { conversationId, attachmentId }
       );
       return { ok: true, analysis: res.analysis };
     } catch (e: unknown) {

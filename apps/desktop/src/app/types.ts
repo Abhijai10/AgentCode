@@ -404,6 +404,30 @@ export interface ProductAnalysis {
   navigation: string[];
 }
 
+/** ReferenceAnalysis (core Doc 06 H28): structured design principles
+ *  extracted from an attached reference image by a vision-capable local
+ *  model, with an explicit copying boundary. */
+export interface ReferenceAnalysisExtracted {
+  hierarchy?: string[];
+  layout?: string[];
+  spacing?: string[];
+  typography?: string[];
+  navigation?: string[];
+  component_behavior?: string[];
+  motion?: string[];
+  visual_motifs?: string[];
+}
+
+export interface ReferenceAnalysis {
+  reference_id: string;
+  source_type: string;
+  artifact_ref: string;
+  vision_model: string;
+  extracted: ReferenceAnalysisExtracted;
+  explicitly_do_not_copy: string[];
+  adopted_principles: string[];
+}
+
 export interface DesignBrief {
   product: string;
   audience: string;

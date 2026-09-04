@@ -41,6 +41,10 @@ path = "realtime_conversation_e2e.rs"
 name = "security_mode_flow"
 path = "security_mode_flow.rs"
 
+[[test]]
+name = "design_reference_vision_e2e"
+path = "design_reference_vision_e2e.rs"
+
 [dev-dependencies]
 ac-agent = { path = "../../crates/ac-agent" }
 ac-changeset = { path = "../../crates/ac-changeset" }

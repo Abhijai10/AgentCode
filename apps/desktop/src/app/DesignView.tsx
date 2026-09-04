@@ -9,6 +9,7 @@ import type {
   Message,
   Attachment,
   ProductAnalysis,
+  ReferenceAnalysis,
   DesignBrief,
   DesignGrammar,
   DesignState,
@@ -79,6 +80,7 @@ export function DesignView({
 
   // Right-panel design state
   const [analysis, setAnalysis] = useState<ProductAnalysis | null>(null);
+  const [reference, setReference] = useState<ReferenceAnalysis | null>(null);
   const [brief, setBrief] = useState<DesignBrief | null>(null);
   const [grammar, setGrammar] = useState<DesignGrammar | null>(null);
   const [designState, setDesignState] = useState<DesignState | null>(null);
@@ -260,6 +262,27 @@ export function DesignView({
       const r = await daemon.designUnderstand(activeConvId!);
       if (r.ok && r.analysis) setAnalysis(r.analysis);
       else setError(r.error || "Could not analyze project");
+    });
+
+  const handleAnalyzeReference = () =>
+    runPanel(async () => {
+      // Analyze the most recent image attachment in this conversation.  The
+      // daemon refuses non-image attachments with a clear error.
+      const images = (convDetail?.attachments ?? []).filter((a) =>
+        a.mime_type.startsWith("image/")
+      );
+      if (images.length === 0) {
+        setError("Attach a reference image first, then run reference analysis.");
+        return;
+      }
+      const latest = images[images.length - 1];
+      const r = await daemon.designAnalyzeReference(activeConvId!, latest.id);
+      if (r.ok && r.analysis) {
+        setReference(r.analysis);
+        await refreshActive();
+      } else {
+        setError(r.error || "Could not analyze reference image");
+      }
     });
 
   const handleBrief = () =>
@@ -728,6 +751,45 @@ export function DesignView({
             ) : (
               <p className="text-xs text-on-surface-variant">
                 Scan the project for routes, components, styles, tokens and assets.
+              </p>
+            )}
+          </section>
+
+          <section className="neo-raised rounded-2xl p-4">
+            <div className="flex items-center justify-between mb-2">
+              <h4 className="text-sm font-semibold text-on-surface">Reference Analysis</h4>
+              <button
+                onClick={handleAnalyzeReference}
+                disabled={panelBusy}
+                className="text-[10px] text-primary hover:opacity-80 disabled:opacity-50"
+                title="Analyze the latest attached reference image with a vision model"
+              >
+                Analyze
+              </button>
+            </div>
+            {reference ? (
+              <div className="space-y-1.5 text-xs text-on-surface-variant">
+                <p>
+                  Model:{" "}
+                  <span className="font-mono text-[10px] text-on-surface">
+                    {reference.vision_model}
+                  </span>
+                </p>
+                {reference.adopted_principles.slice(0, 4).map((p, i) => (
+                  <p key={i} className="text-[11px]">
+                    · {p}
+                  </p>
+                ))}
+                {reference.explicitly_do_not_copy.length > 0 && (
+                  <p className="text-[10px] text-amber-600 dark:text-amber-400">
+                    Do not copy: {reference.explicitly_do_not_copy.join("; ")}
+                  </p>
+                )}
+              </div>
+            ) : (
+              <p className="text-xs text-on-surface-variant">
+                Attach a reference image and extract structured design principles
+                (vision model required).
               </p>
             )}
           </section>

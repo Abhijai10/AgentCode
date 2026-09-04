@@ -70,6 +70,14 @@ fn create_security_fixture(root: &PathBuf) {
         "pub fn handler() -> String {\n    let api_key = \"SECRET=AGENTCODE_TEST_SECRET_48291\";\n    format!(\"ready {}\", api_key)\n}\n",
     )
     .unwrap();
+    // Realistic credential shape (production code path): the builtin
+    // heuristics flag SECRET=, while an installed gitleaks flags the
+    // github-pat pattern — proving the external adapter actually executed.
+    fs::write(
+        root.join("src/auth.rs"),
+        "pub const GITHUB_TOKEN: &str = \"ghp_16C7e42F292c6912E7710c838347Ae178B4a\";\n",
+    )
+    .unwrap();
     // SQL injection sink.
     fs::write(
         root.join("src/db.rs"),
@@ -117,11 +125,28 @@ fn request_via_ipc(
     daemon: &mut DaemonService,
     payload: Value,
 ) -> Value {
+    // The daemon's slow-command IPC budget is 300s (real external scanners
+    // run inside SecurityAudit); the pump deadline matches so a legitimate
+    // multi-scanner audit is never cut off by the test harness itself.
+    request_via_ipc_with_budget(server, listener, daemon, payload, Duration::from_secs(300))
+}
+
+/// Real external scanners (checkov, gitleaks) can legitimately take tens of
+/// seconds inside a SecurityAudit — the daemon's IPC response budget for
+/// provider/scanner commands is 300s.  Slow commands use a matching pump
+/// deadline.
+fn request_via_ipc_with_budget(
+    server: &UnixIpcServer,
+    listener: &std::os::unix::net::UnixListener,
+    daemon: &mut DaemonService,
+    payload: Value,
+    budget: Duration,
+) -> Value {
     let client = std::thread::spawn({
         let socket = server.path().to_path_buf();
         move || UnixIpcClient::new(socket).request(payload).unwrap()
     });
-    let deadline = Instant::now() + Duration::from_secs(30);
+    let deadline = Instant::now() + budget;
     while !client.is_finished() && Instant::now() < deadline {
         let _ = server.serve_once(listener, daemon);
         std::thread::sleep(Duration::from_millis(5));
@@ -1193,6 +1218,156 @@ fn security_mode_self_security_and_authorized_adversarial_gates() {
     assert_eq!(metrics["ok"], true, "metrics: {metrics}");
     assert!(metrics["metrics"]["findings_total"].as_u64().unwrap() > 0);
     assert!(metrics["metrics"]["validation_success"].as_u64().unwrap() > 0);
+
+    // ── Cleanup ────────────────────────────────────────────────────────────
+    drop(server);
+    drop(listener);
+    let _ = fs::remove_dir_all(&runtime);
+    let _ = fs::remove_dir_all(&project);
+}
+
+/// G5 real-scanner honesty (E2E): the Security Mode audit actually executes
+/// the installed governed external scanner set and persists real coverage.
+///
+/// Installed scanners must run and report `Available` (with a version);
+/// missing/unprepared/misconfigured ones must report their honest failure
+/// state; and the persisted session's available/unavailable lists must
+/// agree with the executed set.  When gitleaks is installed and functional
+/// it must surface the fixture's seeded secret as a real ExternalTool
+/// finding.
+#[test]
+fn security_mode_audit_runs_real_external_scanners_with_honest_coverage() {
+    let runtime = temp_root("runtime-realscan");
+    let project = temp_root("project-realscan");
+    let _ = fs::remove_dir_all(&runtime);
+    let _ = fs::remove_dir_all(&project);
+    fs::create_dir_all(&runtime).unwrap();
+    create_security_fixture(&project);
+
+    let (db_path, lock) = default_paths(&runtime);
+    let socket = default_socket_path(&runtime);
+    let mut daemon = DaemonService::open(&db_path, &lock).unwrap();
+    daemon.start().unwrap();
+    let (server, listener) = UnixIpcServer::bind(&socket).expect("bind IPC socket");
+    let project_path = project.to_string_lossy().to_string();
+
+    let create = request_via_ipc(
+        &server,
+        &listener,
+        &mut daemon,
+        json!({"id":"cr","command":"ConversationCreate","project_path": project_path, "mode":"SECURITY","title":"Real scanner audit"}),
+    );
+    assert_eq!(create["ok"], true);
+    let cid = create["conversation_id"].as_str().unwrap().to_string();
+
+    let scope = security_command(
+        &server,
+        &listener,
+        &mut daemon,
+        &cid,
+        "SecurityScopeSet",
+        json!({"target": project_path, "scope_kind": "repository", "auth_state": "read-only"}),
+    );
+    assert_eq!(scope["ok"], true, "scope: {scope}");
+
+    // The managed sweep runs five optional external scanners; each can take
+    // tens of seconds (checkov, gitleaks).  The IPC response budget for
+    // SecurityAudit is 300s; the pump deadline matches it.
+    let audit = request_via_ipc(
+        &server,
+        &listener,
+        &mut daemon,
+        json!({"id":"g5","command":"SecurityAudit","conversation_id": cid}),
+    );
+    assert_eq!(audit["ok"], true, "audit: {audit}");
+
+    // 1. The audit response reports the executed coverage, never a constant.
+    let availability = audit["audit"]["scanner_availability"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    assert!(
+        !availability.is_empty(),
+        "audit must report executed scanner coverage: {audit}"
+    );
+    let gitleaks_row = availability
+        .iter()
+        .find(|row| row["adapter"] == "Gitleaks")
+        .expect("gitleaks adapter row must exist in coverage");
+    let gitleaks_available = gitleaks_row["availability"] == "Available";
+    if gitleaks_available {
+        assert!(
+            gitleaks_row["version"]
+                .as_str()
+                .is_some_and(|v| !v.is_empty()),
+            "an Available scanner must report its version: {gitleaks_row}"
+        );
+    }
+
+    // 2. A functional gitleaks must surface the seeded fixture secret as a
+    //    real ExternalTool finding (the built-in heuristics detect it too;
+    //    the gitleaks instance proves the external adapter actually ran).
+    if gitleaks_available {
+        let findings = audit["audit"]["findings"].as_array().unwrap();
+        assert!(
+            findings.iter().any(|f| f["root_cause"]
+                .as_str()
+                .unwrap_or("")
+                .starts_with("gitleaks:")),
+            "installed gitleaks must produce a real finding: {findings:?}"
+        );
+    }
+
+    // 3. The persisted session agrees with the executed set: available and
+    //    unavailable lists partition the configured adapters, and the
+    //    unavailable count matches the failures — never fabricated.
+    let status = security_command(
+        &server,
+        &listener,
+        &mut daemon,
+        &cid,
+        "SecurityStatus",
+        json!({}),
+    );
+    assert_eq!(status["ok"], true, "status: {status}");
+    let available: Vec<String> = status["status"]["available_scanners"]
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect()
+        })
+        .unwrap_or_default();
+    let unavailable: Vec<String> = status["status"]["unavailable_scanners"]
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect()
+        })
+        .unwrap_or_default();
+    let configured = ["Gitleaks", "Semgrep", "Osv", "Trivy", "Checkov"];
+    for adapter in configured {
+        let in_available = available.iter().any(|a| a == adapter);
+        let in_unavailable = unavailable.iter().any(|u| u == adapter);
+        assert!(
+            in_available != in_unavailable,
+            "adapter {adapter} must appear in exactly one coverage list (available={available:?}, unavailable={unavailable:?})"
+        );
+    }
+    assert_eq!(
+        status["status"]["scanners_unavailable"]
+            .as_u64()
+            .unwrap_or(0),
+        unavailable.len() as u64,
+        "unavailable count must match the unavailable list"
+    );
+    if gitleaks_available {
+        assert!(
+            available.iter().any(|a| a == "Gitleaks"),
+            "executed gitleaks must be persisted as available"
+        );
+    }
 
     // ── Cleanup ────────────────────────────────────────────────────────────
     drop(server);
