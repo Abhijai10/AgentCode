@@ -1355,6 +1355,15 @@ impl<P: PolicyBoundary> AutonomousAgent<P> {
                     ));
                 }
                 Err(err) => {
+                    if std::env::var("AGENTCODE_DEBUG_TASK_ERRORS").is_ok() {
+                        eprintln!(
+                            "TASK-ERROR task={} title={} code={} detail={}",
+                            task.id,
+                            task.title,
+                            err.code(),
+                            err
+                        );
+                    }
                     graph.finish(
                         &task.id,
                         self.session.worker(),
@@ -2093,6 +2102,11 @@ impl<P: PolicyBoundary> AutonomousAgent<P> {
         if self.verification_failures_remaining > 0 {
             self.verification_failures_remaining -= 1;
         }
+        // Ask the implementer to repair the failed verification against the
+        // REAL task (task_id, title, schema).  Asking without a task would
+        // build a PLANNER prompt (PlannerResponse schema), which can never
+        // parse as an ActionProposal and always failed with
+        // AGENT-PLAN_MISSING_FIELD.
         let repair_reasoning = self.ask_provider_for_role(
             "implementer",
             goal,
@@ -2102,22 +2116,45 @@ impl<P: PolicyBoundary> AutonomousAgent<P> {
                 budget: 1,
                 omitted_count: 0,
             },
-            None,
+            Some(task),
         )?;
-        let repair_task = WorkerTask {
-            id: StableId::new("repair-task"),
-            mission_id: task.mission_id.clone(),
-            title: "Modify target".to_string(),
-            dependencies: Vec::new(),
-            state: TaskState::Running,
-            assigned_worker: Some(self.session.worker().id.clone()),
-            retry_count: 0,
-            max_retries: 1,
-            evidence_refs: Vec::new(),
-            acceptance_criteria: Vec::new(),
+        // Prefer the task-matching repair proposal, but a verification-failure
+        // repair NEEDS a mutation.  When the failed task is verify-only the
+        // matching proposal carries no PrepareEdit; fall back to the bundle's
+        // mutation proposal (the code change that should make verification
+        // pass) before giving up.
+        let repair = match ActionProposal::parse(&repair_reasoning.text)
+            .or_else(|_| action_proposal_from_bundle(&repair_reasoning.text, task))
+        {
+            Ok(proposal)
+                if proposal
+                    .actions
+                    .iter()
+                    .any(|action| matches!(action, ProposedAction::PrepareEdit { .. })) =>
+            {
+                proposal
+            }
+            outcome => {
+                let direct_error = outcome.err();
+                action_proposals_from_bundle_all(&repair_reasoning.text)
+                    .and_then(|proposals| {
+                        proposals.into_iter().find(|proposal| {
+                            proposal
+                                .actions
+                                .iter()
+                                .any(|action| matches!(action, ProposedAction::PrepareEdit { .. }))
+                        })
+                    })
+                    .ok_or_else(|| {
+                        direct_error.unwrap_or_else(|| {
+                            AcError::validation(
+                                "AGENT-REPAIR_NO_MUTATION",
+                                "verification repair did not propose a mutation",
+                            )
+                        })
+                    })?
+            }
         };
-        let repair = ActionProposal::parse(&repair_reasoning.text)
-            .or_else(|_| action_proposal_from_bundle(&repair_reasoning.text, &repair_task))?;
         if repair
             .actions
             .iter()
@@ -3023,6 +3060,54 @@ fn register_real_provider(
     Ok(())
 }
 
+/// Register a vision-capable local model route for reference-image analysis
+/// (Design Studio H28).  The identity honestly advertises vision:true; routing
+/// profiles with requires_vision will select it and nothing else.  `local`
+/// must be true today: remote vision providers are not part of this batch.
+pub fn register_vision_model_route(
+    providers: &mut ProviderRegistry,
+    name: &str,
+    adapter: Box<dyn ac_provider::ProviderAdapter>,
+    model_name: String,
+    endpoint_ref: &str,
+    context_window: u32,
+    privacy: PrivacyClass,
+) -> AcResult<StableId> {
+    let provider_id =
+        providers.register_provider(name, None, vec![ProviderCapability::Chat], name)?;
+    providers.register_adapter(&provider_id, adapter)?;
+    let model_id = providers.register_model(
+        &provider_id,
+        model_name.clone(),
+        vec![ProviderCapability::Chat, ProviderCapability::Vision],
+        context_window,
+    )?;
+    let connection_id = providers.register_connection(
+        &provider_id,
+        format!("{name}-vision"),
+        None,
+        name,
+        endpoint_ref,
+        true,
+        false,
+        true,
+    )?;
+    let identity_id = providers.register_model_identity(
+        model_name,
+        context_window,
+        40,
+        60,
+        true,
+        false,
+        true,
+        0,
+        0,
+        privacy,
+    )?;
+    providers.register_model_route(&identity_id, &model_id, &connection_id)?;
+    Ok(identity_id)
+}
+
 fn register_scripted_mock_provider(providers: &mut ProviderRegistry) -> AcResult<()> {
     let provider_id = providers.register_provider(
         "local-scripted",
@@ -3736,6 +3821,18 @@ fn action_proposal_from_bundle(text: &str, task: &WorkerTask) -> AcResult<Action
             )
         })?;
     ActionProposal::parse(&proposal.to_string())
+}
+
+/// Parse every action proposal in a provider bundle, ignoring task matching.
+/// Used by the verification-repair path to find a mutation proposal when the
+/// failed task itself is verify-only.
+fn action_proposals_from_bundle_all(text: &str) -> Option<Vec<ActionProposal>> {
+    let value: Value = serde_json::from_str(text).ok()?;
+    let proposals = value.get("action_proposals")?.as_array()?;
+    proposals
+        .iter()
+        .map(|proposal| ActionProposal::parse(&proposal.to_string()).ok())
+        .collect()
 }
 
 impl PlannerResponse {

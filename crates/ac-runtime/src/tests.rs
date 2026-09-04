@@ -96,6 +96,7 @@ mod tests {
             prompt: "hello".to_string(),
             required: Vec::new(),
             max_output_tokens: 64,
+            image_b64: None,
         };
         session
             .run_plan(

@@ -317,6 +317,10 @@ pub struct NormalizedInferenceRequest {
     pub prompt: String,
     pub required: Vec<ProviderCapability>,
     pub max_output_tokens: u32,
+    /// Optional image payload (base64, no data-URI prefix) for multimodal
+    /// reference analysis.  Only routed to models that advertise the Vision
+    /// capability; adapters translate this into their native image format.
+    pub image_b64: Option<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -799,7 +803,30 @@ impl HttpProviderAdapter {
         )
     }
 
-    fn new_kind(options: HttpProviderOptions, provider_kind: HttpProviderKind) -> AcResult<Self> {
+    fn new_kind(
+        mut options: HttpProviderOptions,
+        provider_kind: HttpProviderKind,
+    ) -> AcResult<Self> {
+        // OllamaChat adapters talk to the /api/chat endpoint.  Users and test
+        // harnesses commonly configure OLLAMA_BASE_URL as the bare server
+        // base (http://127.0.0.1:11434); POSTing there returns Ollama's
+        // plain-text "Ollama is running" banner, which parses as
+        // MalformedResponse.  Normalize the endpoint to the chat path so a
+        // base URL configuration is not a silent footgun.  Full-path
+        // endpoints (including /api/generate for legacy configs) are kept
+        // verbatim.
+        if provider_kind == HttpProviderKind::OllamaChat {
+            let path = Url::parse(&options.endpoint)
+                .ok()
+                .and_then(|url| match url.path() {
+                    "" | "/" => None,
+                    path => Some(path.to_string()),
+                });
+            if path.is_none() {
+                let base = options.endpoint.trim_end_matches('/');
+                options.endpoint = format!("{base}/api/chat");
+            }
+        }
         validate_endpoint(&options.endpoint, options.allow_plain_http_remote)?;
         if options.model_name.trim().is_empty()
             || options.connect_timeout_ms == 0
@@ -826,29 +853,72 @@ impl HttpProviderAdapter {
     }
 
     pub fn request_json(&self, request: &NormalizedInferenceRequest) -> Value {
+        let image = request.image_b64.as_deref();
         match self.provider_kind {
-            HttpProviderKind::OpenAiCompatible | HttpProviderKind::OpenAiChatCompletions => json!({
-                "model": self.model_name,
-                "messages": [{"role": "user", "content": request.prompt}],
-                "max_tokens": request.max_output_tokens,
-                "stream": true
-            }),
-            HttpProviderKind::AnthropicMessages => json!({
-                "model": self.model_name,
-                "messages": [{"role": "user", "content": request.prompt}],
-                "max_tokens": request.max_output_tokens,
-                "stream": true
-            }),
-            HttpProviderKind::GeminiGenerateContent => json!({
-                "contents": [{"role": "user", "parts": [{"text": request.prompt}]}],
-                "generationConfig": {"maxOutputTokens": request.max_output_tokens}
-            }),
-            HttpProviderKind::OllamaChat => json!({
-                "model": self.model_name,
-                "messages": [{"role": "user", "content": request.prompt}],
-                "stream": true,
-                "format": "json"
-            }),
+            HttpProviderKind::OpenAiCompatible | HttpProviderKind::OpenAiChatCompletions => {
+                // Multimodal content-parts format: text first, then the image.
+                let content = match image {
+                    Some(image_b64) => json!([
+                        {"type": "text", "text": request.prompt},
+                        {"type": "image_url", "image_url": {
+                            "url": format!("data:image/png;base64,{image_b64}")
+                        }},
+                    ]),
+                    None => json!(request.prompt),
+                };
+                json!({
+                    "model": self.model_name,
+                    "messages": [{"role": "user", "content": content}],
+                    "max_tokens": request.max_output_tokens,
+                    "stream": true
+                })
+            }
+            HttpProviderKind::AnthropicMessages => {
+                let content = match image {
+                    Some(image_b64) => json!([
+                        {"type": "image", "source": {
+                            "type": "base64",
+                            "media_type": "image/png",
+                            "data": image_b64,
+                        }},
+                        {"type": "text", "text": request.prompt},
+                    ]),
+                    None => json!(request.prompt),
+                };
+                json!({
+                    "model": self.model_name,
+                    "messages": [{"role": "user", "content": content}],
+                    "max_tokens": request.max_output_tokens,
+                    "stream": true
+                })
+            }
+            HttpProviderKind::GeminiGenerateContent => {
+                let mut parts = vec![json!({"text": request.prompt})];
+                if let Some(image_b64) = image {
+                    parts.push(json!({
+                        "inline_data": {
+                            "mime_type": "image/png",
+                            "data": image_b64,
+                        }
+                    }));
+                }
+                json!({
+                    "contents": [{"role": "user", "parts": parts}],
+                    "generationConfig": {"maxOutputTokens": request.max_output_tokens}
+                })
+            }
+            HttpProviderKind::OllamaChat => {
+                let mut body = json!({
+                    "model": self.model_name,
+                    "messages": [{"role": "user", "content": request.prompt}],
+                    "stream": true,
+                    "format": "json"
+                });
+                if let Some(image_b64) = image {
+                    body["images"] = json!([image_b64]);
+                }
+                body
+            }
         }
     }
 
@@ -1241,6 +1311,7 @@ impl ProviderRegistry {
             prompt,
             required,
             max_output_tokens,
+            image_b64: None,
         })
     }
 
@@ -1434,12 +1505,52 @@ impl ProviderRegistry {
         max_output_tokens: u32,
         cancel: &dyn Fn() -> bool,
     ) -> Result<RouteExecution, ProviderFailureClass> {
+        self.request_model_inner(profile, prompt, max_output_tokens, None, cancel)
+    }
+
+    /// Multimodal variant of `request_model`: the prompt is accompanied by a
+    /// base64-encoded image (no data-URI prefix).  Routing additionally
+    /// requires the Vision capability so images are never silently handed to
+    /// a text-only model.
+    pub fn request_model_with_image(
+        &mut self,
+        profile: &TaskProfile,
+        prompt: impl Into<String>,
+        image_b64: String,
+        max_output_tokens: u32,
+        cancel: &dyn Fn() -> bool,
+    ) -> Result<RouteExecution, ProviderFailureClass> {
+        if image_b64.is_empty() {
+            return Err(ProviderFailureClass::InvalidRequest);
+        }
+        self.request_model_inner(profile, prompt, max_output_tokens, Some(image_b64), cancel)
+    }
+
+    fn request_model_inner(
+        &mut self,
+        profile: &TaskProfile,
+        prompt: impl Into<String>,
+        max_output_tokens: u32,
+        image_b64: Option<String>,
+        cancel: &dyn Fn() -> bool,
+    ) -> Result<RouteExecution, ProviderFailureClass> {
         let prompt = prompt.into();
+        // Image-bearing requests must only route to vision-capable models.
+        // The profile flag drives candidate filtering (vision_missing
+        // rejection) and the request capability list.
+        let mut profile = profile.clone();
+        if image_b64.is_some() {
+            profile.requires_vision = true;
+        }
+        let required = required_from_profile(&profile);
         let mut rejected = Vec::new();
         let mut candidates = self
             .routes
             .values()
-            .filter_map(|route| self.candidate_for_route(route, profile, &mut rejected).ok())
+            .filter_map(|route| {
+                self.candidate_for_route(route, &profile, &mut rejected)
+                    .ok()
+            })
             .collect::<Vec<_>>();
         candidates.sort_by_key(|candidate| std::cmp::Reverse(candidate.score));
         let mut fallback_reason = None;
@@ -1456,8 +1567,9 @@ impl ProviderRegistry {
             let request = NormalizedInferenceRequest {
                 model_id: route.model_id,
                 prompt: prompt.clone(),
-                required: required_from_profile(profile),
+                required: required.clone(),
                 max_output_tokens,
+                image_b64: image_b64.clone(),
             };
             for attempt_index in 0..2 {
                 let attempt_id = self
@@ -1488,7 +1600,7 @@ impl ProviderRegistry {
                             usage.output_tokens,
                         );
                         let decision = self.routing_decision(
-                            profile,
+                            &profile,
                             candidates,
                             rejected,
                             Some(candidate),
@@ -1552,7 +1664,7 @@ impl ProviderRegistry {
             }
         }
         let decision = self.routing_decision(
-            profile,
+            &profile,
             candidates,
             rejected,
             None,
@@ -2523,12 +2635,154 @@ mod tests {
         ]
     }
 
+    #[test]
+    fn ollama_adapter_normalizes_bare_base_url_to_chat_endpoint() {
+        // OLLAMA_BASE_URL is commonly the bare server base.  The adapter must
+        // target /api/chat instead of POSTing to the root (which returns
+        // Ollama's plain-text banner and parses as MalformedResponse).
+        let base = OllamaProviderAdapter::new("http://127.0.0.1:11434", "m").unwrap();
+        assert_eq!(base.inner.endpoint, "http://127.0.0.1:11434/api/chat");
+
+        let trailing_slash = OllamaProviderAdapter::new("http://127.0.0.1:11434/", "m").unwrap();
+        assert_eq!(
+            trailing_slash.inner.endpoint,
+            "http://127.0.0.1:11434/api/chat"
+        );
+
+        // A full path is kept verbatim (including legacy /api/generate).
+        let full = OllamaProviderAdapter::new("http://127.0.0.1:11434/api/chat", "m").unwrap();
+        assert_eq!(full.inner.endpoint, "http://127.0.0.1:11434/api/chat");
+        let legacy =
+            OllamaProviderAdapter::new("http://127.0.0.1:11434/api/generate", "m").unwrap();
+        assert_eq!(legacy.inner.endpoint, "http://127.0.0.1:11434/api/generate");
+    }
+
+    #[test]
+    fn image_requests_translate_to_provider_native_formats() {
+        // Ollama: base64 payload in the `images` array.
+        let ollama = OllamaProviderAdapter::new("http://127.0.0.1:11434", "vision-model").unwrap();
+        let mut image_request = request();
+        image_request.image_b64 = Some("aGVsbG8=".to_string());
+        let body = ollama.inner.request_json(&image_request);
+        assert_eq!(
+            body.get("images")
+                .and_then(|i| i.get(0))
+                .and_then(|v| v.as_str()),
+            Some("aGVsbG8=")
+        );
+        assert!(body.get("format").and_then(|f| f.as_str()) == Some("json"));
+
+        // Text-only requests keep the exact legacy shape (no images key).
+        let text_body = ollama.inner.request_json(&request());
+        assert!(text_body.get("images").is_none());
+
+        // OpenAI-compatible: content parts with a data-URI image.
+        let openai = HttpProviderAdapter::new_kind(
+            HttpProviderOptions {
+                endpoint: "http://127.0.0.1:1234/v1/chat/completions".to_string(),
+                credential_env: None,
+                model_name: "gpt-vision".to_string(),
+                connect_timeout_ms: 100,
+                read_timeout_ms: 100,
+                max_response_bytes: 4096,
+                custom_headers: Vec::new(),
+                allow_plain_http_remote: true,
+            },
+            HttpProviderKind::OpenAiCompatible,
+        )
+        .unwrap();
+        let body = openai.request_json(&image_request);
+        let content = body
+            .get("messages")
+            .and_then(|m| m.get(0))
+            .and_then(|m| m.get("content"))
+            .cloned()
+            .unwrap();
+        assert_eq!(
+            content
+                .get(1)
+                .and_then(|p| p.get("type"))
+                .and_then(|t| t.as_str()),
+            Some("image_url")
+        );
+        assert!(content
+            .get(1)
+            .and_then(|p| p.get("image_url"))
+            .and_then(|u| u.get("url"))
+            .and_then(|u| u.as_str())
+            .unwrap()
+            .starts_with("data:image/png;base64,aGVsbG8="));
+    }
+
+    #[test]
+    fn image_request_routes_only_to_vision_capable_models() {
+        // A text-only route set must refuse an image-bearing request rather
+        // than silently sending it to a model that cannot see it.
+        let mut registry = ProviderRegistry::new();
+        let mut profile = TaskProfile::discuss(StableId::new("img"), RoutingProfile::LocalFirst);
+        profile.required_context = 4096;
+        let result = registry.request_model_with_image(
+            &profile,
+            "describe this reference",
+            "aGVsbG8=".to_string(),
+            256,
+            &|| false,
+        );
+        assert_eq!(
+            result.unwrap_err(),
+            ProviderFailureClass::UnsupportedCapability
+        );
+
+        // With a vision-capable identity registered, the capability filter
+        // selects it (select_model is the same gate request_model_inner uses
+        // via profile.requires_vision -> identity.vision).
+        let mut registry = ProviderRegistry::new();
+        let provider_id = registry
+            .register_provider(
+                "vision",
+                None,
+                vec![
+                    ProviderCapability::Chat,
+                    ProviderCapability::Vision,
+                    ProviderCapability::LocalModel,
+                ],
+                "vision",
+            )
+            .unwrap();
+        registry
+            .register_model(
+                &provider_id,
+                "vision-model",
+                vec![ProviderCapability::Chat, ProviderCapability::Vision],
+                8192,
+            )
+            .unwrap();
+        profile.requires_vision = true;
+        let model = registry
+            .select_model(&required_from_profile(&profile))
+            .unwrap();
+        assert!(model.capabilities.contains(&ProviderCapability::Vision));
+    }
+
+    #[test]
+    fn openai_compatible_adapter_does_not_rewrite_endpoint_paths() {
+        // Only the OllamaChat adapter normalizes; OpenAI-compatible endpoints
+        // (which carry their own full paths) must stay verbatim.
+        let adapter =
+            LMStudioProviderAdapter::new("http://127.0.0.1:1234/v1/chat/completions", "m").unwrap();
+        assert_eq!(
+            adapter.inner.endpoint,
+            "http://127.0.0.1:1234/v1/chat/completions"
+        );
+    }
+
     fn request() -> NormalizedInferenceRequest {
         NormalizedInferenceRequest {
             model_id: StableId::new("model"),
             prompt: "plan".to_string(),
             required: vec![ProviderCapability::Chat],
             max_output_tokens: 32,
+            image_b64: None,
         }
     }
 
@@ -2830,6 +3084,7 @@ mod tests {
             prompt: "hello world".to_string(),
             required: vec![ProviderCapability::Chat],
             max_output_tokens: 16,
+            image_b64: None,
         };
         assert_eq!(
             adapter.stream(&request, &|| false).unwrap_err(),
