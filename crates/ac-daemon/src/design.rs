@@ -291,6 +291,199 @@ impl DaemonService {
         Ok(analysis)
     }
 
+    /// Reference-image analysis (core Doc 06 H28): extract structured design
+    /// principles from an attached reference image using a vision-capable
+    /// local model.  The result is persisted as a `reference_analysis` design
+    /// document with an explicit copying boundary: adopted_principles may
+    /// inform the design, but logos, illustrations, marketing text and trade
+    /// dress must never be reproduced.
+    ///
+    /// Honesty rules: this fails with a clear error when no vision model is
+    /// configured or the attachment is not a readable image; it never
+    /// fabricates an analysis from text alone.
+    pub fn design_analyze_reference(
+        &self,
+        conversation_id: &str,
+        attachment_id: &str,
+    ) -> AcResult<Value> {
+        self.ensure_running()?;
+        let conv = self.db.conversation(conversation_id)?.ok_or_else(|| {
+            AcError::validation("CONVERSATION-NOT_FOUND", "conversation not found")
+        })?;
+        if conv.mode != "DESIGN" {
+            return Err(AcError::validation(
+                "CONVERSATION-WRONG_MODE",
+                "design_analyze_reference requires a DESIGN conversation",
+            ));
+        }
+        let row = self.db.attachment(attachment_id)?.ok_or_else(|| {
+            AcError::validation(
+                "CONVERSATION-ATTACHMENT_NOT_FOUND",
+                "attachment not found",
+            )
+        })?;
+        if row.project_path != conv.project_path {
+            return Err(AcError::policy_denied(
+                "CONVERSATION-PROJECT_MISMATCH",
+                "attachment does not belong to this project",
+            ));
+        }
+        if !row.mime_type.starts_with("image/") {
+            return Err(AcError::validation(
+                "DESIGN-REFERENCE_NOT_IMAGE",
+                "reference analysis requires an image attachment",
+            ));
+        }
+        // Bounded image payload: 6 MiB encoded is far beyond what a <=4B
+        // vision model can meaningfully consume, and keeps the request small.
+        const MAX_IMAGE_BYTES: i64 = 6 * 1024 * 1024;
+        if row.size_bytes > MAX_IMAGE_BYTES {
+            return Err(AcError::validation(
+                "DESIGN-REFERENCE_TOO_LARGE",
+                "reference image exceeds the 6 MiB analysis limit",
+            ));
+        }
+        let file_path = self
+            .attachment_path(attachment_id, &conv.project_path)?
+            .ok_or_else(|| {
+                AcError::validation(
+                    "CONVERSATION-FILE_NOT_FOUND",
+                    "attachment file not found on disk",
+                )
+            })?;
+        let image_bytes = std::fs::read(&file_path).map_err(|err| {
+            AcError::validation(
+                "DESIGN-REFERENCE_READ_FAILED",
+                format!("cannot read reference image: {err}"),
+            )
+        })?;
+        let image_b64 = base64::Engine::encode(
+            &base64::engine::general_purpose::STANDARD,
+            &image_bytes,
+        );
+
+        let vision_model = std::env::var("AGENTCODE_VISION_MODEL")
+            .ok()
+            .filter(|m| !m.trim().is_empty())
+            .unwrap_or_else(|| "gemma3:4b".to_string());
+        let ollama_base = std::env::var("OLLAMA_BASE_URL")
+            .map(|base| base.trim_end_matches('/').to_string())
+            .unwrap_or_else(|_| "http://127.0.0.1:11434".to_string());
+
+        let mut providers = ac_provider::ProviderRegistry::new();
+        let adapter = Box::new(ac_provider::OllamaProviderAdapter::new(
+            &ollama_base,
+            vision_model.clone(),
+        )?);
+        ac_agent::register_vision_model_route(
+            &mut providers,
+            "ollama-vision",
+            adapter,
+            vision_model.clone(),
+            "config:ollama.vision",
+            8192,
+            ac_provider::PrivacyClass::LocalOnly,
+        )
+        .map_err(|err| {
+            AcError::validation(
+                "DESIGN-PROVIDER_SETUP",
+                format!("cannot register vision model route: {err}"),
+            )
+        })?;
+
+        let mut profile = ac_provider::TaskProfile::discuss(
+            ac_common::StableId::new("refanalysis"),
+            ac_provider::RoutingProfile::LocalFirst,
+        );
+        profile.required_context = 4096;
+        let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let prompt = r#"You are a design reference analyst. Examine the attached image and produce a strict JSON object with exactly this shape:
+{
+  "extracted": {
+    "hierarchy": ["..."], "layout": ["..."], "spacing": ["..."],
+    "typography": ["..."], "navigation": ["..."],
+    "component_behavior": ["..."], "motion": ["..."], "visual_motifs": ["..."]
+  },
+  "explicitly_do_not_copy": ["logos, illustrations, marketing text, protected assets, or trade dress you observe"],
+  "adopted_principles": ["abstract design principles safe to adopt, e.g. dense top navigation, editorial typography"]
+}
+Rules: describe only what is actually visible. Each array holds short factual strings. Never reproduce or transcribe protected assets; name them under explicitly_do_not_copy instead. Output JSON only."#;
+        let result = providers.request_model_with_image(
+            &profile,
+            prompt,
+            image_b64,
+            1024,
+            &|| cancel.load(std::sync::atomic::Ordering::Relaxed),
+        );
+        let text = match result {
+            Ok(execution) => ac_agent::provider_events_text(&execution.events),
+            Err(failure) => {
+                return Err(AcError::new(
+                    "DESIGN-VISION_MODEL_UNAVAILABLE",
+                    format!(
+                        "vision model '{vision_model}' failed ({failure:?}); \
+                         set AGENTCODE_VISION_MODEL to an installed vision-capable model"
+                    ),
+                    ac_common::ErrorKind::Unavailable,
+                    ac_common::Retryability::Retryable,
+                ));
+            }
+        };
+        let parsed: Value = parse_reference_json(&text).ok_or_else(|| {
+            AcError::validation(
+                "DESIGN-VISION_RESPONSE_UNPARSEABLE",
+                "vision model did not return a structured reference analysis",
+            )
+        })?;
+        let analysis = json!({
+            "reference_id": attachment_id,
+            "source_type": "IMAGE",
+            "artifact_ref": row.storage_key,
+            "vision_model": vision_model,
+            "extracted": parsed.get("extracted").cloned().unwrap_or(json!({})),
+            "explicitly_do_not_copy": parsed
+                .get("explicitly_do_not_copy")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default(),
+            "adopted_principles": parsed
+                .get("adopted_principles")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default(),
+        });
+        if analysis["explicitly_do_not_copy"].as_array().map(|a| a.is_empty()).unwrap_or(true) {
+            return Err(AcError::validation(
+                "DESIGN-VISION_RESPONSE_INCOMPLETE",
+                "vision analysis did not state a copying boundary",
+            ));
+        }
+
+        let now = TimestampMillis::now().as_millis() as i64;
+        let doc = DesignDocumentRow {
+            id: StableId::new("ddesign").to_string(),
+            conversation_id: conversation_id.to_string(),
+            doc_type: "reference_analysis".to_string(),
+            content_json: analysis.to_string(),
+            version: 1,
+            evidence_refs: String::new(),
+            created_at_ms: now,
+            updated_at_ms: now,
+        };
+        self.db.save_design_document(&doc)?;
+        self.append_message(
+            conversation_id,
+            "assistant",
+            &format!(
+                "Reference image analyzed (model {vision_model}). Extracted hierarchy/layout/spacing observations, {} adopted principles, and an explicit do-not-copy boundary. See the reference analysis document.",
+                analysis["adopted_principles"].as_array().map(|a| a.len()).unwrap_or(0),
+            ),
+            None,
+            r#"{"mode":"design","kind":"reference_analysis"}"#,
+        )?;
+        Ok(analysis)
+    }
+
     pub fn design_brief(&self, conversation_id: &str, audience: &str, workflow: &str) -> AcResult<Value> {
         self.ensure_running()?;
         let conv = self.db.conversation(conversation_id)?.ok_or_else(|| {
@@ -906,8 +1099,55 @@ port: port.map(|p| p as i64),
 
 const DEFAULT_DEV_PORTS: [u16; 7] = [5173, 3000, 8080, 8000, 4173, 4321, 1420];
 
-fn detect_dev_command(project_path: &str) -> String {
-    let dir = Path::new(project_path);
+/// Extract a JSON object from a vision-model response.  Small models
+/// frequently wrap the JSON in prose or markdown fences despite strict
+/// prompting; try the raw text, then fenced blocks, then the first
+/// balanced-brace object.  Returns None when nothing JSON-shaped is present —
+/// the caller then fails honestly instead of fabricating an analysis.
+fn parse_reference_json(text: &str) -> Option<Value> {
+    let trimmed = text.trim();
+    if let Ok(value) = serde_json::from_str::<Value>(trimmed) {
+        if value.is_object() {
+            return Some(value);
+        }
+    }
+    for line in trimmed.lines() {
+        let line = line.trim();
+        if (line.starts_with("```") || line.starts_with("'''"))
+            && line.len() > 3
+        {
+            if let Ok(value) = serde_json::from_str::<Value>(&line[3..]) {
+                if value.is_object() {
+                    return Some(value);
+                }
+            }
+        }
+    }
+    if let Some(start) = trimmed.find('{') {
+        let mut depth = 0i32;
+        for (offset, ch) in trimmed[start..].char_indices() {
+            match ch {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        let candidate = &trimmed[start..start + offset + 1];
+                        if let Ok(value) = serde_json::from_str::<Value>(candidate) {
+                            if value.is_object() {
+                                return Some(value);
+                            }
+                        }
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    None
+}
+
+fn detect_dev_command(project_path: &str) -> String {    let dir = Path::new(project_path);
     if dir.join("package.json").exists() {
         if let Ok(content) = fs::read_to_string(dir.join("package.json")) {
             if let Ok(pkg) = serde_json::from_str::<Value>(&content) {
