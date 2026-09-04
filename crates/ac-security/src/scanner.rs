@@ -137,9 +137,24 @@ impl BaselineSecurityOrchestrator {
         if input.commit.trim().is_empty() || !input.workspace_root.is_dir() { return Err(AcError::validation("SECURITY-SCAN_INVALID", "security scan needs commit and workspace")); }
         let mut report = SecurityScanReport { id: StableId::new("secscan"), adapters_run: Vec::new(), missing_adapters: Vec::new(), threat_model: empty_threat_model(), instances: Vec::new(), findings: Vec::new(), executions: Vec::new() };
         for config in input.configurations.iter().filter(|c| c.enabled) {
-            validate_config(config, input)?;
+            // Per-scanner configuration problems (a missing executable, a
+            // semgrep without local rules, an unauthorized ZAP target) are
+            // recorded honestly against THAT scanner — they never abort the
+            // whole sweep.  Only a REQUIRED misconfigured scanner fails the
+            // run (via record_failure).
+            if let Err(error) = validate_config(config, input) {
+                self.record_failure(&mut report, config, input, ScannerFailure::Misconfigured(error.to_string()))?;
+                continue;
+            }
             let version = match executor.execute(version_request(config, &input.workspace_root)) { Ok(out) if out.exit_code == Some(0) => scanner_version(config.adapter, &out.stdout), Ok(out) => { self.record_failure(&mut report, config, input, ScannerFailure::Unavailable(redact_output(&out.stderr)))?; continue; }, Err(failure) => { self.record_failure(&mut report, config, input, failure)?; continue; } };
-            let output = match executor.execute(scan_request(config, input)?) { Ok(out) if scan_exit_is_result(config.adapter, out.exit_code) => out, Ok(out) => { self.record_failure(&mut report, config, input, ScannerFailure::ExecutionFailed(redact_output(&out.stderr)))?; continue; }, Err(failure) => { self.record_failure(&mut report, config, input, failure)?; continue; } };
+            let scan = match scan_request(config, input) {
+                Ok(scan) => scan,
+                Err(error) => {
+                    self.record_failure(&mut report, config, input, ScannerFailure::Misconfigured(error.to_string()))?;
+                    continue;
+                }
+            };
+            let output = match executor.execute(scan) { Ok(out) if scan_exit_is_result(config.adapter, out.exit_code) => out, Ok(out) => { self.record_failure(&mut report, config, input, ScannerFailure::ExecutionFailed(redact_output(&out.stderr)))?; continue; }, Err(failure) => { self.record_failure(&mut report, config, input, failure)?; continue; } };
             if output.stdout_truncated || output.stderr_truncated { return Err(AcError::new("SECURITY-SCANNER_OUTPUT_TRUNCATED", "scanner output exceeded governed limit", ErrorKind::Unavailable, Retryability::NotRetryable)); }
             let raw = redact_output(&output.stdout);
             let evidence_ref = evidence.append_tool_output(Provenance { source: "security-orchestrator".to_string(), commit: Some(input.commit.clone()), worktree: Some(input.workspace_root.display().to_string()), tool: Some(adapter_name(config.adapter).to_string()) }, format!("mem://security/{}/{}", adapter_name(config.adapter), StableId::new("raw")), raw.clone(), &[])?;
@@ -149,6 +164,33 @@ impl BaselineSecurityOrchestrator {
         }
         report.findings = self.triage(self.group(report.instances.clone()));
         Ok(report)
+    }
+
+    /// Merges a managed external-scanner report into a baseline heuristic
+    /// report: combined instances are re-grouped and re-triaged so external
+    /// findings flow through the same normalization pipeline, adapter
+    /// coverage and availability are unioned, and the baseline threat model
+    /// (built from file content) is preserved.
+    pub fn merge_reports(&self, baseline: SecurityScanReport, managed: SecurityScanReport) -> SecurityScanReport {
+        let threat_model = baseline.threat_model.clone();
+        let mut adapters_run = baseline.adapters_run.clone();
+        for adapter in managed.adapters_run.iter() {
+            if !adapters_run.contains(adapter) {
+                adapters_run.push(*adapter);
+            }
+        }
+        let mut instances = baseline.instances.clone();
+        instances.extend(managed.instances.iter().cloned());
+        let findings = self.triage(self.group(instances.clone()));
+        SecurityScanReport {
+            id: baseline.id,
+            adapters_run,
+            missing_adapters: managed.missing_adapters.clone(),
+            threat_model,
+            instances,
+            findings,
+            executions: managed.executions.clone(),
+        }
     }
     fn record_failure(&self, report: &mut SecurityScanReport, config: &ScannerConfiguration, input: &ManagedSecurityScanInput, failure: ScannerFailure) -> AcResult<SecurityScanReport> { let availability = match failure { ScannerFailure::Unavailable(_) => ScannerAvailability::Unavailable, ScannerFailure::Misconfigured(_) => ScannerAvailability::Misconfigured, _ => ScannerAvailability::Failed }; let reason = format!("{}:{:?}", adapter_name(config.adapter), failure); report.missing_adapters.push(reason.clone()); report.executions.push(ScannerExecution { adapter: config.adapter, availability, version: None, raw_evidence_ref: None, source_commit: input.commit.clone(), failure: Some(failure) }); if config.required { return Err(AcError::new("SECURITY-SCANNER_REQUIRED_UNAVAILABLE", reason, ErrorKind::Unavailable, Retryability::NotRetryable)); } Ok(report.clone()) }
     pub fn manual_business_logic_finding(&self, file_path: impl Into<String>, evidence: impl Into<String>) -> NormalizedSecurityFinding { NormalizedSecurityFinding { id: StableId::new("secfinding"), root_cause: "business-logic authorization gap".to_string(), severity: SecuritySeverity::High, confidence: 80, exploitability: 70, status: FindingStatus::NeedsValidation, affected_code: vec![file_path.into()], evidence_refs: vec![StableId::new("evidence")], remediation: evidence.into(), instance_ids: Vec::new() } }
@@ -174,10 +216,19 @@ fn version_request(config: &ScannerConfiguration, cwd: &Path) -> ScannerProcessR
 fn scan_request(c: &ScannerConfiguration, input: &ManagedSecurityScanInput) -> AcResult<ScannerProcessRequest> {
     let root = input.workspace_root.display().to_string();
     let mut cleanup_paths = Vec::new();
-    let report_path = None;
+    let mut report_path = None;
     let mut env = BTreeMap::new();
     let argv = match c.adapter {
-        SecurityAdapter::Gitleaks => vec![c.executable.clone(), "detect".to_string(), "--source".to_string(), root, "--report-format".to_string(), "json".to_string(), "--report-path".to_string(), "/dev/stdout".to_string(), "--no-banner".to_string()],
+        SecurityAdapter::Gitleaks => {
+            // /dev/stdout is not a writable report target on macOS hosts
+            // (gitleaks fails with "Report path is not writable"), so the
+            // report goes to a governed temp file the executor reads back
+            // and removes afterwards.
+            let report = std::env::temp_dir().join(format!("agentcode-gitleaks-{}.json", StableId::new("gl")));
+            cleanup_paths.push(report.clone());
+            report_path = Some(report.clone());
+            vec![c.executable.clone(), "detect".to_string(), "--source".to_string(), root, "--report-format".to_string(), "json".to_string(), "--report-path".to_string(), report.display().to_string(), "--no-banner".to_string(), "--exit-code".to_string(), "0".to_string()]
+        }
         SecurityAdapter::Osv => {
             let data = scanner_data_dir(c, "osv");
             if !data.exists() {

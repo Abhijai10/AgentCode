@@ -351,7 +351,69 @@ impl DaemonService {
             dependency_manifest: None,
             include_iac: true,
         };
-        let report = orchestrator.run(&scan_input)?;
+        let report = {
+            // Baseline heuristic pass first: it builds the content-derived
+            // threat model that persists into the session.
+            let baseline = orchestrator.run(&scan_input)?;
+
+            // Real external scanner adapters (G5): the Security Mode audit
+            // runs the installed, governed scanner set through the same
+            // Tool-Broker governed executor the security.verify mission tool
+            // uses.  Every adapter is OPTIONAL here — a missing scanner is
+            // recorded honestly as unavailable and never blocks the audit,
+            // and the persisted session reflects actual executed coverage
+            // (available_scanners / unavailable_scanners /
+            // scanners_unavailable), driving FinalSecurityStatus through its
+            // SCANNER_COVERAGE_INCOMPLETE state instead of a constant.
+            let mut configurations = Vec::new();
+            for adapter in [
+                ac_security::SecurityAdapter::Gitleaks,
+                ac_security::SecurityAdapter::Semgrep,
+                ac_security::SecurityAdapter::Osv,
+                ac_security::SecurityAdapter::Trivy,
+                ac_security::SecurityAdapter::Checkov,
+            ] {
+                let mut config = ac_security::ScannerConfiguration::external(adapter);
+                config.required = false;
+                if matches!(
+                    adapter,
+                    ac_security::SecurityAdapter::Osv | ac_security::SecurityAdapter::Trivy
+                ) {
+                    config.timeout_ms = 180_000;
+                }
+                configurations.push(config);
+            }
+            let managed_input = ac_security::ManagedSecurityScanInput {
+                repository_id: StableId::new("secmode"),
+                commit: commit.clone(),
+                workspace_root: std::path::PathBuf::from(&conv.project_path),
+                configurations,
+                target_url: None,
+                target_authorized: false,
+            };
+            let project_root = std::path::PathBuf::from(&conv.project_path);
+            let sandbox = ac_sandbox::SandboxManager::new(ac_sandbox::SandboxPolicy {
+                workspace_roots: vec![project_root.clone()],
+                capability_policy: ac_security::CapabilityPolicy::new()
+                    .allow(ac_security::Capability::ProcessExec("*".to_string())),
+                network_default_allow: false,
+                max_timeout_ms: 180_000,
+                required_isolation: ac_sandbox::IsolationLevel::None,
+                ..ac_sandbox::SandboxPolicy::new(vec![project_root])
+            });
+            let executor = ac_tool::GovernedScannerExecutor::new(sandbox);
+            let mut evidence = ac_evidence::EvidenceStore::new();
+            match orchestrator.run_managed(&managed_input, &executor, &mut evidence) {
+                Ok(managed) => orchestrator.merge_reports(baseline, managed),
+                Err(error) => {
+                    // A governed-execution policy failure (e.g. sandbox
+                    // denied) is honest unavailability for the whole managed
+                    // set — recorded, never fabricated.
+                    eprintln!("managed scanner sweep unavailable: {error:?}");
+                    baseline
+                }
+            }
+        };
         let threat_model = report.threat_model.clone();
 
 // AI security applicability detection: only when AI surfaces exist.
@@ -1458,6 +1520,10 @@ impl DaemonService {
             "scope": security_scope_json(&scope),
             "active_testing_allowed": scope.active_testing_allowed(),
             "scanners_unavailable": session.scanners_unavailable,
+            "available_scanners": serde_json::from_str::<Value>(&session.available_scanners)
+                .unwrap_or_else(|_| json!([])),
+            "unavailable_scanners": serde_json::from_str::<Value>(&session.unavailable_scanners)
+                .unwrap_or_else(|_| json!([])),
             "findings_total": findings.len(),
             "findings_confirmed": confirmed,
             "state_counts": counts,
