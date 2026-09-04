@@ -274,6 +274,11 @@ pub struct BrowserProcessRecord {
     pub state: BrowserProcessState,
     pub profile_dir: String,
     pub created_at: TimestampMillis,
+    /// Honest degradation marker: Chrome was relaunched with its internal
+    /// sandbox disabled because the host OS could not provide the sandbox
+    /// profile Chrome needs (e.g. macOS seatbelt unavailable to the browser).
+    /// AgentCode's own process-restricted boundary still applies.
+    pub internal_sandbox_degraded: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -433,6 +438,10 @@ struct RealBrowserProcess {
     child: Child,
     _profile_dir: TempDir,
     port: u16,
+    /// Browser-endpoint websocket path from DevToolsActivePort (line 2).
+    /// Modern Chrome only serves websockets on this endpoint; page-level
+    /// /devtools/page/<id> handshakes return 404.
+    browser_ws_path: String,
 }
 
 struct RealBrowserPage {
@@ -444,6 +453,10 @@ struct RealBrowserPage {
 struct CdpClient {
     socket: WebSocket<MaybeTlsStream<TcpStream>>,
     next_id: u64,
+    /// Flat-session identifier (Target.attachToTarget with flatten:true).
+    /// Commands are routed to the page session; None speaks on the browser
+    /// endpoint directly.
+    session_id: Option<String>,
     console_errors: Vec<String>,
     page_errors: Vec<String>,
     network_failures: Vec<String>,
@@ -1278,6 +1291,7 @@ impl BrowserRuntime {
             mode: self.mode,
             state: BrowserProcessState::Running,
             created_at: TimestampMillis::now(),
+            internal_sandbox_degraded: false,
         };
         self.processes.insert(process.id.clone(), process.clone());
         Ok(process)
@@ -1308,7 +1322,7 @@ impl BrowserRuntime {
                     "real browser process is not registered",
                 )
             })?;
-            let page = RealBrowserPage::create(real_process.port)?;
+            let page = RealBrowserPage::create(real_process.port, &real_process.browser_ws_path)?;
             self.real_pages.insert(process_id.clone(), page);
         }
         let session = BrowserSessionRecord {
@@ -1685,57 +1699,8 @@ impl BrowserRuntime {
                 ac_common::Retryability::NotRetryable,
             )
         })?;
-        let profile_dir = tempfile::Builder::new()
-            .prefix("agentcode-browser-profile-")
-            .tempdir()
-            .map_err(|err| {
-                AcError::new(
-                    "BROWSER-PROFILE_CREATE",
-                    err.to_string(),
-                    ac_common::ErrorKind::Unavailable,
-                    ac_common::Retryability::NotRetryable,
-                )
-            })?;
-        let browser_args = vec![
-            "--headless=new".to_string(),
-            "--remote-debugging-port=0".to_string(),
-            format!("--user-data-dir={}", profile_dir.path().display()),
-            "--no-first-run".to_string(),
-            "--no-default-browser-check".to_string(),
-            "--disable-background-networking".to_string(),
-            "--disable-sync".to_string(),
-            "--disable-extensions".to_string(),
-            "--disable-popup-blocking".to_string(),
-            "about:blank".to_string(),
-        ];
-        let plan = prepare_browser_spawn(&executable, &browser_args, profile_dir.path())?;
-        let mut child = Command::new(plan.backend_argv.first().ok_or_else(|| {
-            AcError::validation("BROWSER-SANDBOX_PLAN", "sandbox plan has no executable")
-        })?)
-        .args(plan.backend_argv.iter().skip(1))
-        .current_dir(plan.cwd)
-        .env_clear()
-        .envs(plan.allowed_env)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .map_err(|err| {
-            AcError::new(
-                "BROWSER-LAUNCH_FAILED",
-                err.to_string(),
-                ac_common::ErrorKind::Unavailable,
-                ac_common::Retryability::NotRetryable,
-            )
-        })?;
-        let port = match wait_for_devtools_port(profile_dir.path(), &mut child) {
-            Ok(port) => port,
-            Err(err) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return Err(err);
-            }
-        };
+        let (child, profile_dir, port, browser_ws_path, internal_sandbox_degraded) =
+            self.launch_chrome_with_degraded_retry(&executable)?;
         let process = BrowserProcessRecord {
             id: StableId::new("browserproc"),
             profile_dir: profile_dir.path().display().to_string(),
@@ -1743,6 +1708,7 @@ impl BrowserRuntime {
             mode: BrowserAdapterMode::ChromiumCdp,
             state: BrowserProcessState::Running,
             created_at: TimestampMillis::now(),
+            internal_sandbox_degraded,
         };
         self.real_processes.insert(
             process.id.clone(),
@@ -1750,10 +1716,103 @@ impl BrowserRuntime {
                 child,
                 _profile_dir: profile_dir,
                 port,
+                browser_ws_path,
             },
         );
         self.processes.insert(process.id.clone(), process.clone());
         Ok(process)
+    }
+
+    /// Spawn Chrome and wait for its DevTools endpoint.  Chrome's internal
+    /// sandbox requires OS support (macOS seatbelt); on hosts where that is
+    /// unavailable Chrome accepts the launch but its renderer/DevTools session
+    /// dies on first attach.  This is detected with a real browser-endpoint
+    /// probe, and only then is Chrome relaunched with `--no-sandbox`.
+    /// AgentCode's own process-restricted boundary always still applies; the
+    /// degradation is recorded honestly on the process record.
+    fn launch_chrome_with_degraded_retry(
+        &mut self,
+        executable: &Path,
+    ) -> AcResult<(Child, TempDir, u16, String, bool)> {
+        let base_args = [
+            "--headless=new",
+            "--remote-debugging-port=0",
+            "--no-first-run",
+            "--no-default-browser-check",
+            "--disable-background-networking",
+            "--disable-sync",
+            "--disable-extensions",
+            "--disable-popup-blocking",
+        ];
+        let attempt = |extra_args: &[&str]| -> AcResult<(Child, TempDir, u16, String)> {
+            let profile_dir = tempfile::Builder::new()
+                .prefix("agentcode-browser-profile-")
+                .tempdir()
+                .map_err(|err| {
+                    AcError::new(
+                        "BROWSER-PROFILE_CREATE",
+                        err.to_string(),
+                        ac_common::ErrorKind::Unavailable,
+                        ac_common::Retryability::NotRetryable,
+                    )
+                })?;
+            let mut browser_args: Vec<String> =
+                base_args.iter().map(|arg| arg.to_string()).collect();
+            browser_args.extend(extra_args.iter().map(|arg| arg.to_string()));
+            browser_args.push(format!("--user-data-dir={}", profile_dir.path().display()));
+            browser_args.push("about:blank".to_string());
+            let plan = prepare_browser_spawn(executable, &browser_args, profile_dir.path())?;
+            let mut child = Command::new(plan.backend_argv.first().ok_or_else(|| {
+                AcError::validation("BROWSER-SANDBOX_PLAN", "sandbox plan has no executable")
+            })?)
+            .args(plan.backend_argv.iter().skip(1))
+            .current_dir(plan.cwd)
+            .env_clear()
+            .envs(plan.allowed_env)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .map_err(|err| {
+                AcError::new(
+                    "BROWSER-LAUNCH_FAILED",
+                    err.to_string(),
+                    ac_common::ErrorKind::Unavailable,
+                    ac_common::Retryability::NotRetryable,
+                )
+            })?;
+            let (port, browser_ws_path) =
+                match wait_for_devtools_port(profile_dir.path(), &mut child) {
+                    Ok(found) => found,
+                    Err(err) => {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        return Err(err);
+                    }
+                };
+            Ok((child, profile_dir, port, browser_ws_path))
+        };
+
+        let (mut child, profile_dir, port, browser_ws_path) = attempt(&[])?;
+        if probe_chrome_browser_endpoint(port, &browser_ws_path).is_ok() {
+            return Ok((child, profile_dir, port, browser_ws_path, false));
+        }
+        // The host cannot support Chrome's internal sandbox profile (its
+        // DevTools session dies when a page session attaches).  Relaunch once
+        // with Chrome's internal sandbox disabled; AgentCode's own
+        // process-restricted sandbox boundary still wraps the browser.
+        let _ = child.kill();
+        let _ = child.wait();
+        let (child, profile_dir, port, browser_ws_path) = attempt(&["--no-sandbox"])?;
+        probe_chrome_browser_endpoint(port, &browser_ws_path).map_err(|_| {
+            AcError::new(
+                "BROWSER-LAUNCH_FAILED",
+                "Chrome DevTools endpoint did not stay reachable even with its internal sandbox disabled",
+                ac_common::ErrorKind::Unavailable,
+                ac_common::Retryability::NotRetryable,
+            )
+        })?;
+        Ok((child, profile_dir, port, browser_ws_path, true))
     }
 
     fn real_page_mut(&mut self, session_id: &StableId) -> AcResult<&mut RealBrowserPage> {
@@ -1979,7 +2038,70 @@ impl Drop for BrowserRuntime {
 }
 
 impl RealBrowserPage {
-    fn create(port: u16) -> AcResult<Self> {
+    fn create(port: u16, browser_ws_path: &str) -> AcResult<Self> {
+        // Chrome 111+ deprecated the HTTP PUT /json/new flow: the devtools
+        // HTTP listener dies after serving it, and page-endpoint websocket
+        // handshakes return 404.  When DevToolsActivePort publishes a browser
+        // endpoint path (all modern Chrome does), connect there and drive the
+        // page through Target.createTarget + a flat session.  Only fall back
+        // to the legacy page-websocket flow on old Chrome versions that
+        // neither publish the browser path nor support the flat protocol.
+        let browser_ws_url = if browser_ws_path.starts_with('/') {
+            Some(format!("ws://127.0.0.1:{port}{browser_ws_path}"))
+        } else if browser_ws_path.starts_with("ws") {
+            Some(browser_ws_path.to_string())
+        } else {
+            None
+        };
+        if let Some(browser_ws_url) = browser_ws_url {
+            let mut client = CdpClient::connect(&browser_ws_url)?;
+            let target = client.call(
+                "Target.createTarget",
+                json!({ "url": "about:blank", "background": false }),
+            )?;
+            let target_id = target
+                .get("targetId")
+                .and_then(Value::as_str)
+                .ok_or_else(|| {
+                    AcError::validation(
+                        "BROWSER-CDP_TARGET",
+                        "Chrome did not return a targetId for the new page",
+                    )
+                })?
+                .to_string();
+            let session = client.call(
+                "Target.attachToTarget",
+                json!({ "targetId": target_id, "flatten": true }),
+            )?;
+            let session_id = session
+                .get("sessionId")
+                .and_then(Value::as_str)
+                .ok_or_else(|| {
+                    AcError::validation(
+                        "BROWSER-CDP_TARGET",
+                        "Chrome did not return a sessionId for the attached page",
+                    )
+                })?
+                .to_string();
+            client.session_id = Some(session_id);
+            Self::enable_page_domains(&mut client)?;
+            return Ok(Self {
+                client,
+                url: "about:blank".to_string(),
+                viewport: default_viewports()[2],
+            });
+        }
+        // Legacy path: old Chrome served page websockets directly.
+        let mut client = Self::connect_page_ws(port)?;
+        Self::enable_page_domains(&mut client)?;
+        Ok(Self {
+            client,
+            url: "about:blank".to_string(),
+            viewport: default_viewports()[2],
+        })
+    }
+
+    fn connect_page_ws(port: u16) -> AcResult<CdpClient> {
         let target = http_request_json("PUT", port, "/json/new?about:blank")
             .or_else(|_| http_request_json("GET", port, "/json/new?about:blank"))?;
         let ws_url = target
@@ -1990,18 +2112,22 @@ impl RealBrowserPage {
                     "BROWSER-CDP_TARGET",
                     "Chrome did not return a page websocket URL",
                 )
-            })?;
-        let mut client = CdpClient::connect(ws_url)?;
-        client.call("Page.enable", json!({}))?;
-        client.call("Runtime.enable", json!({}))?;
-        client.call("DOM.enable", json!({}))?;
-        client.call("Network.enable", json!({}))?;
-        client.call("Accessibility.enable", json!({}))?;
-        Ok(Self {
-            client,
-            url: "about:blank".to_string(),
-            viewport: default_viewports()[2],
-        })
+            })?
+            .to_string();
+        CdpClient::connect(&ws_url)
+    }
+
+    fn enable_page_domains(client: &mut CdpClient) -> AcResult<()> {
+        for method in [
+            "Page.enable",
+            "Runtime.enable",
+            "DOM.enable",
+            "Network.enable",
+            "Accessibility.enable",
+        ] {
+            client.call(method, json!({}))?;
+        }
+        Ok(())
     }
 
     fn navigate(&mut self, url: &str) -> AcResult<()> {
@@ -2207,6 +2333,7 @@ impl CdpClient {
         Ok(Self {
             socket,
             next_id: 1,
+            session_id: None,
             console_errors: Vec::new(),
             page_errors: Vec::new(),
             network_failures: Vec::new(),
@@ -2223,11 +2350,14 @@ impl CdpClient {
     fn call_until(&mut self, method: &str, params: Value, deadline: Instant) -> AcResult<Value> {
         let id = self.next_id;
         self.next_id += 1;
-        let payload = json!({
+        let mut payload = json!({
             "id": id,
             "method": method,
             "params": params,
         });
+        if let Some(session_id) = &self.session_id {
+            payload["sessionId"] = json!(session_id);
+        }
         self.socket
             .send(Message::Text(payload.to_string().into()))
             .map_err(|err| AcError::validation("BROWSER-CDP_SEND", err.to_string()))?;
@@ -2551,6 +2681,7 @@ fn prepare_browser_spawn(
         max_timeout_ms: 60_000,
         required_isolation: IsolationLevel::ProcessRestricted,
         max_output_bytes: 1024 * 1024,
+        allow_degraded_execution: false,
     };
     SandboxManager::with_backend(policy, Box::new(ProcessRestrictedBackend)).prepare_execution(
         ExecRequest {
@@ -2563,7 +2694,54 @@ fn prepare_browser_spawn(
     )
 }
 
-fn wait_for_devtools_port(profile_dir: &Path, child: &mut Child) -> AcResult<u16> {
+/// Verify that Chrome's browser DevTools endpoint accepts a websocket and
+/// survives a full create-target + attach + page-command round trip.  On
+/// hosts whose OS cannot provide the seatbelt profile Chrome's internal
+/// sandbox needs, the first page-scoped command tears the connection down;
+/// this probe makes that failure observable before the process record is
+/// published, so the caller can relaunch with honest degradation evidence.
+fn probe_chrome_browser_endpoint(port: u16, browser_ws_path: &str) -> AcResult<()> {
+    if !browser_ws_path.starts_with('/') {
+        return Ok(());
+    }
+    let ws_url = format!("ws://127.0.0.1:{port}{browser_ws_path}");
+    let mut client = CdpClient::connect(&ws_url)?;
+    let target = client.call(
+        "Target.createTarget",
+        json!({ "url": "about:blank", "background": false }),
+    )?;
+    let target_id = target
+        .get("targetId")
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            AcError::validation("BROWSER-CDP_TARGET", "Chrome did not return a targetId")
+        })?
+        .to_string();
+    let session = client.call(
+        "Target.attachToTarget",
+        json!({ "targetId": target_id, "flatten": true }),
+    )?;
+    let session_id = session
+        .get("sessionId")
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            AcError::validation("BROWSER-CDP_TARGET", "Chrome did not return a sessionId")
+        })?
+        .to_string();
+    client.session_id = Some(session_id.clone());
+    client.call("Page.enable", json!({}))?;
+    client
+        .call("Runtime.evaluate", json!({ "expression": "1+1" }))?
+        .get("result")
+        .ok_or_else(|| {
+            AcError::validation("BROWSER-CDP_TARGET", "probe evaluation returned no result")
+        })?;
+    client.session_id = None;
+    let _ = client.call("Target.closeTarget", json!({ "targetId": target_id }));
+    Ok(())
+}
+
+fn wait_for_devtools_port(profile_dir: &Path, child: &mut Child) -> AcResult<(u16, String)> {
     let port_file = profile_dir.join("DevToolsActivePort");
     let deadline = Instant::now() + Duration::from_secs(8);
     while Instant::now() < deadline {
@@ -2583,8 +2761,19 @@ fn wait_for_devtools_port(profile_dir: &Path, child: &mut Child) -> AcResult<u16
             ));
         }
         if let Ok(contents) = fs::read_to_string(&port_file) {
-            if let Some(port) = contents.lines().next().and_then(|line| line.parse().ok()) {
-                return Ok(port);
+            let mut lines = contents.lines();
+            if let Some(port) = lines.next().and_then(|line| line.parse().ok()) {
+                // Second line carries the browser websocket path token.  Modern
+                // Chrome (111+) only accepts websocket handshakes on endpoints
+                // listed here; direct /devtools/page/<id> handshakes return 404.
+                let browser_path = lines
+                    .next()
+                    .map(|line| line.trim().to_string())
+                    .unwrap_or_default();
+                if !browser_path.is_empty() && browser_path.starts_with('/') {
+                    return Ok((port, browser_path));
+                }
+                return Ok((port, String::new()));
             }
         }
         thread::sleep(Duration::from_millis(50));

@@ -113,6 +113,15 @@ pub struct SandboxPolicy {
     pub max_timeout_ms: u64,
     pub required_isolation: IsolationLevel,
     pub max_output_bytes: usize,
+    /// Honesty-preserving degraded execution (Doc 04 §80-81): when the
+    /// selected backend cannot deliver the requested OS isolation, a
+    /// trusted-workspace profile may explicitly opt in to executing at the
+    /// backend's proven level instead of failing closed.  The evidence
+    /// always records the requested level separately from the achieved
+    /// level, so a degraded run is never reported as fully isolated.
+    /// Levels above `ProcessRestricted` (network/strong) never degrade —
+    /// they fail closed regardless of this flag.
+    pub allow_degraded_execution: bool,
 }
 
 impl SandboxPolicy {
@@ -124,6 +133,7 @@ impl SandboxPolicy {
             max_timeout_ms: 60_000,
             required_isolation: IsolationLevel::FilesystemIsolated,
             max_output_bytes: 1024 * 1024,
+            allow_degraded_execution: false,
         }
     }
 }
@@ -287,16 +297,40 @@ impl SandboxManager {
         } else {
             NetworkPolicy::DenyAll
         };
-        let prepared = self.backend.prepare(&SandboxBackendRequest {
+        let requested_isolation = self.policy.required_isolation;
+        let mut backend_request = SandboxBackendRequest {
             argv: request.argv.clone(),
             cwd: cwd.clone(),
             allowed_env: request.env.clone(),
             workspace_roots: self.policy.workspace_roots.clone(),
             timeout_ms: request.timeout_ms,
             network_policy,
-            required_isolation: self.policy.required_isolation,
+            required_isolation: requested_isolation,
             max_output_bytes: self.policy.max_output_bytes,
-        })?;
+        };
+        let prepared = match self.backend.prepare(&backend_request) {
+            Ok(prepared) => prepared,
+            Err(error)
+                if self.policy.allow_degraded_execution
+                    && requested_isolation <= IsolationLevel::FilesystemIsolated
+                    && matches!(
+                        error.code(),
+                        "SANDBOX-ISOLATION_UNSUPPORTED" | "SANDBOX-UNAVAILABLE"
+                    ) =>
+            {
+                // Doc 04 §80-81: the configured backend cannot deliver the
+                // requested OS isolation.  A trusted-workspace profile that
+                // opted into degraded execution retries at the process-
+                // restricted level; the evidence keeps the ORIGINAL requested
+                // level so the run is never reported as fully isolated.
+                // Network/strong requirements never degrade (guarded above).
+                backend_request.required_isolation = IsolationLevel::ProcessRestricted;
+                let mut prepared = self.backend.prepare(&backend_request)?;
+                prepared.evidence.requested_isolation = requested_isolation;
+                prepared
+            }
+            Err(error) => return Err(error),
+        };
         Ok(SandboxedExecutionPlan {
             id: StableId::new("exec"),
             argv: request.argv,
@@ -1076,6 +1110,129 @@ mod tests {
         assert!(!text.contains(&escape_profile_string(&target.display().to_string())));
         assert!(!text.contains(&escape_profile_string(&link.display().to_string())));
         let _ = std::fs::remove_file(profile);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn degraded_execution_records_requested_and_achieved_isolation_honestly() {
+        // Doc 04 §80-81: a trusted-workspace profile that opted into degraded
+        // execution runs at the backend's proven level when filesystem
+        // isolation is unavailable — and the evidence keeps the requested
+        // level so the run is never reported as fully isolated.
+        let root = std::env::temp_dir().join(format!("agentcode-sandbox-{}", StableId::new("t")));
+        std::fs::create_dir_all(&root).unwrap();
+        let manager = SandboxManager::with_backend(
+            SandboxPolicy {
+                capability_policy: CapabilityPolicy::new()
+                    .allow(Capability::ProcessExec("*".to_string())),
+                allow_degraded_execution: true,
+                ..SandboxPolicy::new(vec![root.clone()])
+            },
+            Box::new(ProcessRestrictedBackend),
+        );
+        let plan = manager
+            .prepare_execution(ExecRequest {
+                argv: vec!["/bin/echo".to_string(), "degraded-ok".to_string()],
+                cwd: root.clone(),
+                env: BTreeMap::new(),
+                network: false,
+                timeout_ms: 1_000,
+            })
+            .unwrap();
+        assert_eq!(
+            plan.sandbox_evidence.requested_isolation,
+            IsolationLevel::FilesystemIsolated,
+            "evidence must retain the originally requested isolation level"
+        );
+        assert_eq!(
+            plan.sandbox_evidence.achieved_isolation,
+            IsolationLevel::ProcessRestricted,
+            "degraded run must be reported at the level actually achieved"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn degraded_execution_never_applies_without_opt_in() {
+        // Policies that did not opt in (e.g. arbitrary cmd.exec) keep
+        // failing closed when the backend cannot deliver the requested level.
+        let root = std::env::temp_dir().join(format!("agentcode-sandbox-{}", StableId::new("t")));
+        std::fs::create_dir_all(&root).unwrap();
+        let manager = SandboxManager::with_backend(
+            SandboxPolicy {
+                capability_policy: CapabilityPolicy::new()
+                    .allow(Capability::ProcessExec("*".to_string())),
+                ..SandboxPolicy::new(vec![root.clone()])
+            },
+            Box::new(ProcessRestrictedBackend),
+        );
+        let err = manager
+            .prepare_execution(ExecRequest {
+                argv: vec!["/bin/echo".to_string(), "blocked".to_string()],
+                cwd: root.clone(),
+                env: BTreeMap::new(),
+                network: false,
+                timeout_ms: 1_000,
+            })
+            .unwrap_err();
+        assert_eq!(err.code(), "SANDBOX-ISOLATION_UNSUPPORTED");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn degraded_execution_never_weakens_network_isolated_requirements() {
+        // Levels above FilesystemIsolated never degrade, even when the policy
+        // opted in — network/strong isolation fails closed.
+        let root = std::env::temp_dir().join(format!("agentcode-sandbox-{}", StableId::new("t")));
+        std::fs::create_dir_all(&root).unwrap();
+        let manager = SandboxManager::with_backend(
+            SandboxPolicy {
+                capability_policy: CapabilityPolicy::new()
+                    .allow(Capability::ProcessExec("*".to_string())),
+                required_isolation: IsolationLevel::NetworkIsolated,
+                allow_degraded_execution: true,
+                ..SandboxPolicy::new(vec![root.clone()])
+            },
+            Box::new(ProcessRestrictedBackend),
+        );
+        let err = manager
+            .prepare_execution(ExecRequest {
+                argv: vec!["/bin/echo".to_string(), "blocked".to_string()],
+                cwd: root.clone(),
+                env: BTreeMap::new(),
+                network: false,
+                timeout_ms: 1_000,
+            })
+            .unwrap_err();
+        assert_eq!(err.code(), "SANDBOX-ISOLATION_UNSUPPORTED");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn degraded_execution_does_not_mask_non_isolation_failures() {
+        // A backend failure that is NOT an isolation capability gap (e.g.
+        // invalid command) must surface as-is even in degraded policies.
+        let root = std::env::temp_dir().join(format!("agentcode-sandbox-{}", StableId::new("t")));
+        std::fs::create_dir_all(&root).unwrap();
+        let manager = SandboxManager::with_backend(
+            SandboxPolicy {
+                capability_policy: CapabilityPolicy::new()
+                    .allow(Capability::ProcessExec("*".to_string())),
+                allow_degraded_execution: true,
+                ..SandboxPolicy::new(vec![root.clone()])
+            },
+            Box::new(ProcessRestrictedBackend),
+        );
+        let err = manager
+            .prepare_execution(ExecRequest {
+                argv: vec![String::new()],
+                cwd: root.clone(),
+                env: BTreeMap::new(),
+                network: false,
+                timeout_ms: 1_000,
+            })
+            .unwrap_err();
+        assert_eq!(err.code(), "SANDBOX-INVALID_COMMAND");
         let _ = std::fs::remove_dir_all(root);
     }
 }
