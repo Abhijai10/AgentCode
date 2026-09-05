@@ -850,7 +850,11 @@ Rules: describe only what is actually visible. Each array holds short factual st
             viewport,
             &mut evidence_store,
         )?;
-        let _ = browser.mark_crashed(&process.id);
+        // Batch N2: SUCCESS path closes the browser gracefully (CDP
+        // Browser.close) — a forced SIGKILL here is what produced the
+        // user-visible "Chrome quit unexpectedly" dialogs after every
+        // visual-critic run.
+        let _ = browser.close_process(&process.id);
 
         // Read the real screenshot bytes for the vision model.
         let screenshot_bytes = std::fs::read(&screenshot.artifact_uri).map_err(|err| {
@@ -2041,7 +2045,8 @@ port: port.map(|p| p as i64),
             updated_at_ms: now,
         });
 
-        let _ = browser.mark_crashed(&process.id);
+        // Batch N2: graceful close on the success path (was a forced kill).
+        let _ = browser.close_process(&process.id);
         Ok(report)
     }
 
