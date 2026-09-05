@@ -356,6 +356,99 @@ fn dispatch_request(request: &Value, daemon: &mut DaemonService) -> (Value, bool
             },
             None => error_response(correlation_id, "DAEMON-IPC_INVALID", "account_id is required".to_string()),
         },
+        "ProviderPreferencesGet" => {
+            let preference = daemon
+                .db
+                .provider_preference("global")
+                .map(|row| {
+                    json!({
+                        "routing_profile": row.as_ref().map(|r| r.routing_profile.clone()).unwrap_or_else(|| "LocalFirst".to_string()),
+                        "preferred_model": row.as_ref().map(|r| r.preferred_model.clone()).unwrap_or_default(),
+                        "updated_at_ms": row.as_ref().map(|r| r.updated_at_ms).unwrap_or(0),
+                        "configured": row.is_some(),
+                    })
+                })
+                .unwrap_or_else(|error| {
+                    json!({
+                        "routing_profile": "LocalFirst",
+                        "preferred_model": "",
+                        "updated_at_ms": 0,
+                        "configured": false,
+                        "error": error.to_string(),
+                    })
+                });
+            json!({"id": correlation_id, "ok": true, "preferences": preference})
+        }
+        "ProviderPreferencesSet" => {
+            let routing_profile = request.get("routing_profile").and_then(Value::as_str).unwrap_or("");
+            let preferred_model = request.get("preferred_model").and_then(Value::as_str).unwrap_or("");
+            let valid = ["FreeOnly", "FreeFirst", "LocalFirst", "QualityFirst", "PaidAllowed", "Offline"];
+            if !valid.contains(&routing_profile) {
+                error_response(
+                    correlation_id,
+                    "PROVIDER-PREFERENCES_INVALID_PROFILE",
+                    format!("routing_profile must be one of: {}", valid.join(", ")),
+                )
+            } else {
+            let row = ac_db::ProviderPreferenceRow {
+                id: "global".to_string(),
+                routing_profile: routing_profile.to_string(),
+                preferred_model: preferred_model.trim().to_string(),
+                updated_at_ms: ac_common::TimestampMillis::now().as_millis() as i64,
+            };
+            match daemon.db.save_provider_preference(&row) {
+                Ok(()) => json!({"id": correlation_id, "ok": true, "preferences": {
+                    "routing_profile": row.routing_profile,
+                    "preferred_model": row.preferred_model,
+                    "updated_at_ms": row.updated_at_ms,
+                    "configured": true,
+                }}),
+                Err(error) => error_response(correlation_id, error.code(), error.to_string()),
+            }
+            }
+        }
+        "ProviderHealthGet" => {
+            // Batch N1 (G2): surface real failover/health evidence — per
+            // account health observations from SQLite plus each provider
+            // catalog entry's health_state.  Display-only; routing stays
+            // backend-owned.
+            let mut observations = Vec::new();
+            if let Ok(entries) = daemon.db.provider_catalog_entries() {
+                for entry in entries {
+                    if let Ok(accounts) = daemon.db.provider_accounts(&entry.id) {
+                        for account in accounts {
+                            if let Ok(rows) = daemon.db.provider_health_observations(&account.id, 10) {
+                                for row in rows {
+                                    observations.push(json!({
+                                        "account_id": account.id,
+                                        "provider_id": account.provider_id,
+                                        "success": row.success,
+                                        "latency_ms": row.latency_ms,
+                                        "failure_code": row.failure_code,
+                                        "failure_message": row.failure_message,
+                                        "observed_at_ms": row.observed_at_ms,
+                                    }));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            let mut catalog = Vec::new();
+            if let Ok(entries) = daemon.db.provider_catalog_entries() {
+                for entry in entries {
+                    catalog.push(json!({
+                        "id": entry.id,
+                        "display_name": entry.display_name,
+                        "pricing_classification": entry.pricing_classification,
+                    }));
+                }
+            }
+            json!({"id": correlation_id, "ok": true, "health": {
+                "observations": observations,
+                "catalog": catalog,
+            }})
+        }
         "CreateProviderAccount" => {
             let provider_id = request.get("provider_id").and_then(Value::as_str).unwrap_or("");
             let label = request.get("label").and_then(Value::as_str).unwrap_or("");
@@ -1618,6 +1711,91 @@ mod ipc_tests {
         });
         pump_until(server, listener, daemon, &client);
         client.join().unwrap()
+    }
+
+    /// Batch N1: provider/routing preferences persist through IPC, invalid
+    /// profiles are rejected with an honest error, the persisted profile
+    /// governs daemon routing (preferred_routing_profile), and preferences
+    /// survive a daemon restart (fresh open on the same DB).
+    #[test]
+    fn provider_preferences_persist_and_govern_routing() {
+        let _env_lock = crate::TEST_ENV_LOCK.lock().unwrap();
+        std::env::set_var("AGENTCODE_PROVIDER_MODE", "mock");
+        let (dir, db, lock, socket) = temp_paths("ipc-provider-prefs");
+
+        let mut daemon = DaemonService::open(&db, &lock).unwrap();
+        daemon.start().unwrap();
+        let Some((server, listener)) = bind_or_skip(&socket, None) else {
+            daemon.shutdown().unwrap();
+            std::env::remove_var("AGENTCODE_PROVIDER_MODE");
+            let _ = fs::remove_dir_all(dir);
+            return;
+        };
+
+        // 1) Default state: unconfigured, falls back to LocalFirst.
+        let get0 = request_via_ipc(
+            &server, &listener, &mut daemon,
+            json!({"id":"p0","command":"ProviderPreferencesGet"}),
+        );
+        assert_eq!(get0["ok"], true, "get0: {get0}");
+        assert_eq!(get0["preferences"]["configured"], false);
+        assert_eq!(get0["preferences"]["routing_profile"], "LocalFirst");
+        assert_eq!(daemon.preferred_routing_profile(), ac_provider::RoutingProfile::LocalFirst);
+
+        // 2) Set a valid preference.
+        let set = request_via_ipc(
+            &server, &listener, &mut daemon,
+            json!({"id":"p1","command":"ProviderPreferencesSet","routing_profile":"QualityFirst","preferred_model":"qwen2.5-coder:3b"}),
+        );
+        assert_eq!(set["ok"], true, "set: {set}");
+        assert_eq!(set["preferences"]["routing_profile"], "QualityFirst");
+        assert_eq!(set["preferences"]["preferred_model"], "qwen2.5-coder:3b");
+
+        // 3) The daemon routing now reflects it.
+        assert_eq!(daemon.preferred_routing_profile(), ac_provider::RoutingProfile::QualityFirst);
+        assert_eq!(daemon.preferred_model(), "qwen2.5-coder:3b");
+
+        // 4) Invalid profile rejected honestly.
+        let bad = request_via_ipc(
+            &server, &listener, &mut daemon,
+            json!({"id":"p2","command":"ProviderPreferencesSet","routing_profile":"Bogus"}),
+        );
+        assert_eq!(bad["ok"], false);
+        assert_eq!(bad["error"]["code"], "PROVIDER-PREFERENCES_INVALID_PROFILE");
+
+        // 5) Read-back round-trip.
+        let get1 = request_via_ipc(
+            &server, &listener, &mut daemon,
+            json!({"id":"p3","command":"ProviderPreferencesGet"}),
+        );
+        assert_eq!(get1["ok"], true);
+        assert_eq!(get1["preferences"]["configured"], true);
+        assert_eq!(get1["preferences"]["routing_profile"], "QualityFirst");
+
+        // 6) Health endpoint is well-formed (display-only evidence).
+        let health = request_via_ipc(
+            &server, &listener, &mut daemon,
+            json!({"id":"p4","command":"ProviderHealthGet"}),
+        );
+        assert_eq!(health["ok"], true, "health: {health}");
+        assert!(health["health"]["observations"].is_array());
+        assert!(health["health"]["catalog"].is_array());
+
+        // 7) Persistence across restart: fresh daemon on the same DB.
+        server.cleanup();
+        daemon.shutdown().unwrap();
+        let mut daemon2 = DaemonService::open(&db, &lock).unwrap();
+        daemon2.start().unwrap();
+        assert_eq!(
+            daemon2.preferred_routing_profile(),
+            ac_provider::RoutingProfile::QualityFirst,
+            "persisted preference must survive restart"
+        );
+        assert_eq!(daemon2.preferred_model(), "qwen2.5-coder:3b");
+        daemon2.shutdown().unwrap();
+
+        std::env::remove_var("AGENTCODE_PROVIDER_MODE");
+        let _ = fs::remove_dir_all(dir);
     }
 
     #[test]

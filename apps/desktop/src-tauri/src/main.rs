@@ -423,6 +423,33 @@ fn daemon_list_providers(state: tauri::State<DaemonClient>) -> Result<Value, Str
     provider_catalog(&state.0)
 }
 
+/// Batch N1: persisted provider/routing preferences (display + set; all
+/// routing logic remains backend-owned — the UI never routes).
+#[tauri::command]
+fn daemon_provider_preferences_get(state: tauri::State<DaemonClient>) -> Result<Value, String> {
+    request(&state.0, "ui", "ProviderPreferencesGet", json!({}))
+}
+
+#[tauri::command]
+fn daemon_provider_preferences_set(
+    state: tauri::State<DaemonClient>,
+    routing_profile: String,
+    preferred_model: String,
+) -> Result<Value, String> {
+    request(
+        &state.0,
+        "ui",
+        "ProviderPreferencesSet",
+        json!({ "routing_profile": routing_profile, "preferred_model": preferred_model }),
+    )
+}
+
+/// Batch N1 (G2): real failover/health evidence for the Providers panel.
+#[tauri::command]
+fn daemon_provider_health_get(state: tauri::State<DaemonClient>) -> Result<Value, String> {
+    request(&state.0, "ui", "ProviderHealthGet", json!({}))
+}
+
 /// Store a credential in the backend-owned secret store and create a provider
 /// account that references it.  The raw key transits only to the daemon's
 /// secret store; the UI never receives or persists the raw secret after save.
@@ -1968,6 +1995,9 @@ fn main() {
             daemon_resume_mission,
             daemon_cancel_mission,
             daemon_list_providers,
+            daemon_provider_preferences_get,
+            daemon_provider_preferences_set,
+            daemon_provider_health_get,
             daemon_add_account,
             daemon_test_connection,
             daemon_set_account_enabled,

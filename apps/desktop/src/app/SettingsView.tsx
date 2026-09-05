@@ -63,6 +63,74 @@ export function SettingsView() {
   const [testing, setTesting] = useState(false);
   const [saving, setSaving] = useState(false);
   const [providerSearch, setProviderSearch] = useState("");
+  // Batch N1: persisted provider/routing preferences (daemon-owned).
+  const [providerPrefs, setProviderPrefs] = useState<{
+    routing_profile: string;
+    preferred_model: string;
+    updated_at_ms: number;
+    configured: boolean;
+  } | null>(null);
+  const [pendingPreferredModel, setPendingPreferredModel] = useState<string | null>(null);
+  const [prefsError, setPrefsError] = useState<string | null>(null);
+  // G2: real failover/health evidence (display-only; routing stays backend-owned).
+  const [providerHealth, setProviderHealth] = useState<{
+    observations: {
+      account_id: string;
+      provider_id: string;
+      success: boolean;
+      latency_ms: number;
+      failure_code: string;
+      failure_message: string;
+      observed_at_ms: number;
+    }[];
+    catalog: { id: string; display_name: string; pricing_classification: string }[];
+  } | null>(null);
+
+  const loadProviderHealth = () => {
+    daemon.providerHealthGet().then((res) => {
+      if (res.ok && res.health) setProviderHealth(res.health);
+    });
+  };
+
+  const loadProviderPrefs = () => {
+    daemon.providerPreferencesGet().then((res) => {
+      if (res.ok && res.preferences) {
+        setProviderPrefs(res.preferences);
+        setPrefsError(null);
+      } else if (res.error) {
+        setPrefsError(res.error);
+      }
+    });
+  };
+
+  const persistPrefs = (profile: string | null, model: string | null) => {
+    const routingProfile = profile ?? providerPrefs?.routing_profile ?? "LocalFirst";
+    const preferredModel = model ?? pendingPreferredModel ?? providerPrefs?.preferred_model ?? "";
+    daemon
+      .providerPreferencesSet(routingProfile, preferredModel)
+      .then((res) => {
+        if (res.ok) {
+          loadProviderPrefs();
+          setPrefsError(null);
+        } else {
+          setPrefsError(res.error ?? "failed to persist preferences");
+        }
+      });
+  };
+
+  const handleRoutingProfileChange = (profile: string) => {
+    setProviderPrefs((prev) =>
+      prev ? { ...prev, routing_profile: profile } : prev
+    );
+    persistPrefs(profile, null);
+  };
+
+  const handlePreferredModelSave = () => {
+    if (pendingPreferredModel === null) return;
+    persistPrefs(null, pendingPreferredModel);
+    setPendingPreferredModel(null);
+  };
+
   const [providerCategoryFilter, setProviderCategoryFilter] = useState<string | null>(null);
   const [rotateAccountId, setRotateAccountId] = useState<string | null>(null);
   const [rotateKey, setRotateKey] = useState("");
@@ -125,6 +193,12 @@ export function SettingsView() {
   };
 
   useEffect(() => {
+    if (tab === "autonomy") {
+      loadProviderPrefs();
+    }
+  }, [tab]);
+
+  useEffect(() => {
     if (tab === "providers") {
       let cancelled = false;
       const refresh = async () => {
@@ -134,6 +208,8 @@ export function SettingsView() {
         }
       };
       refresh();
+      loadProviderPrefs();
+      loadProviderHealth();
       return () => {
         cancelled = true;
       };
@@ -175,6 +251,26 @@ export function SettingsView() {
                 <h3 className="font-semibold text-2xl text-on-surface">Providers & Models</h3>
                 <p className="text-on-surface-variant mt-2">Configure AI providers and manage model routing.</p>
               </div>
+
+              {/* G2: real failover/health evidence from the daemon. */}
+              {providerHealth && providerHealth.observations.length > 0 && (
+                <div className="neo-raised p-4 rounded-2xl mb-6">
+                  <p className="text-sm font-medium text-on-surface mb-2">
+                    Provider Health &amp; Failover (recent observations)
+                  </p>
+                  <div className="space-y-1 max-h-40 overflow-y-auto">
+                    {providerHealth.observations.slice(0, 12).map((obs, i) => (
+                      <p key={i} className="text-[11px] text-on-surface-variant">
+                        <span className={obs.success ? "text-emerald-600" : "text-red-600"}>
+                          {obs.success ? "ok" : obs.failure_code || "failed"}
+                        </span>{" "}
+                        · {obs.provider_id} · {obs.latency_ms}ms ·{" "}
+                        {new Date(obs.observed_at_ms).toLocaleTimeString()}
+                      </p>
+                    ))}
+                  </div>
+                </div>
+              )}
 
               {/* Search + filters */}
               <div className="neo-raised p-4 rounded-2xl mb-6 flex flex-col gap-3">
@@ -555,17 +651,44 @@ export function SettingsView() {
               <div className="space-y-6">
                 <div className="neo-pressed rounded-xl p-4">
                   <p className="text-sm font-medium text-on-surface mb-1">Default Model Routing</p>
-                  <p className="text-sm text-on-surface-variant">
-                    Not available in this build — the daemon IPC does not expose a routing-profile override.
-                    Routing is determined by the daemon's own provider configuration.
+                  <p className="text-xs text-on-surface-variant mb-2">
+                    Persisted in the daemon (SQLite) and applied to every mode's provider routing.
                   </p>
+                  <select
+                    className="neo-input w-full py-2 px-3 rounded-xl text-sm text-on-surface"
+                    value={providerPrefs?.routing_profile ?? "LocalFirst"}
+                    onChange={(e) => handleRoutingProfileChange(e.target.value)}
+                  >
+                    <option value="LocalFirst">Local-first (prefer local models)</option>
+                    <option value="QualityFirst">Quality-first (best available)</option>
+                    <option value="FreeFirst">Free-first (prefer free tiers)</option>
+                    <option value="FreeOnly">Free-only (never paid)</option>
+                    <option value="PaidAllowed">Paid allowed</option>
+                    <option value="Offline">Offline (local only)</option>
+                  </select>
+                  {prefsError && (
+                    <p className="text-xs text-red-600 mt-2">{prefsError}</p>
+                  )}
                 </div>
                 <div className="neo-pressed rounded-xl p-4">
                   <p className="text-sm font-medium text-on-surface mb-1">Preferred Model</p>
-                  <p className="text-sm text-on-surface-variant">
-                    Not available in this build — the daemon IPC does not expose a preferred-model override.
-                    The daemon selects its model from its provider configuration (e.g. the Ollama default).
+                  <p className="text-xs text-on-surface-variant mb-2">
+                    Optional model name hint (e.g. qwen2.5-coder:3b). Empty means no preference —
+                    routing follows the profile.
                   </p>
+                  <input
+                    type="text"
+                    className="neo-input w-full py-2 px-3 rounded-xl text-sm text-on-surface"
+                    placeholder="e.g. qwen2.5-coder:3b"
+                    value={providerPrefs?.preferred_model ?? ""}
+                    onChange={(e) => setPendingPreferredModel(e.target.value)}
+                    onBlur={() => handlePreferredModelSave()}
+                  />
+                  {providerPrefs?.configured && (
+                    <p className="text-[10px] text-on-surface-variant mt-1">
+                      persisted (updated {new Date(providerPrefs.updated_at_ms).toLocaleString()})
+                    </p>
+                  )}
                 </div>
                 <div>
                   <label className="block text-sm text-on-surface-variant mb-2">Budget Limit (micros, optional)</label>

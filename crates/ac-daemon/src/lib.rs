@@ -1676,6 +1676,28 @@ impl DaemonService {
         daemon_provider_registry(&self.db, &self.db_path)
     }
 
+    /// Batch N1 (G1): the user's persisted routing profile, with a safe
+    /// fallback to LocalFirst when nothing (or something invalid) is
+    /// stored.  Production call sites use this instead of hardcoding a
+    /// profile, so the Settings control actually governs routing.
+    pub fn preferred_routing_profile(&self) -> ac_provider::RoutingProfile {
+        match self.db.provider_preference("global") {
+            Ok(Some(row)) => parse_routing_profile(&row.routing_profile),
+            _ => ac_provider::RoutingProfile::LocalFirst,
+        }
+    }
+
+    /// Batch N1 (G1): the persisted preferred-model hint (may be empty,
+    /// meaning "no preference" — routing then follows the profile only).
+    pub fn preferred_model(&self) -> String {
+        self.db
+            .provider_preference("global")
+            .ok()
+            .flatten()
+            .map(|row| row.preferred_model)
+            .unwrap_or_default()
+    }
+
     pub fn handle(&mut self, command: DaemonCommand) -> AcResult<DaemonResponse> {
         match command {
             DaemonCommand::Health => Ok(DaemonResponse::Health(self.health())),
@@ -1935,6 +1957,21 @@ fn db_account_to_ac(row: ac_db::ProviderAccountRow) -> AcResult<CatalogAccount> 
         last_failure_at_ms: row.last_failure_at_ms.map(|v| v as u64),
         failure_reason: row.failure_reason,
     })
+}
+
+/// Parse a persisted routing-profile name into the enum.  Unknown values
+/// fall back to LocalFirst (safe, offline-capable default) — a corrupted
+/// preference must never make routing fail closed.
+pub fn parse_routing_profile(value: &str) -> ac_provider::RoutingProfile {
+    match value {
+        "FreeOnly" => ac_provider::RoutingProfile::FreeOnly,
+        "FreeFirst" => ac_provider::RoutingProfile::FreeFirst,
+        "LocalFirst" => ac_provider::RoutingProfile::LocalFirst,
+        "QualityFirst" => ac_provider::RoutingProfile::QualityFirst,
+        "PaidAllowed" => ac_provider::RoutingProfile::PaidAllowed,
+        "Offline" => ac_provider::RoutingProfile::Offline,
+        _ => ac_provider::RoutingProfile::LocalFirst,
+    }
 }
 
 /// Build a ProviderRegistry from the durable catalog + environment,

@@ -381,7 +381,7 @@ impl DaemonService {
         let mut providers = crate::daemon_provider_registry(&self.db, &db_path).ok()?;
         let mut profile = ac_provider::TaskProfile::discuss(
             StableId::new("discussplan"),
-            ac_provider::RoutingProfile::LocalFirst,
+            self.preferred_routing_profile(), // N1: user-persisted routing profile
         );
         profile.required_context = 2048;
         let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));

@@ -1,4 +1,4 @@
-pub const CURRENT_SCHEMA_VERSION: u32 = 28;
+pub const CURRENT_SCHEMA_VERSION: u32 = 29;
 
 impl ControlPlaneDb {
     pub fn open(path: impl AsRef<Path>) -> AcResult<Self> {
@@ -203,6 +203,12 @@ impl ControlPlaneDb {
                 "unavailable_scanners",
                 "TEXT NOT NULL DEFAULT '[]'",
             )?;
+        }
+        if current_version < 29 {
+            tx.execute_batch(include_str!(
+                "../../../migrations/0027_provider_preferences.sql"
+            ))
+            .map_err(db_error)?;
         }
         tx.pragma_update(None, "user_version", CURRENT_SCHEMA_VERSION)
             .map_err(db_error)?;

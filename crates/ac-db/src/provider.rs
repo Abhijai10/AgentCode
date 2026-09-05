@@ -232,6 +232,48 @@ impl ControlPlaneDb {
         rows.collect::<Result<Vec<_>, _>>().map_err(db_error)
     }
 
+    /// Batch N1: read the persisted provider/routing preference row
+    /// (conventionally id 'global').  None means "defaults apply" — the
+    /// daemon then uses the per-call-site fallback profile.
+    pub fn provider_preference(&self, id: &str) -> AcResult<Option<ProviderPreferenceRow>> {
+        self.connection
+            .query_row(
+                "SELECT id, routing_profile, preferred_model, updated_at_ms
+                 FROM provider_preferences WHERE id=?1",
+                [id],
+                |row| {
+                    Ok(ProviderPreferenceRow {
+                        id: row.get(0)?,
+                        routing_profile: row.get(1)?,
+                        preferred_model: row.get(2)?,
+                        updated_at_ms: row.get(3)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(db_error)
+    }
+
+    /// Batch N1: persist (upsert) the provider/routing preference row.
+    /// The daemon is the single writer; the UI only sends the request.
+    pub fn save_provider_preference(&self, row: &ProviderPreferenceRow) -> AcResult<()> {
+        self.connection
+            .execute(
+                "INSERT INTO provider_preferences VALUES (?1, ?2, ?3, ?4)
+                 ON CONFLICT(id) DO UPDATE SET routing_profile=excluded.routing_profile,
+                 preferred_model=excluded.preferred_model,
+                 updated_at_ms=excluded.updated_at_ms",
+                params![
+                    row.id,
+                    row.routing_profile,
+                    row.preferred_model,
+                    row.updated_at_ms
+                ],
+            )
+            .map_err(db_error)?;
+        Ok(())
+    }
+
     pub fn append_provider_health_observation(
         &self,
         row: &ProviderHealthObservationRow,

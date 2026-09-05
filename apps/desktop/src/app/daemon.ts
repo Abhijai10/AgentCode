@@ -182,6 +182,87 @@ export const daemon = {
     }
   },
 
+  async providerPreferencesGet(): Promise<{
+    ok: boolean;
+    preferences?: {
+      routing_profile: string;
+      preferred_model: string;
+      updated_at_ms: number;
+      configured: boolean;
+    };
+    error?: string;
+  }> {
+    try {
+      const res = await invoke<{ preferences: unknown }>(
+        "daemon_provider_preferences_get"
+      );
+      return {
+        ok: true,
+        preferences: res.preferences as {
+          routing_profile: string;
+          preferred_model: string;
+          updated_at_ms: number;
+          configured: boolean;
+        },
+      };
+    } catch (error) {
+      return { ok: false, error: String(error) };
+    }
+  },
+
+  async providerPreferencesSet(
+    routingProfile: string,
+    preferredModel: string
+  ): Promise<{ ok: boolean; preferences?: unknown; error?: string }> {
+    try {
+      const res = await invoke<{ preferences: unknown }>(
+        "daemon_provider_preferences_set",
+        { routingProfile, preferredModel }
+      );
+      return { ok: true, preferences: res.preferences };
+    } catch (error) {
+      return { ok: false, error: String(error) };
+    }
+  },
+
+  async providerHealthGet(): Promise<{
+    ok: boolean;
+    health?: {
+      observations: {
+        account_id: string;
+        provider_id: string;
+        success: boolean;
+        latency_ms: number;
+        failure_code: string;
+        failure_message: string;
+        observed_at_ms: number;
+      }[];
+      catalog: { id: string; display_name: string; pricing_classification: string }[];
+    };
+    error?: string;
+  }> {
+    try {
+      const res = await invoke<{ health: unknown }>("daemon_provider_health_get");
+      return {
+        ok: true,
+        health: res.health as {
+          observations: {
+            account_id: string;
+            provider_id: string;
+            success: boolean;
+            latency_ms: number;
+            failure_code: string;
+            failure_message: string;
+            observed_at_ms: number;
+          }[];
+          catalog: { id: string; display_name: string; pricing_classification: string }[];
+        },
+      };
+    } catch (error) {
+      return { ok: false, error: String(error) };
+    }
+  },
+
   async listProviders(): Promise<ProviderInfo[]> {
     try {
       return await invoke<ProviderInfo[]>("daemon_list_providers");

@@ -135,7 +135,7 @@ impl DaemonService {
 
         let mut profile = ac_provider::TaskProfile::discuss(
             ac_common::StableId::new("security"),
-            ac_provider::RoutingProfile::LocalFirst,
+            self.preferred_routing_profile(), // N1: user-persisted routing profile
         );
         profile.required_context = 4096;
         let cancel = Arc::new(AtomicBool::new(false));

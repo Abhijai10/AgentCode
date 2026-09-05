@@ -89,7 +89,7 @@ impl DaemonService {
 
         let mut profile = ac_provider::TaskProfile::discuss(
             ac_common::StableId::new("design"),
-            ac_provider::RoutingProfile::LocalFirst,
+            self.preferred_routing_profile(), // N1: user-persisted routing profile
         );
         profile.required_context = 4096;
         let cancel = Arc::new(AtomicBool::new(false));
@@ -393,7 +393,7 @@ impl DaemonService {
 
         let mut profile = ac_provider::TaskProfile::discuss(
             ac_common::StableId::new("refanalysis"),
-            ac_provider::RoutingProfile::LocalFirst,
+            self.preferred_routing_profile(), // N1: user-persisted routing profile
         );
         profile.required_context = 4096;
         let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -903,7 +903,7 @@ Rules: describe only what is actually visible. Each array holds short factual st
 
         let mut profile = ac_provider::TaskProfile::discuss(
             ac_common::StableId::new("designcritic"),
-            ac_provider::RoutingProfile::LocalFirst,
+            self.preferred_routing_profile(), // N1: user-persisted routing profile
         );
         profile.required_context = 4096;
         let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));

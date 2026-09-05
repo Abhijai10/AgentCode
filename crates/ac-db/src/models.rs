@@ -1112,6 +1112,17 @@ pub struct ProviderHealthObservationRow {
     pub observed_at_ms: i64,
 }
 
+/// Batch N1 (G1): persisted provider/routing preferences.  Global row id
+/// 'global'; per-project rows may follow later without a schema change
+/// (id is the primary key).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProviderPreferenceRow {
+    pub id: String,
+    pub routing_profile: String,
+    pub preferred_model: String,
+    pub updated_at_ms: i64,
+}
+
 // ── Security Mode (G5) ──────────────────────────────────────────────────────
 
 #[derive(Clone, Debug, Eq, PartialEq)]

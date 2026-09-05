@@ -457,7 +457,7 @@ impl DaemonService {
             })?;
         let profile = ac_provider::TaskProfile::discuss(
             ac_common::StableId::new("discuss"),
-            ac_provider::RoutingProfile::LocalFirst,
+            self.preferred_routing_profile(), // N1: user-persisted routing profile
         );
         // Bound the required context so already-installed small local models
         // (e.g. qwen2.5-coder:3b with an 8K window) satisfy the routing check.
