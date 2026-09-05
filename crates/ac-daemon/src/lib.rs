@@ -905,6 +905,7 @@ include!("release.rs");
 include!("observability.rs");
 include!("ipc.rs");
 include!("repo_context.rs");
+include!("lsp.rs");
 include!("conversation.rs");
 include!("discuss_plan.rs");
 include!("design.rs");

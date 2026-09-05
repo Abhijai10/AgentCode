@@ -74,6 +74,7 @@ version = "0.1.0"
 dependencies = [
  "ac-agent",
  "ac-changeset",
+ "ac-code-intel",
  "ac-common",
  "ac-config",
  "ac-db",

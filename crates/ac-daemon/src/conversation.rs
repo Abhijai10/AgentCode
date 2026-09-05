@@ -412,6 +412,11 @@ impl DaemonService {
         let project_hint = format!("Project: {}\n", conv.project_path);
         let grounding =
             crate::build_repo_grounding(&conv.project_path, content);
+        // Batch N3: enrich the deterministic grounding with LSP
+        // definition/references sources (graceful degradation; the
+        // deterministic selection is never replaced).
+        let (grounding, lsp_status) =
+            crate::enrich_grounding_with_lsp(&conv.project_path, grounding, content);
         let source_block = crate::render_source_block(&grounding);
         let project_files = if source_block.is_empty() {
             // Degraded fallback, explicitly labeled for the model.
@@ -527,6 +532,7 @@ impl DaemonService {
             }),
             "sources": crate::citations_json(&grounding)["sources"],
             "sources_degraded": grounding.degraded_reason.is_some(),
+            "lsp": lsp_status,
         });
         self.append_message(
             conversation_id,

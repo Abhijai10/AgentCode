@@ -182,6 +182,18 @@ fn collect_candidates(project_path: &str) -> Vec<(String, String)> {
 }
 
 /// Tokenize a question into lowered alphanumeric terms worth matching.
+/// LSP enrichment (batch N3) needs the same question terms as the
+/// deterministic walk — exposed crate-internally so lsp.rs shares it.
+pub(crate) fn repo_context_terms(question: &str) -> Vec<String> {
+    question_terms(question)
+}
+
+/// Per-file excerpt byte budget shared with LSP enrichment so both
+/// selection paths stay under the same grounding limits.
+pub(crate) fn repo_context_file_budget() -> usize {
+    MAX_BYTES_PER_FILE
+}
+
 fn question_terms(question: &str) -> Vec<String> {
     question
         .split(|ch: char| !ch.is_ascii_alphanumeric() && ch != '_' && ch != '.' && ch != '/')

@@ -17,6 +17,7 @@ ac-logging = { path = "../ac-logging" }
 ac-provider = { path = "../ac-provider" }
 ac-runtime = { path = "../ac-runtime" }
 ac-sandbox = { path = "../ac-sandbox" }
+ac-code-intel = { path = "../ac-code-intel" }
 ac-security = { path = "../ac-security" }
 ac-tool = { path = "../ac-tool" }
 ac-verification = { path = "../ac-verification" }
