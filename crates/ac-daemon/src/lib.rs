@@ -904,7 +904,9 @@ fn backend_tool_policy() -> ac_security::CapabilityPolicy {
 include!("release.rs");
 include!("observability.rs");
 include!("ipc.rs");
+include!("repo_context.rs");
 include!("conversation.rs");
+include!("discuss_plan.rs");
 include!("design.rs");
 include!("security.rs");
 

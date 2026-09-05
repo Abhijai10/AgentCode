@@ -1426,6 +1426,79 @@ fn daemon_discuss_send(
 }
 
 #[tauri::command]
+fn daemon_discuss_turn_into_plan(
+    state: tauri::State<DaemonClient>,
+    conversation_id: String,
+) -> Result<Value, String> {
+    request(
+        &state.0,
+        "ui",
+        "DiscussTurnIntoPlan",
+        json!({ "conversation_id": conversation_id }),
+    )
+}
+
+#[tauri::command]
+fn daemon_discuss_execute_plan(
+    state: tauri::State<DaemonClient>,
+    conversation_id: String,
+) -> Result<Value, String> {
+    request(
+        &state.0,
+        "ui",
+        "DiscussExecutePlan",
+        json!({ "conversation_id": conversation_id }),
+    )
+}
+
+#[tauri::command]
+fn daemon_discuss_accept_decision(
+    state: tauri::State<DaemonClient>,
+    conversation_id: String,
+    message_id: String,
+    decision: String,
+    rationale: Option<String>,
+) -> Result<Value, String> {
+    request(
+        &state.0,
+        "ui",
+        "DiscussAcceptDecision",
+        json!({
+            "conversation_id": conversation_id,
+            "message_id": message_id,
+            "decision": decision,
+            "rationale": rationale.unwrap_or_default(),
+        }),
+    )
+}
+
+#[tauri::command]
+fn daemon_discuss_plan_get(
+    state: tauri::State<DaemonClient>,
+    conversation_id: String,
+) -> Result<Value, String> {
+    request(
+        &state.0,
+        "ui",
+        "DiscussPlanGet",
+        json!({ "conversation_id": conversation_id }),
+    )
+}
+
+#[tauri::command]
+fn daemon_discuss_decisions_get(
+    state: tauri::State<DaemonClient>,
+    conversation_id: String,
+) -> Result<Value, String> {
+    request(
+        &state.0,
+        "ui",
+        "DiscussDecisionsGet",
+        json!({ "conversation_id": conversation_id }),
+    )
+}
+
+#[tauri::command]
 fn daemon_design_send(
     state: tauri::State<DaemonClient>,
     conversation_id: String,
@@ -1755,6 +1828,11 @@ fn main() {
             daemon_attachment_remove,
             daemon_conversation_activity,
             daemon_discuss_send,
+            daemon_discuss_turn_into_plan,
+            daemon_discuss_execute_plan,
+            daemon_discuss_accept_decision,
+            daemon_discuss_plan_get,
+            daemon_discuss_decisions_get,
             daemon_design_send,
             daemon_design_understand,
             daemon_design_analyze_reference,

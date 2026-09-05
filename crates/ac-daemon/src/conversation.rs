@@ -395,7 +395,12 @@ impl DaemonService {
                 ));
             }
         }
-        // Build bounded context: recent messages + project context + attachments
+        // Build bounded context: recent messages + project context + attachments.
+        // G3 repository grounding: the model receives actual source excerpts of
+        // deterministically-selected relevant files (Doc 06 §20-21), with
+        // user-referenced paths prioritized and secret lines redacted.  The
+        // bounded filename listing remains only as a degraded fallback when
+        // the grounding walk yields nothing.
         let messages = self.db.messages_for_conversation(conversation_id)?;
         let recent = messages
             .iter()
@@ -405,12 +410,41 @@ impl DaemonService {
             .collect::<Vec<_>>()
             .join("\n");
         let project_hint = format!("Project: {}\n", conv.project_path);
-        let project_files = bounded_project_listing(&conv.project_path, 80);
+        let grounding =
+            crate::build_repo_grounding(&conv.project_path, content);
+        let source_block = crate::render_source_block(&grounding);
+        let project_files = if source_block.is_empty() {
+            // Degraded fallback, explicitly labeled for the model.
+            format!(
+                "{}\n{}",
+                bounded_project_listing(&conv.project_path, 80),
+                "\n[DEGRADED CONTEXT: only file names are available; deeper \
+                 source grounding was unavailable for this question.]\n"
+            )
+        } else {
+            String::new()
+        };
+        let grounding_note = if grounding.degraded_reason.is_some() {
+            format!(
+                "\n[Context degraded: {}]\n",
+                grounding.degraded_reason.clone().unwrap_or_default()
+            )
+        } else {
+            String::new()
+        };
+        // Persist the exact citations that entered the prompt so they survive
+        // restart and the UI can render real sources (Doc 06 §20: source
+        // citations).  Persistence failure must not lose the answer.
+        if let Err(error) = crate::persist_grounding(&self.db, conversation_id, &grounding) {
+            eprintln!("discuss grounding persistence failed: {error:?}");
+        }
         let prompt = format!(
-            "{}\n{}\n{}\n{}\n\n--\nProvide a helpful, project-aware conversational response. \
-             Do NOT write code, modify files, or execute commands. \
-             Only discuss the project, architecture, design, and implementation ideas.\n",
-            project_hint, project_files, recent, attachment_block,
+            "{}\n{}\n{}\n{}\n{}\n{}\n\n--\nProvide a helpful, project-aware conversational response \
+             grounded in the repository sources below. Cite the source paths you \
+             relied on when you answer. Do NOT write code, modify files, or execute \
+             commands. Only discuss the project, architecture, design, and \
+             implementation ideas.\n",
+            project_hint, project_files, source_block, grounding_note, recent, attachment_block,
         );
         // Build a lightweight provider registry and request a conversational answer
         let db_path = self.db_path.clone();
@@ -491,6 +525,8 @@ impl DaemonService {
                     json!({"provider_id": s.provider_id.to_string(), "model_name": s.model_name})
                 })
             }),
+            "sources": crate::citations_json(&grounding)["sources"],
+            "sources_degraded": grounding.degraded_reason.is_some(),
         });
         self.append_message(
             conversation_id,

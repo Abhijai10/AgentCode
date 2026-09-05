@@ -36,6 +36,47 @@ export interface Attachment {
   created_at_ms: number;
 }
 
+/** Source citation for a repository-grounded Discuss answer: the exact
+ *  files whose contents entered the model prompt. */
+export interface SourceCitation {
+  path: string;
+  reason: string;
+  excerpt_bytes: number;
+}
+
+/** Parsed Message.metadata for Discuss assistant messages. */
+export interface DiscussMessageMetadata {
+  mode?: string;
+  kind?: string;
+  decision_id?: string;
+  sources?: SourceCitation[];
+  sources_degraded?: boolean;
+}
+
+/** Structured plan from Discuss Turn Into Plan (Doc 06 §23). */
+export interface DiscussPlan {
+  goal: string;
+  requirements: string[];
+  constraints: string[];
+  rejected_approaches: string[];
+  open_questions: string[];
+  accepted_decisions?: DiscussDecisionRecord[];
+  relevant_files?: string[];
+  conversation_id?: string;
+  promoted_mission_id?: string;
+}
+
+/** An accepted Discuss decision (Doc 06 §25). */
+export interface DiscussDecisionRecord {
+  id: string;
+  conversation_id: string;
+  message_id: string;
+  decision: string;
+  rationale: string;
+  source_excerpt?: string;
+  accepted_at_ms?: number;
+}
+
 export interface ConversationDetail extends Conversation {
   messages: Message[];
   attachments: Attachment[];

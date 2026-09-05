@@ -8,6 +8,8 @@ import type {
   OllamaStatus,
   DiscussSession,
   DiscussMessage,
+  DiscussPlan,
+  DiscussDecisionRecord,
   DesignSession,
   SettingsState,
   MissionProgress,
@@ -588,6 +590,87 @@ export const daemon = {
         attachmentIds: attachmentIds ?? [],
       });
       return { ok: true, message: res.message };
+    } catch (e: unknown) {
+      const message = e instanceof Error ? e.message : String(e);
+      const cleaned = message.replace(/^[A-Z0-9_-]+:\s*/, "");
+      return { ok: false, error: cleaned || message };
+    }
+  },
+
+  async discussTurnIntoPlan(
+    conversationId: string
+  ): Promise<{ ok: boolean; plan?: DiscussPlan; error?: string }> {
+    try {
+      const res = await invoke<{ plan: DiscussPlan }>(
+        "daemon_discuss_turn_into_plan",
+        { conversationId }
+      );
+      return { ok: true, plan: res.plan };
+    } catch (e: unknown) {
+      const message = e instanceof Error ? e.message : String(e);
+      const cleaned = message.replace(/^[A-Z0-9_-]+:\s*/, "");
+      return { ok: false, error: cleaned || message };
+    }
+  },
+
+  async discussExecutePlan(
+    conversationId: string
+  ): Promise<{ ok: boolean; missionId?: string; planGoal?: string; error?: string }> {
+    try {
+      const res = await invoke<{ mission_id: string; plan_goal: string }>(
+        "daemon_discuss_execute_plan",
+        { conversationId }
+      );
+      return { ok: true, missionId: res.mission_id, planGoal: res.plan_goal };
+    } catch (e: unknown) {
+      const message = e instanceof Error ? e.message : String(e);
+      const cleaned = message.replace(/^[A-Z0-9_-]+:\s*/, "");
+      return { ok: false, error: cleaned || message };
+    }
+  },
+
+  async discussAcceptDecision(
+    conversationId: string,
+    messageId: string,
+    decision: string,
+    rationale?: string
+  ): Promise<{ ok: boolean; decisionRecord?: DiscussDecisionRecord; error?: string }> {
+    try {
+      const res = await invoke<{ decision_record: DiscussDecisionRecord }>(
+        "daemon_discuss_accept_decision",
+        { conversationId, messageId, decision, rationale: rationale ?? "" }
+      );
+      return { ok: true, decisionRecord: res.decision_record };
+    } catch (e: unknown) {
+      const message = e instanceof Error ? e.message : String(e);
+      const cleaned = message.replace(/^[A-Z0-9_-]+:\s*/, "");
+      return { ok: false, error: cleaned || message };
+    }
+  },
+
+  async discussGetPlan(
+    conversationId: string
+  ): Promise<{ ok: boolean; plan?: string | null; error?: string }> {
+    try {
+      const res = await invoke<{ plan: string | null }>("daemon_discuss_plan_get", {
+        conversationId,
+      });
+      return { ok: true, plan: res.plan };
+    } catch (e: unknown) {
+      const message = e instanceof Error ? e.message : String(e);
+      const cleaned = message.replace(/^[A-Z0-9_-]+:\s*/, "");
+      return { ok: false, error: cleaned || message };
+    }
+  },
+
+  async discussGetDecisions(
+    conversationId: string
+  ): Promise<{ ok: boolean; decisions?: string; error?: string }> {
+    try {
+      const res = await invoke<{ decisions: string }>("daemon_discuss_decisions_get", {
+        conversationId,
+      });
+      return { ok: true, decisions: res.decisions };
     } catch (e: unknown) {
       const message = e instanceof Error ? e.message : String(e);
       const cleaned = message.replace(/^[A-Z0-9_-]+:\s*/, "");

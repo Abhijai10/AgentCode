@@ -8,6 +8,9 @@ import type {
   ConversationDetail,
   Message,
   Attachment,
+  DiscussPlan,
+  DiscussDecisionRecord,
+  DiscussMessageMetadata,
 } from "./types";
 
 function formatTime(ms: number): string {
@@ -45,6 +48,15 @@ export function DiscussView({
   >(project ? "loading" : "no_project");
   const [renameTarget, setRenameTarget] = useState<string | null>(null);
   const [renameValue, setRenameValue] = useState("");
+  const [plan, setPlan] = useState<DiscussPlan | null>(null);
+  const [decisions, setDecisions] = useState<DiscussDecisionRecord[]>([]);
+  const [planBusy, setPlanBusy] = useState(false);
+  const [decisionDraft, setDecisionDraft] = useState<{
+    messageId: string;
+    excerpt: string;
+  } | null>(null);
+  const [decisionText, setDecisionText] = useState("");
+  const [decisionRationale, setDecisionRationale] = useState("");
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLTextAreaElement>(null);
 
@@ -78,6 +90,9 @@ export function DiscussView({
   useEffect(() => {
     if (!activeConvId) {
       setConvDetail(null);
+      setPlan(null);
+      setDecisions([]);
+      setDecisionDraft(null);
       return;
     }
     let cancelled = false;
@@ -85,6 +100,31 @@ export function DiscussView({
       const detail = await daemon.getConversation(activeConvId);
       if (cancelled) return;
       if (detail) setConvDetail(detail);
+      const planRes = await daemon.discussGetPlan(activeConvId);
+      if (cancelled) return;
+      if (planRes.ok && planRes.plan) {
+        try {
+          setPlan(JSON.parse(planRes.plan) as DiscussPlan);
+        } catch {
+          setPlan(null);
+        }
+      } else {
+        setPlan(null);
+      }
+      const decRes = await daemon.discussGetDecisions(activeConvId);
+      if (cancelled) return;
+      if (decRes.ok && decRes.decisions) {
+        try {
+          const parsed = JSON.parse(decRes.decisions) as {
+            decisions?: DiscussDecisionRecord[];
+          };
+          setDecisions(parsed.decisions ?? []);
+        } catch {
+          setDecisions([]);
+        }
+      } else {
+        setDecisions([]);
+      }
     })();
     return () => {
       cancelled = true;
@@ -106,7 +146,84 @@ export function DiscussView({
     if (!activeConvId) return;
     const detail = await daemon.getConversation(activeConvId);
     if (detail) setConvDetail(detail);
+    // Load the structured plan + decisions for this conversation (if any).
+    const planRes = await daemon.discussGetPlan(activeConvId);
+    if (planRes.ok && planRes.plan) {
+      try {
+        setPlan(JSON.parse(planRes.plan) as DiscussPlan);
+      } catch {
+        setPlan(null);
+      }
+    } else {
+      setPlan(null);
+    }
+    const decRes = await daemon.discussGetDecisions(activeConvId);
+    if (decRes.ok && decRes.decisions) {
+      try {
+        const parsed = JSON.parse(decRes.decisions) as {
+          decisions?: DiscussDecisionRecord[];
+        };
+        setDecisions(parsed.decisions ?? []);
+      } catch {
+        setDecisions([]);
+      }
+    } else {
+      setDecisions([]);
+    }
   }, [activeConvId]);
+
+  const handleTurnIntoPlan = async () => {
+    if (!activeConvId || planBusy) return;
+    setPlanBusy(true);
+    setError(null);
+    const result = await daemon.discussTurnIntoPlan(activeConvId);
+    if (result.ok && result.plan) {
+      setPlan(result.plan);
+      await refreshActive();
+    } else {
+      setError(result.error || "Could not create plan");
+    }
+    setPlanBusy(false);
+  };
+
+  const handleExecutePlan = async () => {
+    if (!activeConvId || planBusy || !plan) return;
+    setPlanBusy(true);
+    setError(null);
+    const result = await daemon.discussExecutePlan(activeConvId);
+    if (result.ok && result.missionId) {
+      await refreshActive();
+      onOpenMission(result.missionId);
+    } else {
+      setError(result.error || "Could not execute plan");
+    }
+    setPlanBusy(false);
+  };
+
+  const handleAcceptDecision = async () => {
+    if (!activeConvId || !decisionDraft || planBusy) return;
+    if (!decisionText.trim()) {
+      setError("Decision text is required");
+      return;
+    }
+    setPlanBusy(true);
+    setError(null);
+    const result = await daemon.discussAcceptDecision(
+      activeConvId,
+      decisionDraft.messageId,
+      decisionText.trim(),
+      decisionRationale.trim()
+    );
+    if (result.ok) {
+      setDecisionDraft(null);
+      setDecisionText("");
+      setDecisionRationale("");
+      await refreshActive();
+    } else {
+      setError(result.error || "Could not accept decision");
+    }
+    setPlanBusy(false);
+  };
 
   const handleNewChat = async () => {
     if (!project) return;
@@ -212,17 +329,20 @@ export function DiscussView({
     const isAssistant = msg.role === "assistant";
     let providerModel: { provider_id?: string; model_name?: string } | null =
       null;
+    let meta: DiscussMessageMetadata | null = null;
     if (isAssistant && msg.metadata) {
       try {
-        const meta =
+        const parsed =
           typeof msg.metadata === "string"
             ? JSON.parse(msg.metadata)
             : msg.metadata;
-        if (meta?.provider_model) providerModel = meta.provider_model;
+        meta = parsed as DiscussMessageMetadata;
+        if (parsed?.provider_model) providerModel = parsed.provider_model;
       } catch {
         providerModel = null;
       }
     }
+    const sources = meta?.sources ?? [];
     return (
       <div
         key={msg.id}
@@ -251,7 +371,47 @@ export function DiscussView({
                 </span>
               </div>
             )}
-            {msg.mission_ref && (
+            {/* Repository source citations: the exact files whose contents
+                entered the model prompt for this answer. */}
+            {isAssistant && sources.length > 0 && (
+              <div className="mt-2 pt-2 border-t border-outline-variant/30 dark:border-white/10">
+                <div className="flex items-center gap-1.5 text-[10px] font-medium uppercase text-on-surface-variant mb-1">
+                  <Icon name="folder_open" size={11} />
+                  Sources ({sources.length})
+                </div>
+                <div className="flex flex-wrap gap-1">
+                  {sources.map((source) => (
+                    <span
+                      key={source.path}
+                      title={`${source.reason} · ${source.excerpt_bytes}B`}
+                      className="inline-flex items-center gap-1 text-[10px] neo-raised rounded-full px-2 py-0.5 text-on-surface-variant max-w-full"
+                    >
+                      <Icon name="description" size={10} className="shrink-0 text-primary" />
+                      <span className="truncate">{source.path}</span>
+                    </span>
+                  ))}
+                </div>
+              </div>
+            )}
+            {isAssistant && meta?.sources_degraded && (
+              <div className="mt-2 text-[10px] text-amber-600 dark:text-amber-400 flex items-center gap-1">
+                <Icon name="warning" size={11} />
+                Grounding degraded: answer used only file names, not source contents.
+              </div>
+            )}
+            {isAssistant && msg.mission_ref && (
+              <div className="mt-2 flex items-center gap-2 text-xs text-on-surface-variant">
+                <Icon name="terminal" size={12} />
+                <span>Mission: {msg.mission_ref}</span>
+                <button
+                  onClick={() => onOpenMission(msg.mission_ref!)}
+                  className="underline hover:opacity-80"
+                >
+                  View
+                </button>
+              </div>
+            )}
+            {msg.mission_ref && !isAssistant && (
               <div className="mt-2 flex items-center gap-2 text-xs text-on-surface-variant">
                 <Icon name="terminal" size={12} />
                 <span>Mission: {msg.mission_ref}</span>
@@ -264,8 +424,24 @@ export function DiscussView({
               </div>
             )}
           </div>
-          <p className="text-[10px] text-on-surface-variant mt-0.5 px-1">
-            {formatTime(msg.created_at_ms)}
+          <p className="text-[10px] text-on-surface-variant mt-0.5 px-1 flex items-center gap-2">
+            <span>{formatTime(msg.created_at_ms)}</span>
+            {isAssistant && (
+              <button
+                onClick={() => {
+                  setDecisionDraft({
+                    messageId: msg.id,
+                    excerpt: msg.content.slice(0, 200),
+                  });
+                  setDecisionText("");
+                  setDecisionRationale("");
+                }}
+                className="underline hover:text-primary"
+                title="Accept a decision derived from this answer"
+              >
+                Accept as Decision
+              </button>
+            )}
           </p>
         </div>
       </div>
@@ -523,45 +699,152 @@ export function DiscussView({
                   </button>
                 </div>
               </div>
-              {/* Create Mission button */}
-              <div className="flex justify-end mt-2">
+              {/* Structured plan panel (Turn Into Plan result) */}
+              {plan && (
+                <div className="mt-3 neo-pressed rounded-2xl p-4">
+                  <div className="flex items-center justify-between mb-2">
+                    <div className="flex items-center gap-2">
+                      <Icon name="checklist" size={16} className="text-primary" />
+                      <span className="text-sm font-semibold text-on-surface">
+                        Plan
+                      </span>
+                    </div>
+                    {plan.promoted_mission_id && (
+                      <button
+                        onClick={() => onOpenMission(plan.promoted_mission_id!)}
+                        className="text-xs underline text-primary"
+                      >
+                        Mission {plan.promoted_mission_id.slice(0, 16)}…
+                      </button>
+                    )}
+                  </div>
+                  <p className="text-sm text-on-surface mb-2">
+                    <span className="font-medium">Goal:</span> {plan.goal}
+                  </p>
+                  {plan.requirements.length > 0 && (
+                    <div className="mb-2">
+                      <p className="text-[10px] uppercase font-medium text-on-surface-variant mb-1">
+                        Requirements
+                      </p>
+                      <ul className="text-xs text-on-surface space-y-0.5">
+                        {plan.requirements.map((r, i) => (
+                          <li key={i}>• {r}</li>
+                        ))}
+                      </ul>
+                    </div>
+                  )}
+                  {plan.open_questions.length > 0 && (
+                    <div className="mb-2">
+                      <p className="text-[10px] uppercase font-medium text-on-surface-variant mb-1">
+                        Open Questions
+                      </p>
+                      <ul className="text-xs text-on-surface space-y-0.5">
+                        {plan.open_questions.map((q, i) => (
+                          <li key={i}>? {q}</li>
+                        ))}
+                      </ul>
+                    </div>
+                  )}
+                  {(plan.constraints?.length ?? 0) > 0 && (
+                    <div className="mb-2">
+                      <p className="text-[10px] uppercase font-medium text-on-surface-variant mb-1">
+                        Constraints
+                      </p>
+                      <ul className="text-xs text-on-surface space-y-0.5">
+                        {plan.constraints.map((c, i) => (
+                          <li key={i}>! {c}</li>
+                        ))}
+                      </ul>
+                    </div>
+                  )}
+                </div>
+              )}
+
+              {/* Accepted decisions panel */}
+              {decisions.length > 0 && (
+                <div className="mt-3 neo-pressed rounded-2xl p-4">
+                  <div className="flex items-center gap-2 mb-2">
+                    <Icon name="gavel" size={16} className="text-primary" />
+                    <span className="text-sm font-semibold text-on-surface">
+                      Accepted Decisions ({decisions.length})
+                    </span>
+                  </div>
+                  <ul className="space-y-1.5">
+                    {decisions.map((d) => (
+                      <li key={d.id} className="text-xs">
+                        <span className="text-on-surface font-medium">
+                          {d.decision}
+                        </span>
+                        <span className="text-on-surface-variant block pl-2">
+                          {d.rationale}
+                        </span>
+                      </li>
+                    ))}
+                  </ul>
+                </div>
+              )}
+
+              {/* Decision acceptance dialog (explicit user action only) */}
+              {decisionDraft && (
+                <div className="mt-3 neo-raised rounded-2xl p-4 border border-primary/30">
+                  <div className="flex items-center gap-2 mb-2">
+                    <Icon name="gavel" size={16} className="text-primary" />
+                    <span className="text-sm font-semibold text-on-surface">
+                      Accept as Decision
+                    </span>
+                  </div>
+                  <p className="text-[10px] text-on-surface-variant mb-2 truncate">
+                    From: “{decisionDraft.excerpt}…”
+                  </p>
+                  <input
+                    className="neo-input rounded-xl px-3 py-2 w-full text-sm mb-2"
+                    placeholder="Decision (e.g. Use SQLite WAL mode)"
+                    value={decisionText}
+                    onChange={(e) => setDecisionText(e.target.value)}
+                  />
+                  <input
+                    className="neo-input rounded-xl px-3 py-2 w-full text-sm mb-3"
+                    placeholder="Rationale (optional)"
+                    value={decisionRationale}
+                    onChange={(e) => setDecisionRationale(e.target.value)}
+                  />
+                  <div className="flex gap-2 justify-end">
+                    <button
+                      onClick={() => setDecisionDraft(null)}
+                      className="neo-button rounded-xl px-3 py-1.5 text-xs text-on-surface-variant"
+                    >
+                      Cancel
+                    </button>
+                    <button
+                      onClick={handleAcceptDecision}
+                      disabled={planBusy || !decisionText.trim()}
+                      className="rounded-xl px-4 py-1.5 text-xs font-medium bg-primary text-on-primary disabled:opacity-50"
+                    >
+                      {planBusy ? "Accepting…" : "Accept Decision"}
+                    </button>
+                  </div>
+                </div>
+              )}
+
+              {/* Discussion actions: Turn Into Plan → Execute Plan (Doc 06 §23-24) */}
+              <div className="flex justify-end mt-2 gap-2">
                 <button
-                  onClick={async () => {
-                    if (!activeConvId || !convDetail) return;
-                    const lastUserMsg = convDetail.messages
-                      .filter((m) => m.role === "user" && !m.mission_ref)
-                      .pop();
-                    const goal =
-                      input.trim() || lastUserMsg?.content || "";
-                    if (!goal) return;
-                    const result = await daemon.submitGoalFromConversation(
-                      activeConvId,
-                      goal,
-                      []
-                    );
-                    if (result.ok) {
-                      setInput("");
-                      await refreshActive();
-                      onOpenMission(result.mission_id);
-                    } else {
-                      setError(
-                        result.error || "Could not create mission"
-                      );
-                    }
-                  }}
-                  disabled={
-                    sending ||
-                    thinking ||
-                    (!input.trim() &&
-                      !convDetail?.messages?.some(
-                        (m) => m.role === "user" && !m.mission_ref
-                      ))
-                  }
+                  onClick={handleTurnIntoPlan}
+                  disabled={sending || thinking || planBusy || !convDetail?.messages?.some((m) => m.role === "assistant")}
                   className="neo-button rounded-xl px-4 py-2 text-sm font-medium text-violet-600 dark:text-violet-400 flex items-center gap-2 disabled:opacity-50"
-                  aria-label="Create Mission from Discussion"
+                  aria-label="Turn this discussion into a structured plan"
+                >
+                  <Icon name={planBusy ? "autorenew" : "checklist"} size={16} className={planBusy ? "animate-spin" : ""} />
+                  Turn Into Plan
+                </button>
+                <button
+                  onClick={handleExecutePlan}
+                  disabled={sending || thinking || planBusy || !plan}
+                  className="neo-button rounded-xl px-4 py-2 text-sm font-medium text-violet-600 dark:text-violet-400 flex items-center gap-2 disabled:opacity-50"
+                  aria-label="Execute the structured plan as a mission with full context"
                 >
                   <Icon name="terminal" size={16} />
-                  Create Mission
+                  Execute Plan
                 </button>
               </div>
             </div>

@@ -566,6 +566,46 @@ fn dispatch_request(request: &Value, daemon: &mut DaemonService) -> (Value, bool
                 Ok(message) => json!({"id": correlation_id, "ok": true, "message": message_json(message)}),
                 Err(error) => error_response(correlation_id, error.code(), error.to_string()),
             }
+        }
+        "DiscussTurnIntoPlan" => {
+            let conversation_id = request.get("conversation_id").and_then(Value::as_str).unwrap_or("");
+            match daemon.discuss_turn_into_plan(conversation_id) {
+                Ok(plan) => json!({"id": correlation_id, "ok": true, "plan": plan}),
+                Err(error) => error_response(correlation_id, error.code(), error.to_string()),
+            }
+        }
+        "DiscussExecutePlan" => {
+            let conversation_id = request.get("conversation_id").and_then(Value::as_str).unwrap_or("");
+            match daemon.discuss_execute_plan(conversation_id) {
+                Ok(result) => json!({"id": correlation_id, "ok": true, "mission_id": result["mission_id"], "plan_goal": result["plan_goal"]}),
+                Err(error) => error_response(correlation_id, error.code(), error.to_string()),
+            }
+        }
+        "DiscussAcceptDecision" => {
+            let conversation_id = request.get("conversation_id").and_then(Value::as_str).unwrap_or("");
+            let message_id = request.get("message_id").and_then(Value::as_str).unwrap_or("");
+            let decision = request.get("decision").and_then(Value::as_str).unwrap_or("");
+            let rationale = request.get("rationale").and_then(Value::as_str).unwrap_or("");
+            match daemon.discuss_accept_decision(conversation_id, message_id, decision, rationale) {
+                Ok(record) => json!({"id": correlation_id, "ok": true, "decision_record": record}),
+                Err(error) => error_response(correlation_id, error.code(), error.to_string()),
+            }
+        }
+        "DiscussPlanGet" => {
+            let conversation_id = request.get("conversation_id").and_then(Value::as_str).unwrap_or("");
+            match daemon.db.design_document(conversation_id, "discuss_plan") {
+                Ok(Some(doc)) => json!({"id": correlation_id, "ok": true, "plan": doc.content_json, "version": doc.version}),
+                Ok(None) => json!({"id": correlation_id, "ok": true, "plan": Value::Null, "version": 0}),
+                Err(error) => error_response(correlation_id, error.code(), error.to_string()),
+            }
+        }
+        "DiscussDecisionsGet" => {
+            let conversation_id = request.get("conversation_id").and_then(Value::as_str).unwrap_or("");
+            match daemon.db.design_document(conversation_id, "discuss_decisions") {
+                Ok(Some(doc)) => json!({"id": correlation_id, "ok": true, "decisions": doc.content_json}),
+                Ok(None) => json!({"id": correlation_id, "ok": true, "decisions": "{\"decisions\": [], \"source_paths\": []}"}),
+                Err(error) => error_response(correlation_id, error.code(), error.to_string()),
+            }
         },
         "DesignSend" => {
             let conversation_id = request.get("conversation_id").and_then(Value::as_str).unwrap_or("");
@@ -3471,6 +3511,438 @@ mod ipc_tests {
             json!({"id":"x1","command":"CancelMission","mission_id": mission_id}),
         );
         assert_eq!(cancel["ok"], true);
+
+        server.cleanup();
+        daemon.shutdown().unwrap();
+        std::env::remove_var("AGENTCODE_PROVIDER_MODE");
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    /// G3 production-path grounding: a repository-grounded Discuss question
+    /// must put real source excerpts into the model prompt and persist real,
+    /// non-fabricated citations that survive restart.  Uses the mock
+    /// provider: the assertion is about what the daemon put in the prompt
+    /// and metadata, not about model prose.
+    #[test]
+    fn discuss_send_grounds_in_real_source_and_citations_survive_restart() {
+        let _env_lock = crate::TEST_ENV_LOCK.lock().unwrap();
+        std::env::set_var("AGENTCODE_PROVIDER_MODE", "mock");
+        let (dir, db, lock, socket) = temp_paths("ipc-discuss-grounding");
+        let project_dir = dir.join("workspace");
+        fs::create_dir_all(project_dir.join("src").join("auth")).unwrap();
+        fs::write(
+            project_dir.join("src").join("auth").join("mod.rs"),
+            "pub fn verify_token(token: &str) -> bool {\n    token.len() > 8\n}\n",
+        )
+        .unwrap();
+        fs::write(
+            project_dir.join("src").join("billing.rs"),
+            "pub fn charge(amount: u32) { }\n",
+        )
+        .unwrap();
+        let project_path = project_dir.to_string_lossy().to_string();
+
+        let mut daemon = DaemonService::open(&db, &lock).unwrap();
+        daemon.start().unwrap();
+        let Some((server, listener)) = bind_or_skip(&socket, None) else {
+            daemon.shutdown().unwrap();
+            std::env::remove_var("AGENTCODE_PROVIDER_MODE");
+            let _ = fs::remove_dir_all(dir);
+            return;
+        };
+
+        let create = request_via_ipc(
+            &server, &listener, &mut daemon,
+            json!({"id":"c1","command":"ConversationCreate","project_path": project_path, "mode":"DISCUSS","title":"Grounded Discuss"}),
+        );
+        assert_eq!(create["ok"], true, "create: {create}");
+        let cid = create["conversation_id"].as_str().unwrap().to_string();
+
+        let send = request_via_ipc(
+            &server, &listener, &mut daemon,
+            json!({"id":"d1","command":"DiscussSend","conversation_id": cid, "content": "How does authentication work?"}),
+        );
+        assert_eq!(send["ok"], true, "send: {send}");
+
+        // 1. The persisted discuss_context document contains the auth file
+        //    (exact files whose content entered the prompt).
+        let ctx_doc = daemon
+            .db
+            .design_document(&cid, "discuss_context")
+            .unwrap()
+            .expect("grounding must persist a discuss_context document");
+        let ctx: serde_json::Value = serde_json::from_str(&ctx_doc.content_json).unwrap();
+        assert_eq!(ctx["grounded"], true, "context: {ctx}");
+        let sources = ctx["sources"].as_array().unwrap();
+        assert!(
+            sources
+                .iter()
+                .any(|s| s["path"].as_str().unwrap_or("").contains("auth")),
+            "citation must reference the auth fixture: {sources:?}"
+        );
+
+        // 2. Assistant message metadata carries the same citations.
+        let msg = &send["message"];
+        let metadata: serde_json::Value =
+            serde_json::from_str(msg["metadata"].as_str().unwrap_or("{}")).unwrap();
+        let meta_sources = metadata["sources"].as_array().cloned().unwrap_or_default();
+        assert!(
+            meta_sources
+                .iter()
+                .any(|s| s["path"].as_str().unwrap_or("").contains("auth")),
+            "metadata citations: {metadata}"
+        );
+        assert_eq!(metadata["sources_degraded"], false);
+
+        // 3. The billing file must NOT be cited for an auth question
+        //    (citations correspond to supplied context, not everything).
+        assert!(
+            !meta_sources
+                .iter()
+                .any(|s| s["path"].as_str().unwrap_or("").contains("billing")),
+            "irrelevant file must not be cited: {meta_sources:?}"
+        );
+
+        // 4. Restart the daemon; citations must survive.
+        server.cleanup();
+        daemon.shutdown().unwrap();
+        daemon.start().unwrap();
+        let Some((server, listener)) = bind_or_skip(&socket, None) else {
+            daemon.shutdown().unwrap();
+            std::env::remove_var("AGENTCODE_PROVIDER_MODE");
+            let _ = fs::remove_dir_all(dir);
+            return;
+        };
+        let get = request_via_ipc(
+            &server, &listener, &mut daemon,
+            json!({"id":"g1","command":"ConversationGet","conversation_id": cid}),
+        );
+        assert_eq!(get["ok"], true);
+        let msgs = get["conversation"]["messages"].as_array().unwrap();
+        assert_eq!(msgs.len(), 2);
+        let assistant_meta: serde_json::Value =
+            serde_json::from_str(msgs[1]["metadata"].as_str().unwrap_or("{}")).unwrap();
+        assert!(
+            assistant_meta["sources"]
+                .as_array()
+                .map(|a| !a.is_empty())
+                .unwrap_or(false),
+            "citations must survive restart: {assistant_meta}"
+        );
+        let ctx_doc2 = daemon
+            .db
+            .design_document(&cid, "discuss_context")
+            .unwrap()
+            .expect("grounding doc must survive restart");
+        assert!(ctx_doc2.content_json.contains("auth"));
+
+        server.cleanup();
+        daemon.shutdown().unwrap();
+        std::env::remove_var("AGENTCODE_PROVIDER_MODE");
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    /// G3 isolation: a grounded question in Project A must never cite
+    /// Project B files.  Two projects with distinct fixtures, same daemon.
+    #[test]
+    fn discuss_grounding_cannot_cross_projects() {
+        let _env_lock = crate::TEST_ENV_LOCK.lock().unwrap();
+        std::env::set_var("AGENTCODE_PROVIDER_MODE", "mock");
+        let (dir, db, lock, socket) = temp_paths("ipc-discuss-grounding-iso");
+        let project_a = dir.join("workspace-a");
+        let project_b = dir.join("workspace-b");
+        fs::create_dir_all(project_a.join("src")).unwrap();
+        fs::create_dir_all(project_b.join("src")).unwrap();
+        fs::write(
+            project_a.join("src").join("alpha_marker.rs"),
+            "pub const ALPHA: &str = \"alpha-project-secret-name\";\n",
+        )
+        .unwrap();
+        fs::write(
+            project_b.join("src").join("beta_marker.rs"),
+            "pub const BETA: &str = \"beta-project-secret-name\";\n",
+        )
+        .unwrap();
+        let path_a = project_a.to_string_lossy().to_string();
+        let path_b = project_b.to_string_lossy().to_string();
+
+        let mut daemon = DaemonService::open(&db, &lock).unwrap();
+        daemon.start().unwrap();
+        let Some((server, listener)) = bind_or_skip(&socket, None) else {
+            daemon.shutdown().unwrap();
+            std::env::remove_var("AGENTCODE_PROVIDER_MODE");
+            let _ = fs::remove_dir_all(dir);
+            return;
+        };
+
+        let create_a = request_via_ipc(
+            &server, &listener, &mut daemon,
+            json!({"id":"ca","command":"ConversationCreate","project_path": path_a, "mode":"DISCUSS","title":"Project A"}),
+        );
+        let cid_a = create_a["conversation_id"].as_str().unwrap().to_string();
+        let create_b = request_via_ipc(
+            &server, &listener, &mut daemon,
+            json!({"id":"cb","command":"ConversationCreate","project_path": path_b, "mode":"DISCUSS","title":"Project B"}),
+        );
+        let cid_b = create_b["conversation_id"].as_str().unwrap().to_string();
+
+        let send_a = request_via_ipc(
+            &server, &listener, &mut daemon,
+            json!({"id":"da","command":"DiscussSend","conversation_id": cid_a, "content": "What does the alpha marker constant mean?"}),
+        );
+        assert_eq!(send_a["ok"], true);
+        let send_b = request_via_ipc(
+            &server, &listener, &mut daemon,
+            json!({"id":"db","command":"DiscussSend","conversation_id": cid_b, "content": "What does the beta marker constant mean?"}),
+        );
+        assert_eq!(send_b["ok"], true);
+
+        let ctx_a = daemon.db.design_document(&cid_a, "discuss_context").unwrap().unwrap();
+        let ctx_b = daemon.db.design_document(&cid_b, "discuss_context").unwrap().unwrap();
+        let json_a: serde_json::Value = serde_json::from_str(&ctx_a.content_json).unwrap();
+        let json_b: serde_json::Value = serde_json::from_str(&ctx_b.content_json).unwrap();
+        let paths_a: Vec<String> = json_a["sources"]
+            .as_array()
+            .map(|a| a.iter().map(|s| s["path"].as_str().unwrap_or("").to_string()).collect())
+            .unwrap_or_default();
+        let paths_b: Vec<String> = json_b["sources"]
+            .as_array()
+            .map(|a| a.iter().map(|s| s["path"].as_str().unwrap_or("").to_string()).collect())
+            .unwrap_or_default();
+        assert!(
+            paths_a.iter().any(|p| p.contains("alpha_marker")),
+            "A must cite its own file: {paths_a:?}"
+        );
+        assert!(
+            paths_b.iter().any(|p| p.contains("beta_marker")),
+            "B must cite its own file: {paths_b:?}"
+        );
+        assert!(
+            !paths_a.iter().any(|p| p.contains("beta")),
+            "Project A must never cite Project B: {paths_a:?}"
+        );
+        assert!(
+            !paths_b.iter().any(|p| p.contains("alpha")),
+            "Project B must never cite Project A: {paths_b:?}"
+        );
+
+        server.cleanup();
+        daemon.shutdown().unwrap();
+        std::env::remove_var("AGENTCODE_PROVIDER_MODE");
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    /// G3 §23-24: Turn Into Plan → structured plan persisted → Execute Plan
+    /// creates a mission whose goal retains the full plan context (never a
+    /// single sentence).  Plan survives restart.
+    #[test]
+    fn discuss_turn_into_plan_executes_with_full_context_and_persists() {
+        let _env_lock = crate::TEST_ENV_LOCK.lock().unwrap();
+        std::env::set_var("AGENTCODE_PROVIDER_MODE", "mock");
+        let (dir, db, lock, socket) = temp_paths("ipc-discuss-plan");
+        let project_dir = dir.join("workspace");
+        fs::create_dir_all(&project_dir).unwrap();
+        let project_path = project_dir.to_string_lossy().to_string();
+
+        let mut daemon = DaemonService::open(&db, &lock).unwrap();
+        daemon.start().unwrap();
+        let Some((server, listener)) = bind_or_skip(&socket, None) else {
+            daemon.shutdown().unwrap();
+            std::env::remove_var("AGENTCODE_PROVIDER_MODE");
+            let _ = fs::remove_dir_all(dir);
+            return;
+        };
+
+        let create = request_via_ipc(
+            &server, &listener, &mut daemon,
+            json!({"id":"c1","command":"ConversationCreate","project_path": project_path, "mode":"DISCUSS","title":"Plan Flow"}),
+        );
+        assert_eq!(create["ok"], true);
+        let cid = create["conversation_id"].as_str().unwrap().to_string();
+
+        // A real discussion first (plan requires one).
+        let send = request_via_ipc(
+            &server, &listener, &mut daemon,
+            json!({"id":"d1","command":"DiscussSend","conversation_id": cid, "content": "We should add rate limiting to the login endpoint."}),
+        );
+        assert_eq!(send["ok"], true, "discuss: {send}");
+        let assistant_id = send["message"]["id"].as_str().unwrap().to_string();
+
+        // Turn Into Plan (explicit user action).
+        let plan = request_via_ipc(
+            &server, &listener, &mut daemon,
+            json!({"id":"p1","command":"DiscussTurnIntoPlan","conversation_id": cid}),
+        );
+        assert_eq!(plan["ok"], true, "plan: {plan}");
+        let plan_value = &plan["plan"];
+        assert!(
+            plan_value["goal"].as_str().unwrap_or("").contains("rate limiting"),
+            "goal must come from the real discussion: {plan_value}"
+        );
+        assert!(
+            !plan_value["requirements"].as_array().unwrap().is_empty(),
+            "requirements must be structured, not empty: {plan_value}"
+        );
+
+        // Accept as Decision (explicit, message-derived).
+        let decision = request_via_ipc(
+            &server, &listener, &mut daemon,
+            json!({"id":"dec1","command":"DiscussAcceptDecision","conversation_id": cid, "message_id": assistant_id, "decision": "Login endpoint will be rate limited per IP.", "rationale": "agreed in discussion"}),
+        );
+        assert_eq!(decision["ok"], true, "decision: {decision}");
+        let decision_id = decision["decision_record"]["id"].as_str().unwrap().to_string();
+
+        // DECISIONS.md materialized in the project + recorded change.
+        let decisions_md = std::fs::read_to_string(project_dir.join("DECISIONS.md"))
+            .expect("DECISIONS.md must be materialized");
+        assert!(decisions_md.contains("rate limited per IP"));
+        let ctx = daemon
+            .db
+            .design_document(&cid, "decisions_materialization")
+            .unwrap()
+            .expect("materialization must be recorded");
+        let ctx_json: serde_json::Value = serde_json::from_str(&ctx.content_json).unwrap();
+        assert_eq!(ctx_json["decision_count"], 1);
+
+        // memory_decisions persisted under this project identity.
+        let count = daemon
+            .db
+            .memory_decision_count(&crate::project_repository_identity(&project_path))
+            .unwrap();
+        assert_eq!(count, 1, "decision must persist into memory_decisions");
+
+        // Re-plan: accepted decision becomes plan context.
+        let plan2 = request_via_ipc(
+            &server, &listener, &mut daemon,
+            json!({"id":"p2","command":"DiscussTurnIntoPlan","conversation_id": cid}),
+        );
+        assert_eq!(plan2["ok"], true);
+        let decisions_in_plan = plan2["plan"]["accepted_decisions"].as_array().unwrap();
+        assert!(
+            decisions_in_plan.iter().any(|d| d["id"].as_str() == Some(decision_id.as_str())),
+            "accepted decision must enter subsequent plans: {decisions_in_plan:?}"
+        );
+
+        // Execute Plan → mission with full structured context.
+        let execute = request_via_ipc(
+            &server, &listener, &mut daemon,
+            json!({"id":"e1","command":"DiscussExecutePlan","conversation_id": cid}),
+        );
+        assert_eq!(execute["ok"], true, "execute: {execute}");
+        let mission_id = execute["mission_id"].as_str().unwrap().to_string();
+        assert!(mission_id.starts_with("mission-"));
+        let plan_goal = execute["plan_goal"].as_str().unwrap();
+        assert!(
+            plan_goal.contains("GOAL:") && plan_goal.contains("rate limiting"),
+            "mission goal must embed the plan contract: {plan_goal}"
+        );
+        assert!(
+            plan_goal.contains("rate limited per IP"),
+            "mission goal must retain accepted decisions: {plan_goal}"
+        );
+
+        // Cancel the mission so nothing real executes.
+        let cancel = request_via_ipc(
+            &server, &listener, &mut daemon,
+            json!({"id":"x1","command":"CancelMission","mission_id": mission_id}),
+        );
+        assert_eq!(cancel["ok"], true);
+
+        // Restart: plan + decision + mission link survive.
+        server.cleanup();
+        daemon.shutdown().unwrap();
+        daemon.start().unwrap();
+        let Some((server, listener)) = bind_or_skip(&socket, None) else {
+            daemon.shutdown().unwrap();
+            std::env::remove_var("AGENTCODE_PROVIDER_MODE");
+            let _ = fs::remove_dir_all(dir);
+            return;
+        };
+        let get_plan = request_via_ipc(
+            &server, &listener, &mut daemon,
+            json!({"id":"gp","command":"DiscussPlanGet","conversation_id": cid}),
+        );
+        assert_eq!(get_plan["ok"], true);
+        let persisted_plan: serde_json::Value =
+            serde_json::from_str(get_plan["plan"].as_str().unwrap()).unwrap();
+        assert_eq!(
+            persisted_plan["promoted_mission_id"].as_str().unwrap(),
+            mission_id,
+            "plan↔mission link must survive restart"
+        );
+        let get_decisions = request_via_ipc(
+            &server, &listener, &mut daemon,
+            json!({"id":"gd","command":"DiscussDecisionsGet","conversation_id": cid}),
+        );
+        assert_eq!(get_decisions["ok"], true);
+        assert!(get_decisions["decisions"].as_str().unwrap().contains("rate limited per IP"));
+
+        server.cleanup();
+        daemon.shutdown().unwrap();
+        std::env::remove_var("AGENTCODE_PROVIDER_MODE");
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    /// G3: decision acceptance requires an explicit message from THIS
+    /// conversation — a foreign message id is rejected (no fabricated
+    /// provenance).
+    #[test]
+    fn discuss_accept_decision_rejects_foreign_message_and_cross_conversation() {
+        let _env_lock = crate::TEST_ENV_LOCK.lock().unwrap();
+        std::env::set_var("AGENTCODE_PROVIDER_MODE", "mock");
+        let (dir, db, lock, socket) = temp_paths("ipc-discuss-decision-guard");
+        let project_dir = dir.join("workspace");
+        fs::create_dir_all(&project_dir).unwrap();
+        let project_path = project_dir.to_string_lossy().to_string();
+
+        let mut daemon = DaemonService::open(&db, &lock).unwrap();
+        daemon.start().unwrap();
+        let Some((server, listener)) = bind_or_skip(&socket, None) else {
+            daemon.shutdown().unwrap();
+            std::env::remove_var("AGENTCODE_PROVIDER_MODE");
+            let _ = fs::remove_dir_all(dir);
+            return;
+        };
+
+        let create = request_via_ipc(
+            &server, &listener, &mut daemon,
+            json!({"id":"c1","command":"ConversationCreate","project_path": project_path, "mode":"DISCUSS","title":"Decision Guard"}),
+        );
+        let cid = create["conversation_id"].as_str().unwrap().to_string();
+        let send = request_via_ipc(
+            &server, &listener, &mut daemon,
+            json!({"id":"d1","command":"DiscussSend","conversation_id": cid, "content": "Topic"}),
+        );
+        assert_eq!(send["ok"], true);
+
+        // Foreign message id: rejected.
+        let bad = request_via_ipc(
+            &server, &listener, &mut daemon,
+            json!({"id":"b1","command":"DiscussAcceptDecision","conversation_id": cid, "message_id": "msg-does-not-exist", "decision": "X", "rationale": ""}),
+        );
+        assert_eq!(bad["ok"], false, "foreign message must be rejected: {bad}");
+        assert!(bad["error"]["code"].as_str().unwrap_or("").contains("DISCUSS-DECISION_SOURCE_MISSING"));
+
+        // Empty decision: rejected.
+        let empty = request_via_ipc(
+            &server, &listener, &mut daemon,
+            json!({"id":"b2","command":"DiscussAcceptDecision","conversation_id": cid, "message_id": send["message"]["id"].as_str().unwrap(), "decision": "  ", "rationale": ""}),
+        );
+        assert_eq!(empty["ok"], false);
+        assert!(empty["error"]["code"].as_str().unwrap_or("").contains("DISCUSS-DECISION_EMPTY"));
+
+        // Plan before discussion is impossible on a fresh conversation.
+        let fresh = request_via_ipc(
+            &server, &listener, &mut daemon,
+            json!({"id":"c2","command":"ConversationCreate","project_path": project_path, "mode":"DISCUSS","title":"Empty"}),
+        );
+        let fresh_cid = fresh["conversation_id"].as_str().unwrap().to_string();
+        let early_plan = request_via_ipc(
+            &server, &listener, &mut daemon,
+            json!({"id":"b3","command":"DiscussTurnIntoPlan","conversation_id": fresh_cid}),
+        );
+        assert_eq!(early_plan["ok"], false);
+        assert!(early_plan["error"]["code"].as_str().unwrap_or("").contains("DISCUSS-PLAN_NO_DISCUSSION"));
 
         server.cleanup();
         daemon.shutdown().unwrap();
