@@ -976,12 +976,16 @@ fn daemon_security_scope_set(
 fn daemon_security_audit(
     state: tauri::State<DaemonClient>,
     conversation_id: String,
+    depth: Option<String>,
 ) -> Result<Value, String> {
     request(
         &state.0,
         "ui",
         "SecurityAudit",
-        json!({ "conversation_id": conversation_id }),
+        json!({
+            "conversation_id": conversation_id,
+            "depth": depth.unwrap_or_else(|| "quick".to_string()),
+        }),
     )
 }
 

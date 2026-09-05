@@ -674,4 +674,71 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(root);
     }
+
+    #[test]
+    fn manifest_dependency_parsing_recognizes_real_lockfile_formats() {
+        let cargo_lock = r#"
+[[package]]
+name = "ac-common"
+version = "0.1.0"
+
+[[package]]
+name = "serde_json"
+version = "1.0.128"
+"#;
+        let deps = parse_manifest_dependencies(cargo_lock);
+        assert!(deps.contains(&("ac-common".to_string(), "0.1.0".to_string())), "{deps:?}");
+        assert!(deps.contains(&("serde_json".to_string(), "1.0.128".to_string())), "{deps:?}");
+
+        let package_lock = r#"
+    "lodash": {
+      "version": "4.17.15",
+    "request": "2.40.0",
+"#;
+        let deps = parse_manifest_dependencies(package_lock);
+        assert!(deps.contains(&("lodash".to_string(), "4.17.15".to_string())), "{deps:?}");
+        assert!(deps.contains(&("request".to_string(), "2.40.0".to_string())), "{deps:?}");
+
+        let requirements = "Django==2.1.0\nrequests==2.25.0\n";
+        let deps = parse_manifest_dependencies(requirements);
+        assert!(deps.contains(&("Django".to_string(), "2.1.0".to_string())), "{deps:?}");
+
+        let yarn = "'lodash@4.17.15':\n  version: 4.17.15\n";
+        let deps = parse_manifest_dependencies(yarn);
+        assert!(deps.iter().any(|(n, v)| n == "lodash" && v.starts_with("4.17")), "{deps:?}");
+
+        let go_mod = "module example.com/foo\n\ngo 1.22\n\nrequire (\n  github.com/sirupsen/logrus v1.0.0\n)\n";
+        let deps = parse_manifest_dependencies(go_mod);
+        assert!(deps.contains(&("github.com/sirupsen/logrus".to_string(), "1.0.0".to_string())), "{deps:?}");
+    }
+
+    #[test]
+    fn dependency_advisory_matches_known_vulnerable_and_ignores_clean() {
+        let orchestrator = BaselineSecurityOrchestrator::new(SecurityPolicy::baseline());
+        let manifest = "lodash = \"4.17.15\"\nreact = \"18.2.0\"\n";
+        let report = orchestrator.run(&SecurityScanInput {
+            repository_id: StableId::new("repo"),
+            commit: "abc".to_string(),
+            files: vec![],
+            dependency_manifest: Some(manifest.to_string()),
+            include_iac: false,
+        })
+        .unwrap();
+        let vulnerable: Vec<_> = report
+            .findings
+            .iter()
+            .filter(|f| f.root_cause.contains("lodash"))
+            .collect();
+        assert_eq!(vulnerable.len(), 1, "lodash 4.17.15 must be flagged: {:?}", report.findings.iter().map(|f| &f.root_cause).collect::<Vec<_>>());
+        assert!(
+            !report.findings.iter().any(|f| f.root_cause.contains("react")),
+            "clean react 18.2.0 must NOT be flagged"
+        );
+        let evidence_text = report
+            .instances
+            .iter()
+            .map(|i| i.redacted_evidence.clone())
+            .collect::<String>();
+        assert!(evidence_text.contains("lodash 4.17.15"), "evidence names package and version");
+    }
 }

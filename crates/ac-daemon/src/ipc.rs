@@ -830,7 +830,8 @@ fn dispatch_request(request: &Value, daemon: &mut DaemonService) -> (Value, bool
         },
         "SecurityAudit" => {
             let conversation_id = request.get("conversation_id").and_then(Value::as_str).unwrap_or("");
-            match daemon.security_audit(conversation_id) {
+            let depth = request.get("depth").and_then(Value::as_str).unwrap_or("quick");
+            match daemon.security_audit_depth(conversation_id, depth) {
                 Ok(result) => json!({"id": correlation_id, "ok": true, "audit": result}),
                 Err(error) => error_response(correlation_id, error.code(), error.to_string()),
             }

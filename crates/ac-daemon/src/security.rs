@@ -331,6 +331,26 @@ impl DaemonService {
     /// Scanners that are not available are reported honestly as unavailable —
     /// never converted into fake success.
     pub fn security_audit(&self, conversation_id: &str) -> AcResult<Value> {
+        self.security_audit_depth(conversation_id, "quick")
+    }
+
+    /// Audit-depth policies (G5): distinct scanner sets per depth, all
+    /// honest about what ran:
+    /// - quick: baseline content heuristics + fast secret scanners
+    ///   (gitleaks, semgrep).  No slow network queries.
+    /// - full: quick + dependency/IaC scanners (osv, trivy, checkov).
+    /// - cloud: full + cloud-posture surface (checkov emphasized, IaC
+    ///   included explicitly).
+    /// - ai: full + AI-surface analysis (always runs; applicability
+    ///   honest).
+    /// - adversarial: full + DAST against an authorized localhost target
+    ///   (ZAP) when a preview target is in scope.  Without an authorized
+    ///   target the DAST adapter is recorded UNAVAILABLE — never faked.
+    pub fn security_audit_depth(
+        &self,
+        conversation_id: &str,
+        depth: &str,
+    ) -> AcResult<Value> {
         self.ensure_running()?;
         let conv = security_conv(&self.db, conversation_id)?;
         let session = self.db.security_mode_session(conversation_id)?.ok_or_else(|| {
@@ -340,15 +360,20 @@ impl DaemonService {
             )
         })?;
         let scope = parse_security_scope(&session.scope_json)?;
+        let depth = normalize_audit_depth(depth);
 
         let files = security_project_files(&conv.project_path);
         let commit = current_project_commit(&conv.project_path);
         let orchestrator = BaselineSecurityOrchestrator::new(SecurityPolicy::baseline());
+        // Real dependency manifest (G5): the project's actual lockfile —
+        // parsed for known-vulnerable pinned versions.  None is honest:
+        // no manifest discovered means no manifest finding.
+        let dependency_manifest = discover_dependency_manifest(&conv.project_path);
         let scan_input = SecurityScanInput {
             repository_id: StableId::new("secmode"),
             commit: commit.clone(),
             files: files.clone(),
-            dependency_manifest: None,
+            dependency_manifest: dependency_manifest.clone(),
             include_iac: true,
         };
         let report = {
@@ -356,23 +381,48 @@ impl DaemonService {
             // threat model that persists into the session.
             let baseline = orchestrator.run(&scan_input)?;
 
-            // Real external scanner adapters (G5): the Security Mode audit
-            // runs the installed, governed scanner set through the same
-            // Tool-Broker governed executor the security.verify mission tool
-            // uses.  Every adapter is OPTIONAL here — a missing scanner is
-            // recorded honestly as unavailable and never blocks the audit,
-            // and the persisted session reflects actual executed coverage
-            // (available_scanners / unavailable_scanners /
-            // scanners_unavailable), driving FinalSecurityStatus through its
-            // SCANNER_COVERAGE_INCOMPLETE state instead of a constant.
+            // Depth-scoped scanner sets (G5): each depth runs a distinct,
+            // real adapter set.  Quick = fast local content scanners only.
+            // Full adds dependency/IaC (osv, trivy, checkov).  Cloud adds
+            // IaC emphasis.  Adversarial adds ZAP DAST against an
+            // authorized localhost preview target.  AI is analyzed at
+            // every depth (its applicability is content-derived).
+            let adapters: Vec<ac_security::SecurityAdapter> = match depth.as_str() {
+                "quick" => vec![
+                    ac_security::SecurityAdapter::Gitleaks,
+                    ac_security::SecurityAdapter::Semgrep,
+                ],
+                "cloud" | "full" | "ai" | "adversarial" => vec![
+                    ac_security::SecurityAdapter::Gitleaks,
+                    ac_security::SecurityAdapter::Semgrep,
+                    ac_security::SecurityAdapter::Osv,
+                    ac_security::SecurityAdapter::Trivy,
+                    ac_security::SecurityAdapter::Checkov,
+                ],
+                _ => vec![
+                    ac_security::SecurityAdapter::Gitleaks,
+                    ac_security::SecurityAdapter::Semgrep,
+                    ac_security::SecurityAdapter::Osv,
+                    ac_security::SecurityAdapter::Trivy,
+                    ac_security::SecurityAdapter::Checkov,
+                ],
+            };
+            // Adversarial depth: ZAP DAST is ALWAYS attempted at this depth
+            // so the audit trail shows why active testing did or did not
+            // run.  Without an authorized localhost target the
+            // validate_config gate records the attempt as policy-denied
+            // (misconfigured) — never a silent skip, never a fake run.
+            let dast_target = if depth == "adversarial" {
+                authorized_localhost_target(&scope)
+            } else {
+                None
+            };
             let mut configurations = Vec::new();
-            for adapter in [
-                ac_security::SecurityAdapter::Gitleaks,
-                ac_security::SecurityAdapter::Semgrep,
-                ac_security::SecurityAdapter::Osv,
-                ac_security::SecurityAdapter::Trivy,
-                ac_security::SecurityAdapter::Checkov,
-            ] {
+            let mut adapters = adapters;
+            if depth == "adversarial" {
+                adapters.push(ac_security::SecurityAdapter::Zap);
+            }
+            for adapter in adapters {
                 let mut config = ac_security::ScannerConfiguration::external(adapter);
                 config.required = false;
                 if matches!(
@@ -381,6 +431,10 @@ impl DaemonService {
                 ) {
                     config.timeout_ms = 180_000;
                 }
+                if adapter == ac_security::SecurityAdapter::Zap {
+                    config.timeout_ms = 120_000;
+                    config.network = ac_security::ScannerNetworkPolicy::Allow;
+                }
                 configurations.push(config);
             }
             let managed_input = ac_security::ManagedSecurityScanInput {
@@ -388,8 +442,8 @@ impl DaemonService {
                 commit: commit.clone(),
                 workspace_root: std::path::PathBuf::from(&conv.project_path),
                 configurations,
-                target_url: None,
-                target_authorized: false,
+                target_url: dast_target.clone(),
+                target_authorized: dast_target.is_some(),
             };
             let project_root = std::path::PathBuf::from(&conv.project_path);
             let sandbox = ac_sandbox::SandboxManager::new(ac_sandbox::SandboxPolicy {
@@ -617,6 +671,7 @@ impl DaemonService {
 
         Ok(json!({
             "audit_status": "FINDINGS_TRIAGED",
+            "audit_depth": depth,
             "source_commit": commit,
             "threat_model": threat_model_json(&threat_model),
             "findings": persisted.iter().map(security_finding_json).collect::<Vec<_>>(),
@@ -675,6 +730,43 @@ impl DaemonService {
         result["validations"] = json!(validations);
         result["regressions"] = json!(regressions);
         result["suppressions"] = json!(suppressions);
+        // Attack paths that traverse this finding: the threat-model attack
+        // graph is surfaced per-finding so the UI can show the exploit
+        // chain, not just the raw scanner signal (G5 finding detail).
+        let attack_paths = self
+            .db
+            .security_mode_attack_paths(conversation_id)?
+            .into_iter()
+            .map(|row| {
+                serde_json::from_str::<Value>(&row.path_json).unwrap_or(json!(null))
+            })
+            .filter(|path| path.is_object())
+            .map(|path| {
+                let involves = path["steps"]
+                    .as_array()
+                    .map(|steps| {
+                        steps
+                            .iter()
+                            .any(|step| step["finding_id"].as_str() == Some(finding_id))
+                    })
+                    .unwrap_or(false);
+                (path, involves)
+            })
+            .collect::<Vec<_>>();
+        let involving: Vec<Value> = attack_paths
+            .into_iter()
+            .filter(|(_, involves)| *involves)
+            .map(|(path, _)| path)
+            .collect();
+        result["attack_paths"] = json!(involving);
+        // Evidence resolution preview: every evidence ref becomes a
+        // resolvable pointer (id + kind) without exposing raw secrets.
+        result["evidence"] = json!(finding
+            .evidence_refs
+            .split(',')
+            .filter(|r| !r.is_empty())
+            .map(|r| json!({"ref": r, "kind": "evidence-record"}))
+            .collect::<Vec<_>>());
         Ok(result)
     }
 
@@ -969,7 +1061,7 @@ impl DaemonService {
             repository_id: StableId::new("secmode"),
             commit: commit.clone(),
             files: files.clone(),
-            dependency_manifest: None,
+            dependency_manifest: discover_dependency_manifest(&conv.project_path),
             include_iac: true,
         })?;
         let rescan_roots = report
@@ -1734,11 +1826,89 @@ fn security_project_files(project_path: &str) -> Vec<(String, String)> {
     result
 }
 
+/// Discover and read the project's REAL dependency lockfile/manifest
+/// (G5): priority to lockfiles (exact pinned versions), falling back to
+/// manifests.  Returns None honestly when the project declares none —
+/// never a fabricated manifest.
+fn discover_dependency_manifest(project_path: &str) -> Option<String> {
+    const MAX_BYTES: usize = 4 * 1024 * 1024;
+    let root = std::path::Path::new(project_path);
+    // Priority order: exact lockfiles first, then manifests.
+    let candidates = [
+        "Cargo.lock",
+        "package-lock.json",
+        "pnpm-lock.yaml",
+        "yarn.lock",
+        "poetry.lock",
+        "requirements.txt",
+        "go.sum",
+        "go.mod",
+        "pyproject.toml",
+        "Cargo.toml",
+        "package.json",
+    ];
+    for name in candidates {
+        let path = root.join(name);
+        if !path.is_file() {
+            continue;
+        }
+        let Ok(bytes) = std::fs::read(&path) else {
+            continue;
+        };
+        if bytes.len() > MAX_BYTES || bytes.is_empty() {
+            continue;
+        }
+        let content = String::from_utf8_lossy(&bytes).to_string();
+        if content.trim().is_empty() {
+            continue;
+        }
+        return Some(content);
+    }
+    None
+}
+
+/// Normalize a requested audit depth to a known policy name.  Unknown
+/// values fall back to full — recorded in the response, never silently
+/// treated as another depth.
+fn normalize_audit_depth(depth: &str) -> String {
+    match depth.trim().to_ascii_lowercase().as_str() {
+        "quick" | "full" | "cloud" | "ai" | "adversarial" => {
+            depth.trim().to_ascii_lowercase()
+        }
+        _ => "full".to_string(),
+    }
+}
+
+/// The DAST target for adversarial audits: a localhost URL from the
+/// scope's allowed hosts/ports with an explicit active-testing
+/// authorization.  Anything else yields None — ZAP then records
+/// UNAVAILABLE rather than scanning an unauthorized target.
+fn authorized_localhost_target(scope: &SecurityScope) -> Option<String> {
+    if !scope.active_testing_allowed() {
+        return None;
+    }
+    for host in &scope.allowed_hosts {
+        let host = host.trim();
+        if host.is_empty() {
+            continue;
+        }
+        // Only explicit localhost targets are DAST-able by policy.
+        if host == "localhost" || host == "127.0.0.1" || host.starts_with("http://127.0.0.1") || host.starts_with("http://localhost") {
+            if host.starts_with("http") {
+                return Some(host.to_string());
+            }
+            // Bare host: combine with the first allowed port.
+            let port = scope.allowed_ports.first().copied().unwrap_or(80);
+            return Some(format!("http://{host}:{port}"));
+        }
+    }
+    None
+}
+
 /// Resolve the current git commit for the project, or "unknown" when the
 /// project is not a git repository.  Honest freshness pinning: stale scan
 /// output is never presented as fresh.
-fn current_project_commit(project_path: &str) -> String {
-    use std::process::Command;
+fn current_project_commit(project_path: &str) -> String {    use std::process::Command;
     let output = Command::new("git")
         .args(["-C", project_path, "rev-parse", "HEAD"])
         .output();

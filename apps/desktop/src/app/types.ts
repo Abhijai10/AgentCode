@@ -647,6 +647,26 @@ export interface SecurityModeFinding {
   validations?: SecurityValidation[];
   regressions?: SecurityRegression[];
   suppressions?: SecuritySuppression[];
+  /** Attack paths from the threat model that traverse this finding
+   *  (finding detail only): entry point → steps → impact. */
+  attack_paths?: SecurityAttackPathDetail[];
+  /** Resolvable evidence pointers (finding detail only). */
+  evidence?: { ref: string; kind: string }[];
+}
+
+export interface SecurityAttackPathDetail {
+  id: string;
+  entry_point?: string;
+  privilege_required?: string;
+  impact?: string;
+  validation_state?: string;
+  affected_assets?: string[];
+  steps?: {
+    label?: string;
+    step_kind?: string;
+    finding_id?: string | null;
+    evidence_ref?: string | null;
+  }[];
 }
 
 export interface SecurityValidation {
@@ -718,6 +738,8 @@ export interface SecurityAttackPath {
 
 export interface SecurityAuditResult {
   audit_status: string;
+  /** Audit-depth policy that ran: quick | full | cloud | ai | adversarial */
+  audit_depth?: string;
   source_commit: string;
   threat_model: {
     entry_points: string[];

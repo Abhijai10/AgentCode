@@ -93,6 +93,9 @@ export function SecurityView({
   const [findings, setFindings] = useState<SecurityModeFinding[]>([]);
   const [attackPaths, setAttackPaths] = useState<SecurityAttackPath[]>([]);
   const [audit, setAudit] = useState<SecurityAuditResult | null>(null);
+  const [auditDepth, setAuditDepth] = useState<
+    "quick" | "full" | "cloud" | "ai" | "adversarial"
+  >("quick");
   const [report, setReport] = useState<SecurityReportData | null>(null);
   const [selectedFinding, setSelectedFinding] = useState<SecurityModeFinding | null>(null);
   const [detailLoading, setDetailLoading] = useState(false);
@@ -294,7 +297,7 @@ export function SecurityView({
     if (!activeConvId) return;
     setBusy("audit");
     setError(null);
-    const result = await daemon.securityAudit(activeConvId);
+    const result = await daemon.securityAudit(activeConvId, auditDepth);
     if (result.ok) {
       setAudit(result.audit ?? null);
       await refreshSecurity();
@@ -567,6 +570,36 @@ export function SecurityView({
                 <span className="text-on-surface font-medium">Regression protection:</span>{" "}
                 {selectedFinding.regressions.map((r) => `${r.regression_type}:${r.state}`).join(", ")}
               </p>
+            )}
+            {selectedFinding.attack_paths && selectedFinding.attack_paths.length > 0 && (
+              <div className="rounded-lg bg-red-500/5 px-3 py-2 space-y-1">
+                <p className="text-xs text-on-surface font-medium">
+                  Attack paths traversing this finding
+                </p>
+                {selectedFinding.attack_paths.map((path) => (
+                  <div key={path.id} className="text-[11px] text-on-surface-variant">
+                    <p>
+                      <span className="text-on-surface">{path.entry_point ?? "entry"}</span>
+                      {path.privilege_required && ` (${path.privilege_required} required)`}
+                      {" → impact: "}
+                      <span className="text-red-600 dark:text-red-400">{path.impact ?? "unknown"}</span>
+                    </p>
+                    {(path.steps ?? []).length > 0 && (
+                      <ol className="list-decimal list-inside ml-2">
+                        {(path.steps ?? []).map((step, i) => (
+                          <li key={i}>
+                            {step.label ?? step.step_kind ?? "step"}
+                          </li>
+                        ))}
+                      </ol>
+                    )}
+                    <p className="text-[10px]">
+                      validation: {path.validation_state ?? "unvalidated"} · assets:{" "}
+                      {(path.affected_assets ?? []).join(", ") || "—"}
+                    </p>
+                  </div>
+                ))}
+              </div>
             )}
             {selectedFinding.category === "secret" && secretLifecycle && (
               <div className="rounded-lg bg-amber-500/5 px-3 py-2 space-y-1">
@@ -866,13 +899,28 @@ export function SecurityView({
                               Ports: {secStatus.scope.allowed_ports.join(", ")}
                             </p>
                           )}
-                          <div className="flex flex-wrap gap-2 pt-1">
+                          <div className="flex flex-wrap items-center gap-2 pt-1">
                             <button
                               onClick={() => setShowScopeForm(true)}
                               className="text-[11px] px-2.5 py-1 rounded-lg neo-button text-on-surface-variant hover:text-primary"
                             >
                               Change scope
                             </button>
+                            <select
+                              value={auditDepth}
+                              onChange={(e) =>
+                                setAuditDepth(e.target.value as typeof auditDepth)
+                              }
+                              className="text-[11px] px-2 py-1 rounded-lg neo-input bg-background text-on-surface"
+                              aria-label="Audit depth"
+                              title="Scanner set per depth: quick = fast content scanners; full adds dependency/IaC; cloud adds IaC emphasis; adversarial adds ZAP DAST against an authorized localhost target"
+                            >
+                              <option value="quick">Quick</option>
+                              <option value="full">Full</option>
+                              <option value="cloud">Cloud</option>
+                              <option value="ai">AI</option>
+                              <option value="adversarial">Adversarial (DAST)</option>
+                            </select>
                             <button
                               disabled={busy === "audit"}
                               onClick={handleAudit}
@@ -992,6 +1040,12 @@ export function SecurityView({
                           ))}
                           {audit && (
                             <div className="pt-1 border-t border-outline-variant/30 space-y-1">
+                              <p>
+                                Last audit depth:{" "}
+                                <span className="text-on-surface">
+                                  {audit.audit_depth ?? "quick"}
+                                </span>
+                              </p>
                               <p>
                                 AI security surface:{" "}
                                 <span className="text-on-surface">

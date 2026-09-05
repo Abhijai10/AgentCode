@@ -1145,12 +1145,13 @@ export const daemon = {
   },
 
   async securityAudit(
-    conversationId: string
+    conversationId: string,
+    depth?: "quick" | "full" | "cloud" | "ai" | "adversarial"
   ): Promise<{ ok: boolean; audit?: SecurityAuditResult; error?: string }> {
     try {
       const res = await invoke<{ audit: SecurityAuditResult }>(
         "daemon_security_audit",
-        { conversationId }
+        { conversationId, depth: depth ?? "quick" }
       );
       return { ok: true, audit: res.audit };
     } catch (e: unknown) {

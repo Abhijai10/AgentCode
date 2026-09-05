@@ -15,7 +15,7 @@ pub enum ProofLevel { Pattern, Dependency, Secret, Manual, Rescan, ActiveValidat
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
 pub enum SecurityAdapter {
     Gitleaks, Osv, Trivy, Semgrep, Checkov, Zap,
-    BuiltInSecretHeuristic, BuiltInSuspiciousSqlHeuristic, BuiltInIacHeuristic, BuiltInActiveDastHeuristic, BuiltInCloudPostureHeuristic,
+    BuiltInSecretHeuristic, BuiltInSuspiciousSqlHeuristic, BuiltInIacHeuristic, BuiltInActiveDastHeuristic, BuiltInCloudPostureHeuristic, BuiltInDependencyHeuristic,
     Nuclei, Prowler, Stratus, CloudGoat, Pacu, AiNative, Promptfoo, Garak, PyRit, Manual,
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -127,6 +127,7 @@ impl BaselineSecurityOrchestrator {
         let mut instances = self.secret_heuristic(input);
         instances.extend(self.sql_heuristic(input));
         if input.include_iac { instances.extend(self.iac_heuristic(input)); }
+        if let Some(manifest) = input.dependency_manifest.as_deref() { instances.extend(self.dependency_heuristic(manifest)); }
         let findings = self.triage(self.group(instances.clone()));
         Ok(SecurityScanReport { id: StableId::new("secscan"), adapters_run: instances.iter().map(|i| i.adapter).collect(), missing_adapters: Vec::new(), threat_model, instances, findings, executions: Vec::new() })
     }
@@ -202,7 +203,35 @@ impl BaselineSecurityOrchestrator {
     fn secret_heuristic(&self, input: &SecurityScanInput) -> Vec<SecurityFindingInstance> { input.files.iter().flat_map(|(path, content)| content.lines().enumerate().filter(|(_, line)| line.contains("AKIA") || line.contains("SECRET=")).map(move |(n, line)| external_instance(SecurityAdapter::BuiltInSecretHeuristic, "builtin.secret-pattern", SecuritySeverity::Critical, ProofLevel::Pattern, path, n as u32 + 1, "builtin-secret-pattern", redact_output(line), StableId::new("evidence")))).collect() }
     fn sql_heuristic(&self, input: &SecurityScanInput) -> Vec<SecurityFindingInstance> { input.files.iter().filter_map(|(path, content)| content.lines().position(|line| line.contains("SELECT * FROM users WHERE name = '") || line.contains("dangerouslySetInnerHTML")).map(|n| external_instance(SecurityAdapter::BuiltInSuspiciousSqlHeuristic, "builtin.suspicious-sink", SecuritySeverity::High, ProofLevel::Pattern, path, n as u32 + 1, "builtin-suspicious-sink", "suspicious source sink pattern".to_string(), StableId::new("evidence")))).collect() }
     fn iac_heuristic(&self, input: &SecurityScanInput) -> Vec<SecurityFindingInstance> { input.files.iter().filter_map(|(path, content)| content.lines().position(|line| line.contains("0.0.0.0/0") || line.contains("public-read")).map(|n| external_instance(SecurityAdapter::BuiltInIacHeuristic, "builtin.iac-public-exposure", SecuritySeverity::High, ProofLevel::Pattern, path, n as u32 + 1, "builtin-iac-public-exposure", "public infrastructure exposure heuristic".to_string(), StableId::new("evidence")))).collect() }
-    fn group(&self, items: Vec<SecurityFindingInstance>) -> Vec<NormalizedSecurityFinding> { let mut groups = BTreeMap::new(); for item in items { let key = format!("{}:{}:{}", item.file_path, item.rule_id, item.fingerprint); groups.entry(key).and_modify(|f: &mut NormalizedSecurityFinding| { f.affected_code.push(item.file_path.clone()); f.evidence_refs.push(item.raw_evidence_ref.clone()); f.instance_ids.push(item.id.clone()); f.confidence = f.confidence.max(item.confidence); f.severity = f.severity.max(item.severity); }).or_insert_with(|| NormalizedSecurityFinding { id: StableId::new("secfinding"), root_cause: item.fingerprint.clone(), severity: item.severity, confidence: item.confidence, exploitability: if self.policy.blocking_severities.contains(&item.severity) { 80 } else { 40 }, status: FindingStatus::Candidate, affected_code: vec![item.file_path.clone()], evidence_refs: vec![item.raw_evidence_ref.clone()], remediation: remediation_for(&item.fingerprint), instance_ids: vec![item.id.clone()] }); } groups.into_values().collect() }
+    /// Real dependency-manifest analysis (G5): parses the project's actual
+    /// lockfile/manifest content for declared dependency versions and flags
+    /// KNOWN-VULNERABLE versions from the bundled advisory list.  A
+    /// version with no advisory is never flagged.  Version strings never
+    /// enter evidence beyond the name+version pair.
+    fn dependency_heuristic(&self, manifest: &str) -> Vec<SecurityFindingInstance> {
+        let mut out = Vec::new();
+        for (name, version) in parse_manifest_dependencies(manifest) {
+            if let Some(advisory) = known_vulnerable_dependency(&name, &version) {
+                out.push(external_instance(
+                    SecurityAdapter::BuiltInDependencyHeuristic,
+                    "builtin.dependency-advisory",
+                    advisory.severity,
+                    ProofLevel::Pattern,
+                    &advisory.evidence_file,
+                    1,
+                    &format!("builtin-dependency-{}-{}", name, version),
+                    format!(
+                        "{} {} matches a known-vulnerable range: {} ({})| remediation: {}",
+                        name, version, advisory.summary, advisory.advisory_id, advisory.remediation
+                    ),
+                    StableId::new("evidence"),
+                ));
+            }
+        }
+        out
+    }
+    fn group(&self, items: Vec<SecurityFindingInstance>) -> Vec<NormalizedSecurityFinding> { let mut groups = BTreeMap::new(); for item in items { let key = format!("{}:{}:{}", item.file_path, item.rule_id, item.fingerprint); groups.entry(key).and_modify(|f: &mut NormalizedSecurityFinding| { f.affected_code.push(item.file_path.clone()); f.evidence_refs.push(item.raw_evidence_ref.clone()); f.instance_ids.push(item.id.clone()); f.confidence = f.confidence.max(item.confidence); f.severity = f.severity.max(item.severity); }).or_insert_with(|| NormalizedSecurityFinding { id: StableId::new("secfinding"), root_cause: item.fingerprint.clone(), severity: item.severity, confidence: item.confidence, exploitability: if self.policy.blocking_severities.contains(&item.severity) { 80 } else { 40 }, status: FindingStatus::Candidate, affected_code: vec![item.file_path.clone()], evidence_refs: vec![item.raw_evidence_ref.clone()], remediation: if item.fingerprint.starts_with("builtin-dependency") { // The advisory remediation is carried in the instance evidence after the "| remediation: " marker.
+ item.redacted_evidence.split("| remediation: ").nth(1).map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).unwrap_or_else(|| remediation_for(&item.fingerprint)) } else { remediation_for(&item.fingerprint) }, instance_ids: vec![item.id.clone()] }); } groups.into_values().collect() }
     fn triage(&self, mut findings: Vec<NormalizedSecurityFinding>) -> Vec<NormalizedSecurityFinding> { for f in &mut findings { f.status = if self.policy.blocking_severities.contains(&f.severity) { FindingStatus::NeedsValidation } else { FindingStatus::Candidate }; } findings }
 }
 
@@ -448,7 +477,185 @@ fn normalize_item(adapter: SecurityAdapter, v: &Value, evidence: StableId) -> Se
 fn field(v: &Value, names: &[&str]) -> Option<String> { names.iter().find_map(|n| v.get(*n).and_then(Value::as_str).map(ToString::to_string)) }
 fn number(v: &Value, names: &[&str]) -> Option<u32> { names.iter().find_map(|n| v.get(*n).and_then(Value::as_u64).map(|x| x as u32)) }
 fn severity(value: Option<&str>) -> SecuritySeverity { match value.unwrap_or_default().to_ascii_uppercase().as_str() { "CRITICAL" | "4" => SecuritySeverity::Critical, "HIGH" | "ERROR" | "3" => SecuritySeverity::High, "MEDIUM" | "WARNING" | "2" => SecuritySeverity::Medium, _ => SecuritySeverity::Low } }
-fn adapter_name(a: SecurityAdapter) -> &'static str { match a { SecurityAdapter::Gitleaks => "gitleaks", SecurityAdapter::Osv => "osv-scanner", SecurityAdapter::Trivy => "trivy", SecurityAdapter::Semgrep => "semgrep", SecurityAdapter::Checkov => "checkov", SecurityAdapter::Zap => "zap", SecurityAdapter::BuiltInSecretHeuristic => "builtin-secret-heuristic", SecurityAdapter::BuiltInSuspiciousSqlHeuristic => "builtin-suspicious-sql-heuristic", SecurityAdapter::BuiltInIacHeuristic => "builtin-iac-heuristic", SecurityAdapter::BuiltInActiveDastHeuristic => "builtin-active-dast-heuristic", SecurityAdapter::BuiltInCloudPostureHeuristic => "builtin-cloud-posture-heuristic", _ => "agentcode" } }
+
+/// Extract (name, version) pairs from a real dependency lockfile or
+/// manifest.  Recognized formats: Cargo.lock/Cargo.toml (`name = "x"`),
+/// package-lock.json (`"x": "1.2.3"`), pnpm/yarn locks (`'x@1.2.3'`),
+/// requirements.txt (`x==1.2.3`), go.mod (`mod v1.2.3`).
+pub fn parse_manifest_dependencies(manifest: &str) -> Vec<(String, String)> {
+    let mut deps = Vec::new();
+    let lines: Vec<&str> = manifest.lines().collect();
+    for (index, line) in lines.iter().enumerate() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') || line.starts_with("//") {
+            continue;
+        }
+        // Cargo.lock window: `name = "x"` followed by `version = "y"`.
+        if let Some(value) = line.strip_prefix("name = ") {
+            let name = value.trim().trim_matches('"');
+            if !name.is_empty() && name.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_')) {
+                if let Some(next) = lines.get(index + 1) {
+                    if let Some(version) = next.trim().strip_prefix("version = ") {
+                        let version = version.trim().trim_matches('"');
+                        if valid_pair(name, version) {
+                            deps.push((name.to_string(), version.to_string()));
+                            continue;
+                        }
+                    }
+                }
+            }
+        }
+        // requirements.txt: name==1.2.3
+        if let Some((name, version)) = line.split_once("==") {
+            let name = name.trim();
+            let version = version.split([';', '>', '<', ' ', ',']).next().unwrap_or("").trim();
+            if valid_pair(name, version) {
+                deps.push((name.to_string(), version.to_string()));
+                continue;
+            }
+        }
+        // JSON pair: "name": "1.2.3" (direct) or "name": { followed by a
+        // "version": "1.2.3" line (package-lock nesting).
+        if let Some((name, version)) = parse_json_pair(line) {
+            if valid_pair(&name, &version) {
+                deps.push((name, version));
+                continue;
+            }
+        }
+        if let Some(name) = line.strip_suffix("\": {") {
+            let name = name.trim_start_matches('"').trim();
+            if name.is_empty() { continue; }
+            // Look ahead for the "version" key inside this object.
+            for next in lines.iter().skip(index + 1).take(4) {
+                let next = next.trim().trim_end_matches(',');
+                if let Some((key, value)) = next.split_once("\": ") {
+                    let key = key.trim_start_matches('"').trim();
+                    let version = value.trim().trim_matches('"');
+                    if key == "version" && valid_pair(name, version) {
+                        deps.push((name.to_string(), version.to_string()));
+                        break;
+                    }
+                }
+            }
+        }
+        // TOML dep: name = "1.2" (skip structural keys)
+        if let Some((name, version)) = parse_toml_pair(line) {
+            if valid_pair(&name, &version) {
+                deps.push((name, version));
+                continue;
+            }
+        }
+        // yarn/pnpm: 'name@1.2.3' or 'name@npm:1.2.3'
+        if line.starts_with('\'') || line.starts_with('"') {
+            let inner = line.trim_matches(['\'', '"']);
+            if let Some((name, version)) = inner.rsplit_once('@') {
+                let version = version.strip_prefix("npm:").unwrap_or(version);
+                let name = name.rsplit_once('@').map(|(n, _)| n).unwrap_or(name);
+                if valid_pair(name, version) {
+                    deps.push((name.to_string(), version.to_string()));
+                    continue;
+                }
+            }
+        }
+        // go.mod: module v1.2.3
+        if let Some((name, version)) = line.split_once(' ') {
+            if version.starts_with('v')
+                && name.contains('/')
+                && valid_pair(name, version.trim_start_matches('v'))
+            {
+                deps.push((name.to_string(), version[1..].to_string()));
+            }
+        }
+    }
+    deps.sort();
+    deps.dedup();
+    deps
+}
+
+fn parse_json_pair(line: &str) -> Option<(String, String)> {
+    let line = line.trim().trim_end_matches(',');
+    let (key, value) = line.split_once("\": ")?;
+    let name = key.trim_start_matches('"').trim();
+    let version = value.trim().trim_matches('"');
+    if name.is_empty()
+        || version.is_empty()
+        // Structural keys are not dependencies.
+        || matches!(name, "version" | "name" | "id" | "resolved" | "integrity" | "type")
+    {
+        return None;
+    }
+    Some((name.to_string(), version.to_string()))
+}
+
+fn parse_toml_pair(line: &str) -> Option<(String, String)> {
+    let (key, value) = line.split_once(" = ")?;
+    let name = key.trim();
+    if name.is_empty()
+        || name.contains(' ')
+        || name.contains('.')
+        || name.contains('/')
+        || name.contains(':')
+        || matches!(name, "version" | "name" | "edition" | "license" | "path")
+    {
+        return None;
+    }
+    let version = value.trim().trim_matches('"');
+    if version.is_empty() { return None; }
+    Some((name.to_string(), version.to_string()))
+}
+
+fn valid_pair(name: &str, version: &str) -> bool {
+    !name.is_empty()
+        && !version.is_empty()
+        && version.len() <= 32
+        && version.chars().next().map(|c| c.is_ascii_digit()).unwrap_or(false)
+        && name.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_' | '/' | '@'))
+}
+
+/// A bundled minimal advisory set of widely-known vulnerable dependency
+/// versions (long-standing public advisories).  Real depth comes from the
+/// external Osv/Trivy adapters when installed; this list keeps the
+/// builtin path honest when they are not — no version without an entry
+/// is ever flagged.
+struct DependencyAdvisory {
+    severity: SecuritySeverity,
+    summary: &'static str,
+    advisory_id: &'static str,
+    remediation: &'static str,
+    evidence_file: String,
+}
+
+fn known_vulnerable_dependency(name: &str, version: &str) -> Option<DependencyAdvisory> {
+    let name = name.rsplit('/').next().unwrap_or(name).to_ascii_lowercase();
+    let file = format!("manifest:{}@{}", name, version);
+    let mk = |severity, summary: &'static str, advisory_id: &'static str, remediation: &'static str, file: String| {
+        Some(DependencyAdvisory { severity, summary, advisory_id, remediation, evidence_file: file })
+    };
+    let major: Option<u32> = version.split('.').next()?.parse().ok();
+    let minor: Option<u32> = version.split('.').nth(1).unwrap_or("0").parse().ok();
+    let (major, minor) = (major?, minor.unwrap_or(0));
+    if name == "lodash" && (major < 4 || (major == 4 && minor < 17) || (major == 4 && minor == 17 && version.split('.').nth(2).unwrap_or("0").parse::<u32>().unwrap_or(0) < 21)) {
+        return mk(SecuritySeverity::High, "prototype pollution / template injection", "CVE-2015-8861 / CVE-2021-23337", "upgrade lodash to >=4.17.21", file);
+    }
+    if name == "request" && (major < 2 || (major == 2 && minor < 68)) {
+        return mk(SecuritySeverity::Medium, "credential leak on cross-origin redirects", "GHSA-52mw-8j83-vb5w", "replace request with a maintained HTTP client", file);
+    }
+    if name == "node-sass" && major < 7 {
+        return mk(SecuritySeverity::High, "libsass path traversal", "CVE-2020-24073", "replace node-sass with sass (dart-sass)", file);
+    }
+    if name == "moment" && (major < 2 || (major == 2 && minor < 29)) {
+        return mk(SecuritySeverity::Low, "ReDoS in long date strings", "CVE-2022-31129", "upgrade moment to >=2.29.4", file);
+    }
+    if name == "validator" && (major < 13 || (major == 13 && minor < 7)) {
+        return mk(SecuritySeverity::Medium, "inefficient regular expression DoS", "CVE-2021-3765", "upgrade validator to >=13.7.0", file);
+    }
+    if name == "elliptic" && (major < 6 || (major == 6 && minor < 5)) {
+        return mk(SecuritySeverity::High, "invalid signature malleability", "GHSA-r9p9-mrjm-926w", "upgrade elliptic to >=6.5.4", file);
+    }
+    None
+}
+
+fn adapter_name(a: SecurityAdapter) -> &'static str { match a { SecurityAdapter::Gitleaks => "gitleaks", SecurityAdapter::Osv => "osv-scanner", SecurityAdapter::Trivy => "trivy", SecurityAdapter::Semgrep => "semgrep", SecurityAdapter::Checkov => "checkov", SecurityAdapter::Zap => "zap", SecurityAdapter::BuiltInSecretHeuristic => "builtin-secret-heuristic", SecurityAdapter::BuiltInSuspiciousSqlHeuristic => "builtin-suspicious-sql-heuristic", SecurityAdapter::BuiltInIacHeuristic => "builtin-iac-heuristic", SecurityAdapter::BuiltInActiveDastHeuristic => "builtin-active-dast-heuristic", SecurityAdapter::BuiltInCloudPostureHeuristic => "builtin-cloud-posture-heuristic", SecurityAdapter::BuiltInDependencyHeuristic => "builtin-dependency-heuristic", _ => "agentcode" } }
 struct InstanceSpec<'a> { adapter: SecurityAdapter, rule_id: &'a str, severity: SecuritySeverity, proof_level: ProofLevel, file_path: &'a str, line: u32, fingerprint: &'a str, redacted_evidence: String }
 fn instance(spec: InstanceSpec<'_>) -> SecurityFindingInstance { external_instance(spec.adapter, spec.rule_id, spec.severity, spec.proof_level, spec.file_path, spec.line, spec.fingerprint, spec.redacted_evidence, StableId::new("evidence")) }
 #[allow(clippy::too_many_arguments)]
@@ -468,5 +675,5 @@ fn scanner_version(adapter: SecurityAdapter, s: &str) -> String {
 }
 fn redact_secret(value: &str) -> String { redact_output(value) }
 fn redact_output(value: &str) -> String { value.split_whitespace().map(|part| if part.contains("AKIA") || part.contains("SECRET=") || part.contains("Authorization:") || part.contains("Cookie:") || part.contains("token=") || part.contains("password=") { "[REDACTED]" } else { part }).collect::<Vec<_>>().join(" ") }
-fn remediation_for(f: &str) -> String { if f.contains("secret") { "remove committed secret and rotate credential".to_string() } else if f.contains("vulnerab") { "upgrade vulnerable dependency".to_string() } else { "review and remediate security finding".to_string() } }
+fn remediation_for(f: &str) -> String { if f.contains("secret") { "remove committed secret and rotate credential".to_string() } else if f.contains("vulnerab") || f.starts_with("builtin-dependency") { "upgrade vulnerable dependency".to_string() } else { "review and remediate security finding".to_string() } }
 fn json_escape(v: &str) -> String { v.replace('\\', "\\\\").replace('"', "\\\"").replace('\n', "\\n") }
