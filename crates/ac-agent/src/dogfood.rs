@@ -341,7 +341,7 @@ fn affected_files(kind: DogfoodMissionKind) -> Vec<String> {
             "crates/ac-agent/src/lib.rs".to_string(),
             "crates/ac-runtime/src/lib.rs".to_string(),
         ],
-        DogfoodMissionKind::DesignStudio => vec!["crates/ac-agent/src/design.rs".to_string()],
+        DogfoodMissionKind::DesignStudio => vec!["crates/ac-daemon/src/design.rs".to_string()],
         DogfoodMissionKind::SecurityAudit
         | DogfoodMissionKind::PromptInjection
         | DogfoodMissionKind::MaliciousMcp

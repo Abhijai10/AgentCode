@@ -1764,7 +1764,7 @@ impl BrowserRuntime {
             .real_pages
             .values()
             .next()
-            .map(|p| p.viewport.clone())
+            .map(|p| p.viewport)
             .unwrap_or(ViewportProfile {
                 name: "desktop",
                 width: 1440,

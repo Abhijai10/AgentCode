@@ -1,9 +1,10 @@
 // ── Discuss Turn-Into-Plan / Decision capture (G3, Doc 06 §23-25) ────────────
 //
-// The production conversation model is conversations/conversation_messages;
-// the ac-agent DiscussSession lifecycle in ac-agent/src/discuss.rs is an
-// orphaned parallel model (never called by the daemon) and is being
-// consolidated away.  Structured Discuss plans and accepted decisions live
+// The production conversation model is conversations/conversation_messages.
+// The former ac-agent DiscussSession lifecycle (ac-agent/src/discuss.rs) was
+// an orphaned parallel model — never called by the daemon — and has been
+// deleted (see tests/integration/orphan_guard.rs for the durable guard).
+// Structured Discuss plans and accepted decisions live
 // in the conversation-scoped `design_documents` store (doc types
 // `discuss_plan` / `discuss_decisions`) so they persist with the
 // conversation, survive restart, and are project-isolated by the same

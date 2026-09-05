@@ -1272,12 +1272,14 @@ fn security_mode_audit_runs_real_external_scanners_with_honest_coverage() {
 
     // The managed sweep runs five optional external scanners; each can take
     // tens of seconds (checkov, gitleaks).  The IPC response budget for
-    // SecurityAudit is 300s; the pump deadline matches it.
+    // SecurityAudit is 300s; the pump deadline matches it.  Full depth
+    // covers the complete static set (gitleaks, semgrep, osv, trivy,
+    // checkov) so every adapter reports honest coverage.
     let audit = request_via_ipc(
         &server,
         &listener,
         &mut daemon,
-        json!({"id":"g5","command":"SecurityAudit","conversation_id": cid}),
+        json!({"id":"g5","command":"SecurityAudit","conversation_id": cid, "depth": "full"}),
     );
     assert_eq!(audit["ok"], true, "audit: {audit}");
 
@@ -1458,7 +1460,10 @@ fn security_audit_discovers_real_dependency_manifest_and_flags_known_vulnerable(
     let finding = elliptic.unwrap();
     assert_eq!(finding["severity"], "High");
     assert!(
-        finding["remediation"].as_str().unwrap_or("").contains("elliptic"),
+        finding["remediation"]
+            .as_str()
+            .unwrap_or("")
+            .contains("elliptic"),
         "remediation must name the package: {}",
         finding["remediation"]
     );
@@ -1492,7 +1497,9 @@ fn security_audit_discovers_real_dependency_manifest_and_flags_known_vulnerable(
         })
         .unwrap_or_default();
     assert!(
-        persisted_roots.iter().any(|r| r.contains("builtin-dependency-elliptic-6.4.1")),
+        persisted_roots
+            .iter()
+            .any(|r| r.contains("builtin-dependency-elliptic-6.4.1")),
         "manifest finding must persist with its fingerprint: {persisted_roots:?}"
     );
 
@@ -1557,11 +1564,20 @@ fn security_audit_depth_policies_are_distinct_and_dast_requires_authorization() 
     assert_eq!(quick_body["audit_depth"], "quick");
     let quick_attempted: Vec<String> = quick_body["scanner_availability"]
         .as_array()
-        .map(|a| a
-            .iter()
-            .filter(|s| s.get("availability").and_then(|v| v.as_str()) == Some("Available") || s.get("availability").is_some())
-            .map(|s| s.get("adapter").and_then(|v| v.as_str()).unwrap_or("").to_string())
-            .collect())
+        .map(|a| {
+            a.iter()
+                .filter(|s| {
+                    s.get("availability").and_then(|v| v.as_str()) == Some("Available")
+                        || s.get("availability").is_some()
+                })
+                .map(|s| {
+                    s.get("adapter")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string()
+                })
+                .collect()
+        })
         .unwrap_or_default();
     // Quick must NOT attempt osv/trivy/checkov/zap (the slow/network set).
     for slow in ["Osv", "Trivy", "Checkov", "Zap"] {
@@ -1587,7 +1603,12 @@ fn security_audit_depth_policies_are_distinct_and_dast_requires_authorization() 
     assert_eq!(adversarial_body["audit_depth"], "adversarial");
     let zap_rows: Vec<Value> = adversarial_body["scanner_availability"]
         .as_array()
-        .map(|a| a.iter().filter(|s| s.get("adapter").and_then(|v| v.as_str()) == Some("Zap")).cloned().collect())
+        .map(|a| {
+            a.iter()
+                .filter(|s| s.get("adapter").and_then(|v| v.as_str()) == Some("Zap"))
+                .cloned()
+                .collect()
+        })
         .unwrap_or_default();
     assert!(
         !zap_rows.is_empty(),
@@ -1595,7 +1616,9 @@ fn security_audit_depth_policies_are_distinct_and_dast_requires_authorization() 
         adversarial_body["scanner_availability"]
     );
     assert!(
-        zap_rows.iter().all(|z| z["availability"] != "Available" || z.get("failure").is_none()),
+        zap_rows
+            .iter()
+            .all(|z| z["availability"] != "Available" || z.get("failure").is_none()),
         "ZAP must not claim success against an unauthorized target: {zap_rows:?}"
     );
     // Read-only scope never allows active testing: ZAP records

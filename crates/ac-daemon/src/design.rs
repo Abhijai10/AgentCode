@@ -989,6 +989,14 @@ Rules: describe only what is actually visible in the image. Findings must be con
         let analysis = self.design_understand(conversation_id)?;
         // Project-scoped durable constraints (Doc 06 §92).
         let constraints = self.design_constraints_get(conversation_id)?;
+        let messages = self.db.messages_for_conversation(conversation_id)?;
+        let recent_start = messages.len().saturating_sub(10);
+        let recent_messages: Vec<Value> = messages[recent_start..]
+            .iter()
+            .map(|m| {
+                json!({"role": m.role, "content": bounded_ui_summary(&m.content, 512)})
+            })
+            .collect();
         let contract = json!({
             "conversation_id": conversation_id,
             "project_path": conv.project_path,
@@ -1003,18 +1011,9 @@ Rules: describe only what is actually visible in the image. Findings must be con
                 .db
                 .design_critiques(conversation_id)?
                 .into_iter()
-                .rev()
-                .next()
+                .last()
                 .and_then(|row| serde_json::from_str::<Value>(&row.findings_json).ok()),
-            "recent_messages": self
-                .db
-                .messages_for_conversation(conversation_id)?
-                .iter()
-                .rev()
-                .take(10)
-                .rev()
-                .map(|m| json!({"role": m.role, "content": bounded_ui_summary(&m.content, 512)}))
-                .collect::<Vec<_>>(),
+            "recent_messages": recent_messages,
         });
         Ok(contract)
     }

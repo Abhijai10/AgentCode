@@ -42,6 +42,10 @@ name = "security_mode_flow"
 path = "security_mode_flow.rs"
 
 [[test]]
+name = "orphan_guard"
+path = "orphan_guard.rs"
+
+[[test]]
 name = "design_reference_vision_e2e"
 path = "design_reference_vision_e2e.rs"
 
