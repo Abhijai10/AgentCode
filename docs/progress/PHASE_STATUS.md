@@ -5,7 +5,16 @@ Doc 10 gates for the phase pass and completion evidence exists).
 
 Phase names are the EXACT canonical names from Doc 09 HC-P00..HC-P29 (no aliases).
 
-Last updated: 2026-08-24 (Phase 28 release candidate and Phase 29 V1 release closure)
+Last updated: 2026-09-05 (G-Closure-2 post-release production-path hardening pass complete — see docs/progress/g-closure-2-final-report.md; roadmap phases P00–P29 unchanged)
+
+Post-V1 hardening (G-Closure-2, final HEAD `4eb43ac`): closed production-path gaps
+in Discuss (repository grounding, citations, plan/decision promotion), Design Studio
+(real-browser QA, gemma3:4b visual critic, design contract→mission, durable
+constraints, repair-loop iteration history, cross-chat design memory, governed
+DESIGN_STATE.md ChangeSet materialization), and Security (real dependency manifests,
+audit-depth policies, DAST authorization gate, attack-path finding detail); deleted
+the orphaned ac-agent Discuss/Design parallel implementations with a durable guard.
+All roadmap phase statuses above remain COMPLETE per their recorded gate evidence.
 
 | Phase | Name (Doc 09 HC-*) | Status | Notes |
 |-------|--------------------|--------|-------|

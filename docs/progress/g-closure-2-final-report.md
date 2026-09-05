@@ -1,7 +1,7 @@
 # G-Closure-2 Final Realization Pass — Adversarial Final Report
 
 **Branch:** `batch/phase-0-2-foundation`
-**Starting HEAD:** `95fb41d` → **Final HEAD:** `405ef3a` (7 focused commits this pass)
+**Starting HEAD:** `95fb41d` → **Final HEAD:** `4eb43ac` (9 focused commits this pass)
 **Date:** 2026-09-05
 **Mandate:** Close the remaining production-path gaps from the G-batch audit — no new roadmap batches. A capability is complete only when the actual user-facing production path performs the intended behavior, the behavior is persisted correctly, tests exercise that production path, and the evidence supports the claim.
 
@@ -9,7 +9,7 @@
 
 ## A. HEAD SHA and commit manifest
 
-Final HEAD: `405ef3a`
+Final HEAD: `4eb43ac`
 
 | # | SHA | Subject | Files | ± |
 |---|---|---|---|---|
@@ -20,6 +20,8 @@ Final HEAD: `405ef3a`
 | 5 | `d41402f` | refactor: delete orphaned ac-agent mode implementations + durable guard | 8 | +151/−407 |
 | 6 | `b4f7f65` | docs: G-Closure-2 final realization report (adversarial, sections A-L) | 1 | report |
 | 7 | `405ef3a` | refactor: remove the orphaned ac-agent mode source files (the deletions d41402f described) | 2 | −1120 |
+| 8 | `530ff23` | feat(design): governed DESIGN_STATE.md, repair-loop history, constraint-aware critics, cross-chat design memory | 7 | +667/−10 |
+| 9 | `4eb43ac` | fix(design): DesignVisualCritique/DesignQAReport need the provider response budget | 1 | +2 |
 
 Nothing pushed. Never-stage untracked files untouched: `.freebuff/`, `.kilo/`, `AGENTCODE_BACKEND_REMAINING_WORK.md`, `AgentCode_Master_Product_Learnings_and_Completion_Gap_Reference.md`, `Agent_Code_logo.png`.
 
@@ -57,8 +59,11 @@ Conversation-scoped persistence extended: grounding docs, discuss plans/decision
 - **Design contract→mission**: closed (see G1).
 - **Durable constraints** (Doc 06 §92): project-scoped (hash-keyed doc), editable in UI, inherited by every design chat in the project, never leaked across projects (both tested). Marked NON-NEGOTIABLE in contracts — outrank aesthetics.
 - **Design memory across chats**: same-project inheritance tested (`design_execute_contract...constraints_are_project_scoped`).
-- **DESIGN_STATE.md** (Doc 06 §91): materialized via recorded `design_state_materialization` doc; SQLite remains code-authoritative (noted in the file itself).
-- Repair-loop iteration history: persisted critique rows with doc_type discrimination (visual-critic vs default) — IMPLEMENTED via `design_critiques` rows; full multi-iteration repair-loop UI replay remains OPTIONAL/DEFERRED (persistence is real; a dedicated iteration-history view is polish).
+- **DESIGN_STATE.md through the governed ChangeSet path (§28, round 2)**: materialization now runs a real EditEngine transaction (prepare → attach metadata → validate → approve → apply) with journal, rollback plan, and content-hash preconditions against the existing file — never a bare `fs::write`.  The record and response carry the changeset id + journal entry count.  Proven by the same integration test asserting `changeset_id` starts with `cs-` and journal ≥ 1 entry, plus an idempotent second materialization through the update path.
+- **Constraint-aware critics (§16, round 2)**: the deterministic critique and the gemma3:4b visual critic both receive the project's durable constraints; the critique marks repairs that could violate one (`constraint_violations` + outrank-aesthetics note), the vision prompt explicitly forbids suggesting violations and asks for per-constraint adherence, and the UI renders the constraint check.  §16's "the critic must not recommend violating explicit constraints" is now enforced at prompt level and flagged in results.
+- **Design memory across chats (§27, round 2)**: `DesignMemoryGet` — a new design chat in the same project inherits constraints, accepted decisions (real `memory_decisions` via a new read-only `memory_decisions_for` db API), and the latest same-project design conversation's brief/grammar/reference/QA, with the source conversation recorded.  Cross-project isolation proven (second project gets empty memory, no inheritance marker).
+- **Production bug found and fixed (round 2)**: `DesignVisualCritique`/`DesignQAReport` were not in the provider-command timeout map — they ran a real vision round trip under the 5s frame timeout, so the GUI path silently dropped the response.  Now on the 300s provider budget; proven by the real gemma3:4b E2E failing at 5s before the fix and passing at 27.5s after.  This is exactly the class of bug the acceptance criterion exists to catch.
+- **Repair-loop iteration history (§24, round 2)**: every `design_repair` call persists a numbered `design_iteration` document (input summary, findings, repairs, remaining issues); `DesignIterations` IPC/Tauri/UI exposes the full history; the UI shows the current iteration number, remaining-issue count, and a history list.  Proven by `design_repair_history_constraints_memory_and_governed_state` (two iterations → history contains #1 and #2).
 
 ### G5 — Security — VERIFIED_COMPLETE (this pass, commit 4)
 - **Real dependency manifest** (audit finding: hardcoded `dependency_manifest: None`): real lockfile discovery (Cargo.lock > package-lock.json > pnpm-lock.yaml > yarn.lock > poetry.lock > requirements.txt > go.sum > go.mod > pyproject.toml > Cargo.toml > package.json), five-syntax parser, bundled advisory set (lodash CVE-2015-8861/CVE-2021-23337, elliptic GHSA-r9p9-mrjm-926w, request, node-sass, moment, validator). Clean deps never flagged; no manifest ⇒ no manifest finding. Priority proven (Cargo.lock wins over package.json). Wired into audit AND retest.
@@ -106,13 +111,16 @@ No model >4B was ever run or downloaded. Env note: realtime E2E with gemma3:1b f
 | Suite | Result |
 |---|---|
 | `make validate` (fmt-check, clippy -D warnings, check --all-targets, workspace tests) | **GREEN** |
-| `cargo test --workspace` | **431 passed, 0 failed, 26 env-gated ignored** (53 suites ok) |
-| ac-daemon --lib | 98 passed |
+| `cargo test --workspace` | **432 passed, 0 failed, 26 env-gated ignored** |
+| ac-daemon --lib | 99 passed |
 | ac-security --lib | 27 passed (2 new manifest tests) |
 | integration security_mode_flow | 5/5 |
 | integration orphan_guard | 1/1 |
 | integration daemon_process_boundary --ignored | 14/14 |
-| Frontend: `pnpm build` + `tsc --noEmit` + `eslint` | **GREEN** |
+| Frontend: `pnpm build` + `tsc --noEmit` + `eslint` | **GREEN** (round-2 rerun) |
+| Real gemma3:4b visual-critic E2E (round 2, after timeout fix) | **PASS 27.5s** |
+| `make validate` (round-2 rerun) | **GREEN** |
+| daemon_process_boundary --ignored (round-2 rerun) | **14/14 PASS** |
 
 One transient workspace failure (realtime E2E planner flake under full parallel load) did not reproduce on rerun — the same known load-flake class recorded in the prior pass.
 
@@ -127,7 +135,7 @@ All three modes' user-facing paths were rewired to the new capabilities this pas
 | G1 Mission chain + context preservation | 9/10 | All promotions carry full context, proven by tests; planner quality depends on model choice (documented) |
 | G2 Persistence | 9/10 | Everything persists + survives restart; audit trail complete |
 | G3 Discuss | 9/10 | Full flow real-model-proven; grounding is heuristic selection (honest, bounded) not semantic search |
-| G4 Design | 8.5/10 | Real browser QA + real vision critic + contract + constraints all proven; repair-loop iteration-history UI replay deferred; DESIGN_STATE.md is a snapshot (code-authoritative store is SQLite by design) |
+| G4 Design | 9/10 | Real browser QA + real vision critic + contract + constraints all proven; round 2 closed repair-loop history, constraint-aware critics, cross-chat memory, and the governed DESIGN_STATE.md path; the GUI timeout bug was found and fixed; live ZAP-class env items remain honestly recorded |
 | G5 Security | 8.5/10 | Real scanners + real manifest + depth policies + DAST gate all proven; advisory set is a curated public list (osv/trivy are the real depth when prepared); no live ZAP execution available on this machine |
 | Orphan elimination | 10/10 | Deleted, guarded durably, guard proven to catch |
 
@@ -137,7 +145,7 @@ All three modes' user-facing paths were rewired to the new capabilities this pas
 |---|---|---|
 | semgrep rules path / osv+trivy DB preparation | OPTIONAL/DEFERRED | Honest-unavailable is recorded; installing these is env setup, not code |
 | Live ZAP DAST execution | BLOCKED_BY_ENVIRONMENT | No ZAP install + no authorized live target on this machine; the attempt/gate/trail is implemented and tested |
-| Design repair-loop iteration-history UI replay | OPTIONAL/DEFERRED | Iterations persist as critique rows; a dedicated history view is polish |
+| ~~Design repair-loop iteration-history UI replay~~ | CLOSED in round 2 (`530ff23`) | `design_iteration` docs + `DesignIterations` command + UI history list, proven by integration test |
 | gemma3:1b planner failure | NOT A DEFECT | Model-capability limit; suitable models documented in test headers |
 | Real 3B self-verification load flake | NOT A DEFECT | Known parallel-load variance, passes on rerun (recorded in prior pass) |
 
@@ -148,4 +156,4 @@ Only ≤4B local models were used: qwen2.5-coder:3b (coding), gemma3:4b (vision)
 Focused commits with exact SHAs; no `git reset --hard`, no history rewrite, no push, no broad `git add .`; never-stage files untouched; tree left green.
 
 ## L. Handoff
-Next agent can continue from `405ef3a`: run `make validate`, `cargo test --workspace` (431/0/26), the four real-model E2Es (commands in test headers), and the boundary suite. The durable orphan guard runs in every `cargo test -p agentcode-integration-tests`. Optional env work (scanner DBs, ZAP install) is listed in §I.
+Next agent can continue from `4eb43ac`: run `make validate`, `cargo test --workspace` (431/0/26), the four real-model E2Es (commands in test headers), and the boundary suite. The durable orphan guard runs in every `cargo test -p agentcode-integration-tests`. Optional env work (scanner DBs, ZAP install) is listed in §I.
