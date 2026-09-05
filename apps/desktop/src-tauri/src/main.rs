@@ -1774,6 +1774,94 @@ fn daemon_design_qa_report(
     )
 }
 
+#[tauri::command]
+fn daemon_design_visual_critique(
+    state: tauri::State<DaemonClient>,
+    conversation_id: String,
+    url: Option<String>,
+    deterministic: Option<bool>,
+) -> Result<Value, String> {
+    request(
+        &state.0,
+        "ui",
+        "DesignVisualCritique",
+        json!({
+            "conversation_id": conversation_id,
+            "url": url.unwrap_or_default(),
+            "deterministic": deterministic.unwrap_or(false),
+        }),
+    )
+}
+
+#[tauri::command]
+fn daemon_design_contract(
+    state: tauri::State<DaemonClient>,
+    conversation_id: String,
+) -> Result<Value, String> {
+    request(
+        &state.0,
+        "ui",
+        "DesignContract",
+        json!({ "conversation_id": conversation_id }),
+    )
+}
+
+#[tauri::command]
+fn daemon_design_execute_contract(
+    state: tauri::State<DaemonClient>,
+    conversation_id: String,
+) -> Result<Value, String> {
+    request(
+        &state.0,
+        "ui",
+        "DesignExecuteContract",
+        json!({ "conversation_id": conversation_id }),
+    )
+}
+
+#[tauri::command]
+fn daemon_design_constraints_set(
+    state: tauri::State<DaemonClient>,
+    conversation_id: String,
+    constraints: Value,
+) -> Result<Value, String> {
+    request(
+        &state.0,
+        "ui",
+        "DesignConstraintsSet",
+        json!({
+            "conversation_id": conversation_id,
+            "constraints": constraints,
+        }),
+    )
+}
+
+#[tauri::command]
+fn daemon_design_constraints_get(
+    state: tauri::State<DaemonClient>,
+    conversation_id: String,
+) -> Result<Value, String> {
+    request(
+        &state.0,
+        "ui",
+        "DesignConstraintsGet",
+        json!({ "conversation_id": conversation_id }),
+    )
+}
+
+#[tauri::command]
+fn daemon_design_materialize_state(
+    state: tauri::State<DaemonClient>,
+    conversation_id: String,
+) -> Result<Value, String> {
+    request(
+        &state.0,
+        "ui",
+        "DesignMaterializeState",
+        json!({ "conversation_id": conversation_id }),
+    )
+}
+
 fn guess_mime(filename: &str) -> String {
     let lower = filename.to_ascii_lowercase();
     if lower.ends_with(".png") {
@@ -1903,6 +1991,12 @@ fn main() {
             daemon_design_browser,
             daemon_design_qa_responsive,
             daemon_design_qa_report,
+            daemon_design_visual_critique,
+            daemon_design_contract,
+            daemon_design_execute_contract,
+            daemon_design_constraints_set,
+            daemon_design_constraints_get,
+            daemon_design_materialize_state,
             daemon_design_qa_accessibility,
             daemon_design_qa_functional,
             daemon_security_send,

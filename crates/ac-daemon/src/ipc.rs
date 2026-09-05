@@ -744,6 +744,51 @@ fn dispatch_request(request: &Value, daemon: &mut DaemonService) -> (Value, bool
                 Err(error) => error_response(correlation_id, error.code(), error.to_string()),
             }
         },
+        "DesignVisualCritique" => {
+            let conversation_id = request.get("conversation_id").and_then(Value::as_str).unwrap_or("");
+            let url = request.get("url").and_then(Value::as_str).unwrap_or("");
+            let deterministic = request.get("deterministic").and_then(Value::as_bool).unwrap_or(false);
+            match daemon.design_visual_critique(conversation_id, url, deterministic) {
+                Ok(result) => json!({"id": correlation_id, "ok": true, "visual_critique": result}),
+                Err(error) => error_response(correlation_id, error.code(), error.to_string()),
+            }
+        },
+        "DesignContract" => {
+            let conversation_id = request.get("conversation_id").and_then(Value::as_str).unwrap_or("");
+            match daemon.design_contract(conversation_id) {
+                Ok(result) => json!({"id": correlation_id, "ok": true, "contract": result}),
+                Err(error) => error_response(correlation_id, error.code(), error.to_string()),
+            }
+        },
+        "DesignExecuteContract" => {
+            let conversation_id = request.get("conversation_id").and_then(Value::as_str).unwrap_or("");
+            match daemon.design_execute_contract(conversation_id) {
+                Ok(result) => json!({"id": correlation_id, "ok": true, "mission_id": result["mission_id"], "contract_goal": result["contract_goal"]}),
+                Err(error) => error_response(correlation_id, error.code(), error.to_string()),
+            }
+        },
+        "DesignConstraintsSet" => {
+            let conversation_id = request.get("conversation_id").and_then(Value::as_str).unwrap_or("");
+            let constraints = request.get("constraints").and_then(Value::as_array).cloned().unwrap_or_default();
+            match daemon.design_constraints_set(conversation_id, &constraints) {
+                Ok(result) => json!({"id": correlation_id, "ok": true, "constraints": result}),
+                Err(error) => error_response(correlation_id, error.code(), error.to_string()),
+            }
+        },
+        "DesignConstraintsGet" => {
+            let conversation_id = request.get("conversation_id").and_then(Value::as_str).unwrap_or("");
+            match daemon.design_constraints_get(conversation_id) {
+                Ok(result) => json!({"id": correlation_id, "ok": true, "constraints": result}),
+                Err(error) => error_response(correlation_id, error.code(), error.to_string()),
+            }
+        },
+        "DesignMaterializeState" => {
+            let conversation_id = request.get("conversation_id").and_then(Value::as_str).unwrap_or("");
+            match daemon.design_materialize_state(conversation_id) {
+                Ok(result) => json!({"id": correlation_id, "ok": true, "materialization": result}),
+                Err(error) => error_response(correlation_id, error.code(), error.to_string()),
+            }
+        },
         "DesignRepair" => {
             let conversation_id = request.get("conversation_id").and_then(Value::as_str).unwrap_or("");
             let content = request.get("content").and_then(Value::as_str).unwrap_or("");
@@ -4956,6 +5001,321 @@ mod ipc_tests {
         std::env::remove_var("AGENTCODE_PROVIDER_MODE");
         let _ = fs::remove_dir_all(dir);
         let _ = socket;
+    }
+
+    /// G4 contract→mission: Implement via Mission must carry the FULL
+    /// design contract (brief, constraints marked non-negotiable, QA
+    /// findings, conversation context) — never a single sentence.
+    /// Constraints are project-scoped: a second chat in the same project
+    /// inherits them; another project never sees them.
+    #[test]
+    fn design_execute_contract_carries_full_context_and_constraints_are_project_scoped() {
+        let _env_lock = crate::TEST_ENV_LOCK.lock().unwrap();
+        std::env::set_var("AGENTCODE_PROVIDER_MODE", "mock");
+        let (dir, db, lock, socket) = temp_paths("ipc-design-contract");
+        let project_dir = dir.join("workspace");
+        let other_project_dir = dir.join("other-workspace");
+        fs::create_dir_all(&project_dir).unwrap();
+        fs::create_dir_all(&other_project_dir).unwrap();
+        let project_path = project_dir.to_string_lossy().to_string();
+        let other_project_path = other_project_dir.to_string_lossy().to_string();
+
+        let mut daemon = DaemonService::open(&db, &lock).unwrap();
+        daemon.start().unwrap();
+        let Some((server, listener)) = bind_or_skip(&socket, None) else {
+            daemon.shutdown().unwrap();
+            std::env::remove_var("AGENTCODE_PROVIDER_MODE");
+            let _ = fs::remove_dir_all(dir);
+            return;
+        };
+
+        let create = request_via_ipc(
+            &server, &listener, &mut daemon,
+            json!({"id":"c1","command":"ConversationCreate","project_path": project_path, "mode":"DESIGN","title":"Contract"}),
+        );
+        assert_eq!(create["ok"], true);
+        let cid = create["conversation_id"].as_str().unwrap().to_string();
+
+        // A design discussion first.
+        let send = request_via_ipc(
+            &server, &listener, &mut daemon,
+            json!({"id":"d1","command":"DesignSend","conversation_id": cid, "content": "Design a metrics dashboard for the ops team with a dense data table and side filter panel."}),
+        );
+        assert_eq!(send["ok"], true, "design send: {send}");
+
+        // Set durable constraints (project-scoped).
+        let set = request_via_ipc(
+            &server, &listener, &mut daemon,
+            json!({"id":"cons1","command":"DesignConstraintsSet","conversation_id": cid, "constraints": [
+                {"text": "Data density outranks whitespace on every screen"},
+                {"text": "No dark-mode-only color choices"},
+            ]}),
+        );
+        assert_eq!(set["ok"], true, "set: {set}");
+        assert_eq!(set["constraints"]["constraints"].as_array().unwrap().len(), 2);
+
+        // Execute via contract: mission must embed the constraints as
+        // NON-NEGOTIABLE and the design conversation context.
+        let execute = request_via_ipc(
+            &server, &listener, &mut daemon,
+            json!({"id":"e1","command":"DesignExecuteContract","conversation_id": cid}),
+        );
+        assert_eq!(execute["ok"], true, "execute: {execute}");
+        let mission_id = execute["mission_id"].as_str().unwrap().to_string();
+        assert!(mission_id.starts_with("mission-"));
+        let goal = execute["contract_goal"].as_str().unwrap();
+        assert!(goal.contains("Design Contract"), "goal: {goal}");
+        assert!(
+            goal.contains("NON-NEGOTIABLE"),
+            "constraints must be marked non-negotiable: {goal}"
+        );
+        assert!(
+            goal.contains("Data density outranks whitespace"),
+            "constraint text must be in the goal: {goal}"
+        );
+        assert!(
+            goal.contains("metrics dashboard"),
+            "design conversation context must be in the goal: {goal}"
+        );
+
+        // Cancel so nothing real executes.
+        let cancel = request_via_ipc(
+            &server, &listener, &mut daemon,
+            json!({"id":"x1","command":"CancelMission","mission_id": mission_id}),
+        );
+        assert_eq!(cancel["ok"], true);
+
+        // Second chat in the SAME project inherits constraints (design
+        // memory across chats).
+        let create2 = request_via_ipc(
+            &server, &listener, &mut daemon,
+            json!({"id":"c2","command":"ConversationCreate","project_path": project_path, "mode":"DESIGN","title":"Second chat"}),
+        );
+        let cid2 = create2["conversation_id"].as_str().unwrap().to_string();
+        let get2 = request_via_ipc(
+            &server, &listener, &mut daemon,
+            json!({"id":"g2","command":"DesignConstraintsGet","conversation_id": cid2}),
+        );
+        assert_eq!(get2["ok"], true);
+        assert_eq!(
+            get2["constraints"]["constraints"].as_array().unwrap().len(),
+            2,
+            "same project must inherit constraints: {}",
+            get2["constraints"]
+        );
+
+        // Another project NEVER sees them.
+        let create3 = request_via_ipc(
+            &server, &listener, &mut daemon,
+            json!({"id":"c3","command":"ConversationCreate","project_path": other_project_path, "mode":"DESIGN","title":"Other project"}),
+        );
+        let cid3 = create3["conversation_id"].as_str().unwrap().to_string();
+        let get3 = request_via_ipc(
+            &server, &listener, &mut daemon,
+            json!({"id":"g3","command":"DesignConstraintsGet","conversation_id": cid3}),
+        );
+        assert_eq!(get3["ok"], true);
+        assert_eq!(
+            get3["constraints"]["constraints"].as_array().unwrap().len(),
+            0,
+            "constraints must never leak across projects: {}",
+            get3["constraints"]
+        );
+
+        // DESIGN_STATE.md materializes through the recorded path.
+        let materialize = request_via_ipc(
+            &server, &listener, &mut daemon,
+            json!({"id":"m1","command":"DesignMaterializeState","conversation_id": cid}),
+        );
+        assert_eq!(materialize["ok"], true, "materialize: {materialize}");
+        assert!(project_dir.join("DESIGN_STATE.md").exists(), "DESIGN_STATE.md must exist");
+        let state_content = fs::read_to_string(project_dir.join("DESIGN_STATE.md")).unwrap();
+        assert!(state_content.contains("DESIGN_STATE.md"), "state: {state_content}");
+        let record = daemon
+            .db
+            .design_document(&cid, "design_state_materialization")
+            .unwrap()
+            .expect("materialization must be recorded");
+        assert!(record.content_json.contains("DESIGN_STATE.md"));
+
+        server.cleanup();
+        daemon.shutdown().unwrap();
+        std::env::remove_var("AGENTCODE_PROVIDER_MODE");
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    /// G4 visual critic: deterministic mode reports VISION_CRITIC_UNAVAILABLE
+    /// honestly (no fabricated findings).
+    #[test]
+    fn design_visual_critique_deterministic_reports_unavailable_honestly() {
+        let _env_lock = crate::TEST_ENV_LOCK.lock().unwrap();
+        std::env::set_var("AGENTCODE_PROVIDER_MODE", "mock");
+        let (dir, db, lock, socket) = temp_paths("ipc-design-visual-critic");
+        let project_dir = dir.join("workspace");
+        fs::create_dir_all(&project_dir).unwrap();
+        let project_path = project_dir.to_string_lossy().to_string();
+
+        let mut daemon = DaemonService::open(&db, &lock).unwrap();
+        daemon.start().unwrap();
+        let Some((server, listener)) = bind_or_skip(&socket, None) else {
+            daemon.shutdown().unwrap();
+            std::env::remove_var("AGENTCODE_PROVIDER_MODE");
+            let _ = fs::remove_dir_all(dir);
+            return;
+        };
+
+        let create = request_via_ipc(
+            &server, &listener, &mut daemon,
+            json!({"id":"c1","command":"ConversationCreate","project_path": project_path, "mode":"DESIGN","title":"Visual Critic"}),
+        );
+        let cid = create["conversation_id"].as_str().unwrap().to_string();
+
+        let critique = request_via_ipc(
+            &server, &listener, &mut daemon,
+            json!({"id":"vc1","command":"DesignVisualCritique","conversation_id": cid, "deterministic": true}),
+        );
+        assert_eq!(critique["ok"], true, "critique: {critique}");
+        let vc = &critique["visual_critique"];
+        assert_eq!(vc["available"], false, "deterministic must be unavailable: {vc}");
+        assert!(
+            vc["unavailable_reason"].as_str().unwrap_or("").contains("VISION_CRITIC_UNAVAILABLE"),
+            "honest unavailability: {vc}"
+        );
+        assert!(vc["findings"].as_array().unwrap().is_empty(), "no fabricated findings");
+
+        // Persisted as a visual-critic critique row.
+        let rows = daemon.db.design_critiques(&cid).unwrap();
+        assert!(
+            rows.iter().any(|r| r.doc_type.as_deref() == Some("visual-critic")),
+            "visual critique must persist: {:?}",
+            rows.iter().map(|r| r.doc_type.clone()).collect::<Vec<_>>()
+        );
+
+        server.cleanup();
+        daemon.shutdown().unwrap();
+        std::env::remove_var("AGENTCODE_PROVIDER_MODE");
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    /// G4 REAL visual critic E2E (gemma3:4b, ≤4B local vision model):
+    /// captures a real Chrome screenshot of a served page, sends it to the
+    /// real vision model, and asserts structured findings came back from
+    /// the model — proving the production vision path end to end.
+    /// Ignored by default; run with:
+    ///   cargo test -p ac-daemon --lib design_visual_critic_real -- --ignored
+    #[test]
+    #[ignore]
+    fn design_visual_critic_real_gemma_e2e() {
+        let model = std::env::var("AGENTCODE_VISION_MODEL")
+            .unwrap_or_else(|_| "gemma3:4b".to_string());
+        let host = "http://127.0.0.1:11434";
+        let check = std::process::Command::new("curl")
+            .args(["-s", "--max-time", "10", "-o", "/dev/null", "-w", "%{http_code}", &format!("{host}/api/tags")])
+            .output()
+            .expect("curl must exist");
+        let status = String::from_utf8_lossy(&check.stdout);
+        if !status.starts_with('2') {
+            eprintln!("SKIP: Ollama not reachable at {host}");
+            return;
+        }
+        // Local fixture server: a deliberately flawed design (huge cramped
+        // heading, tiny low-contrast subtitle) the critic should find
+        // issues in.
+        let (tx, rx) = std::sync::mpsc::channel();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            if let Ok((stream, _)) = listener.accept() {
+                use std::io::{Read, Write};
+                let mut stream = stream;
+                let mut buf = [0u8; 4096];
+                let _ = stream.read(&mut buf);
+                let body = r#"<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8"><title>Flawed Fixture</title>
+<style>body{margin:0;font-family:Helvetica}h1{font-size:14px;margin:4px;color:#aaa}
+p{font-size:9px;color:#ccc}</style></head>
+<body><main><h1>flawed cramped heading that is far too small for a page title</h1>
+<p>nearly unreadable low-contrast tiny subtitle</p></main></body></html>"#;
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = stream.write_all(response.as_bytes());
+                let _ = tx.send(());
+            }
+        });
+        std::thread::sleep(std::time::Duration::from_millis(150));
+
+        let (dir, db, lock, socket) = temp_paths("e2e-design-critic-real");
+        let project_dir = dir.join("workspace");
+        fs::create_dir_all(&project_dir).unwrap();
+        let project_path = project_dir.to_string_lossy().to_string();
+
+        let mut daemon = DaemonService::open(&db, &lock).unwrap();
+        daemon.start().unwrap();
+        let Some((server, ipc_listener)) = bind_or_skip(&socket, None) else {
+            daemon.shutdown().unwrap();
+            let _ = fs::remove_dir_all(dir);
+            return;
+        };
+
+        let create = request_via_ipc(
+            &server, &ipc_listener, &mut daemon,
+            json!({"id":"c1","command":"ConversationCreate","project_path": project_path, "mode":"DESIGN","title":"Real Critic"}),
+        );
+        assert_eq!(create["ok"], true);
+        let cid = create["conversation_id"].as_str().unwrap().to_string();
+
+        let url = format!("http://127.0.0.1:{port}/");
+        let critique = request_via_ipc(
+            &server, &ipc_listener, &mut daemon,
+            json!({"id":"vc1","command":"DesignVisualCritique","conversation_id": cid, "url": url, "deterministic": false}),
+        );
+        let _ = rx.recv_timeout(std::time::Duration::from_secs(1));
+        assert_eq!(critique["ok"], true, "critique response: {critique}");
+        let vc = &critique["visual_critique"];
+        let reason = vc["unavailable_reason"].as_str().unwrap_or("");
+        assert_eq!(
+            vc["available"], true,
+            "real vision model path must succeed (reason: {reason}; model {model})"
+        );
+        assert!(
+            vc["findings"].is_array(),
+            "vision model must return structured findings: {vc}"
+        );
+        let findings = vc["findings"].as_array().unwrap();
+        if !findings.is_empty() {
+            // The model saw the cramped heading/low-contrast text; whatever
+            // it names must be structured (aspect + issue strings).
+            for finding in findings {
+                assert!(
+                    finding.get("issue").and_then(Value::as_str).is_some()
+                        || finding.get("aspect").and_then(Value::as_str).is_some(),
+                    "each finding must be structured: {finding}"
+                );
+            }
+        }
+        assert!(
+            vc["screenshot_uri"].as_str().unwrap_or("").starts_with('/')
+                || vc["screenshot_uri"].as_str().unwrap_or("").contains("://"),
+            "real screenshot must be referenced: {}",
+            vc["screenshot_uri"]
+        );
+
+        // Persisted for the conversation.
+        let rows = daemon.db.design_critiques(&cid).unwrap();
+        assert!(
+            rows.iter()
+                .any(|r| r.doc_type.as_deref() == Some("visual-critic")
+                    && !r.evidence_refs.is_empty()),
+            "real critic run must persist with evidence refs: {:?}",
+            rows.iter().map(|r| (r.doc_type.clone(), r.evidence_refs.clone())).collect::<Vec<_>>()
+        );
+
+        server.cleanup();
+        daemon.shutdown().unwrap();
+        let _ = fs::remove_dir_all(dir);
     }
 
     #[test]

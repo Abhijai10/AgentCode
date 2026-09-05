@@ -17,6 +17,8 @@ import type {
   DesignRepair,
   DesignBrowserResult,
   DesignQaReport,
+  VisualCritique,
+  DesignConstraint,
 } from "./types";
 
 function formatTime(ms: number): string {
@@ -87,6 +89,9 @@ export function DesignView({
   const [critique, setCritique] = useState<DesignCritique | null>(null);
   const [repair, setRepair] = useState<DesignRepair | null>(null);
   const [browser, setBrowser] = useState<DesignBrowserResult | null>(null);
+  const [visualCritique, setVisualCritique] = useState<VisualCritique | null>(null);
+  const [constraints, setConstraints] = useState<DesignConstraint[]>([]);
+  const [constraintDraft, setConstraintDraft] = useState("");
   const [qa, setQa] = useState<{
     responsive?: DesignQaReport;
     accessibility?: DesignQaReport;
@@ -153,6 +158,11 @@ export function DesignView({
     if (!activeConvId) return;
     const detail = await daemon.getConversation(activeConvId);
     if (detail) setConvDetail(detail);
+    // Project-scoped durable constraints (design memory across chats).
+    const consRes = await daemon.designConstraintsGet(activeConvId);
+    if (consRes.ok && consRes.constraints) {
+      setConstraints(consRes.constraints.constraints ?? []);
+    }
   }, [activeConvId]);
 
   const handleNewChat = async () => {
@@ -669,32 +679,45 @@ export function DesignView({
                   </button>
                 </div>
               </div>
-              <div className="flex justify-end mt-2">
+              <div className="flex justify-end mt-2 gap-2">
                 <button
-                  onClick={async () => {
-                    if (!activeConvId || !convDetail) return;
-                    const lastUserMsg = convDetail.messages
-                      .filter((m) => m.role === "user" && !m.mission_ref)
-                      .pop();
-                    const goal = input.trim() || lastUserMsg?.content || "";
-                    if (!goal) return;
-                    const result = await daemon.submitGoalFromConversation(activeConvId, goal, []);
-                    if (result.ok) {
-                      setInput("");
-                      await refreshActive();
-                      onOpenMission(result.mission_id);
-                    } else {
-                      setError(result.error || "Could not create mission");
-                    }
-                  }}
-                  disabled={
-                    sending ||
-                    thinking ||
-                    (!input.trim() &&
-                      !convDetail?.messages?.some((m) => m.role === "user" && !m.mission_ref))
+                  onClick={() =>
+                    runPanel(async () => {
+                      const r = await daemon.designVisualCritique(activeConvId!);
+                      if (r.ok && r.visualCritique) {
+                        setVisualCritique(r.visualCritique);
+                        if (!r.visualCritique.available) {
+                          setError(r.visualCritique.unavailable_reason || "Visual critic unavailable");
+                        }
+                      } else {
+                        setError(r.error || "Could not run visual critique");
+                      }
+                    })
                   }
+                  disabled={sending || thinking || panelBusy}
                   className="neo-button rounded-xl px-4 py-2 text-sm font-medium text-primary flex items-center gap-2 disabled:opacity-50"
-                  aria-label="Create Implementation Mission from Design"
+                  aria-label="Run visual critic (gemma3:4b) on the live screenshot"
+                  title="Independent visual critic (gemma3:4b) on the real rendered screenshot"
+                >
+                  <Icon name="visibility" size={16} />
+                  Visual Critic
+                </button>
+                <button
+                  onClick={() =>
+                    runPanel(async () => {
+                      const r = await daemon.designExecuteContract(activeConvId!);
+                      if (r.ok && r.missionId) {
+                        await refreshActive();
+                        onOpenMission(r.missionId);
+                      } else {
+                        setError(r.error || "Could not create mission");
+                      }
+                    })
+                  }
+                  disabled={sending || thinking || panelBusy}
+                  className="neo-button rounded-xl px-4 py-2 text-sm font-medium text-primary flex items-center gap-2 disabled:opacity-50"
+                  aria-label="Implement via Mission with the full design contract"
+                  title="Creates a mission carrying the full design contract: brief, constraints, QA findings, context"
                 >
                   <Icon name="terminal" size={16} />
                   Implement via Mission
@@ -939,6 +962,11 @@ export function DesignView({
                       className={qa.responsive.passed ? "text-emerald-600" : "text-red-600"}
                     />
                     Responsive: {qa.responsive.passed ? "pass" : `${qa.responsive.issues.length} issue(s)`}
+                    {Array.isArray(qa.responsive.unmeasured) && qa.responsive.unmeasured.length > 0 && (
+                      <span className="text-amber-600 dark:text-amber-400">
+                        {" "}· {qa.responsive.unmeasured.length} unmeasured (manual review)
+                      </span>
+                    )}
                   </p>
                 )}
                 {qa.accessibility && (
@@ -949,6 +977,11 @@ export function DesignView({
                       className={qa.accessibility.passed ? "text-emerald-600" : "text-red-600"}
                     />
                     Accessibility: {qa.accessibility.passed ? "pass" : `${qa.accessibility.issues.length} issue(s)`}
+                    {Array.isArray(qa.accessibility.unmeasured) && qa.accessibility.unmeasured.length > 0 && (
+                      <span className="text-amber-600 dark:text-amber-400">
+                        {" "}· {qa.accessibility.unmeasured.length} unmeasured (manual review)
+                      </span>
+                    )}
                   </p>
                 )}
                 {qa.functional && (
@@ -968,6 +1001,127 @@ export function DesignView({
                 network diagnostics, and produce screenshot evidence.
               </p>
             )}
+          </section>
+
+          <section className="neo-raised rounded-2xl p-4">
+            <div className="flex items-center justify-between mb-2">
+              <h4 className="text-sm font-semibold text-on-surface">Visual Critic</h4>
+              <span className="text-[10px] text-on-surface-variant">
+                gemma3:4b · independent of anti-slop
+              </span>
+            </div>
+            {visualCritique ? (
+              visualCritique.available ? (
+                <div className="space-y-1.5">
+                  <p className="text-xs text-on-surface">{visualCritique.overall}</p>
+                  {visualCritique.findings.map((f, i) => (
+                    <div key={i} className="text-[11px] text-on-surface-variant">
+                      <span className="text-red-600 dark:text-red-400 font-medium">
+                        [{f.aspect ?? "?"}] {f.issue}
+                      </span>
+                      {f.suggestion && <span className="block pl-2">→ {f.suggestion}</span>}
+                    </div>
+                  ))}
+                  {(visualCritique.strengths ?? []).length > 0 && (
+                    <p className="text-[10px] text-emerald-600 dark:text-emerald-400">
+                      Strengths: {visualCritique.strengths?.join("; ")}
+                    </p>
+                  )}
+                </div>
+              ) : (
+                <p className="text-xs text-amber-600 dark:text-amber-400">
+                  {visualCritique.unavailable_reason}
+                </p>
+              )
+            ) : (
+              <p className="text-xs text-on-surface-variant">
+                An independent vision model critiques the real screenshot — a separate
+                signal from the deterministic anti-slop critique.
+              </p>
+            )}
+          </section>
+
+          <section className="neo-raised rounded-2xl p-4">
+            <div className="flex items-center justify-between mb-2">
+              <h4 className="text-sm font-semibold text-on-surface">
+                Durable Constraints
+              </h4>
+              <span className="text-[10px] text-on-surface-variant">
+                project-wide · outrank aesthetics
+              </span>
+            </div>
+            <ul className="space-y-1 mb-2">
+              {constraints.map((c, i) => (
+                <li key={i} className="text-[11px] text-on-surface flex items-start gap-1">
+                  <button
+                    onClick={() =>
+                      runPanel(async () => {
+                        const next = constraints.filter((_, index) => index !== i);
+                        const r = await daemon.designConstraintsSet(activeConvId!, next);
+                        if (r.ok && r.constraints) setConstraints(r.constraints.constraints ?? []);
+                      })
+                    }
+                    className="text-red-600 dark:text-red-400 hover:opacity-70 shrink-0"
+                    aria-label={`Remove constraint: ${c.text}`}
+                  >
+                    <Icon name="close" size={12} />
+                  </button>
+                  <span>{c.text}</span>
+                </li>
+              ))}
+            </ul>
+            {constraints.length === 0 && (
+              <p className="text-[10px] text-on-surface-variant mb-2">
+                No constraints set. Constraints persist across every design chat in this
+                project and are marked non-negotiable in design contracts.
+              </p>
+            )}
+            <div className="flex gap-1.5">
+              <input
+                className="neo-input rounded-xl px-3 py-1.5 text-xs flex-1"
+                placeholder="e.g. Data density outranks whitespace"
+                value={constraintDraft}
+                onChange={(e) => setConstraintDraft(e.target.value)}
+                onKeyDown={(e: KeyboardEvent) => {
+                  if (e.key === "Enter" && constraintDraft.trim() && activeConvId) {
+                    e.preventDefault();
+                    runPanel(async () => {
+                      const next = [
+                        ...constraints,
+                        { text: constraintDraft.trim() },
+                      ];
+                      const r = await daemon.designConstraintsSet(activeConvId!, next);
+                      if (r.ok && r.constraints) {
+                        setConstraints(r.constraints.constraints ?? []);
+                        setConstraintDraft("");
+                      } else {
+                        setError(r.error || "Could not save constraint");
+                      }
+                    });
+                  }
+                }}
+              />
+              <button
+                onClick={() =>
+                  runPanel(async () => {
+                    if (!constraintDraft.trim() || !activeConvId) return;
+                    const next = [...constraints, { text: constraintDraft.trim() }];
+                    const r = await daemon.designConstraintsSet(activeConvId!, next);
+                    if (r.ok && r.constraints) {
+                      setConstraints(r.constraints.constraints ?? []);
+                      setConstraintDraft("");
+                    } else {
+                      setError(r.error || "Could not save constraint");
+                    }
+                  })
+                }
+                disabled={!constraintDraft.trim() || panelBusy}
+                className="rounded-xl px-3 py-1.5 text-xs font-medium bg-primary text-on-primary disabled:opacity-50"
+                aria-label="Add constraint"
+              >
+                Add
+              </button>
+            </div>
           </section>
 
           <section className="neo-raised rounded-2xl p-4">

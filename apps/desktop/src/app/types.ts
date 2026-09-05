@@ -567,6 +567,38 @@ export interface DesignQaReport {
   [key: string]: unknown;
 }
 
+/** Visual critic layer: a vision model (gemma3:4b) critiquing the actual
+ *  rendered screenshot.  `available: false` means the vision model was
+ *  unreachable — honest unavailability, never fabricated findings. */
+export interface VisualCritiqueFinding {
+  aspect?: string;
+  severity?: number;
+  issue?: string;
+  suggestion?: string;
+}
+
+export interface VisualCritique {
+  available: boolean;
+  vision_model?: string;
+  overall?: string;
+  findings: VisualCritiqueFinding[];
+  strengths?: string[];
+  unavailable_reason?: string;
+  screenshot_uri?: string;
+  source?: string;
+}
+
+/** Durable project-scoped design constraint (Doc 06 §92): outranks
+ *  aesthetics; carried into every design contract of the project. */
+export interface DesignConstraint {
+  text: string;
+}
+
+export interface DesignConstraints {
+  constraints: DesignConstraint[];
+  project_path?: string;
+}
+
 // ── Security Mode (G5) ────────────────────────────────────────────────────
 // Real Security workspace contract from the daemon IPC. Security conversations
 // are SECURITY-mode conversations; the structured scope, findings, attack

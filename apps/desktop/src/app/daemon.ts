@@ -51,6 +51,9 @@ import type {
   DesignPreviewStatus,
   DesignBrowserResult,
   DesignQaReport,
+  VisualCritique,
+  DesignConstraint,
+  DesignConstraints,
 } from "./types";
 
 function toDaemonStatus(h: DaemonHealth): DaemonStatus {
@@ -1000,6 +1003,89 @@ export const daemon = {
         viewportHint: viewportHint ?? "desktop",
       });
       return { ok: true, qa: res.qa };
+    } catch (e: unknown) {
+      const message = e instanceof Error ? e.message : String(e);
+      const cleaned = message.replace(/^[A-Z0-9_-]+:\s*/, "");
+      return { ok: false, error: cleaned || message };
+    }
+  },
+
+  async designVisualCritique(
+    conversationId: string,
+    url?: string,
+    deterministic?: boolean
+  ): Promise<{ ok: boolean; visualCritique?: VisualCritique; error?: string }> {
+    try {
+      const res = await invoke<{ visual_critique: VisualCritique }>(
+        "daemon_design_visual_critique",
+        { conversationId, url: url ?? "", deterministic: deterministic ?? false }
+      );
+      return { ok: true, visualCritique: res.visual_critique };
+    } catch (e: unknown) {
+      const message = e instanceof Error ? e.message : String(e);
+      const cleaned = message.replace(/^[A-Z0-9_-]+:\s*/, "");
+      return { ok: false, error: cleaned || message };
+    }
+  },
+
+  async designExecuteContract(
+    conversationId: string
+  ): Promise<{ ok: boolean; missionId?: string; contractGoal?: string; error?: string }> {
+    try {
+      const res = await invoke<{ mission_id: string; contract_goal: string }>(
+        "daemon_design_execute_contract",
+        { conversationId }
+      );
+      return { ok: true, missionId: res.mission_id, contractGoal: res.contract_goal };
+    } catch (e: unknown) {
+      const message = e instanceof Error ? e.message : String(e);
+      const cleaned = message.replace(/^[A-Z0-9_-]+:\s*/, "");
+      return { ok: false, error: cleaned || message };
+    }
+  },
+
+  async designConstraintsGet(
+    conversationId: string
+  ): Promise<{ ok: boolean; constraints?: DesignConstraints; error?: string }> {
+    try {
+      const res = await invoke<{ constraints: DesignConstraints }>(
+        "daemon_design_constraints_get",
+        { conversationId }
+      );
+      return { ok: true, constraints: res.constraints };
+    } catch (e: unknown) {
+      const message = e instanceof Error ? e.message : String(e);
+      const cleaned = message.replace(/^[A-Z0-9_-]+:\s*/, "");
+      return { ok: false, error: cleaned || message };
+    }
+  },
+
+  async designConstraintsSet(
+    conversationId: string,
+    constraints: DesignConstraint[]
+  ): Promise<{ ok: boolean; constraints?: DesignConstraints; error?: string }> {
+    try {
+      const res = await invoke<{ constraints: DesignConstraints }>(
+        "daemon_design_constraints_set",
+        { conversationId, constraints }
+      );
+      return { ok: true, constraints: res.constraints };
+    } catch (e: unknown) {
+      const message = e instanceof Error ? e.message : String(e);
+      const cleaned = message.replace(/^[A-Z0-9_-]+:\s*/, "");
+      return { ok: false, error: cleaned || message };
+    }
+  },
+
+  async designMaterializeState(
+    conversationId: string
+  ): Promise<{ ok: boolean; materialization?: unknown; error?: string }> {
+    try {
+      const res = await invoke<{ materialization: unknown }>(
+        "daemon_design_materialize_state",
+        { conversationId }
+      );
+      return { ok: true, materialization: res.materialization };
     } catch (e: unknown) {
       const message = e instanceof Error ? e.message : String(e);
       const cleaned = message.replace(/^[A-Z0-9_-]+:\s*/, "");

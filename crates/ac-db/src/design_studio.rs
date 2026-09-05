@@ -76,6 +76,38 @@ impl ControlPlaneDb {
         rows.collect::<Result<Vec<_>, _>>().map_err(db_error)
     }
 
+    /// All design documents with a given doc_type, regardless of
+    /// conversation — used for project-scoped design memory (constraints)
+    /// keyed by a deterministic per-project doc_type.
+    pub fn design_documents_by_type(
+        &self,
+        doc_type: &str,
+    ) -> AcResult<Vec<DesignDocumentRow>> {
+        let mut stmt = self
+            .connection
+            .prepare(
+                "SELECT id, conversation_id, doc_type, content_json, version, evidence_refs,
+                 created_at_ms, updated_at_ms
+                 FROM design_documents WHERE doc_type=?1 ORDER BY updated_at_ms ASC",
+            )
+            .map_err(db_error)?;
+        let rows = stmt
+            .query_map([doc_type], |row| {
+                Ok(DesignDocumentRow {
+                    id: row.get(0)?,
+                    conversation_id: row.get(1)?,
+                    doc_type: row.get(2)?,
+                    content_json: row.get(3)?,
+                    version: row.get(4)?,
+                    evidence_refs: row.get(5)?,
+                    created_at_ms: row.get(6)?,
+                    updated_at_ms: row.get(7)?,
+                })
+            })
+            .map_err(db_error)?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(db_error)
+    }
+
     pub fn save_design_preview(&self, row: &DesignPreviewRow) -> AcResult<()> {
         self.connection
             .execute(

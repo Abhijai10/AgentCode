@@ -724,6 +724,557 @@ Rules: describe only what is actually visible. Each array holds short factual st
         Ok(result)
     }
 
+    /// Visual critic layer (Doc 06 §50-51): a vision model (gemma3:4b,
+    /// ≤4B local) critiques the ACTUAL rendered screenshot of the running
+    /// design, independent of the deterministic anti-slop critique.  The
+    /// two signals are reported separately — never merged into one verdict.
+    ///
+    /// Failure behavior: when the vision model is unreachable or returns
+    /// nothing structured, the result is an honest VISION_CRITIC_UNAVAILABLE
+    /// layer with `available: false` — no fabricated findings, and the
+    /// deterministic anti-slop critique remains the only signal.
+    pub fn design_visual_critique(
+        &self,
+        conversation_id: &str,
+        url: &str,
+        deterministic: bool,
+    ) -> AcResult<Value> {
+        self.ensure_running()?;
+        let preview = self.db.design_preview(conversation_id)?;
+        let target_url = if url.is_empty() {
+            preview
+                .as_ref()
+                .and_then(|p| p.ready_url.clone())
+                .unwrap_or_else(|| "about:blank".to_string())
+        } else {
+            url.to_string()
+        };
+
+        // Capture a real screenshot of the running design.
+        let mut evidence_store = EvidenceStore::new();
+        let policy = ac_security::CapabilityPolicy::new()
+            .allow(ac_security::Capability::BrowserAutomation);
+        let mut browser = if deterministic {
+            ac_verification::BrowserRuntime::deterministic_harness_for_tests(policy)
+        } else {
+            ac_verification::BrowserRuntime::new(policy)
+        };
+        let task_id = StableId::new("designcritic");
+        let process = browser.launch(task_id.clone())?;
+        let session = browser.create_session(task_id.clone(), process.id.clone())?;
+        if deterministic {
+            // Deterministic mode has no rendered pixels: the visual critic is
+            // unavailable by construction and must say so.
+            let _ = browser.mark_crashed(&process.id);
+            let unavailable = json!({
+                "conversation_id": conversation_id,
+                "url": target_url,
+                "available": false,
+                "unavailable_reason": "VISION_CRITIC_UNAVAILABLE: deterministic harness renders no pixels; visual critique requires the real preview",
+                "vision_model": Self::vision_model_name(),
+                "findings": [],
+                "source": "vision-unavailable",
+            });
+            let now = TimestampMillis::now().as_millis() as i64;
+            let _ = self.db.save_design_critique(&DesignCritiqueRow {
+                id: StableId::new("dcritique").to_string(),
+                conversation_id: conversation_id.to_string(),
+                doc_type: Some("visual-critic".to_string()),
+                passed: false,
+                findings_json: unavailable.to_string(),
+                improvement_required: false,
+                evidence_refs: String::new(),
+                created_at_ms: now,
+            });
+            return Ok(unavailable);
+        }
+        let _ = browser.act(
+            &session.id,
+            ac_verification::BrowserAction::Navigate {
+                url: target_url.clone(),
+            },
+            &mut evidence_store,
+        )?;
+        let _ = browser.act(
+            &session.id,
+            ac_verification::BrowserAction::Wait { millis: 400 },
+            &mut evidence_store,
+        )?;
+        let viewport = ac_verification::ViewportProfile {
+            name: "desktop",
+            width: 1440,
+            height: 900,
+        };
+        let screenshot = browser.capture_screenshot(
+            &session.id,
+            task_id,
+            "design-critic",
+            viewport,
+            &mut evidence_store,
+        )?;
+        let _ = browser.mark_crashed(&process.id);
+
+        // Read the real screenshot bytes for the vision model.
+        let screenshot_bytes = std::fs::read(&screenshot.artifact_uri).map_err(|err| {
+            AcError::validation(
+                "DESIGN-SCREENSHOT_READ_FAILED",
+                format!("cannot read captured screenshot: {err}"),
+            )
+        })?;
+        const MAX_SCREENSHOT_BYTES: usize = 6 * 1024 * 1024;
+        if screenshot_bytes.len() > MAX_SCREENSHOT_BYTES {
+            return Err(AcError::validation(
+                "DESIGN-SCREENSHOT_TOO_LARGE",
+                "screenshot exceeds the 6 MiB vision analysis limit",
+            ));
+        }
+        let image_b64 = base64::Engine::encode(
+            &base64::engine::general_purpose::STANDARD,
+            &screenshot_bytes,
+        );
+
+        // Route to the local vision model (gemma3:4b default; ≤4B rule).
+        let vision_model = Self::vision_model_name();
+        let ollama_base = std::env::var("OLLAMA_BASE_URL")
+            .map(|base| base.trim_end_matches('/').to_string())
+            .unwrap_or_else(|_| "http://127.0.0.1:11434".to_string());
+        let mut providers = ac_provider::ProviderRegistry::new();
+        let adapter = Box::new(ac_provider::OllamaProviderAdapter::new(
+            &ollama_base,
+            vision_model.clone(),
+        )?);
+        ac_agent::register_vision_model_route(
+            &mut providers,
+            "ollama-vision",
+            adapter,
+            vision_model.clone(),
+            "config:ollama.vision",
+            8192,
+            ac_provider::PrivacyClass::LocalOnly,
+        )
+        .map_err(|err| {
+            AcError::validation(
+                "DESIGN-PROVIDER_SETUP",
+                format!("cannot register vision model route: {err}"),
+            )
+        })?;
+
+        let mut profile = ac_provider::TaskProfile::discuss(
+            ac_common::StableId::new("designcritic"),
+            ac_provider::RoutingProfile::LocalFirst,
+        );
+        profile.required_context = 4096;
+        let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let prompt = r#"You are an independent visual design critic examining a screenshot of a real product UI. Produce a strict JSON object:
+{
+  "overall": "one sentence verdict of visual quality",
+  "findings": [
+    {"aspect": "hierarchy|spacing|typography|color|contrast|alignment|density|focus", "severity": 1-5, "issue": "what is wrong, observed in the screenshot", "suggestion": "concrete fix"}
+  ],
+  "strengths": ["short factual strengths visible in the screenshot"]
+}
+Rules: describe only what is actually visible in the image. Findings must be concrete and locatable (name the region). Do not invent features. Output JSON only."#;
+        let result = providers.request_model_with_image(
+            &profile,
+            prompt,
+            image_b64,
+            1024,
+            &|| cancel.load(std::sync::atomic::Ordering::Relaxed),
+        );
+
+        let parsed = match result {
+            Ok(execution) => {
+                let text = ac_agent::provider_events_text(&execution.events);
+                parse_reference_json(&text)
+            }
+            Err(failure) => {
+                let unavailable = json!({
+                    "conversation_id": conversation_id,
+                    "url": target_url,
+                    "available": false,
+                    "unavailable_reason": format!(
+                        "VISION_CRITIC_UNAVAILABLE: vision model '{vision_model}' failed ({failure:?}); set AGENTCODE_VISION_MODEL to an installed vision-capable model"
+                    ),
+                    "vision_model": vision_model,
+                    "findings": [],
+                    "source": "vision-unavailable",
+                });
+                let now = TimestampMillis::now().as_millis() as i64;
+                let _ = self.db.save_design_critique(&DesignCritiqueRow {
+                    id: StableId::new("dcritique").to_string(),
+                    conversation_id: conversation_id.to_string(),
+                    doc_type: Some("visual-critic".to_string()),
+                    passed: false,
+                    findings_json: unavailable.to_string(),
+                    improvement_required: false,
+                    evidence_refs: String::new(),
+                    created_at_ms: now,
+                });
+                return Ok(unavailable);
+            }
+        };
+
+        let critique = match parsed {
+            Some(value) if value.get("findings").is_some() => {
+                let findings = value.get("findings").cloned().unwrap_or(json!([]));
+                let findings_list = findings.as_array().cloned().unwrap_or_default();
+                json!({
+                    "conversation_id": conversation_id,
+                    "url": target_url,
+                    "available": true,
+                    "vision_model": vision_model,
+                    "overall": value.get("overall").cloned().unwrap_or(Value::Null),
+                    "findings": findings_list,
+                    "strengths": value.get("strengths").cloned().unwrap_or(json!([])),
+                    "screenshot_uri": screenshot.artifact_uri,
+                    "screenshot_evidence_ref": screenshot.evidence_ref.to_string(),
+                    "source": "vision-model-gemma",
+                })
+            }
+            _ => {
+                json!({
+                    "conversation_id": conversation_id,
+                    "url": target_url,
+                    "available": false,
+                    "unavailable_reason":
+                        "VISION_CRITIC_UNAVAILABLE: vision model returned no structured critique",
+                    "vision_model": vision_model,
+                    "findings": [],
+                    "source": "vision-unavailable",
+                })
+            }
+        };
+
+        // Persist the visual critique as its own layer.
+        let now = TimestampMillis::now().as_millis() as i64;
+        let _ = self.db.save_design_critique(&DesignCritiqueRow {
+            id: StableId::new("dcritique").to_string(),
+            conversation_id: conversation_id.to_string(),
+            doc_type: Some("visual-critic".to_string()),
+            passed: critique["available"].as_bool().unwrap_or(false)
+                && critique["findings"].as_array().map(|a| a.is_empty()).unwrap_or(false),
+            findings_json: critique.to_string(),
+            improvement_required: false,
+            evidence_refs: screenshot.evidence_ref.to_string(),
+            created_at_ms: now,
+        });
+
+        Ok(critique)
+    }
+
+    /// The configured vision model, defaulting to the ≤4B local gemma3:4b.
+    fn vision_model_name() -> String {
+        std::env::var("AGENTCODE_VISION_MODEL")
+            .ok()
+            .filter(|m| !m.trim().is_empty())
+            .unwrap_or_else(|| "gemma3:4b".to_string())
+    }
+
+    /// Build the structured Design Contract for this conversation (Doc 06
+    /// §26): product analysis, brief, grammar, reference principles with
+    /// do-not-copy boundaries, durable constraints, design state, latest
+    /// critique/QA findings, and relevant files — the full context a
+    /// mission needs to implement the design without losing it.
+    pub fn design_contract(&self, conversation_id: &str) -> AcResult<Value> {
+        let conv = self.db.conversation(conversation_id)?.ok_or_else(|| {
+            AcError::validation("CONVERSATION-NOT_FOUND", "conversation not found")
+        })?;
+        let doc = |doc_type: &str| {
+            self.db
+                .design_document(conversation_id, doc_type)
+                .ok()
+                .flatten()
+                .and_then(|row| serde_json::from_str::<Value>(&row.content_json).ok())
+        };
+        let analysis = self.design_understand(conversation_id)?;
+        // Project-scoped durable constraints (Doc 06 §92).
+        let constraints = self.design_constraints_get(conversation_id)?;
+        let contract = json!({
+            "conversation_id": conversation_id,
+            "project_path": conv.project_path,
+            "product_analysis": analysis,
+            "brief": doc("design_brief"),
+            "grammar": doc("design_grammar"),
+            "reference_principles": doc("design_reference"),
+            "constraints": constraints,
+            "design_state": doc("design_state"),
+            "qa_report": doc("design_qa_report"),
+            "critique": self
+                .db
+                .design_critiques(conversation_id)?
+                .into_iter()
+                .rev()
+                .next()
+                .and_then(|row| serde_json::from_str::<Value>(&row.findings_json).ok()),
+            "recent_messages": self
+                .db
+                .messages_for_conversation(conversation_id)?
+                .iter()
+                .rev()
+                .take(10)
+                .rev()
+                .map(|m| json!({"role": m.role, "content": bounded_ui_summary(&m.content, 512)}))
+                .collect::<Vec<_>>(),
+        });
+        Ok(contract)
+    }
+
+    /// Implement via Mission with the FULL design contract (never a bare
+    /// sentence).  The contract text becomes the mission goal so the
+    /// mission retains product analysis, constraints, QA findings, and the
+    /// design state.
+    pub fn design_execute_contract(&mut self, conversation_id: &str) -> AcResult<Value> {
+        self.ensure_running()?;
+        let contract = self.design_contract(conversation_id)?;
+        let goal = Self::contract_to_goal_text(&contract);
+        let (mission_id, _session_id) = self.goal_submit(conversation_id, &goal, &[])?;
+        let now = TimestampMillis::now().as_millis() as i64;
+        let mut promoted = contract;
+        promoted["promoted_mission_id"] = json!(mission_id.to_string());
+        let _ = self.db.save_design_document(&DesignDocumentRow {
+            id: StableId::new("dcontract").to_string(),
+            conversation_id: conversation_id.to_string(),
+            doc_type: "design_contract".to_string(),
+            content_json: promoted.to_string(),
+            version: 1,
+            evidence_refs: String::new(),
+            created_at_ms: now,
+            updated_at_ms: now,
+        });
+        Ok(json!({
+            "mission_id": mission_id.to_string(),
+            "contract_goal": goal,
+            "conversation_id": conversation_id,
+        }))
+    }
+
+    /// ── Durable design constraints (Doc 06 §92) ─────────────────────────
+    /// Project-scoped, user-editable, and explicitly ranked ABOVE
+    /// aesthetics: the contract marks them NON-NEGOTIABLE so the critic
+    /// and missions cannot trade them away for visual polish.
+    pub fn design_constraints_set(
+        &self,
+        conversation_id: &str,
+        constraints: &[Value],
+    ) -> AcResult<Value> {
+        let conv = self.db.conversation(conversation_id)?.ok_or_else(|| {
+            AcError::validation("CONVERSATION-NOT_FOUND", "conversation not found")
+        })?;
+        let validated: Vec<Value> = constraints
+            .iter()
+            .filter(|c| c.get("text").and_then(Value::as_str).map(|t| !t.trim().is_empty()).unwrap_or(false))
+            .take(32)
+            .cloned()
+            .collect();
+        let project = &conv.project_path;
+        let now = TimestampMillis::now().as_millis() as i64;
+        // Constraints are project-scoped: shared across every design chat in
+        // the project.  Stored under a deterministic per-project key.
+        let key = format!("design_constraints:{}", fnv1a64_hash(project.as_bytes()));
+        let existing = self
+            .db
+            .design_documents_by_type(&key)?
+            .into_iter()
+            .last();
+        let version = existing.as_ref().map(|row| row.version + 1).unwrap_or(1);
+        let id = existing
+            .as_ref()
+            .map(|row| row.id.clone())
+            .unwrap_or_else(|| StableId::new("dcons").to_string());
+        let _ = self.db.save_design_document(&DesignDocumentRow {
+            id,
+            conversation_id: conversation_id.to_string(),
+            doc_type: key,
+            content_json: json!({
+                "project_path": project,
+                "constraints": validated,
+                "updated_via_conversation": conversation_id,
+            })
+            .to_string(),
+            version,
+            evidence_refs: String::new(),
+            created_at_ms: existing
+                .as_ref()
+                .map(|row| row.created_at_ms)
+                .unwrap_or(now),
+            updated_at_ms: now,
+        });
+        self.design_constraints_get(conversation_id)
+    }
+
+    /// Load the project-scoped constraints.  Visible from any design chat
+    /// in the same project; never leaks to another project's chats.
+    pub fn design_constraints_get(&self, conversation_id: &str) -> AcResult<Value> {
+        let conv = self.db.conversation(conversation_id)?.ok_or_else(|| {
+            AcError::validation("CONVERSATION-NOT_FOUND", "conversation not found")
+        })?;
+        let key = format!(
+            "design_constraints:{}",
+            fnv1a64_hash(conv.project_path.as_bytes())
+        );
+        let found = self
+            .db
+            .design_documents_by_type(&key)?
+            .into_iter()
+            .last();
+        Ok(match found {
+            Some(row) => serde_json::from_str::<Value>(&row.content_json)
+                .unwrap_or_else(|_| json!({"constraints": [], "project_path": conv.project_path})),
+            None => json!({
+                "constraints": [],
+                "project_path": conv.project_path,
+            }),
+        })
+    }
+
+    /// Materialize DESIGN_STATE.md in the project worktree as a readable
+    /// snapshot (Doc 06 §91).  The SQLite design_documents store remains
+    /// the code-authoritative state; the file is derived and written
+    /// through a recorded change so the evidence path can audit it.
+    pub fn design_materialize_state(&self, conversation_id: &str) -> AcResult<Value> {
+        let conv = self.db.conversation(conversation_id)?.ok_or_else(|| {
+            AcError::validation("CONVERSATION-NOT_FOUND", "conversation not found")
+        })?;
+        let state = self.design_state(conversation_id)?;
+        let content = state
+            .get("content")
+            .and_then(Value::as_str)
+            .unwrap_or("# DESIGN_STATE.md\n");
+        let path = std::path::Path::new(&conv.project_path).join("DESIGN_STATE.md");
+        std::fs::write(&path, content).map_err(|error| {
+            AcError::validation(
+                "DESIGN-STATE_MATERIALIZATION",
+                format!("could not write DESIGN_STATE.md: {error}"),
+            )
+        })?;
+        let now = TimestampMillis::now().as_millis() as i64;
+        let record_id = StableId::new("dstatemat");
+        let _ = self.db.save_design_document(&DesignDocumentRow {
+            id: record_id.to_string(),
+            conversation_id: conversation_id.to_string(),
+            doc_type: "design_state_materialization".to_string(),
+            content_json: json!({
+                "path": path.to_string_lossy(),
+                "content_sha": fnv1a64_hash(content.as_bytes()),
+                "derived_from": "design_documents (code-authoritative)",
+            })
+            .to_string(),
+            version: 1,
+            evidence_refs: String::new(),
+            created_at_ms: now,
+            updated_at_ms: now,
+        });
+        Ok(json!({
+            "materialized": true,
+            "path": path.to_string_lossy(),
+            "record_id": record_id.to_string(),
+            "note": "DESIGN_STATE.md is a derived readable snapshot; SQLite design_documents is authoritative",
+        }))
+    }
+
+    /// Render the design contract as the mission goal text.  Constraints
+    /// and do-not-copy boundaries are marked non-negotiable — they outrank
+    /// aesthetics in the mission's priorities.
+    fn contract_to_goal_text(contract: &Value) -> String {
+        let mut out = String::new();
+        let product = contract
+            .get("product_analysis")
+            .and_then(|v| v.get("product_summary"))
+            .and_then(Value::as_str)
+            .or_else(|| {
+                contract
+                    .get("product_analysis")
+                    .and_then(|v| v.get("framework"))
+                    .and_then(Value::as_str)
+            })
+            .unwrap_or("the product discussed in this design conversation");
+        out.push_str(&format!(
+            "GOAL: Implement the design agreed in this Design Studio conversation for {product}.\n\n"
+        ));
+        out.push_str("This mission was promoted from a structured Design Contract:\n\n");
+
+        if let Some(brief) = contract.get("brief").and_then(|v| v.get("brief")) {
+            if let Some(text) = brief.as_str() {
+                out.push_str("DESIGN BRIEF (the intent):\n");
+                out.push_str(&bounded_ui_summary(text, 2048));
+                out.push_str("\n\n");
+            }
+        }
+        if let Some(grammar) = contract.get("grammar") {
+            if let Some(tokens) = grammar.get("tokens").and_then(Value::as_array) {
+                out.push_str("DESIGN TOKENS:\n");
+                for token in tokens.iter().take(20) {
+                    out.push_str(&format!("- {token}\n"));
+                }
+                out.push('\n');
+            }
+        }
+        if let Some(reference) = contract.get("reference_principles") {
+            if let Some(principles) = reference.get("adopted_principles").and_then(Value::as_array)
+            {
+                if !principles.is_empty() {
+                    out.push_str("ADOPTED REFERENCE PRINCIPLES (abstract only):\n");
+                    for principle in principles.iter().take(10) {
+                        out.push_str(&format!("- {principle}\n"));
+                    }
+                    out.push('\n');
+                }
+            }
+            if let Some(do_not_copy) =
+                reference.get("explicitly_do_not_copy").and_then(Value::as_array)
+            {
+                if !do_not_copy.is_empty() {
+                    out.push_str("DO NOT COPY (NON-NEGOTIABLE):\n");
+                    for item in do_not_copy.iter().take(10) {
+                        out.push_str(&format!("- {item}\n"));
+                    }
+                    out.push('\n');
+                }
+            }
+        }
+        if let Some(constraints) = contract
+            .get("constraints")
+            .and_then(|v| v.get("constraints"))
+            .and_then(Value::as_array)
+        {
+            if !constraints.is_empty() {
+                out.push_str("DURABLE CONSTRAINTS (NON-NEGOTIABLE — outrank aesthetics):\n");
+                for constraint in constraints.iter().take(20) {
+                    if let Some(text) = constraint.get("text").and_then(Value::as_str) {
+                        out.push_str(&format!("- {text}\n"));
+                    } else if let Some(text) = constraint.as_str() {
+                        out.push_str(&format!("- {text}\n"));
+                    }
+                }
+                out.push('\n');
+            }
+        }
+        if let Some(qa) = contract.get("qa_report") {
+            if let Some(layers) = qa.get("layers").and_then(Value::as_object) {
+                out.push_str("QA FINDINGS TO FIX (from real-browser QA):\n");
+                for (layer, report) in layers {
+                    if let Some(issues) = report.get("issues").and_then(Value::as_array) {
+                        for issue in issues.iter().take(10) {
+                            if let Some(text) = issue.as_str() {
+                                out.push_str(&format!("- [{layer}] {text}\n"));
+                            }
+                        }
+                    }
+                }
+                out.push('\n');
+            }
+        }
+        if let Some(messages) = contract.get("recent_messages").and_then(Value::as_array) {
+            out.push_str("DESIGN CONVERSATION CONTEXT (recent):\n");
+            for message in messages.iter().take(10) {
+                let role = message.get("role").and_then(Value::as_str).unwrap_or("");
+                let content = message.get("content").and_then(Value::as_str).unwrap_or("");
+                out.push_str(&format!("- {role}: {content}\n"));
+            }
+        }
+        bounded_ui_summary(&out, 12 * 1024)
+    }
+
     pub fn design_preview_start(&self, conversation_id: &str) -> AcResult<Value> {
         self.ensure_running()?;
         let conv = self.db.conversation(conversation_id)?.ok_or_else(|| {
