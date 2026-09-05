@@ -331,6 +331,43 @@ pub struct DomSnapshot {
     pub evidence_ref: StableId,
 }
 
+/// One interactive element with its rendered size (design QA touch-target
+/// check, WCAG 2.5.8).  Sizes come from the real layout engine via CDP.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DesignTouchTarget {
+    pub tag: String,
+    pub label: String,
+    pub role: String,
+    pub width: i64,
+    pub height: i64,
+    pub visible: bool,
+}
+
+/// Real design-QA metrics measured in a live page (Doc 06 §49-50).
+/// `needs_manual_review: true` marks every metric the current runtime
+/// cannot measure honestly (deterministic harness has no layout engine).
+/// Layout-dependent fields are `None` — never a fabricated verdict.
+#[derive(Clone, Debug, PartialEq)]
+pub struct DesignMetrics {
+    pub mode: String,
+    pub needs_manual_review: bool,
+    pub viewport: ViewportProfile,
+    /// Some(true) = horizontal overflow detected; Some(false) = fits;
+    /// None = not measurable in this runtime.
+    pub horizontal_overflow: Option<bool>,
+    pub has_viewport_meta: bool,
+    pub scroll_width: Option<i64>,
+    pub client_width: Option<i64>,
+    pub touch_targets: Vec<DesignTouchTarget>,
+    pub small_touch_targets: Vec<String>,
+    pub unlabeled_controls: Vec<String>,
+    pub control_count: Option<u32>,
+    pub heading_skips: Vec<String>,
+    pub focus_visible_support: Option<bool>,
+    pub has_lang_attribute: bool,
+    pub document_title: Option<String>,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct BrowserDiagnostics {
     pub session_id: StableId,
@@ -1566,6 +1603,295 @@ impl BrowserRuntime {
         })
     }
 
+    /// Real layout/interaction metrics for design QA (Doc 06 §49-50).
+    ///
+    /// In CDP mode this evaluates a metrics bundle in the live page:
+    ///   - horizontal overflow (`scrollWidth > clientWidth + 1` on document
+    ///     element and body)
+    ///   - viewport meta presence and initial-scale
+    ///   - touch-target sizes of interactive elements (WCAG 2.5.8 ≥24px)
+    ///   - control inventory with roles/names and unlabeled controls
+    ///   - heading hierarchy (skipped levels)
+    ///   - focus visibility capability (focus-visible styling)
+    ///   - lang attribute and document title
+    ///
+    /// In deterministic mode there is no layout engine, so every metric that
+    /// needs real layout is returned as `null` and `needs_manual_review`
+    /// is true — the caller must fail honestly instead of fabricating
+    /// pass/fail verdicts.
+    /// Apply a viewport to a live session (design QA responsive checks).
+    /// CDP mode sets device metrics on the page; deterministic mode records
+    /// the viewport in the page state.
+    pub fn set_viewport(
+        &mut self,
+        session_id: &StableId,
+        viewport: ViewportProfile,
+    ) -> AcResult<()> {
+        if self.mode == BrowserAdapterMode::ChromiumCdp {
+            let page = self.real_page_mut(session_id)?;
+            page.viewport = viewport;
+            page.client.call(
+                "Emulation.setDeviceMetricsOverride",
+                json!({
+                    "width": viewport.width,
+                    "height": viewport.height,
+                    "deviceScaleFactor": 1,
+                    "mobile": viewport.width < 600
+                }),
+            )?;
+            page.client.drain_events(Duration::from_millis(100))?;
+            return Ok(());
+        }
+        if let Some(page) = self.pages.get_mut(session_id) {
+            page.viewport = viewport;
+        }
+        Ok(())
+    }
+
+    pub fn design_metrics(&mut self, session_id: &StableId) -> AcResult<DesignMetrics> {
+        if self.mode == BrowserAdapterMode::ChromiumCdp {
+            return self.design_metrics_chromium_cdp(session_id);
+        }
+        // Deterministic harness: only structural facts available from the
+        // fixture HTML — anything layout-dependent is explicitly null.
+        // Structural a11y facts (labels, roles, control inventory, heading
+        // order) ARE computable from HTML and are reported honestly;
+        // touch-target sizes and overflow need a layout engine and stay
+        // None so the caller flags NEEDS_MANUAL_REVIEW for them.
+        let page = self.page(session_id)?;
+        let has_viewport_meta =
+            page.html.contains("name=\"viewport\"") || page.html.contains("name='viewport'");
+        let has_lang = page.html.contains("<html") && page.html.contains("lang=");
+
+        // Structural control inventory from the fixture HTML.
+        // Deterministic mode extracts what static HTML can honestly provide:
+        // aria-label/placeholder/title attributes, button inner text, and
+        // <label> elements (any form labeling).  Sizes stay 0 — they need
+        // a layout engine and are reported as unmeasured.
+        let control_tags = ["<button", "<input", "<select", "<textarea", "<a "];
+        let mut touch_targets = Vec::new();
+        for tag in control_tags {
+            let mut search = page.html.as_str();
+            while let Some(pos) = search.find(tag) {
+                let end = (pos + 200).min(search.len());
+                let snippet = &search[pos..end];
+                let mut label = extract_attribute(snippet, "aria-label")
+                    .or_else(|| extract_attribute(snippet, "placeholder"))
+                    .or_else(|| extract_attribute(snippet, "title"))
+                    .unwrap_or_default();
+                // Buttons and links carry their inner text as the label.
+                if label.is_empty() {
+                    if let Some(close) = snippet.find('>') {
+                        let inner = &snippet[close + 1..];
+                        if let Some(text) = inner.find("</") {
+                            let text_value = inner[..text].trim();
+                            if !text_value.is_empty() && text_value.len() < 80 {
+                                label = text_value.to_string();
+                            }
+                        }
+                    }
+                }
+                // A <label> element anywhere in the form labels form fields
+                // (fixture-level structural approximation).
+                if label.is_empty()
+                    && matches!(tag, "<input" | "<select" | "<textarea")
+                    && page.html.contains("<label")
+                {
+                    label = "(labelled)".to_string();
+                }
+                touch_targets.push(DesignTouchTarget {
+                    tag: tag.trim_start_matches('<').trim_end().to_string(),
+                    label,
+                    role: if snippet.contains("role=") {
+                        "explicit".to_string()
+                    } else {
+                        String::new()
+                    },
+                    width: 0,
+                    height: 0,
+                    visible: true,
+                });
+                search = &search[pos + tag.len()..];
+            }
+        }
+        let unlabeled_controls: Vec<String> = touch_targets
+            .iter()
+            .filter(|target| target.label.is_empty() && target.tag != "a")
+            .map(|target| format!("{} has no accessible name", target.tag))
+            .collect();
+        // Heading order from the fixture HTML (document order preserved).
+        let ordered: Vec<i64> = {
+            let mut positions: Vec<(usize, i64)> = Vec::new();
+            for level in 1..=6 {
+                let tag = format!("<h{level}");
+                let mut search = page.html.as_str();
+                while let Some(pos) = search.find(&tag) {
+                    positions.push((pos, level as i64));
+                    search = &search[pos + tag.len()..];
+                }
+            }
+            positions.sort();
+            positions.into_iter().map(|(_, level)| level).collect()
+        };
+        let mut heading_skips = Vec::new();
+        for pair in ordered.windows(2) {
+            if pair[1] > pair[0] + 1 {
+                heading_skips.push(format!("heading jumps from h{} to h{}", pair[0], pair[1]));
+            }
+        }
+
+        Ok(DesignMetrics {
+            mode: "deterministic".to_string(),
+            needs_manual_review: true,
+            viewport: page.viewport,
+            horizontal_overflow: None,
+            has_viewport_meta,
+            scroll_width: None,
+            client_width: None,
+            touch_targets,
+            small_touch_targets: Vec::new(), // needs real layout
+            unlabeled_controls,
+            control_count: None,
+            heading_skips,
+            focus_visible_support: None,
+            has_lang_attribute: has_lang,
+            document_title: None,
+        })
+    }
+
+    fn design_metrics_chromium_cdp(&mut self, session_id: &StableId) -> AcResult<DesignMetrics> {
+        let viewport = self
+            .real_pages
+            .values()
+            .next()
+            .map(|p| p.viewport.clone())
+            .unwrap_or(ViewportProfile {
+                name: "desktop",
+                width: 1440,
+                height: 900,
+            });
+        let page = self.real_page_mut(session_id)?;
+
+        // Layout overflow + viewport readiness.
+        let overflow_json = page.client.evaluate_value(
+            "(() => { const d = document.documentElement, b = document.body;\
+             return JSON.stringify({\
+                 sw: Math.max(d.scrollWidth, b ? b.scrollWidth : 0),\
+                 cw: d.clientWidth,\
+                 meta: !!document.querySelector('meta[name=viewport]')\
+             }); })()",
+        )?;
+        let overflow: Value =
+            serde_json::from_str(overflow_json.as_str().unwrap_or("{}")).unwrap_or(Value::Null);
+
+        // Touch targets: every interactive element with its rendered size.
+        let targets_json = page.client.evaluate_value(
+            "(() => {\
+                 const sels = 'button, a[href], input, select, textarea, [role=button], [role=link], [role=tab], [role=switch], [role=checkbox], [onclick]';\
+                 return JSON.stringify(Array.from(document.querySelectorAll(sels)).map(el => {\
+                     const r = el.getBoundingClientRect();\
+                     return {\
+                         tag: el.tagName.toLowerCase(),\
+                         label: (el.getAttribute('aria-label') || el.innerText || el.value || el.getAttribute('title') || '').trim().slice(0, 80),\
+                         role: el.getAttribute('role') || '',\
+                         w: Math.round(r.width),\
+                         h: Math.round(r.height),\
+                         visible: r.width > 0 && r.height > 0\
+                     };\
+                 })); })()",
+        )?;
+        let targets: Vec<Value> =
+            serde_json::from_str(targets_json.as_str().unwrap_or("[]")).unwrap_or_default();
+
+        let touch_targets: Vec<DesignTouchTarget> = targets
+            .iter()
+            .map(|t| DesignTouchTarget {
+                tag: t["tag"].as_str().unwrap_or("").to_string(),
+                label: t["label"].as_str().unwrap_or("").to_string(),
+                role: t["role"].as_str().unwrap_or("").to_string(),
+                width: t["w"].as_i64().unwrap_or(0),
+                height: t["h"].as_i64().unwrap_or(0),
+                visible: t["visible"].as_bool().unwrap_or(false),
+            })
+            .collect();
+        let small_touch_targets: Vec<String> = touch_targets
+            .iter()
+            .filter(|t| t.visible && (t.width < 24 || t.height < 24))
+            .map(|t| {
+                format!(
+                    "{} '{}' is {}x{}px (below 24px minimum)",
+                    t.tag, t.label, t.width, t.height
+                )
+            })
+            .collect();
+        let unlabeled_controls: Vec<String> = touch_targets
+            .iter()
+            .filter(|t| t.label.is_empty() && t.tag != "a")
+            .map(|t| format!("{} has no accessible name", t.tag))
+            .collect();
+        let control_count = touch_targets.len() as u32;
+
+        // Heading hierarchy: h1..h6 order with skipped levels.
+        let headings_json = page.client.evaluate_value(
+            "(() => JSON.stringify(Array.from(document.querySelectorAll('h1,h2,h3,h4,h5,h6'))\
+                 .map(h => parseInt(h.tagName[1]))))()",
+        )?;
+        let levels: Vec<i64> =
+            serde_json::from_str(headings_json.as_str().unwrap_or("[]")).unwrap_or_default();
+        let mut heading_skips = Vec::new();
+        for pair in levels.windows(2) {
+            if pair[1] > pair[0] + 1 {
+                heading_skips.push(format!("heading jumps from h{} to h{}", pair[0], pair[1]));
+            }
+        }
+
+        // Focus visibility: does the UA default or author CSS style focus?
+        let focus_visible = page.client.evaluate_value(
+            "(() => {\
+                 const probe = document.querySelector('button, a[href], [role=button]');\
+                 if (!probe) return null;\
+                 try { probe.focus(); } catch (e) {}\
+                 const st = getComputedStyle(probe);\
+                 const outline = st.outlineStyle !== 'none' && st.outlineWidth !== '0px';\
+                 const shadow = (st.boxShadow || '') !== '';\
+                 const underline = st.textDecorationLine.includes('underline');\
+                 return !!(outline || shadow || underline); })()",
+        )?;
+
+        let title = page.client.evaluate_value("document.title || ''")?;
+
+        let scroll_width = overflow["sw"].as_i64();
+        let client_width = overflow["cw"].as_i64();
+        let horizontal_overflow = match (scroll_width, client_width) {
+            (Some(sw), Some(cw)) => Some(sw > cw + 1),
+            _ => None,
+        };
+
+        let has_lang_attribute = page
+            .client
+            .evaluate_value("!!document.documentElement.getAttribute('lang')")?
+            .as_bool()
+            .unwrap_or(false);
+
+        Ok(DesignMetrics {
+            mode: "cdp".to_string(),
+            needs_manual_review: false,
+            viewport,
+            horizontal_overflow,
+            has_viewport_meta: overflow["meta"].as_bool().unwrap_or(false),
+            scroll_width,
+            client_width,
+            touch_targets,
+            small_touch_targets,
+            unlabeled_controls,
+            control_count: Some(control_count),
+            heading_skips,
+            focus_visible_support: focus_visible.as_bool(),
+            has_lang_attribute,
+            document_title: title.as_str().map(ToString::to_string),
+        })
+    }
+
     pub fn manage_dev_server(
         &self,
         task_id: StableId,
@@ -2643,7 +2969,9 @@ fn push_bounded(items: &mut Vec<String>, value: String) {
     items.push(value);
 }
 
-fn discover_chromium_executable() -> Option<PathBuf> {
+/// Discover a usable Chromium executable (real-browser QA capability
+/// probe).  None means real-browser QA cannot run in this environment.
+pub fn discover_chromium_executable() -> Option<PathBuf> {
     if let Ok(value) = std::env::var("AGENTCODE_CHROME_EXECUTABLE") {
         let path = PathBuf::from(value);
         return path.is_file().then_some(path);
@@ -3240,6 +3568,24 @@ fn environment_fingerprint() -> String {
         std::env::consts::OS,
         std::env::consts::ARCH
     )
+}
+
+/// Extract a double- or single-quoted attribute value from an HTML snippet.
+/// Returns None when the attribute is absent or malformed.
+fn extract_attribute(snippet: &str, attribute: &str) -> Option<String> {
+    for quote in ['"', '\''] {
+        let pattern = format!("{attribute}={quote}");
+        if let Some(start) = snippet.find(&pattern) {
+            let value_start = start + pattern.len();
+            let rest = &snippet[value_start..];
+            let value_end = rest.find(quote)?;
+            let value = &rest[..value_end];
+            if !value.trim().is_empty() {
+                return Some(value.trim().to_string());
+            }
+        }
+    }
+    None
 }
 
 fn local_hash(content: &str) -> String {
@@ -3964,6 +4310,171 @@ mod tests {
             .network_failures
             .iter()
             .any(|failure| { failure.contains("missing.html") || failure.contains("net::ERR") }));
+        runtime.mark_crashed(&process.id).unwrap();
+    }
+
+    /// design_metrics: deterministic harness must report honest
+    /// NEEDS_MANUAL_REVIEW (no layout engine ⇒ no fabricated verdicts).
+    #[test]
+    fn design_metrics_deterministic_reports_needs_manual_review() {
+        let mut runtime = BrowserRuntime::deterministic_harness_for_tests(
+            CapabilityPolicy::new().allow(Capability::BrowserAutomation),
+        );
+        let mut evidence = EvidenceStore::new();
+        let task = StableId::new("task");
+        let process = runtime.launch(task.clone()).unwrap();
+        let session = runtime
+            .create_session(task.clone(), process.id.clone())
+            .unwrap();
+        runtime
+            .act(
+                &session.id,
+                BrowserAction::OpenHtmlForTest {
+                    url: "http://127.0.0.1:1/fixture".to_string(),
+                    html: "<!doctype html><html lang=\"en\"><head><meta name=\"viewport\" \
+                           content=\"width=device-width\"></head><body><button>Go</button>\
+                           </body></html>"
+                        .to_string(),
+                },
+                &mut evidence,
+            )
+            .unwrap();
+        let metrics = runtime.design_metrics(&session.id).unwrap();
+        assert_eq!(metrics.mode, "deterministic");
+        assert!(
+            metrics.needs_manual_review,
+            "deterministic mode must flag manual review"
+        );
+        assert_eq!(
+            metrics.horizontal_overflow, None,
+            "layout metrics must be None, not fabricated"
+        );
+        assert!(
+            metrics.has_viewport_meta,
+            "structural fact from fixture HTML"
+        );
+        assert!(metrics.has_lang_attribute);
+    }
+
+    /// design_metrics: real Chrome CDP must measure real layout — overflow,
+    /// touch-target sizes, unlabeled controls, focus visibility, lang.
+    #[test]
+    fn design_metrics_real_chrome_measures_layout_and_touch_targets() {
+        if discover_chromium_executable().is_none() {
+            eprintln!("SKIP: no Chromium executable available");
+            return;
+        }
+        let Ok(listener) = std::net::TcpListener::bind("127.0.0.1:0") else {
+            return;
+        };
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            listener.set_nonblocking(true).unwrap();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+            while std::time::Instant::now() < deadline {
+                if let Ok((mut stream, _)) = listener.accept() {
+                    let mut buffer = [0_u8; 2048];
+                    let n = stream.read(&mut buffer).unwrap_or(0);
+                    let _request = String::from_utf8_lossy(&buffer[..n]);
+                    // Tiny target (16px) + unlabeled control + wide element
+                    // (overflow) + skipped heading + no lang.
+                    let body = "<!doctype html><html><head><style>\
+                        #wide { width: 3000px; height: 10px; }\
+                        #tiny { width: 16px; height: 16px; }</style></head>\
+                        <body><h1>Top</h1><h4>Skip</h4>\
+                        <div id=\"wide\"></div>\
+                        <button id=\"tiny\" aria-label=\"Tiny\">x</button>\
+                        <button id=\"plain\">Labelled</button>\
+                        <input id=\"nolabel\" type=\"text\" />\
+                        </body></html>";
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = stream.write_all(response.as_bytes());
+                }
+            }
+        });
+
+        let mut runtime =
+            BrowserRuntime::new(CapabilityPolicy::new().allow(Capability::BrowserAutomation));
+        let mut evidence = EvidenceStore::new();
+        let task = StableId::new("task");
+        let process = runtime.launch(task.clone()).unwrap();
+        let session = runtime
+            .create_session(task.clone(), process.id.clone())
+            .unwrap();
+        // Apply a viewport like design_qa_run does, then measure.
+        runtime
+            .set_viewport(
+                &session.id,
+                ViewportProfile {
+                    name: "desktop",
+                    width: 1440,
+                    height: 900,
+                },
+            )
+            .unwrap();
+        runtime
+            .act(
+                &session.id,
+                BrowserAction::Navigate {
+                    url: format!("http://{addr}/metrics"),
+                },
+                &mut evidence,
+            )
+            .unwrap();
+        runtime
+            .act(
+                &session.id,
+                BrowserAction::Wait { millis: 300 },
+                &mut evidence,
+            )
+            .unwrap();
+        let metrics = runtime.design_metrics(&session.id).unwrap();
+        assert_eq!(metrics.mode, "cdp");
+        assert!(
+            !metrics.needs_manual_review,
+            "CDP mode measures layout directly"
+        );
+        // Real overflow: the 3000px element must be detected.
+        assert_eq!(
+            metrics.horizontal_overflow,
+            Some(true),
+            "scroll/client: {:?}/{:?}",
+            metrics.scroll_width,
+            metrics.client_width
+        );
+        assert!(
+            metrics.scroll_width.unwrap_or(0) > 2000,
+            "scrollWidth must reflect the 3000px element"
+        );
+        // Tiny touch target below 24px must be flagged with real size.
+        assert!(
+            metrics
+                .small_touch_targets
+                .iter()
+                .any(|t| t.contains("16x16px")),
+            "small targets: {:?}",
+            metrics.small_touch_targets
+        );
+        // Unlabeled input must be flagged.
+        assert!(
+            metrics
+                .unlabeled_controls
+                .iter()
+                .any(|c| c.contains("input")),
+            "unlabeled: {:?}",
+            metrics.unlabeled_controls
+        );
+        // Heading skip h1→h4 must be detected.
+        assert!(
+            metrics.heading_skips.iter().any(|h| h.contains("h1 to h4")),
+            "heading skips: {:?}",
+            metrics.heading_skips
+        );
+        // No lang attribute in this fixture.
+        assert!(!metrics.has_lang_attribute);
         runtime.mark_crashed(&process.id).unwrap();
     }
 

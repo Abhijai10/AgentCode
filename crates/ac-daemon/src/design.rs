@@ -1001,58 +1001,347 @@ port: port.map(|p| p as i64),
         Ok(result)
     }
 
-    pub fn design_qa_responsive(&self, _conversation_id: &str, content: &str) -> AcResult<Value> {
-        let mut issues = Vec::new();
-        if content.contains("position: fixed") || content.contains("position:absolute") {
-            issues.push("fixed/absolute positioning may cause overflow on small viewports".to_string());
+    /// Real design QA driven by a live browser session (Doc 06 §49-50).
+    ///
+    /// This is the shared engine behind design_qa_responsive/accessibility/
+    /// functional.  It launches the real Chrome CDP runtime against the
+    /// conversation's preview URL (or the given `url`), measures real layout
+    /// metrics (overflow, touch-target sizes, unlabeled controls, heading
+    /// hierarchy, focus visibility), captures diagnostics, and persists the
+    /// layered report through the design_visual_evaluations store.
+    ///
+    /// Layer separation (audit requirement): Deterministic Browser QA vs
+    /// Manual Review is explicit — `needs_manual_review` is true exactly
+    /// when the runtime could not measure honestly.
+    ///
+    /// `deterministic` runs the deterministic harness with `html` — used by
+    /// tests and recorded as NEEDS_MANUAL_REVIEW for layout metrics, never
+    /// a fabricated pass.
+    pub fn design_qa_run(
+        &self,
+        conversation_id: &str,
+        url: &str,
+        html: &str,
+        deterministic: bool,
+        viewport_hint: &str,
+    ) -> AcResult<Value> {
+        let preview = self.db.design_preview(conversation_id)?;
+        let target_url = if url.is_empty() {
+            preview
+                .as_ref()
+                .and_then(|p| p.ready_url.clone())
+                .unwrap_or_else(|| "about:blank".to_string())
+        } else {
+            url.to_string()
+        };
+
+        let mut evidence_store = EvidenceStore::new();
+        let policy = ac_security::CapabilityPolicy::new()
+            .allow(ac_security::Capability::BrowserAutomation);
+        let mut browser = if deterministic {
+            ac_verification::BrowserRuntime::deterministic_harness_for_tests(policy)
+        } else {
+            ac_verification::BrowserRuntime::new(policy)
+        };
+
+        let task_id = StableId::new("designqa");
+        let process = browser.launch(task_id.clone())?;
+        let session = browser.create_session(task_id.clone(), process.id.clone())?;
+
+        // Apply the requested viewport before measuring.
+        let viewport = match viewport_hint {
+            "compact" => ac_verification::ViewportProfile {
+                name: "compact",
+                width: 1024,
+                height: 768,
+            },
+            "wide" => ac_verification::ViewportProfile {
+                name: "wide",
+                width: 1920,
+                height: 1080,
+            },
+            _ => ac_verification::ViewportProfile {
+                name: "desktop",
+                width: 1440,
+                height: 900,
+            },
+        };
+        let _ = browser.set_viewport(&session.id, viewport);
+
+        if deterministic && !html.is_empty() {
+            let _ = browser.act(
+                &session.id,
+                ac_verification::BrowserAction::OpenHtmlForTest {
+                    url: target_url.clone(),
+                    html: html.to_string(),
+                },
+                &mut evidence_store,
+            )?;
+        } else {
+            let _ = browser.act(
+                &session.id,
+                ac_verification::BrowserAction::Navigate {
+                    url: target_url.clone(),
+                },
+                &mut evidence_store,
+            )?;
+            let _ = browser.act(
+                &session.id,
+                ac_verification::BrowserAction::Wait { millis: 300 },
+                &mut evidence_store,
+            )?;
         }
-        if content.contains("width:") && !content.contains("max-width") && !content.contains("responsive") {
-            issues.push("fixed widths without max-width may overflow".to_string());
+
+        let metrics = browser.design_metrics(&session.id)?;
+        let diag = browser.diagnostics(&session.id, &mut evidence_store)?;
+
+        // ── Layered findings, each traceable to a real measurement ──
+        // `issues` = measured failures.  `unmeasured` = metrics this runtime
+        // cannot measure honestly (NEEDS_MANUAL_REVIEW) — they never flip a
+        // pass verdict and never fabricate one.
+        let mut responsive_issues = Vec::new();
+        let mut responsive_unmeasured = Vec::new();
+        let mut responsive_viewports = Vec::new();
+        match metrics.horizontal_overflow {
+            Some(true) => responsive_issues.push(format!(
+                "horizontal overflow at {}px viewport: scrollWidth {} > clientWidth {}",
+                metrics.viewport.width,
+                metrics.scroll_width.unwrap_or(0),
+                metrics.client_width.unwrap_or(0)
+            )),
+            Some(false) => responsive_viewports.push(format!(
+                "{} ({}px): no horizontal overflow (scroll {}, client {})",
+                metrics.viewport.name,
+                metrics.viewport.width,
+                metrics.scroll_width.unwrap_or(0),
+                metrics.client_width.unwrap_or(0)
+            )),
+            None => responsive_unmeasured
+                .push("layout overflow not measurable in this runtime".to_string()),
         }
-        if content.contains("overflow: hidden") {
-            issues.push("overflow hidden may clip content on small screens".to_string());
+        if !metrics.has_viewport_meta {
+            responsive_issues.push("missing viewport meta tag".to_string());
         }
-        Ok(json!({
-            "passed": issues.is_empty(),
-            "issues": issues,
-            "viewports_checked": ["compact (1024px)", "normal (1440px)", "wide (1920px)"],
-        }))
+
+        let mut accessibility_issues = Vec::new();
+        let mut accessibility_unmeasured = Vec::new();
+        for target in &metrics.small_touch_targets {
+            accessibility_issues.push(format!("touch target below 24px: {target}"));
+        }
+        for control in &metrics.unlabeled_controls {
+            accessibility_issues.push(format!("unlabeled control: {control}"));
+        }
+        for skip in &metrics.heading_skips {
+            accessibility_issues.push(format!("heading hierarchy skip: {skip}"));
+        }
+        if !metrics.has_lang_attribute {
+            accessibility_issues.push("html element has no lang attribute".to_string());
+        }
+        match metrics.focus_visible_support {
+            Some(false) => accessibility_issues
+                .push("focus indicator not visible on interactive elements".to_string()),
+            Some(true) => {}
+            None => accessibility_unmeasured
+                .push("focus visibility not measurable in this runtime".to_string()),
+        }
+
+        let mut functional_issues = Vec::new();
+        for error in &diag.console_errors {
+            functional_issues.push(format!("console error: {error}"));
+        }
+        for error in &diag.page_errors {
+            functional_issues.push(format!("page error: {error}"));
+        }
+        for failure in &diag.network_failures {
+            functional_issues.push(format!("network failure: {failure}"));
+        }
+        if diag.http_status != 200 && diag.http_status != 0 {
+            functional_issues.push(format!("HTTP status {}", diag.http_status));
+        }
+
+        let responsive_passed = responsive_issues.is_empty();
+        let accessibility_passed = accessibility_issues.is_empty();
+        let functional_passed = functional_issues.is_empty();
+
+        // Persist the layered reports through the evidence-backed store,
+        // then the combined evaluation into design_visual_evaluations.
+        let artifact_version = StableId::new("designqa");
+        let verifier = ac_verification::VerificationEngine::new(
+            ac_security::CapabilityPolicy::new()
+                .allow(ac_security::Capability::BrowserAutomation),
+        );
+        let responsive_report = verifier.record_design_responsive_report(
+            &artifact_version,
+            if responsive_viewports.is_empty() {
+                vec![format!(
+                    "{} ({}px)",
+                    metrics.viewport.name, metrics.viewport.width
+                )]
+            } else {
+                responsive_viewports.clone()
+            },
+            responsive_passed,
+            &mut evidence_store,
+        )?;
+        let accessibility_report = verifier.record_design_accessibility_report(
+            &artifact_version,
+            accessibility_passed,
+            if accessibility_issues.is_empty() {
+                vec![
+                    "touch targets >= 24px".to_string(),
+                    "controls labeled".to_string(),
+                    "heading hierarchy intact".to_string(),
+                    "lang attribute present".to_string(),
+                ]
+            } else {
+                accessibility_issues.clone()
+            },
+            &mut evidence_store,
+        )?;
+        let functional_report = verifier.record_design_functional_report(
+            &artifact_version,
+            functional_passed,
+            if functional_passed {
+                vec![format!(
+                    "page loads at {target_url} without console/page/network errors"
+                )]
+            } else {
+                functional_issues.clone()
+            },
+            &mut evidence_store,
+        )?;
+        let _ = self.db.save_design_visual_evaluation(
+            &ac_db::DesignVisualEvaluationRow {
+                id: StableId::new("dqa").to_string(),
+                artifact_version_id: artifact_version.to_string(),
+                passed: responsive_passed && accessibility_passed && functional_passed,
+                findings: serde_json::to_string(&json!({
+                    "responsive": responsive_issues,
+                    "accessibility": accessibility_issues,
+                    "functional": functional_issues,
+                }))
+                .unwrap_or_default(),
+                responsive_viewports: serde_json::to_string(&responsive_viewports).unwrap_or_default(),
+                accessibility_checks: serde_json::to_string(&accessibility_report.checks).unwrap_or_default(),
+                functional_flows: serde_json::to_string(&functional_report.flows).unwrap_or_default(),
+                evidence_refs: [
+                    responsive_report.evidence_ref.to_string(),
+                    accessibility_report.evidence_ref.to_string(),
+                    functional_report.evidence_ref.to_string(),
+                ]
+                .join(","),
+                created_at_ms: TimestampMillis::now().as_millis() as i64,
+            },
+        );
+
+        // Conversation-scoped QA report document (UI + persistence).
+        let report = json!({
+            "conversation_id": conversation_id,
+            "url": target_url,
+            "mode": metrics.mode,
+            "viewport": {
+                "name": metrics.viewport.name,
+                "width": metrics.viewport.width,
+                "height": metrics.viewport.height,
+            },
+            "needs_manual_review": metrics.needs_manual_review,
+            "layers": {
+                "responsive": {
+                    "passed": responsive_passed,
+                    "issues": responsive_issues,
+                    "unmeasured": responsive_unmeasured,
+                    "viewports": responsive_viewports,
+                    "source": if metrics.needs_manual_review { "manual-review" } else { "real-browser-cdp" },
+                },
+                "accessibility": {
+                    "passed": accessibility_passed,
+                    "issues": accessibility_issues,
+                    "unmeasured": accessibility_unmeasured,
+                    "control_count": metrics.control_count,
+                    "source": if metrics.needs_manual_review { "manual-review" } else { "real-browser-cdp" },
+                },
+                "functional": {
+                    "passed": functional_passed,
+                    "issues": functional_issues,
+                    "unmeasured": Vec::<String>::new(),
+                    "http_status": diag.http_status,
+                    "source": if deterministic { "deterministic-harness" } else { "real-browser-cdp" },
+                },
+            },
+            "metrics": {
+                "scroll_width": metrics.scroll_width,
+                "client_width": metrics.client_width,
+                "horizontal_overflow": metrics.horizontal_overflow,
+                "touch_targets": metrics.touch_targets.len(),
+                "small_touch_targets": metrics.small_touch_targets.len(),
+                "unlabeled_controls": metrics.unlabeled_controls.len(),
+                "heading_skips": metrics.heading_skips.len(),
+                "focus_visible": metrics.focus_visible_support,
+                "has_lang": metrics.has_lang_attribute,
+                "has_viewport_meta": metrics.has_viewport_meta,
+                "document_title": metrics.document_title,
+            },
+            "passed": responsive_passed && accessibility_passed && functional_passed,
+        });
+        let now = TimestampMillis::now().as_millis() as i64;
+        let _ = self.db.save_design_document(&DesignDocumentRow {
+            id: StableId::new("dqa").to_string(),
+            conversation_id: conversation_id.to_string(),
+            doc_type: "design_qa_report".to_string(),
+            content_json: report.to_string(),
+            version: 1,
+            evidence_refs: evidence_store
+                .records()
+                .map(|record| record.id.to_string())
+                .collect::<Vec<_>>()
+                .join(","),
+            created_at_ms: now,
+            updated_at_ms: now,
+        });
+
+        let _ = browser.mark_crashed(&process.id);
+        Ok(report)
     }
 
-    pub fn design_qa_accessibility(&self, _conversation_id: &str, content: &str) -> AcResult<Value> {
-        let mut issues = Vec::new();
-        if !content.contains("role=") && !content.contains("aria-") {
-            issues.push("no ARIA roles or attributes found".to_string());
-        }
-        if !content.contains("<button") && !content.contains("<a ") {
-            issues.push("no interactive controls found (buttons or links)".to_string());
-        }
-        if content.contains("color:") && !content.contains("background-color") && !content.contains("contrast") {
-            issues.push("colors found without contrast specification".to_string());
-        }
-        if !content.contains("<label") && !content.contains("aria-label") {
-            issues.push("no form labels found".to_string());
-        }
-        Ok(json!({
-            "passed": issues.is_empty(),
-            "issues": issues,
-            "checks": ["semantic controls", "keyboard navigation", "focus visibility", "labels", "contrast"],
-        }))
+    /// Legacy single-check entry points kept for the UI: they now run the
+    /// full real-browser QA and slice the requested layer.
+    pub fn design_qa_responsive(
+        &self,
+        conversation_id: &str,
+        _content: &str,
+        url: &str,
+        html: &str,
+        deterministic: bool,
+        viewport_hint: &str,
+    ) -> AcResult<Value> {
+        let report = self.design_qa_run(conversation_id, url, html, deterministic, viewport_hint)?;
+        Ok(report["layers"]["responsive"].clone())
     }
 
-    pub fn design_qa_functional(&self, _conversation_id: &str, content: &str) -> AcResult<Value> {
-        let mut issues = Vec::new();
-        if content.contains("404") || content.contains("not found") {
-            issues.push("page contains 404 or not found content".to_string());
-        }
-        if content.contains("console.error") || content.contains("throw new Error") {
-            issues.push("page contains script errors".to_string());
-        }
-        Ok(json!({
-            "passed": issues.is_empty(),
-            "issues": issues,
-            "flows_checked": ["primary workflow navigation"],
-        }))
+    pub fn design_qa_accessibility(
+        &self,
+        conversation_id: &str,
+        _content: &str,
+        url: &str,
+        html: &str,
+        deterministic: bool,
+        viewport_hint: &str,
+    ) -> AcResult<Value> {
+        let report = self.design_qa_run(conversation_id, url, html, deterministic, viewport_hint)?;
+        Ok(report["layers"]["accessibility"].clone())
+    }
+
+    pub fn design_qa_functional(
+        &self,
+        conversation_id: &str,
+        _content: &str,
+        url: &str,
+        html: &str,
+        deterministic: bool,
+        viewport_hint: &str,
+    ) -> AcResult<Value> {
+        let report = self.design_qa_run(conversation_id, url, html, deterministic, viewport_hint)?;
+        Ok(report["layers"]["functional"].clone())
     }
 
     pub fn design_repair(&self, conversation_id: &str, content: &str, doc_type: &str) -> AcResult<Value> {

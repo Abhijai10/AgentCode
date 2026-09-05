@@ -331,17 +331,30 @@ export function DesignView({
       const r = await daemon.designBrowser(activeConvId!, undefined, undefined, undefined, viewportHint);
       if (r.ok && r.browser) {
         setBrowser(r.browser);
-        const dom = r.browser.visible_text;
-        const [resp, acc, fun] = await Promise.all([
-          daemon.designQa(activeConvId!, "responsive", dom),
-          daemon.designQa(activeConvId!, "accessibility", dom),
-          daemon.designQa(activeConvId!, "functional", dom),
-        ]);
-        setQa({
-          responsive: resp.ok ? resp.qa : undefined,
-          accessibility: acc.ok ? acc.qa : undefined,
-          functional: fun.ok ? fun.qa : undefined,
-        });
+        // Real QA: run the layered report against the same real browser
+        // target the user just inspected (the preview URL), not the DOM
+        // text.  The daemon measures real layout via CDP.
+        const qaResult = await daemon.designQaReport(
+          activeConvId!,
+          r.browser.url,
+          undefined,
+          false,
+          viewportHint
+        );
+        if (qaResult.ok && qaResult.qa) {
+          const layers = qaResult.qa as unknown as {
+            layers?: {
+              responsive?: DesignQaReport;
+              accessibility?: DesignQaReport;
+              functional?: DesignQaReport;
+            };
+          };
+          setQa({
+            responsive: layers.layers?.responsive,
+            accessibility: layers.layers?.accessibility,
+            functional: layers.layers?.functional,
+          });
+        }
       } else {
         setError(r.error || "Could not inspect browser");
       }

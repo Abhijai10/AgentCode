@@ -700,7 +700,11 @@ fn dispatch_request(request: &Value, daemon: &mut DaemonService) -> (Value, bool
         "DesignQAResponsive" => {
             let conversation_id = request.get("conversation_id").and_then(Value::as_str).unwrap_or("");
             let content = request.get("content").and_then(Value::as_str).unwrap_or("");
-            match daemon.design_qa_responsive(conversation_id, content) {
+            let url = request.get("url").and_then(Value::as_str).unwrap_or("");
+            let html = request.get("html").and_then(Value::as_str).unwrap_or("");
+            let deterministic = request.get("deterministic").and_then(Value::as_bool).unwrap_or(false);
+            let viewport_hint = request.get("viewport_hint").and_then(Value::as_str).unwrap_or("desktop");
+            match daemon.design_qa_responsive(conversation_id, content, url, html, deterministic, viewport_hint) {
                 Ok(result) => json!({"id": correlation_id, "ok": true, "qa": result}),
                 Err(error) => error_response(correlation_id, error.code(), error.to_string()),
             }
@@ -708,7 +712,11 @@ fn dispatch_request(request: &Value, daemon: &mut DaemonService) -> (Value, bool
         "DesignQAAccessibility" => {
             let conversation_id = request.get("conversation_id").and_then(Value::as_str).unwrap_or("");
             let content = request.get("content").and_then(Value::as_str).unwrap_or("");
-            match daemon.design_qa_accessibility(conversation_id, content) {
+            let url = request.get("url").and_then(Value::as_str).unwrap_or("");
+            let html = request.get("html").and_then(Value::as_str).unwrap_or("");
+            let deterministic = request.get("deterministic").and_then(Value::as_bool).unwrap_or(false);
+            let viewport_hint = request.get("viewport_hint").and_then(Value::as_str).unwrap_or("desktop");
+            match daemon.design_qa_accessibility(conversation_id, content, url, html, deterministic, viewport_hint) {
                 Ok(result) => json!({"id": correlation_id, "ok": true, "qa": result}),
                 Err(error) => error_response(correlation_id, error.code(), error.to_string()),
             }
@@ -716,7 +724,22 @@ fn dispatch_request(request: &Value, daemon: &mut DaemonService) -> (Value, bool
         "DesignQAFunctional" => {
             let conversation_id = request.get("conversation_id").and_then(Value::as_str).unwrap_or("");
             let content = request.get("content").and_then(Value::as_str).unwrap_or("");
-            match daemon.design_qa_functional(conversation_id, content) {
+            let url = request.get("url").and_then(Value::as_str).unwrap_or("");
+            let html = request.get("html").and_then(Value::as_str).unwrap_or("");
+            let deterministic = request.get("deterministic").and_then(Value::as_bool).unwrap_or(false);
+            let viewport_hint = request.get("viewport_hint").and_then(Value::as_str).unwrap_or("desktop");
+            match daemon.design_qa_functional(conversation_id, content, url, html, deterministic, viewport_hint) {
+                Ok(result) => json!({"id": correlation_id, "ok": true, "qa": result}),
+                Err(error) => error_response(correlation_id, error.code(), error.to_string()),
+            }
+        },
+        "DesignQAReport" => {
+            let conversation_id = request.get("conversation_id").and_then(Value::as_str).unwrap_or("");
+            let url = request.get("url").and_then(Value::as_str).unwrap_or("");
+            let html = request.get("html").and_then(Value::as_str).unwrap_or("");
+            let deterministic = request.get("deterministic").and_then(Value::as_bool).unwrap_or(false);
+            let viewport_hint = request.get("viewport_hint").and_then(Value::as_str).unwrap_or("desktop");
+            match daemon.design_qa_run(conversation_id, url, html, deterministic, viewport_hint) {
                 Ok(result) => json!({"id": correlation_id, "ok": true, "qa": result}),
                 Err(error) => error_response(correlation_id, error.code(), error.to_string()),
             }
@@ -4671,7 +4694,7 @@ mod ipc_tests {
         // QA reports ground functional and a11y checks on real content
         let functional = request_via_ipc(
             &server, &listener, &mut daemon,
-            json!({"id":"f1","command":"DesignQAFunctional","conversation_id": cid, "content": clean}),
+            json!({"id":"f1","command":"DesignQAFunctional","conversation_id": cid, "html": clean, "deterministic": true}),
         );
         assert_eq!(functional["ok"], true);
         assert_eq!(functional["qa"]["passed"], true);
@@ -4782,11 +4805,11 @@ mod ipc_tests {
         let cid = create["conversation_id"].as_str().unwrap().to_string();
 
         let html = r#"
-            <html><body>
+            <html lang="en"><body>
               <nav><a href="/">Home</a></nav>
               <h1>Metrics Review</h1>
               <button role="button">Refresh</button>
-              <form><label>Query</label><input name="q" /></form>
+              <form><label>Query</label><input name="q" aria-label="Query" /></form>
             </body></html>
         "#;
         let browser = request_via_ipc(
@@ -4810,18 +4833,129 @@ mod ipc_tests {
             "screenshot evidence must be produced: {browser_val}"
         );
 
-        // Accessibility QA on the inspected DOM
+        // Accessibility QA on the inspected DOM (deterministic harness: the
+        // structural a11y facts are measured from the fixture HTML; layout
+        // metrics are flagged for manual review, never fabricated).
         let a11y = request_via_ipc(
             &server, &listener, &mut daemon,
-            json!({"id":"a1","command":"DesignQAAccessibility","conversation_id": cid, "content": html}),
+            json!({"id":"a1","command":"DesignQAAccessibility","conversation_id": cid, "html": html, "deterministic": true}),
         );
-        assert_eq!(a11y["ok"], true);
-        assert_eq!(a11y["qa"]["passed"], true, "semantic DOM must pass a11y: {a11y}");
+        assert_eq!(a11y["ok"], true, "a11y: {a11y}");
+        let a11y_qa = &a11y["qa"];
+        // The fixture has aria/label semantics; unlabeled-controls must be
+        // empty for it to pass.
+        assert_eq!(
+            a11y_qa["passed"], true,
+            "semantic DOM must pass a11y: {a11y_qa}"
+        );
+        assert_eq!(a11y_qa["source"], "manual-review");
 
         server.cleanup();
         daemon.shutdown().unwrap();
         std::env::remove_var("AGENTCODE_PROVIDER_MODE");
         let _ = fs::remove_dir_all(dir);
+    }
+
+    /// G4 real-browser QA: design_qa_run against REAL Chrome CDP measures
+    /// real layout (overflow, touch targets) and persists the layered
+    /// report.  Skips honestly when no Chromium is available.
+    #[test]
+    fn design_qa_real_browser_measures_layout_and_persists_report() {
+        if ac_verification::discover_chromium_executable().is_none() {
+            eprintln!("SKIP: no Chromium executable available for real QA");
+            return;
+        }
+        std::env::set_var("AGENTCODE_PROVIDER_MODE", "mock");
+        let (dir, db, lock, socket) = temp_paths("ipc-design-qa-real");
+        let project_dir = dir.join("workspace");
+        fs::create_dir_all(&project_dir).unwrap();
+        let project_path = project_dir.to_string_lossy().to_string();
+
+        // Local HTTP server serving a page with a real layout defect:
+        // a 3000px-wide element (overflow) and a 16px button (small target).
+        let server_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = server_listener.local_addr().unwrap();
+        let port = addr.port();
+        std::thread::spawn(move || {
+            server_listener.set_nonblocking(true).unwrap();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+            while std::time::Instant::now() < deadline {
+                if let Ok((mut stream, _)) = server_listener.accept() {
+                    let mut buffer = [0_u8; 2048];
+                    let n = stream.read(&mut buffer).unwrap_or(0);
+                    let _request = String::from_utf8_lossy(&buffer[..n]);
+                    let body = "<!doctype html><html lang=\"en\"><head><style>\
+                        #wide { width: 3000px; height: 10px; }\
+                        #tiny { width: 16px; height: 16px; }</style></head>\
+                        <body><h1>Real QA</h1><div id=\"wide\"></div>\
+                        <button id=\"tiny\" aria-label=\"Tiny\">x</button>\
+                        <button id=\"ok\">Normal button</button></body></html>";
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = stream.write_all(response.as_bytes());
+                }
+            }
+        });
+
+        let mut daemon = DaemonService::open(&db, &lock).unwrap();
+        daemon.start().unwrap();
+
+        let create = dispatch_request(
+            &json!({"id":"c1","command":"ConversationCreate","project_path": project_path, "mode":"DESIGN","title":"Real QA"}),
+            &mut daemon,
+        ).0;
+        assert_eq!(create["ok"], true, "create: {create}");
+        let cid = create["conversation_id"].as_str().unwrap().to_string();
+
+        // Direct dispatch (no IPC thread) so a panic surfaces with a
+        // backtrace instead of killing the IPC frame.
+        let qa = dispatch_request(
+            &json!({"id":"qa1","command":"DesignQAReport","conversation_id": cid, "url": format!("http://127.0.0.1:{port}/"), "deterministic": false}),
+            &mut daemon,
+        ).0;
+        assert_eq!(qa["ok"], true, "qa: {qa}");
+        let report = &qa["qa"];
+        assert_eq!(report["mode"], "cdp", "must run the real CDP runtime");
+        assert_eq!(report["needs_manual_review"], false);
+
+        // Responsive layer measured the real overflow.
+        let responsive = &report["layers"]["responsive"];
+        assert_eq!(responsive["passed"], false, "3000px element must fail: {responsive}");
+        assert!(
+            responsive["issues"].as_array().unwrap().iter().any(|i| i.as_str().unwrap_or("").contains("horizontal overflow")),
+            "overflow issue: {responsive}"
+        );
+
+        // A11y layer measured the tiny touch target.
+        let a11y = &report["layers"]["accessibility"];
+        assert_eq!(a11y["passed"], false, "16px target must fail: {a11y}");
+        assert!(
+            a11y["issues"].as_array().unwrap().iter().any(|i| i.as_str().unwrap_or("").contains("touch target below 24px")),
+            "touch target issue: {a11y}"
+        );
+
+        // Functional layer: page loads clean.
+        let functional = &report["layers"]["functional"];
+        assert_eq!(functional["passed"], true, "functional: {functional}");
+        assert_eq!(functional["source"], "real-browser-cdp");
+
+        // The layered report persists per conversation.
+        let persisted = daemon
+            .db
+            .design_document(&cid, "design_qa_report")
+            .unwrap()
+            .expect("QA report must persist");
+        let persisted_value: serde_json::Value =
+            serde_json::from_str(&persisted.content_json).unwrap();
+        assert_eq!(persisted_value["mode"], "cdp");
+        assert!(!persisted.evidence_refs.is_empty(), "evidence refs must be recorded");
+
+        daemon.shutdown().unwrap();
+        std::env::remove_var("AGENTCODE_PROVIDER_MODE");
+        let _ = fs::remove_dir_all(dir);
+        let _ = socket;
     }
 
     #[test]
@@ -4926,12 +5060,12 @@ mod ipc_tests {
 
         // 7. Browser inspection (deterministic with HTML fixture)
         let html = r#"
-            <html><body>
+            <html lang="en"><body>
               <header><h1>Dashboard</h1></header>
               <nav><a href="/">Home</a><a href="/settings">Settings</a></nav>
               <main>
                 <button role="button">Refresh</button>
-                <form><label>Filter</label><input name="q" /></form>
+                <form><label>Filter</label><input name="q" aria-label="Filter" /></form>
               </main>
             </body></html>
         "#;
@@ -4978,27 +5112,34 @@ mod ipc_tests {
         assert_eq!(browser2["ok"], true);
         assert!(browser2["browser"]["screenshot_uri"].as_str().unwrap().contains("screenshot:"));
 
-        // 11. Responsive QA
+        // 11. Responsive QA (deterministic: layout metrics honestly flagged
+        // as unmeasured — never a fabricated pass or fail)
         let responsive = request_via_ipc(
             &server, &listener, &mut daemon,
-            json!({"id":"qa1","command":"DesignQAResponsive","conversation_id": cid, "content": html}),
+            json!({"id":"qa1","command":"DesignQAResponsive","conversation_id": cid, "html": html, "deterministic": true}),
         );
         assert_eq!(responsive["ok"], true);
         assert!(responsive["qa"].is_object());
+        assert!(
+            responsive["qa"]["unmeasured"].as_array().unwrap().iter().any(|i| i.as_str().unwrap_or("").contains("not measurable")),
+            "deterministic layout metrics must be flagged unmeasured: {}",
+            responsive["qa"]
+        );
 
         // 12. Accessibility QA
         let a11y = request_via_ipc(
             &server, &listener, &mut daemon,
-            json!({"id":"qa2","command":"DesignQAAccessibility","conversation_id": cid, "content": html}),
+            json!({"id":"qa2","command":"DesignQAAccessibility","conversation_id": cid, "html": html, "deterministic": true}),
         );
         assert_eq!(a11y["ok"], true);
         // The fixture has semantic <button>, <label>, <a> controls — must pass
+        // the structural layer.
         assert_eq!(a11y["qa"]["passed"], true, "semantic HTML should pass a11y: {a11y}");
 
         // 13. Functional QA
         let functional = request_via_ipc(
             &server, &listener, &mut daemon,
-            json!({"id":"qa3","command":"DesignQAFunctional","conversation_id": cid, "content": html}),
+            json!({"id":"qa3","command":"DesignQAFunctional","conversation_id": cid, "html": html, "deterministic": true}),
         );
         assert_eq!(functional["ok"], true);
         assert_eq!(functional["qa"]["passed"], true);

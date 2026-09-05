@@ -955,7 +955,11 @@ export const daemon = {
   async designQa(
     conversationId: string,
     kind: "responsive" | "accessibility" | "functional",
-    content: string
+    content?: string,
+    url?: string,
+    html?: string,
+    deterministic?: boolean,
+    viewportHint?: string
   ): Promise<{ ok: boolean; qa?: DesignQaReport; error?: string }> {
     try {
       const command =
@@ -966,7 +970,34 @@ export const daemon = {
             : "daemon_design_qa_functional";
       const res = await invoke<{ qa: DesignQaReport }>(command, {
         conversationId,
-        content,
+        content: content ?? "",
+        url: url ?? "",
+        html: html ?? "",
+        deterministic: deterministic ?? false,
+        viewportHint: viewportHint ?? "desktop",
+      });
+      return { ok: true, qa: res.qa };
+    } catch (e: unknown) {
+      const message = e instanceof Error ? e.message : String(e);
+      const cleaned = message.replace(/^[A-Z0-9_-]+:\s*/, "");
+      return { ok: false, error: cleaned || message };
+    }
+  },
+
+  async designQaReport(
+    conversationId: string,
+    url?: string,
+    html?: string,
+    deterministic?: boolean,
+    viewportHint?: string
+  ): Promise<{ ok: boolean; qa?: DesignQaReport; error?: string }> {
+    try {
+      const res = await invoke<{ qa: DesignQaReport }>("daemon_design_qa_report", {
+        conversationId,
+        url: url ?? "",
+        html: html ?? "",
+        deterministic: deterministic ?? false,
+        viewportHint: viewportHint ?? "desktop",
       });
       return { ok: true, qa: res.qa };
     } catch (e: unknown) {

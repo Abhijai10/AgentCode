@@ -1680,13 +1680,24 @@ fn daemon_design_browser(
 fn daemon_design_qa_responsive(
     state: tauri::State<DaemonClient>,
     conversation_id: String,
-    content: String,
+    content: Option<String>,
+    url: Option<String>,
+    html: Option<String>,
+    deterministic: Option<bool>,
+    viewport_hint: Option<String>,
 ) -> Result<Value, String> {
     request(
         &state.0,
         "ui",
         "DesignQAResponsive",
-        json!({ "conversation_id": conversation_id, "content": content }),
+        json!({
+            "conversation_id": conversation_id,
+            "content": content.unwrap_or_default(),
+            "url": url.unwrap_or_default(),
+            "html": html.unwrap_or_default(),
+            "deterministic": deterministic.unwrap_or(false),
+            "viewport_hint": viewport_hint.unwrap_or_else(|| "desktop".to_string()),
+        }),
     )
 }
 
@@ -1694,13 +1705,24 @@ fn daemon_design_qa_responsive(
 fn daemon_design_qa_accessibility(
     state: tauri::State<DaemonClient>,
     conversation_id: String,
-    content: String,
+    content: Option<String>,
+    url: Option<String>,
+    html: Option<String>,
+    deterministic: Option<bool>,
+    viewport_hint: Option<String>,
 ) -> Result<Value, String> {
     request(
         &state.0,
         "ui",
         "DesignQAAccessibility",
-        json!({ "conversation_id": conversation_id, "content": content }),
+        json!({
+            "conversation_id": conversation_id,
+            "content": content.unwrap_or_default(),
+            "url": url.unwrap_or_default(),
+            "html": html.unwrap_or_default(),
+            "deterministic": deterministic.unwrap_or(false),
+            "viewport_hint": viewport_hint.unwrap_or_else(|| "desktop".to_string()),
+        }),
     )
 }
 
@@ -1708,13 +1730,47 @@ fn daemon_design_qa_accessibility(
 fn daemon_design_qa_functional(
     state: tauri::State<DaemonClient>,
     conversation_id: String,
-    content: String,
+    content: Option<String>,
+    url: Option<String>,
+    html: Option<String>,
+    deterministic: Option<bool>,
+    viewport_hint: Option<String>,
 ) -> Result<Value, String> {
     request(
         &state.0,
         "ui",
         "DesignQAFunctional",
-        json!({ "conversation_id": conversation_id, "content": content }),
+        json!({
+            "conversation_id": conversation_id,
+            "content": content.unwrap_or_default(),
+            "url": url.unwrap_or_default(),
+            "html": html.unwrap_or_default(),
+            "deterministic": deterministic.unwrap_or(false),
+            "viewport_hint": viewport_hint.unwrap_or_else(|| "desktop".to_string()),
+        }),
+    )
+}
+
+#[tauri::command]
+fn daemon_design_qa_report(
+    state: tauri::State<DaemonClient>,
+    conversation_id: String,
+    url: Option<String>,
+    html: Option<String>,
+    deterministic: Option<bool>,
+    viewport_hint: Option<String>,
+) -> Result<Value, String> {
+    request(
+        &state.0,
+        "ui",
+        "DesignQAReport",
+        json!({
+            "conversation_id": conversation_id,
+            "url": url.unwrap_or_default(),
+            "html": html.unwrap_or_default(),
+            "deterministic": deterministic.unwrap_or(false),
+            "viewport_hint": viewport_hint.unwrap_or_else(|| "desktop".to_string()),
+        }),
     )
 }
 
@@ -1846,6 +1902,7 @@ fn main() {
             daemon_design_preview_stop,
             daemon_design_browser,
             daemon_design_qa_responsive,
+            daemon_design_qa_report,
             daemon_design_qa_accessibility,
             daemon_design_qa_functional,
             daemon_security_send,
