@@ -25,6 +25,8 @@ fn command_response_timeout(command: &str) -> Duration {
         | "DesignAnalyzeReference"
         | "DesignCritique"
         | "DesignRepair"
+        | "DesignVisualCritique"
+        | "DesignQAReport"
         | "SecuritySend"
         | "SecurityAudit" => PROVIDER_COMMAND_TIMEOUT,
         _ => FRAME_TIMEOUT,
