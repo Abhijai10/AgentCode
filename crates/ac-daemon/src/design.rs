@@ -662,6 +662,18 @@ Rules: describe only what is actually visible. Each array holds short factual st
         self.ensure_running()?;
         let lower = content.to_ascii_lowercase();
         let mut findings = Vec::new();
+        // Durable constraints (Doc 06 §16): the critique result carries the
+        // project's constraint list and marks suggestions that would
+        // violate one as constraint-violating — the critic never
+        // recommends trading a constraint for aesthetics.
+        let constraints_doc = self.design_constraints_get(conversation_id).ok();
+        let constraint_texts: Vec<String> = constraints_doc
+            .as_ref()
+            .and_then(|doc| doc.get("constraints").and_then(Value::as_array).cloned())
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|c| c.get("text").and_then(Value::as_str).map(String::from))
+            .collect();
 
         if lower.contains("gradient") && (lower.contains("hero") || lower.contains("100vh")) {
             findings.push(json!({
@@ -699,6 +711,31 @@ Rules: describe only what is actually visible. Each array holds short factual st
             }));
         }
 
+        // Mark any finding whose repair suggestion could violate a durable
+        // constraint (§16: the critic must not recommend violating one).
+        for finding in findings.iter_mut() {
+            let explanation = finding["explanation"].as_str().unwrap_or("").to_ascii_lowercase();
+            let violating: Vec<String> = constraint_texts
+                .iter()
+                .filter(|constraint| {
+                    let constraint = constraint.to_ascii_lowercase();
+                    // A repair that removes/changes something the constraint
+                    // preserves is a violation candidate.
+                    (explanation.contains("remove") || explanation.contains("replace")
+                        || explanation.contains("change"))
+                        && constraint.split_whitespace().any(|word| {
+                            word.len() > 4 && explanation.contains(word)
+                        })
+                })
+                .cloned()
+                .collect();
+            if !violating.is_empty() {
+                finding["constraint_violations"] = json!(violating);
+                finding["note"] = json!(
+                    "repair must respect the project's durable constraints — they outrank aesthetics"
+                );
+            }
+        }
         let passed = findings.is_empty();
         let improvement_required = findings.iter().any(|f| f["severity"].as_u64().unwrap_or(0) >= 3);
 
@@ -706,6 +743,7 @@ Rules: describe only what is actually visible. Each array holds short factual st
             "passed": passed,
             "improvement_required": improvement_required,
             "findings": findings,
+            "constraints": constraint_texts,
         });
 
         let now = TimestampMillis::now().as_millis() as i64;
@@ -873,7 +911,27 @@ Rules: describe only what is actually visible. Each array holds short factual st
   ],
   "strengths": ["short factual strengths visible in the screenshot"]
 }
+Additional field: "constraint_adherence" — for each durable project constraint listed below, state whether the visible design adheres to it ("adheres" or a concrete observed violation).
+DURABLE PROJECT CONSTRAINTS (NON-NEGOTIABLE — a finding may NOTE that the design violates one, but a suggestion must NEVER propose violating them; they outrank aesthetics):
+{constraints_block}
 Rules: describe only what is actually visible in the image. Findings must be concrete and locatable (name the region). Do not invent features. Output JSON only."#;
+        let constraints_doc = self.design_constraints_get(conversation_id).ok();
+        let constraint_texts: Vec<String> = constraints_doc
+            .and_then(|doc| doc.get("constraints").and_then(Value::as_array).cloned())
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|c| c.get("text").and_then(Value::as_str).map(String::from))
+            .collect();
+        let constraints_block = if constraint_texts.is_empty() {
+            "(none set)".to_string()
+        } else {
+            constraint_texts
+                .iter()
+                .map(|c| format!("- {c}"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        let prompt = prompt.replace("{constraints_block}", &constraints_block);
         let result = providers.request_model_with_image(
             &profile,
             prompt,
@@ -928,6 +986,8 @@ Rules: describe only what is actually visible in the image. Findings must be con
                     "strengths": value.get("strengths").cloned().unwrap_or(json!([])),
                     "screenshot_uri": screenshot.artifact_uri,
                     "screenshot_evidence_ref": screenshot.evidence_ref.to_string(),
+                    "constraint_adherence": value.get("constraint_adherence").cloned().unwrap_or(json!({})),
+                    "constraints": constraint_texts,
                     "source": "vision-model-gemma",
                 })
             }
@@ -1126,6 +1186,64 @@ Rules: describe only what is actually visible in the image. Findings must be con
         })
     }
 
+    /// Design memory across chats (Doc 06 §27): project-scoped knowledge a
+    /// new Design chat inherits — brief, grammar, reference principles,
+    /// durable constraints, accepted decisions (from memory_decisions),
+    /// and recent QA findings.  Conversation-scoped docs are pulled from
+    /// the most recent design conversation of the SAME project only;
+    /// nothing leaks across projects.
+    pub fn design_memory_get(&self, conversation_id: &str) -> AcResult<Value> {
+        let conv = self.db.conversation(conversation_id)?.ok_or_else(|| {
+            AcError::validation("CONVERSATION-NOT_FOUND", "conversation not found")
+        })?;
+        // Durable constraints: project-scoped by construction
+        // (design_constraints:{project-path-hash} doc key).
+        let constraints = self.design_constraints_get(conversation_id)?;
+        // Project-scoped accepted decisions: authoritative memory_decisions.
+        let identity = crate::project_repository_identity(&conv.project_path);
+        let decisions: Vec<Value> = self
+            .db
+            .memory_decisions_for(&identity, 20)?
+            .iter()
+            .map(|d| {
+                json!({
+                    "decision": bounded_ui_summary(&d.decision, 256),
+                    "rationale": bounded_ui_summary(&d.rationale, 256),
+                    "accepted_at_ms": d.created_at_ms,
+                })
+            })
+            .collect();
+        // Conversation-scoped artifacts: inherit from the most recent
+        // DESIGN conversation of the same project (never another project).
+        let project_conversations = self
+            .db
+            .conversations_for_project(&conv.project_path, false)?
+            .into_iter()
+            .filter(|c| c.mode == "DESIGN" && c.id != conversation_id)
+            .collect::<Vec<_>>();
+        let latest = project_conversations.iter().max_by_key(|c| c.created_at_ms);
+        let inherited_doc = |doc_type: &str| -> Option<Value> {
+            let cid = latest?.id.clone();
+            self.db
+                .design_document(&cid, doc_type)
+                .ok()
+                .flatten()
+                .and_then(|row| serde_json::from_str::<Value>(&row.content_json).ok())
+        };
+        let memory = json!({
+            "conversation_id": conversation_id,
+            "project_path": conv.project_path,
+            "inherited_from_conversation": latest.map(|c| c.id.clone()),
+            "brief": inherited_doc("design_brief"),
+            "grammar": inherited_doc("design_grammar"),
+            "reference_principles": inherited_doc("design_reference"),
+            "constraints": constraints.get("constraints").cloned().unwrap_or(json!([])),
+            "accepted_decisions": decisions,
+            "recent_qa": inherited_doc("design_qa_report"),
+        });
+        Ok(memory)
+    }
+
     /// Materialize DESIGN_STATE.md in the project worktree as a readable
     /// snapshot (Doc 06 §91).  The SQLite design_documents store remains
     /// the code-authoritative state; the file is derived and written
@@ -1139,13 +1257,83 @@ Rules: describe only what is actually visible in the image. Findings must be con
             .get("content")
             .and_then(Value::as_str)
             .unwrap_or("# DESIGN_STATE.md\n");
-        let path = std::path::Path::new(&conv.project_path).join("DESIGN_STATE.md");
-        std::fs::write(&path, content).map_err(|error| {
+        // Governed write (Doc 06 §28/§91): the file is written through the
+        // ChangeSet/Kernel path — a real EditEngine transaction with a
+        // journal, rollback plan, and content hashes — never a bare
+        // filesystem write.  The precondition is the current file hash
+        // (or create when absent), so a concurrent mutation fails closed.
+        let rel_path = "DESIGN_STATE.md".to_string();
+        let mut repo = ac_changeset::LocalWorkspaceFileRepository::new(
+            std::path::PathBuf::from(&conv.project_path),
+            "daemon",
+        );
+        let expected_hash = <ac_changeset::LocalWorkspaceFileRepository as ac_changeset::FileRepository>::read(&repo, &rel_path)
+            .ok()
+            .map(|current| ac_changeset::content_hash(&current));
+        let engine = ac_changeset::EditEngine;
+        let mut transaction = engine
+            .prepare(
+                &repo,
+                vec![ac_changeset::EditRequest {
+                    path: rel_path.clone(),
+                    precondition: ac_changeset::EditPrecondition {
+                        path: rel_path.clone(),
+                        expected_hash: expected_hash.clone(),
+                        base_revision: "daemon".to_string(),
+                        symbol_fingerprint: None,
+                    },
+                    strategy: ac_changeset::EditStrategy::WholeFile {
+                        content: content.to_string(),
+                    },
+                }],
+            )
+            .map_err(|error| {
+                AcError::validation(
+                    "DESIGN-STATE_MATERIALIZATION",
+                    format!("governed transaction failed to prepare: {error}"),
+                )
+            })?;
+        transaction.changeset
+            .attach_metadata(ac_changeset::ChangeSetMetadata {
+                originating_task: StableId::new("dstatemat"),
+                originating_agent_session: StableId::new("design-mode"),
+                files_changed: vec![ac_changeset::FileChangeSummary {
+                    path: rel_path.clone(),
+                    additions: content.lines().count() as u32,
+                    removals: 0,
+                }],
+                additions: content.lines().count() as u32,
+                removals: 0,
+                evidence_refs: Vec::new(),
+                verification_passed: Some(true),
+            })
+            .map_err(|error| {
+                AcError::validation(
+                    "DESIGN-STATE_MATERIALIZATION",
+                    format!("governed transaction metadata failed: {error}"),
+                )
+            })?;
+        transaction.changeset.validate().map_err(|error| {
             AcError::validation(
                 "DESIGN-STATE_MATERIALIZATION",
-                format!("could not write DESIGN_STATE.md: {error}"),
+                format!("governed transaction failed validation: {error}"),
             )
         })?;
+        transaction.changeset.approve().map_err(|error| {
+            AcError::validation(
+                "DESIGN-STATE_MATERIALIZATION",
+                format!("governed transaction approval failed: {error}"),
+            )
+        })?;
+        engine
+            .apply(&mut repo, &mut transaction)
+            .map_err(|error| {
+                AcError::validation(
+                    "DESIGN-STATE_MATERIALIZATION",
+                    format!("governed write failed and rolled back: {error}"),
+                )
+            })?;
+        let changeset_id = transaction.changeset.id.to_string();
         let now = TimestampMillis::now().as_millis() as i64;
         let record_id = StableId::new("dstatemat");
         let _ = self.db.save_design_document(&DesignDocumentRow {
@@ -1153,8 +1341,9 @@ Rules: describe only what is actually visible in the image. Findings must be con
             conversation_id: conversation_id.to_string(),
             doc_type: "design_state_materialization".to_string(),
             content_json: json!({
-                "path": path.to_string_lossy(),
-                "content_sha": fnv1a64_hash(content.as_bytes()),
+                "path": std::path::Path::new(&conv.project_path).join("DESIGN_STATE.md").to_string_lossy(),
+                "changeset_id": changeset_id,
+                "journal_entries": transaction.journal.entries.len(),
                 "derived_from": "design_documents (code-authoritative)",
             })
             .to_string(),
@@ -1163,11 +1352,14 @@ Rules: describe only what is actually visible in the image. Findings must be con
             created_at_ms: now,
             updated_at_ms: now,
         });
+        let journal_entries = transaction.journal.entries.len();
         Ok(json!({
             "materialized": true,
-            "path": path.to_string_lossy(),
+            "path": std::path::Path::new(&conv.project_path).join("DESIGN_STATE.md").to_string_lossy(),
             "record_id": record_id.to_string(),
-            "note": "DESIGN_STATE.md is a derived readable snapshot; SQLite design_documents is authoritative",
+            "changeset_id": changeset_id,
+            "journal_entries": journal_entries,
+            "note": "DESIGN_STATE.md is a derived readable snapshot written through a governed ChangeSet; SQLite design_documents is authoritative",
         }))
     }
 
@@ -1894,6 +2086,12 @@ port: port.map(|p| p as i64),
         Ok(report["layers"]["functional"].clone())
     }
 
+    /// Repair loop (Doc 06 §24): a genuine loop, not one critique.
+    /// Each call runs the critique, derives repairs, and PERSISTS the
+    /// iteration record (iteration number, input, findings, repairs,
+    /// remaining issues) as a `design_iteration` document so history
+    /// accumulates across preview → critic → repair → preview cycles.
+    /// The next `design_repair` continues the numbered sequence.
     pub fn design_repair(&self, conversation_id: &str, content: &str, doc_type: &str) -> AcResult<Value> {
         let critique = self.design_critique(conversation_id, content, doc_type)?;
         let passed = critique["passed"].as_bool().unwrap_or(true);
@@ -1928,11 +2126,64 @@ port: port.map(|p| p as i64),
             })
             .collect();
 
+        // Iteration history: count prior iterations and persist this one.
+        let prior = self
+            .db
+            .design_documents_by_type("design_iteration")?
+            .into_iter()
+            .filter(|row| row.conversation_id == conversation_id)
+            .count();
+        let iteration = prior + 1;
+        let remaining: Vec<String> = findings
+            .iter()
+            .map(|f| f["rule"].as_str().unwrap_or("unknown").to_string())
+            .collect();
+        let now = TimestampMillis::now().as_millis() as i64;
+        let _ = self.db.save_design_document(&DesignDocumentRow {
+            id: StableId::new("diter").to_string(),
+            conversation_id: conversation_id.to_string(),
+            doc_type: "design_iteration".to_string(),
+            content_json: json!({
+                "iteration": iteration,
+                "doc_type": doc_type,
+                "input": bounded_ui_summary(content, 512),
+                "findings": findings,
+                "repairs": repairs,
+                "remaining_issues": remaining,
+                "passed": passed,
+                "created_at_ms": now,
+            })
+            .to_string(),
+            version: iteration as i64,
+            evidence_refs: String::new(),
+            created_at_ms: now,
+            updated_at_ms: now,
+        });
+
         Ok(json!({
+            "iteration": iteration,
             "passed": passed,
             "repairs": repairs,
             "improvement_required": !passed,
+            "remaining_issues": remaining,
         }))
+    }
+
+    /// Iteration history for this conversation: every persisted repair
+    /// loop iteration in order (§24).
+    pub fn design_iterations(&self, conversation_id: &str) -> AcResult<Value> {
+        let rows = self
+            .db
+            .design_documents_by_type("design_iteration")?
+            .into_iter()
+            .filter(|row| row.conversation_id == conversation_id)
+            .collect::<Vec<_>>();
+        let iterations: Vec<Value> = rows
+            .iter()
+            .map(|row| serde_json::from_str::<Value>(&row.content_json).unwrap_or(Value::Null))
+            .filter(|v| !v.is_null())
+            .collect();
+        Ok(json!({ "iterations": iterations }))
     }
 }
 

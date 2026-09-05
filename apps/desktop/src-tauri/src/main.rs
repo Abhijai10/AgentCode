@@ -1866,6 +1866,32 @@ fn daemon_design_materialize_state(
     )
 }
 
+#[tauri::command]
+fn daemon_design_memory_get(
+    state: tauri::State<DaemonClient>,
+    conversation_id: String,
+) -> Result<Value, String> {
+    request(
+        &state.0,
+        "ui",
+        "DesignMemoryGet",
+        json!({ "conversation_id": conversation_id }),
+    )
+}
+
+#[tauri::command]
+fn daemon_design_iterations(
+    state: tauri::State<DaemonClient>,
+    conversation_id: String,
+) -> Result<Value, String> {
+    request(
+        &state.0,
+        "ui",
+        "DesignIterations",
+        json!({ "conversation_id": conversation_id }),
+    )
+}
+
 fn guess_mime(filename: &str) -> String {
     let lower = filename.to_ascii_lowercase();
     if lower.ends_with(".png") {
@@ -2001,6 +2027,8 @@ fn main() {
             daemon_design_constraints_set,
             daemon_design_constraints_get,
             daemon_design_materialize_state,
+            daemon_design_memory_get,
+            daemon_design_iterations,
             daemon_design_qa_accessibility,
             daemon_design_qa_functional,
             daemon_security_send,

@@ -1077,6 +1077,34 @@ export const daemon = {
     }
   },
 
+  async designMemoryGet(
+    conversationId: string
+  ): Promise<{ ok: boolean; memory?: unknown; error?: string }> {
+    try {
+      const res = await invoke<{ memory: unknown }>(
+        "daemon_design_memory_get",
+        { conversationId }
+      );
+      return { ok: true, memory: res.memory };
+    } catch (error) {
+      return { ok: false, error: String(error) };
+    }
+  },
+
+  async designIterations(
+    conversationId: string
+  ): Promise<{ ok: boolean; iterations?: unknown; error?: string }> {
+    try {
+      const res = await invoke<{ iterations: unknown }>(
+        "daemon_design_iterations",
+        { conversationId }
+      );
+      return { ok: true, iterations: res.iterations };
+    } catch (error) {
+      return { ok: false, error: String(error) };
+    }
+  },
+
   async designMaterializeState(
     conversationId: string
   ): Promise<{ ok: boolean; materialization?: unknown; error?: string }> {

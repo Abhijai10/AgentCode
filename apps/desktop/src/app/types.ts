@@ -510,6 +510,8 @@ export interface AntiSlopFinding {
   rule: string;
   severity: number;
   explanation: string;
+  constraint_violations?: string[];
+  note?: string;
 }
 
 export interface DesignCritique {
@@ -520,8 +522,22 @@ export interface DesignCritique {
 
 export interface DesignRepair {
   passed: boolean;
+  iteration?: number;
   repairs: { issue: string; repair: string }[];
+  remaining_issues?: string[];
   improvement_required: boolean;
+}
+
+export interface DesignMemory {
+  conversation_id: string;
+  project_path: string;
+  inherited_from_conversation: string | null;
+  brief: unknown | null;
+  grammar: unknown | null;
+  reference_principles: unknown | null;
+  constraints: DesignConstraint[];
+  accepted_decisions: { decision: string; rationale: string; accepted_at_ms: number }[];
+  recent_qa: unknown | null;
 }
 
 export interface DesignPreview {

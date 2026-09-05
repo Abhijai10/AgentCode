@@ -15,6 +15,7 @@ import type {
   DesignState,
   DesignCritique,
   DesignRepair,
+  DesignMemory,
   DesignBrowserResult,
   DesignQaReport,
   VisualCritique,
@@ -327,6 +328,42 @@ export function DesignView({
       if (r.ok && r.critique) setCritique(r.critique);
       else setError(r.error || "Could not critique design");
     });
+
+  const [designMemory, setDesignMemory] = useState<DesignMemory | null>(null);
+  const [iterationHistory, setIterationHistory] = useState<
+    { iteration: number; passed: boolean; remaining_issues?: string[] }[] | null
+  >(null);
+
+  const handleDesignMemory = () =>
+    void (async () => {
+      if (!activeConvId) return;
+      setPanelBusy(true);
+      try {
+        const m = await daemon.designMemoryGet(activeConvId);
+        if (m.ok && m.memory) setDesignMemory(m.memory as DesignMemory);
+      } finally {
+        setPanelBusy(false);
+      }
+    })();
+
+  const handleIterationHistory = () =>
+    void (async () => {
+      if (!activeConvId) return;
+      setPanelBusy(true);
+      try {
+        const h = await daemon.designIterations(activeConvId);
+        if (h.ok && h.iterations) {
+          const doc = h.iterations as { iterations?: unknown[] };
+          setIterationHistory(
+            (doc.iterations ?? []).map(
+              (it) => it as { iteration: number; passed: boolean; remaining_issues?: string[] }
+            )
+          );
+        }
+      } finally {
+        setPanelBusy(false);
+      }
+    })();
 
   const handleRepair = () =>
     runPanel(async () => {
@@ -1142,6 +1179,13 @@ export function DesignView({
                 >
                   Repair
                 </button>
+                <button
+                  onClick={handleDesignMemory}
+                  disabled={panelBusy}
+                  className="text-[10px] text-primary hover:opacity-80 disabled:opacity-50"
+                >
+                  Memory
+                </button>
               </div>
             </div>
             {critique && (
@@ -1157,19 +1201,80 @@ export function DesignView({
                   </span>
                 </p>
                 {critique.findings.map((f, i) => (
-                  <p key={i} className={`text-[10px] ${severityColor(f.severity)}`}>
-                    {f.rule} — {f.explanation}
-                  </p>
+                  <div key={i} className="space-y-0.5">
+                    <p className={`text-[10px] ${severityColor(f.severity)}`}>
+                      {f.rule} — {f.explanation}
+                    </p>
+                    {f.constraint_violations && f.constraint_violations.length > 0 && (
+                      <p className="text-[10px] text-red-600 dark:text-red-400 pl-2">
+                        constraint check: {f.constraint_violations.join("; ")} — repair must respect
+                        durable constraints
+                      </p>
+                    )}
+                  </div>
                 ))}
               </div>
             )}
             {repair && repair.repairs.length > 0 && (
               <div className="mt-3 space-y-2 border-t border-outline-variant/40 pt-2">
+                {repair.iteration != null && (
+                  <p className="text-[10px] text-primary font-medium">
+                    Iteration {repair.iteration}
+                    {repair.remaining_issues && repair.remaining_issues.length > 0
+                      ? ` — ${repair.remaining_issues.length} remaining`
+                      : " — no remaining issues"}
+                  </p>
+                )}
                 {repair.repairs.map((r, i) => (
                   <p key={i} className="text-[10px] text-on-surface-variant">
                     <span className="text-amber-600 dark:text-amber-400">{r.issue}:</span> {r.repair}
                   </p>
                 ))}
+                <button
+                  onClick={handleIterationHistory}
+                  disabled={panelBusy}
+                  className="text-[10px] text-primary hover:opacity-80 disabled:opacity-50"
+                >
+                  Iteration History
+                </button>
+              </div>
+            )}
+            {iterationHistory && iterationHistory.length > 0 && (
+              <div className="mt-2 space-y-1 border-t border-outline-variant/40 pt-2">
+                <p className="text-[10px] font-semibold text-on-surface">Repair-loop history</p>
+                {iterationHistory.map((it, i) => (
+                  <p key={i} className="text-[10px] text-on-surface-variant">
+                    #{it.iteration} {it.passed ? "✓" : "•"}
+                    {it.remaining_issues && it.remaining_issues.length > 0
+                      ? ` — ${it.remaining_issues.join(", ")}`
+                      : " — clean"}
+                  </p>
+                ))}
+              </div>
+            )}
+            {designMemory && (
+              <div className="mt-2 space-y-1 border-t border-outline-variant/40 pt-2">
+                <p className="text-[10px] font-semibold text-on-surface">Design memory (project)</p>
+                {designMemory.inherited_from_conversation && (
+                  <p className="text-[10px] text-on-surface-variant">
+                    inherited from a previous design chat
+                  </p>
+                )}
+                {designMemory.constraints.length > 0 && (
+                  <p className="text-[10px] text-on-surface-variant">
+                    {designMemory.constraints.length} durable constraint(s)
+                  </p>
+                )}
+                {designMemory.accepted_decisions.length > 0 && (
+                  <p className="text-[10px] text-on-surface-variant">
+                    {designMemory.accepted_decisions.length} accepted decision(s)
+                  </p>
+                )}
+                <p className="text-[10px] text-on-surface-variant">
+                  brief/grammar/reference: {designMemory.brief ? "yes" : "no"} /{" "}
+                  {designMemory.grammar ? "yes" : "no"} /{" "}
+                  {designMemory.reference_principles ? "yes" : "no"}
+                </p>
               </div>
             )}
             {!critique && !repair && (

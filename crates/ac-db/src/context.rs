@@ -427,6 +427,44 @@ impl ControlPlaneDb {
             .map_err(db_error)
     }
 
+    /// Read-only listing of accepted project decisions for a repository
+    /// identity — used by Discuss/Design memory inheritance.  Never used
+    /// as a write path (single-writer rule).
+    pub fn memory_decisions_for(
+        &self,
+        repository_id: &str,
+        limit: usize,
+    ) -> AcResult<Vec<MemoryDecisionRow>> {
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT id, repository_id, mission_id, task_id, branch, decision, rationale,
+                 authority_refs, supersedes, created_at_ms
+                 FROM memory_decisions WHERE repository_id=?1
+                 ORDER BY created_at_ms DESC LIMIT ?2",
+            )
+            .map_err(db_error)?;
+        let rows = statement
+            .query_map(params![repository_id, limit as i64], |row| {
+                Ok(MemoryDecisionRow {
+                    id: row.get(0)?,
+                    repository_id: row.get(1)?,
+                    mission_id: row.get(2)?,
+                    task_id: row.get(3)?,
+                    branch: row.get(4)?,
+                    decision: row.get(5)?,
+                    rationale: row.get(6)?,
+                    authority_refs: row.get(7)?,
+                    supersedes: row.get(8)?,
+                    created_at_ms: row.get(9)?,
+                })
+            })
+            .map_err(db_error)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(db_error)?;
+        Ok(rows)
+    }
+
     pub fn save_task_memory(&self, memory: &TaskMemoryRow) -> AcResult<()> {
         self.connection
             .execute(

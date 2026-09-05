@@ -789,6 +789,20 @@ fn dispatch_request(request: &Value, daemon: &mut DaemonService) -> (Value, bool
                 Err(error) => error_response(correlation_id, error.code(), error.to_string()),
             }
         },
+        "DesignMemoryGet" => {
+            let conversation_id = request.get("conversation_id").and_then(Value::as_str).unwrap_or("");
+            match daemon.design_memory_get(conversation_id) {
+                Ok(result) => json!({"id": correlation_id, "ok": true, "memory": result}),
+                Err(error) => error_response(correlation_id, error.code(), error.to_string()),
+            }
+        },
+        "DesignIterations" => {
+            let conversation_id = request.get("conversation_id").and_then(Value::as_str).unwrap_or("");
+            match daemon.design_iterations(conversation_id) {
+                Ok(result) => json!({"id": correlation_id, "ok": true, "iterations": result}),
+                Err(error) => error_response(correlation_id, error.code(), error.to_string()),
+            }
+        },
         "DesignRepair" => {
             let conversation_id = request.get("conversation_id").and_then(Value::as_str).unwrap_or("");
             let content = request.get("content").and_then(Value::as_str).unwrap_or("");
@@ -5138,6 +5152,183 @@ mod ipc_tests {
             .unwrap()
             .expect("materialization must be recorded");
         assert!(record.content_json.contains("DESIGN_STATE.md"));
+
+        server.cleanup();
+        daemon.shutdown().unwrap();
+        std::env::remove_var("AGENTCODE_PROVIDER_MODE");
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    /// G-Closure-2 round 2: repair-loop iteration history persists and the
+    /// critique carries durable constraints; design memory across chats
+    /// inherits project knowledge without leaking across projects;
+    /// DESIGN_STATE.md materializes through the GOVERNED ChangeSet path
+    /// (a real transaction with journal + changeset id, not a bare write).
+    #[test]
+    fn design_repair_history_constraints_memory_and_governed_state() {
+        let _env_lock = crate::TEST_ENV_LOCK.lock().unwrap();
+        std::env::set_var("AGENTCODE_PROVIDER_MODE", "mock");
+        let (dir, db, lock, socket) = temp_paths("ipc-design-round2");
+        let project_dir = dir.join("workspace");
+        let other_project_dir = dir.join("other-workspace");
+        fs::create_dir_all(&project_dir).unwrap();
+        fs::create_dir_all(&other_project_dir).unwrap();
+        let project_path = project_dir.to_string_lossy().to_string();
+        let other_project_path = other_project_dir.to_string_lossy().to_string();
+
+        let mut daemon = DaemonService::open(&db, &lock).unwrap();
+        daemon.start().unwrap();
+        let Some((server, listener)) = bind_or_skip(&socket, None) else {
+            daemon.shutdown().unwrap();
+            std::env::remove_var("AGENTCODE_PROVIDER_MODE");
+            let _ = fs::remove_dir_all(dir);
+            return;
+        };
+
+        // First design chat: set constraints, run two repair iterations.
+        let create = request_via_ipc(
+            &server, &listener, &mut daemon,
+            json!({"id":"c1","command":"ConversationCreate","project_path": project_path, "mode":"DESIGN","title":"Design chat"}),
+        );
+        assert_eq!(create["ok"], true);
+        let cid = create["conversation_id"].as_str().unwrap().to_string();
+
+        let set = request_via_ipc(
+            &server, &listener, &mut daemon,
+            json!({"id":"cons1","command":"DesignConstraintsSet","conversation_id": cid, "constraints": [
+                {"text": "Keep the existing sidebar navigation"},
+            ]}),
+        );
+        assert_eq!(set["ok"], true, "set: {set}");
+
+        // Sloppy content: the critique must find issues AND carry the
+        // constraint list in its result (the critic never recommends
+        // violating them).
+        let sloppy = "<div><h1>Welcome to the future of AI productivity</h1><div class='card'>Card one</div><div class='card'>Card two</div><div class='card'>Card three</div></div>";
+        let critique = request_via_ipc(
+            &server, &listener, &mut daemon,
+            json!({"id":"cr1","command":"DesignCritique","conversation_id": cid, "content": sloppy, "doc_type":"rendered"}),
+        );
+        assert_eq!(critique["ok"], true, "critique: {critique}");
+        let crit = &critique["critique"];
+        assert!(!crit["findings"].as_array().unwrap().is_empty(), "sloppy content must produce findings: {crit}");
+        let constraints_in_critique = crit["constraints"].as_array().unwrap();
+        assert_eq!(constraints_in_critique.len(), 1, "critique must carry the constraint: {crit}");
+        assert!(constraints_in_critique[0].as_str().unwrap().contains("sidebar"));
+
+        // Two repair iterations: history must persist with rising numbers.
+        let repair1 = request_via_ipc(
+            &server, &listener, &mut daemon,
+            json!({"id":"r1","command":"DesignRepair","conversation_id": cid, "content": sloppy, "doc_type":"rendered"}),
+        );
+        assert_eq!(repair1["ok"], true, "repair1: {repair1}");
+        assert_eq!(repair1["repair"]["iteration"].as_u64().unwrap(), 1, "first iteration must be 1: {}", repair1["repair"]);
+        let repair2 = request_via_ipc(
+            &server, &listener, &mut daemon,
+            json!({"id":"r2","command":"DesignRepair","conversation_id": cid, "content": sloppy, "doc_type":"rendered"}),
+        );
+        assert_eq!(repair2["ok"], true, "repair2: {repair2}");
+        assert_eq!(repair2["repair"]["iteration"].as_u64().unwrap(), 2, "second iteration must be 2: {}", repair2["repair"]);
+        assert!(!repair2["repair"]["remaining_issues"].as_array().unwrap().is_empty(), "remaining issues must be recorded");
+
+        let history = request_via_ipc(
+            &server, &listener, &mut daemon,
+            json!({"id":"h1","command":"DesignIterations","conversation_id": cid}),
+        );
+        assert_eq!(history["ok"], true, "history: {history}");
+        let iterations = history["iterations"]["iterations"].as_array().unwrap();
+        assert_eq!(iterations.len(), 2, "iteration history must persist both: {history}");
+        assert_eq!(iterations[0]["iteration"].as_u64().unwrap(), 1);
+        assert_eq!(iterations[1]["iteration"].as_u64().unwrap(), 2);
+
+        // Accept a decision in the project (through Discuss memory) so
+        // design memory can inherit it.
+        let d_create = request_via_ipc(
+            &server, &listener, &mut daemon,
+            json!({"id":"dc1","command":"ConversationCreate","project_path": project_path, "mode":"DISCUSS","title":"Decision chat"}),
+        );
+        let d_cid = d_create["conversation_id"].as_str().unwrap().to_string();
+        let d_send = request_via_ipc(
+            &server, &listener, &mut daemon,
+            json!({"id":"ds1","command":"DiscussSend","conversation_id": d_cid, "content": "We should keep the compact density for tables because ops users scan many rows."}),
+        );
+        assert_eq!(d_send["ok"], true, "discuss send: {d_send}");
+        let d_reply_id = d_send["message"]["id"].as_str().unwrap().to_string();
+        let d_accept = request_via_ipc(
+            &server, &listener, &mut daemon,
+            json!({"id":"da1","command":"DiscussAcceptDecision","conversation_id": d_cid, "message_id": d_reply_id, "decision": "Keep compact table density for ops workflows", "rationale": "ops users scan many rows"}),
+        );
+        assert_eq!(d_accept["ok"], true, "accept: {d_accept}");
+
+        // A SECOND design chat in the same project inherits the memory:
+        // constraints + accepted decisions + inherited_from marker.
+        let create2 = request_via_ipc(
+            &server, &listener, &mut daemon,
+            json!({"id":"c2","command":"ConversationCreate","project_path": project_path, "mode":"DESIGN","title":"Second design chat"}),
+        );
+        let cid2 = create2["conversation_id"].as_str().unwrap().to_string();
+        let memory = request_via_ipc(
+            &server, &listener, &mut daemon,
+            json!({"id":"mem1","command":"DesignMemoryGet","conversation_id": cid2}),
+        );
+        assert_eq!(memory["ok"], true, "memory: {memory}");
+        let mem = &memory["memory"];
+        let inherited_constraints = mem["constraints"].as_array().unwrap();
+        assert_eq!(inherited_constraints.len(), 1, "constraints must be inherited: {mem}");
+        assert!(inherited_constraints[0]["text"].as_str().unwrap().contains("sidebar"));
+        let decisions = mem["accepted_decisions"].as_array().unwrap();
+        assert!(!decisions.is_empty(), "accepted decisions must be inherited: {mem}");
+        assert!(
+            decisions.iter().any(|d| d["decision"].as_str().unwrap_or("").contains("compact table density")),
+            "the accepted decision text must be inherited: {mem}"
+        );
+        assert!(
+            mem["inherited_from_conversation"].is_string(),
+            "memory must record the conversation it inherited from: {mem}"
+        );
+
+        // Another project's design chat inherits NOTHING.
+        let create3 = request_via_ipc(
+            &server, &listener, &mut daemon,
+            json!({"id":"c3","command":"ConversationCreate","project_path": other_project_path, "mode":"DESIGN","title":"Other project"}),
+        );
+        let cid3 = create3["conversation_id"].as_str().unwrap().to_string();
+        let memory3 = request_via_ipc(
+            &server, &listener, &mut daemon,
+            json!({"id":"mem3","command":"DesignMemoryGet","conversation_id": cid3}),
+        );
+        assert_eq!(memory3["ok"], true, "memory3: {memory3}");
+        let mem3 = &memory3["memory"];
+        assert_eq!(mem3["constraints"].as_array().unwrap().len(), 0, "no constraint leak: {mem3}");
+        assert_eq!(mem3["accepted_decisions"].as_array().unwrap().len(), 0, "no decision leak: {mem3}");
+        assert!(mem3["inherited_from_conversation"].is_null(), "no inheritance marker leak: {mem3}");
+
+        // GOVERNED DESIGN_STATE.md: the materialization record must carry a
+        // real changeset id + journal entries (EditEngine path), and the
+        // file must exist in the worktree.
+        let materialize = request_via_ipc(
+            &server, &listener, &mut daemon,
+            json!({"id":"m1","command":"DesignMaterializeState","conversation_id": cid}),
+        );
+        assert_eq!(materialize["ok"], true, "materialize: {materialize}");
+        let mat = &materialize["materialization"];
+        assert!(mat["changeset_id"].as_str().unwrap_or("").starts_with("cs-"), "governed write must record a changeset: {mat}");
+        assert!(mat["journal_entries"].as_u64().unwrap_or(0) >= 1, "journal must have entries: {mat}");
+        assert!(project_dir.join("DESIGN_STATE.md").exists(), "DESIGN_STATE.md must exist");
+        let record = daemon
+            .db
+            .design_document(&cid, "design_state_materialization")
+            .unwrap()
+            .expect("materialization must be recorded");
+        assert!(record.content_json.contains("changeset_id"), "record must reference the governed changeset");
+
+        // Second materialization must also succeed (idempotent re-write of
+        // an existing file goes through the update path of the engine).
+        let materialize2 = request_via_ipc(
+            &server, &listener, &mut daemon,
+            json!({"id":"m2","command":"DesignMaterializeState","conversation_id": cid2}),
+        );
+        assert_eq!(materialize2["ok"], true, "second materialize (same project, other chat): {materialize2}");
 
         server.cleanup();
         daemon.shutdown().unwrap();
