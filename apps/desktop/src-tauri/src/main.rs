@@ -419,6 +419,53 @@ fn daemon_cancel_mission(
 }
 
 #[tauri::command]
+fn daemon_terminal_start(
+    state: tauri::State<DaemonClient>,
+    mission_id: Option<String>,
+    argv: Vec<String>,
+    cwd: String,
+) -> Result<Value, String> {
+    request(
+        &state.0,
+        "ui",
+        "TerminalStart",
+        json!({ "mission_id": mission_id, "argv": argv, "cwd": cwd }),
+    )
+}
+
+#[tauri::command]
+fn daemon_terminal_tail(
+    state: tauri::State<DaemonClient>,
+    session_id: String,
+    cursor: Option<u64>,
+) -> Result<Value, String> {
+    request(
+        &state.0,
+        "ui",
+        "TerminalTail",
+        json!({ "session_id": session_id, "cursor": cursor.unwrap_or(0) }),
+    )
+}
+
+#[tauri::command]
+fn daemon_terminal_cancel(
+    state: tauri::State<DaemonClient>,
+    session_id: String,
+) -> Result<Value, String> {
+    request(
+        &state.0,
+        "ui",
+        "TerminalCancel",
+        json!({ "session_id": session_id }),
+    )
+}
+
+#[tauri::command]
+fn daemon_terminal_list(state: tauri::State<DaemonClient>) -> Result<Value, String> {
+    request(&state.0, "ui", "TerminalList", json!({}))
+}
+
+#[tauri::command]
 fn daemon_mission_export(
     state: tauri::State<DaemonClient>,
     mission_id: String,
@@ -2013,6 +2060,10 @@ fn main() {
             daemon_resume_mission,
             daemon_cancel_mission,
             daemon_list_providers,
+            daemon_terminal_start,
+            daemon_terminal_tail,
+            daemon_terminal_cancel,
+            daemon_terminal_list,
             daemon_mission_export,
             daemon_readiness_get,
             daemon_provider_preferences_get,

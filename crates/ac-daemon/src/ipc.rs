@@ -1,7 +1,6 @@
 use std::io::{self, Read};
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
-use std::sync::atomic::AtomicUsize;
 use std::time::Duration;
 
 const MAX_FRAME_BYTES: usize = 1024 * 1024;
@@ -494,6 +493,44 @@ fn dispatch_request(request: &Value, daemon: &mut DaemonService) -> (Value, bool
                 "usable_route": configured_accounts > 0 || ollama["running"].as_bool().unwrap_or(false),
             }})
         }
+        "TerminalStart" => {
+            let mission_id = request.get("mission_id").and_then(Value::as_str);
+            let argv: Vec<String> = request
+                .get("argv")
+                .and_then(Value::as_array)
+                .map(|items| {
+                    items
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .map(str::to_string)
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            let cwd = request.get("cwd").and_then(Value::as_str).unwrap_or("");
+            match daemon.terminal_start(mission_id, &argv, cwd) {
+                Ok(session) => json!({"id": correlation_id, "ok": true, "session": session}),
+                Err(error) => error_response(correlation_id, error.code(), error.to_string()),
+            }
+        }
+        "TerminalTail" => {
+            let session_id = request.get("session_id").and_then(Value::as_str).unwrap_or("");
+            let cursor = request.get("cursor").and_then(Value::as_u64).unwrap_or(0) as usize;
+            match daemon.terminal_tail(session_id, cursor) {
+                Ok(tail) => json!({"id": correlation_id, "ok": true, "tail": tail}),
+                Err(error) => error_response(correlation_id, error.code(), error.to_string()),
+            }
+        }
+        "TerminalCancel" => {
+            let session_id = request.get("session_id").and_then(Value::as_str).unwrap_or("");
+            match daemon.terminal_cancel(session_id) {
+                Ok(result) => json!({"id": correlation_id, "ok": true, "result": result}),
+                Err(error) => error_response(correlation_id, error.code(), error.to_string()),
+            }
+        }
+        "TerminalList" => match daemon.terminal_list() {
+            Ok(list) => json!({"id": correlation_id, "ok": true, "list": list}),
+            Err(error) => error_response(correlation_id, error.code(), error.to_string()),
+        },
         "MissionExport" => {
             let mission_id = request.get("mission_id").and_then(Value::as_str).unwrap_or("");
             match daemon.mission_export(mission_id) {
@@ -1996,6 +2033,171 @@ mod ipc_tests {
             r["scanner_note"].as_str().unwrap_or("").contains("audit"),
             "scanner note must be honest: {r}"
         );
+
+        server.cleanup();
+        daemon.shutdown().unwrap();
+        std::env::remove_var("AGENTCODE_PROVIDER_MODE");
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    /// Batch N4: the terminal surface end-to-end through the REAL IPC path
+    /// with REAL processes — start (allowlisted argv), live tail with
+    /// cursor-based streaming, honest exit state, CommandOutput evidence
+    /// persisted on finish, cancel semantics, list, and honest errors for
+    /// unknown sessions and blocked argv.
+    #[test]
+    fn terminal_surface_streams_cancels_and_persists_evidence() {
+        let _env_lock = crate::TEST_ENV_LOCK.lock().unwrap();
+        std::env::set_var("AGENTCODE_PROVIDER_MODE", "mock");
+        let (dir, db_path, lock, socket) = temp_paths("ipc-terminal");
+
+        let mut daemon = DaemonService::open(&db_path, &lock).unwrap();
+        daemon.start().unwrap();
+        let Some((server, listener)) = bind_or_skip(&socket, None) else {
+            daemon.shutdown().unwrap();
+            std::env::remove_var("AGENTCODE_PROVIDER_MODE");
+            let _ = fs::remove_dir_all(dir);
+            return;
+        };
+
+        // 1) Blocked argv is an honest validation error.
+        let blocked = request_via_ipc(
+            &server, &listener, &mut daemon,
+            json!({"id":"t0","command":"TerminalStart","argv": ["bash", "-c", "echo hi"], "cwd": "/tmp"}),
+        );
+        assert_eq!(blocked["ok"], false);
+        assert_eq!(blocked["error"]["code"], "TERMINAL-COMMAND_NOT_ALLOWED");
+
+        // 2) Invalid cwd is an honest error.
+        let bad_cwd = request_via_ipc(
+            &server, &listener, &mut daemon,
+            json!({"id":"t0b","command":"TerminalStart","argv": ["node", "--version"], "cwd": "/definitely/not/here"}),
+        );
+        assert_eq!(bad_cwd["ok"], false);
+        assert_eq!(bad_cwd["error"]["code"], "TERMINAL-CWD_INVALID");
+
+        // 3) Start a REAL quick node process printing lines.
+        let script = dir.join("hello.js");
+        fs::write(&script, "console.log('terminal-alpha'); console.log('terminal-beta');\n").unwrap();
+        let start = request_via_ipc(
+            &server, &listener, &mut daemon,
+            json!({"id":"t1","command":"TerminalStart","argv": ["node", script.to_string_lossy()], "cwd": dir.to_string_lossy()}),
+        );
+        assert_eq!(start["ok"], true, "start: {start}");
+        let session_id = start["session"]["session_id"].as_str().unwrap().to_string();
+
+        // 4) Poll tail until the process exits; cursor must advance and
+        //    lines must stream in order.
+        let mut cursor = 0usize;
+        let mut lines: Vec<String> = Vec::new();
+        let mut exited = false;
+        for _ in 0..80 {
+            let tail = request_via_ipc(
+                &server, &listener, &mut daemon,
+                json!({"id":"t2","command":"TerminalTail","session_id": session_id, "cursor": cursor}),
+            );
+            assert_eq!(tail["ok"], true, "tail: {tail}");
+            let t = &tail["tail"];
+            if t["lines"].as_array().map(|a| !a.is_empty()).unwrap_or(false) {
+                for line in t["lines"].as_array().unwrap() {
+                    lines.push(line.as_str().unwrap().to_string());
+                }
+            }
+            cursor = t["cursor"].as_u64().unwrap_or(0) as usize;
+            if !t["alive"].as_bool().unwrap_or(true) {
+                exited = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        assert!(exited, "process must exit within the polling window");
+        assert_eq!(lines, vec!["terminal-alpha".to_string(), "terminal-beta".to_string()]);
+
+        // 5) Evidence was persisted on exit and is reported by tail.
+        let final_tail = request_via_ipc(
+            &server, &listener, &mut daemon,
+            json!({"id":"t3","command":"TerminalTail","session_id": session_id, "cursor": cursor}),
+        );
+        let evidence_id = final_tail["tail"]["evidence_id"].as_str().map(str::to_string);
+        assert!(
+            evidence_id.as_deref().map(|e| !e.is_empty()).unwrap_or(false),
+            "evidence id must be reported after exit: {final_tail}"
+        );
+        // The evidence record exists in the DB as CommandOutput.
+        {
+            let db = ac_db::ControlPlaneDb::open(&db_path).unwrap();
+            let record = db
+                .evidence_records()
+                .unwrap()
+                .into_iter()
+                .find(|r| evidence_id.as_deref() == Some(r.id.as_str()))
+                .expect("evidence record must exist");
+            assert_eq!(record.kind, ac_evidence::EvidenceKind::CommandOutput);
+            assert!(record.sensitive);
+            assert!(record.artifact_uri.contains("mem://terminal/"));
+            // Redacted summary, bounded.
+            let summary = record.model_summary.unwrap_or_default();
+            assert!(summary.contains("terminal-alpha"), "summary: {summary}");
+        }
+
+        // 6) List shows the finished session honestly.
+        let list = request_via_ipc(
+            &server, &listener, &mut daemon,
+            json!({"id":"t4","command":"TerminalList"}),
+        );
+        assert_eq!(list["ok"], true);
+        let sessions = list["list"]["sessions"].as_array().unwrap();
+        assert!(sessions.iter().any(|s| s["session_id"].as_str() == Some(session_id.as_str())));
+        let entry = sessions.iter().find(|s| s["session_id"].as_str() == Some(session_id.as_str())).unwrap();
+        assert_eq!(entry["alive"], false);
+
+        // 7) Cancel a LONG-RUNNING process: start node -e infinite loop.
+        let long_script = dir.join("loop.js");
+        fs::write(&long_script, "setInterval(() => {}, 1000); console.log('loop-started');\n").unwrap();
+        let long = request_via_ipc(
+            &server, &listener, &mut daemon,
+            json!({"id":"t5","command":"TerminalStart","argv": ["node", long_script.to_string_lossy()], "cwd": dir.to_string_lossy()}),
+        );
+        assert_eq!(long["ok"], true, "long start: {long}");
+        let long_id = long["session"]["session_id"].as_str().unwrap().to_string();
+        // Wait until it is alive with output.
+        let mut saw_output = false;
+        for _ in 0..40 {
+            let tail = request_via_ipc(
+                &server, &listener, &mut daemon,
+                json!({"id":"t6","command":"TerminalTail","session_id": long_id, "cursor": 0}),
+            );
+            if tail["tail"]["lines"].as_array().map(|a| !a.is_empty()).unwrap_or(false) {
+                saw_output = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        assert!(saw_output, "long process must produce output");
+        // Cancel it.
+        let cancel = request_via_ipc(
+            &server, &listener, &mut daemon,
+            json!({"id":"t7","command":"TerminalCancel","session_id": long_id}),
+        );
+        assert_eq!(cancel["ok"], true, "cancel: {cancel}");
+        assert_eq!(cancel["result"]["cancelled"], true);
+        assert!(cancel["result"]["evidence_id"].as_str().map(|e| !e.is_empty()).unwrap_or(false));
+
+        // 8) Cancel of an already-terminal session is honest, not an error.
+        let cancel_again = request_via_ipc(
+            &server, &listener, &mut daemon,
+            json!({"id":"t8","command":"TerminalCancel","session_id": long_id}),
+        );
+        assert_eq!(cancel_again["ok"], true);
+        assert_eq!(cancel_again["result"]["cancelled"], false);
+
+        // 9) Unknown session ids error honestly.
+        let unknown = request_via_ipc(
+            &server, &listener, &mut daemon,
+            json!({"id":"t9","command":"TerminalTail","session_id": "nope", "cursor": 0}),
+        );
+        assert_eq!(unknown["ok"], false);
+        assert_eq!(unknown["error"]["code"], "TERMINAL-SESSION_UNKNOWN");
 
         server.cleanup();
         daemon.shutdown().unwrap();

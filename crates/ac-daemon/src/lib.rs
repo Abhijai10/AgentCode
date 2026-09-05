@@ -3,7 +3,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::Instant;
@@ -910,6 +910,7 @@ include!("conversation.rs");
 include!("discuss_plan.rs");
 include!("design.rs");
 include!("security.rs");
+include!("terminal.rs");
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum DaemonLifecycle {
@@ -1014,7 +1015,14 @@ pub struct DaemonService {
     /// the Design Studio preview lifecycle; children are killed on stop and
     /// are dropped when the daemon exits.
     design_children: Mutex<BTreeMap<String, std::process::Child>>,
+    /// Tracked terminal sessions (batch N4): live process handles + captured
+    /// output, keyed by session id.  Children are killed on stop (same as
+    /// design_children); finished sessions persist their output as evidence.
+    terminal_sessions: Mutex<BTreeMap<String, Arc<TerminalSessionState>>>,
 }
+
+/// Public alias for the include'd terminal module's session type.
+pub type TerminalSession = TerminalSessionState;
 
 /// Production daemon policy. Tool capability checks remain owned by ToolBroker;
 /// the bound agent's deterministic final-audit/completion gate supplies
@@ -1061,6 +1069,7 @@ impl DaemonService {
             hydrated: Vec::new(),
             default_workspace_root: workspace_root,
             design_children: Mutex::new(BTreeMap::new()),
+            terminal_sessions: Mutex::new(BTreeMap::new()),
         })
     }
 
@@ -2191,6 +2200,9 @@ impl Drop for DaemonService {
                 let _ = child.wait();
             }
         }
+        drop(children);
+        // Kill any live terminal sessions (batch N4) — same guarantee.
+        self.terminal_shutdown_all();
     }
 }
 

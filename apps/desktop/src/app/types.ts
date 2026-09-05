@@ -101,6 +101,39 @@ export interface DaemonHealth {
   recovered_sessions: number;
 }
 
+export interface TerminalSessionInfo {
+  session_id: string;
+  argv: string[];
+  cwd: string;
+  pid: number;
+  mission_id: string | null;
+  started_at_ms: number;
+  note?: string;
+}
+
+export interface TerminalTail {
+  session_id: string;
+  cursor: number;
+  lines: string[];
+  alive: boolean;
+  exit_code: number | null;
+  cancelled: boolean;
+  evidence_id: string | null;
+  total_captured_bytes: number;
+}
+
+export interface TerminalListItem {
+  session_id: string;
+  argv: string[];
+  cwd: string;
+  mission_id: string | null;
+  alive: boolean;
+  exit_code: number | null;
+  cancelled: boolean;
+  started_at_ms: number;
+  captured_lines: number;
+}
+
 export interface ProviderInfo {
   id: string;
   name: string;

@@ -6,6 +6,9 @@ import type {
   TaskState,
   ProviderInfo,
   OllamaStatus,
+  TerminalSessionInfo,
+  TerminalTail,
+  TerminalListItem,
   DiscussSession,
   DiscussMessage,
   DiscussPlan,
@@ -258,6 +261,68 @@ export const daemon = {
           catalog: { id: string; display_name: string; pricing_classification: string }[];
         },
       };
+    } catch (error) {
+      return { ok: false, error: String(error) };
+    }
+  },
+
+  async terminalStart(
+    missionId: string | null,
+    argv: string[],
+    cwd: string
+  ): Promise<{ ok: boolean; session?: TerminalSessionInfo; error?: string }> {
+    try {
+      const res = await invoke<{ session: TerminalSessionInfo }>("daemon_terminal_start", {
+        missionId,
+        argv,
+        cwd,
+      });
+      return { ok: true, session: res.session };
+    } catch (error) {
+      return { ok: false, error: String(error) };
+    }
+  },
+
+  async terminalTail(
+    sessionId: string,
+    cursor: number
+  ): Promise<{ ok: boolean; tail?: TerminalTail; error?: string }> {
+    try {
+      const res = await invoke<{ tail: TerminalTail }>("daemon_terminal_tail", {
+        sessionId,
+        cursor,
+      });
+      return { ok: true, tail: res.tail };
+    } catch (error) {
+      return { ok: false, error: String(error) };
+    }
+  },
+
+  async terminalCancel(
+    sessionId: string
+  ): Promise<{
+    ok: boolean;
+    result?: { cancelled: boolean; exit_code: number | null; evidence_id: string | null; note?: string };
+    error?: string;
+  }> {
+    try {
+      const res = await invoke<{
+        result: { cancelled: boolean; exit_code: number | null; evidence_id: string | null; note?: string };
+      }>("daemon_terminal_cancel", { sessionId });
+      return { ok: true, result: res.result };
+    } catch (error) {
+      return { ok: false, error: String(error) };
+    }
+  },
+
+  async terminalList(): Promise<{
+    ok: boolean;
+    list?: { sessions: TerminalListItem[] };
+    error?: string;
+  }> {
+    try {
+      const res = await invoke<{ list: { sessions: TerminalListItem[] } }>("daemon_terminal_list");
+      return { ok: true, list: res.list };
     } catch (error) {
       return { ok: false, error: String(error) };
     }
