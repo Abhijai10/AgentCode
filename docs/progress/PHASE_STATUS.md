@@ -7,7 +7,7 @@ Phase names are the EXACT canonical names from Doc 09 HC-P00..HC-P29 (no aliases
 
 Last updated: 2026-09-05 (G-Closure-2 post-release production-path hardening pass complete — see docs/progress/g-closure-2-final-report.md; roadmap phases P00–P29 unchanged)
 
-Post-V1 hardening (G-Closure-2, final HEAD `4eb43ac`; product batches N1/N2/N6/N7 landed afterwards —
+Post-V1 hardening (G-Closure-2, final HEAD `4eb43ac`; product batches N1–N4/N6/N7 landed afterwards —
 see the live implementation tracker in the root audit doc): closed production-path gaps
 in Discuss (repository grounding, citations, plan/decision promotion), Design Studio
 (real-browser QA, gemma3:4b visual critic, design contract→mission, durable
