@@ -1,7 +1,7 @@
 # G-Closure-2 Final Realization Pass — Adversarial Final Report
 
 **Branch:** `batch/phase-0-2-foundation`
-**Starting HEAD:** `95fb41d` → **Final HEAD:** `d41402f` (5 focused commits this pass)
+**Starting HEAD:** `95fb41d` → **Final HEAD:** `405ef3a` (7 focused commits this pass)
 **Date:** 2026-09-05
 **Mandate:** Close the remaining production-path gaps from the G-batch audit — no new roadmap batches. A capability is complete only when the actual user-facing production path performs the intended behavior, the behavior is persisted correctly, tests exercise that production path, and the evidence supports the claim.
 
@@ -9,7 +9,7 @@
 
 ## A. HEAD SHA and commit manifest
 
-Final HEAD: `d41402f`
+Final HEAD: `405ef3a`
 
 | # | SHA | Subject | Files | ± |
 |---|---|---|---|---|
@@ -18,6 +18,8 @@ Final HEAD: `d41402f`
 | 3 | `7997ed4` | feat(design): visual critic, full design contract→mission, durable constraints | 7 | +1332/−23 |
 | 4 | `6bf51a8` | feat(security): real dependency manifest, audit-depth policies, DAST gate, finding detail | 9 | +807/−32 |
 | 5 | `d41402f` | refactor: delete orphaned ac-agent mode implementations + durable guard | 8 | +151/−407 |
+| 6 | `b4f7f65` | docs: G-Closure-2 final realization report (adversarial, sections A-L) | 1 | report |
+| 7 | `405ef3a` | refactor: remove the orphaned ac-agent mode source files (the deletions d41402f described) | 2 | −1120 |
 
 Nothing pushed. Never-stage untracked files untouched: `.freebuff/`, `.kilo/`, `AGENTCODE_BACKEND_REMAINING_WORK.md`, `AgentCode_Master_Product_Learnings_and_Completion_Gap_Reference.md`, `Agent_Code_logo.png`.
 
@@ -99,7 +101,7 @@ No model >4B was ever run or downloaded. Env note: realtime E2E with gemma3:1b f
 - ZAP: attempted at adversarial depth; policy-denied without authorized localhost target — honest.
 - Chrome CDP: real layout measurement (overflow, touch targets, heading skips) in QA + vision critic screenshots.
 
-## F. Test totals (final tree `d41402f`)
+## F. Test totals (final tree `405ef3a`)
 
 | Suite | Result |
 |---|---|
@@ -146,4 +148,4 @@ Only ≤4B local models were used: qwen2.5-coder:3b (coding), gemma3:4b (vision)
 Focused commits with exact SHAs; no `git reset --hard`, no history rewrite, no push, no broad `git add .`; never-stage files untouched; tree left green.
 
 ## L. Handoff
-Next agent can continue from `d41402f`: run `make validate`, `cargo test --workspace` (431/0/26), the four real-model E2Es (commands in test headers), and the boundary suite. The durable orphan guard runs in every `cargo test -p agentcode-integration-tests`. Optional env work (scanner DBs, ZAP install) is listed in §I.
+Next agent can continue from `405ef3a`: run `make validate`, `cargo test --workspace` (431/0/26), the four real-model E2Es (commands in test headers), and the boundary suite. The durable orphan guard runs in every `cargo test -p agentcode-integration-tests`. Optional env work (scanner DBs, ZAP install) is listed in §I.
