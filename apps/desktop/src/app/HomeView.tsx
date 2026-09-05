@@ -1,4 +1,4 @@
-import { useState, useEffect } from "react";
+import { useState, useEffect, useRef } from "react";
 import { Icon } from "./Icon";
 import { daemon } from "./daemon";
 import type { Project } from "./ProjectContext";
@@ -19,18 +19,35 @@ export function HomeView({
   const [goal, setGoal] = useState("");
   const [hasUsableRoute, setHasUsableRoute] = useState(true);
   const [routeCheckDone, setRouteCheckDone] = useState(false);
+  // Batch N7: real first-run readiness from the daemon (dismissible).
+  const [readiness, setReadiness] = useState<{
+    daemon_lifecycle: string;
+    provider_accounts_configured: number;
+    ollama: { running: boolean; model_count: number };
+    scanner_note: string;
+    usable_route: boolean;
+  } | null>(null);
+  const [readinessDismissed, setReadinessDismissed] = useState(false);
   const [submitting, setSubmitting] = useState(false);
   const [submitError, setSubmitError] = useState<string | null>(null);
+  // Batch N7: the whole composer surface reads as the input — clicking
+  // anywhere focuses the editor instead of only the textarea itself.
+  const composerRef = useRef<HTMLTextAreaElement>(null);
 
   useEffect(() => {
     if (!project) return;
     let cancelled = false;
     (async () => {
-      const [providers, o] = await Promise.all([daemon.listProviders(), daemon.discoverOllama()]);
+      const [providers, o, ready] = await Promise.all([
+        daemon.listProviders(),
+        daemon.discoverOllama(),
+        daemon.readinessGet(),
+      ]);
       if (cancelled) return;
       const hasAny = providers.some((p) => p.connected_accounts > 0 && p.health === "healthy");
       setHasUsableRoute(hasAny || o.running);
       setRouteCheckDone(true);
+      if (ready.ok && ready.readiness) setReadiness(ready.readiness);
     })();
     return () => {
       cancelled = true;
@@ -117,6 +134,38 @@ export function HomeView({
           <p className="text-xs text-on-surface-variant font-mono max-w-xl mx-auto truncate">{project.path}</p>
         </div>
 
+        {readiness && !readinessDismissed && !readiness.usable_route && (
+          <div className="neo-raised rounded-2xl p-4 mb-4 flex items-start justify-between gap-3">
+            <div className="text-left">
+              <p className="text-sm font-medium text-on-surface">First-run readiness</p>
+              <ul className="text-xs text-on-surface-variant mt-1 space-y-0.5">
+                <li>
+                  daemon:{" "}
+                  <span className="text-emerald-600">{readiness.daemon_lifecycle}</span>
+                </li>
+                <li>
+                  provider accounts:{" "}
+                  <span className={readiness.provider_accounts_configured > 0 ? "text-emerald-600" : "text-amber-600"}>
+                    {readiness.provider_accounts_configured} configured
+                  </span>
+                </li>
+                <li>
+                  local models (Ollama):{" "}
+                  <span className={readiness.ollama.running ? "text-emerald-600" : "text-amber-600"}>
+                    {readiness.ollama.running ? `${readiness.ollama.model_count} available` : "not running"}
+                  </span>
+                </li>
+                <li className="opacity-70">{readiness.scanner_note}</li>
+              </ul>
+            </div>
+            <button
+              onClick={() => setReadinessDismissed(true)}
+              className="text-on-surface-variant hover:opacity-80 text-xs shrink-0"
+            >
+              Dismiss
+            </button>
+          </div>
+        )}
         {routeCheckDone && !hasUsableRoute && (
           <div className="neo-raised p-6 rounded-2xl text-center">
             <div className="w-12 h-12 rounded-full neo-pressed mx-auto mb-3 flex items-center justify-center text-primary">
@@ -148,9 +197,19 @@ export function HomeView({
     <Icon name="error" size={16} fill /> {submitError}
   </div>
 )}
-<div className="neo-raised rounded-[24px] p-2 flex flex-col relative">
+<div
+          className="neo-raised rounded-[24px] p-2 flex flex-col relative cursor-text"
+          onClick={(e) => {
+            // Click anywhere in the intended input area focuses the editor.
+            // Don't steal focus from interactive children (buttons/links).
+            if (!(e.target instanceof HTMLElement && e.target.closest("button, a, input, select"))) {
+              composerRef.current?.focus();
+            }
+          }}
+        >
           <div className="neo-pressed rounded-[20px] p-6 min-h-[160px] flex flex-col">
 <textarea
+                ref={composerRef}
                 className="w-full bg-transparent border-none outline-none resize-none text-on-surface placeholder:text-on-surface-variant/50 text-lg flex-1 focus:ring-0 p-0 disabled:opacity-50"
                 placeholder={`e.g., Build a real-time dashboard in ${project.name} for monitoring satellite telemetry data...`}
                 value={goal}

@@ -419,6 +419,24 @@ fn daemon_cancel_mission(
 }
 
 #[tauri::command]
+fn daemon_mission_export(
+    state: tauri::State<DaemonClient>,
+    mission_id: String,
+) -> Result<Value, String> {
+    request(
+        &state.0,
+        "ui",
+        "MissionExport",
+        json!({ "mission_id": mission_id }),
+    )
+}
+
+#[tauri::command]
+fn daemon_readiness_get(state: tauri::State<DaemonClient>) -> Result<Value, String> {
+    request(&state.0, "ui", "ReadinessGet", json!({}))
+}
+
+#[tauri::command]
 fn daemon_list_providers(state: tauri::State<DaemonClient>) -> Result<Value, String> {
     provider_catalog(&state.0)
 }
@@ -1995,6 +2013,8 @@ fn main() {
             daemon_resume_mission,
             daemon_cancel_mission,
             daemon_list_providers,
+            daemon_mission_export,
+            daemon_readiness_get,
             daemon_provider_preferences_get,
             daemon_provider_preferences_set,
             daemon_provider_health_get,

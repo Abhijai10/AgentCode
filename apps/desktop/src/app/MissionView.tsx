@@ -105,6 +105,28 @@ export function MissionView({ missionId, onOpenSettings }: { missionId: string |
   const [status, setStatus] = useState<"loading" | "no_mission" | "daemon_unavailable" | "loaded">(missionId ? "loading" : "no_mission");
   const [controlBusy, setControlBusy] = useState<"pause" | "resume" | "cancel" | null>(null);
   const [controlError, setControlError] = useState<string | null>(null);
+  // Batch N6: export the mission result context (governed write path).
+  const [exportResult, setExportResult] = useState<{ path: string } | null>(null);
+  const [exportError, setExportError] = useState<string | null>(null);
+  const [exportBusy, setExportBusy] = useState(false);
+
+  const handleExport = () =>
+    void (async () => {
+      if (!missionId) return;
+      setExportBusy(true);
+      setExportError(null);
+      try {
+        const res = await daemon.missionExport(missionId);
+        if (res.ok && res.export) {
+          const doc = res.export as { path?: string };
+          setExportResult({ path: doc.path ?? "" });
+        } else {
+          setExportError(res.error ?? "export failed");
+        }
+      } finally {
+        setExportBusy(false);
+      }
+    })();
   const [expanded, setExpanded] = useState<Set<string>>(new Set());
   const timerRef = useRef<number | null>(null);
 
@@ -328,7 +350,25 @@ export function MissionView({ missionId, onOpenSettings }: { missionId: string |
               Cancel
             </button>
           )}
+          <button
+            onClick={handleExport}
+            disabled={exportBusy}
+            className="neo-button px-5 py-2.5 rounded-xl text-sm font-medium text-primary flex items-center gap-2 disabled:opacity-50"
+          >
+            <Icon name="ios_share" size={18} className={exportBusy ? "animate-spin" : ""} />
+            Export Result
+          </button>
         </div>
+      )}
+      {exportResult && (
+        <p className="text-xs text-emerald-600 flex items-center gap-1.5 mt-1">
+          <Icon name="verified_user" size={14} /> Exported to {exportResult.path}
+        </p>
+      )}
+      {exportError && (
+        <p className="text-xs text-red-600 flex items-center gap-1.5 mt-1">
+          <Icon name="error" size={14} fill /> {exportError}
+        </p>
       )}
       {controlError && (
         <div className="flex items-center gap-2 text-xs text-red-600 dark:text-red-400 font-medium">

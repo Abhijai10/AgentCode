@@ -263,6 +263,49 @@ export const daemon = {
     }
   },
 
+  async readinessGet(): Promise<{
+    ok: boolean;
+    readiness?: {
+      daemon_lifecycle: string;
+      provider_accounts_configured: number;
+      providers_with_accounts: string[];
+      ollama: { running: boolean; model_count: number; models: { id: string; model_name: string }[] };
+      scanner_note: string;
+      usable_route: boolean;
+    };
+    error?: string;
+  }> {
+    try {
+      const res = await invoke<{ readiness: unknown }>("daemon_readiness_get");
+      return {
+        ok: true,
+        readiness: res.readiness as {
+          daemon_lifecycle: string;
+          provider_accounts_configured: number;
+          providers_with_accounts: string[];
+          ollama: { running: boolean; model_count: number; models: { id: string; model_name: string }[] };
+          scanner_note: string;
+          usable_route: boolean;
+        },
+      };
+    } catch (error) {
+      return { ok: false, error: String(error) };
+    }
+  },
+
+  async missionExport(
+    missionId: string
+  ): Promise<{ ok: boolean; export?: unknown; error?: string }> {
+    try {
+      const res = await invoke<{ export: unknown }>("daemon_mission_export", {
+        missionId,
+      });
+      return { ok: true, export: res.export };
+    } catch (error) {
+      return { ok: false, error: String(error) };
+    }
+  },
+
   async listProviders(): Promise<ProviderInfo[]> {
     try {
       return await invoke<ProviderInfo[]>("daemon_list_providers");

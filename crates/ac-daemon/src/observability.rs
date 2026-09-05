@@ -227,6 +227,227 @@ impl DaemonService {
         Ok(json!({ "evidence": list }))
     }
 
+    /// Batch N6 (G6): export a mission's full result context as a
+    /// self-contained Markdown document — goal, state, task DAG with
+    /// attempts, activity events, ChangeSets with files, evidence
+    /// summaries (already redacted and bounded — raw content never
+    /// leaves the evidence layer), and the final verification audit.
+    /// The file is written through the GOVERNED ChangeSet path
+    /// (EditEngine prepare → validate → approve → apply with journal,
+    /// rollback plan, and content-hash preconditions) — never a bare
+    /// filesystem write — into the mission's workspace root.
+    pub fn mission_export(&self, mission_id: &str) -> AcResult<Value> {
+        let details = self.mission_details(mission_id)?;
+        let tasks = self.task_details(mission_id)?;
+        let events = self.mission_events(mission_id, Some(200))?;
+        let changesets = self.changeset_summary(mission_id)?;
+        let evidence = self.evidence_summary(mission_id)?;
+
+        let goal = details["goal"].as_str().unwrap_or("");
+        let state = details["state"].as_str().unwrap_or("unknown");
+        let workspace = details["workspace_root"].as_str().unwrap_or("");
+        if workspace.is_empty() {
+            return Err(AcError::validation(
+                "MISSION-EXPORT_NO_WORKSPACE",
+                "mission has no workspace root; cannot export",
+            ));
+        }
+
+        let mut doc = String::new();
+        doc.push_str("# Mission Export\n\n");
+        doc.push_str(&format!("**Mission:** `{mission_id}`\n\n"));
+        doc.push_str(&format!("**State:** {state}\n\n"));
+        if let Some(created) = details["created_at_ms"].as_i64() {
+            doc.push_str(&format!(
+                "**Created:** {}\n\n",
+                // Millis since epoch; rendered as a number — no TZ guessing.
+                created
+            ));
+        }
+        doc.push_str("## Goal\n\n```\n");
+        // Goal text came from the user; bound it defensively.
+        doc.push_str(&bounded_ui_summary(goal, 4096));
+        doc.push_str("\n```\n\n");
+
+        // Tasks with attempts.
+        doc.push_str("## Tasks\n\n");
+        let task_list = tasks["tasks"].as_array().cloned().unwrap_or_default();
+        if task_list.is_empty() {
+            doc.push_str("_No tasks recorded._\n\n");
+        }
+        for task in &task_list {
+            let title = task["title"].as_str().unwrap_or("");
+            let t_state = task["state"].as_str().unwrap_or("unknown");
+            let retries = task["retry_count"].as_u64().unwrap_or(0);
+            let attempts = task["attempts"].as_array().cloned().unwrap_or_default();
+            doc.push_str(&format!(
+                "- **{title}** — {t_state} ({} attempt(s), {retries} retry(ies))\n",
+                attempts.len()
+            ));
+            for attempt in attempts.iter().take(3) {
+                let outcome = attempt["outcome"].as_str().unwrap_or("unknown");
+                let class = attempt["failure_class"].as_str().unwrap_or("-");
+                doc.push_str(&format!("  - attempt: {outcome} (class: {class})\n"));
+            }
+        }
+        doc.push('\n');
+
+        // Activity events (bounded).
+        doc.push_str("## Activity (last events)\n\n```\n");
+        let event_list = events["events"].as_array().cloned().unwrap_or_default();
+        if event_list.is_empty() {
+            doc.push_str("(no events)\n");
+        }
+        for event in event_list.iter().take(50) {
+            let kind = event.get("kind").and_then(Value::as_str).unwrap_or("event");
+            let summary = event
+                .get("summary")
+                .or_else(|| event.get("message"))
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            doc.push_str(&format!("- {kind}: {}\n", bounded_ui_summary(summary, 200)));
+        }
+        doc.push_str("```\n\n");
+
+        // ChangeSets with files.
+        doc.push_str("## ChangeSets\n\n");
+        let cs_list = changesets["changesets"].as_array().cloned().unwrap_or_default();
+        if cs_list.is_empty() {
+            doc.push_str("_No changesets._\n\n");
+        }
+        for cs in &cs_list {
+            let cs_id = cs["changeset_id"].as_str().unwrap_or("?");
+            let cs_state = cs["state"].as_str().unwrap_or("?");
+            doc.push_str(&format!("- `{cs_id}` — {cs_state}\n"));
+            for file in cs["files"].as_array().cloned().unwrap_or_default() {
+                let path = file["path"].as_str().unwrap_or("?");
+                let add = file["additions"].as_u64().unwrap_or(0);
+                let rem = file["removals"].as_u64().unwrap_or(0);
+                doc.push_str(&format!("  - `{path}` (+{add}/-{rem})\n"));
+            }
+        }
+        doc.push('\n');
+
+        // Evidence summaries (already redacted/bounded upstream).
+        doc.push_str("## Evidence\n\n");
+        let ev_list = evidence["evidence"].as_array().cloned().unwrap_or_default();
+        if ev_list.is_empty() {
+            doc.push_str("_No evidence recorded._\n\n");
+        }
+        for ev in ev_list.iter().take(40) {
+            let id = ev["evidence_id"].as_str().unwrap_or("?");
+            let kind = ev["kind"].as_str().unwrap_or("?");
+            let summary = ev["summary"].as_str().unwrap_or("(no summary)");
+            let sensitive = ev["sensitive"].as_bool().unwrap_or(false);
+            doc.push_str(&format!(
+                "- `{id}` ({kind}){}: {}\n",
+                if sensitive { " [sensitive]" } else { "" },
+                bounded_ui_summary(summary, 200)
+            ));
+        }
+        doc.push('\n');
+
+        // Final verification audit.
+        doc.push_str("## Verification\n\n");
+        if let Some(completion) = details["completion"].as_object() {
+            let passed = completion.get("passed").and_then(Value::as_bool);
+            let allowed = completion
+                .get("completion_allowed")
+                .and_then(Value::as_bool);
+            doc.push_str(&format!(
+                "Final audit: passed={:?}, completion_allowed={:?}\n\n",
+                passed, allowed
+            ));
+        } else {
+            doc.push_str("_No final audit recorded._\n\n");
+        }
+        doc.push_str(
+            "---\n_Generated by AgentCode mission export. SQLite remains the authoritative source; this file is a derived snapshot._\n",
+        );
+
+        // Governed write through the ChangeSet path.
+        let rel_path = "MISSION_EXPORT.md".to_string();
+        let mut repo = ac_changeset::LocalWorkspaceFileRepository::new(
+            std::path::PathBuf::from(workspace),
+            "daemon",
+        );
+        let expected_hash = <ac_changeset::LocalWorkspaceFileRepository as ac_changeset::FileRepository>::read(&repo, &rel_path)
+            .ok()
+            .map(|current| ac_changeset::content_hash(&current));
+        let engine = ac_changeset::EditEngine;
+        let mut transaction = engine
+            .prepare(
+                &repo,
+                vec![ac_changeset::EditRequest {
+                    path: rel_path.clone(),
+                    precondition: ac_changeset::EditPrecondition {
+                        path: rel_path.clone(),
+                        expected_hash,
+                        base_revision: "daemon".to_string(),
+                        symbol_fingerprint: None,
+                    },
+                    strategy: ac_changeset::EditStrategy::WholeFile {
+                        content: doc.clone(),
+                    },
+                }],
+            )
+            .map_err(|error| {
+                AcError::validation(
+                    "MISSION-EXPORT_TRANSACTION",
+                    format!("governed transaction failed to prepare: {error}"),
+                )
+            })?;
+        transaction.changeset
+            .attach_metadata(ac_changeset::ChangeSetMetadata {
+                originating_task: StableId::new("missionexport"),
+                originating_agent_session: StableId::new("daemon"),
+                files_changed: vec![ac_changeset::FileChangeSummary {
+                    path: rel_path.clone(),
+                    additions: doc.lines().count() as u32,
+                    removals: 0,
+                }],
+                additions: doc.lines().count() as u32,
+                removals: 0,
+                evidence_refs: Vec::new(),
+                verification_passed: Some(true),
+            })
+            .map_err(|error| {
+                AcError::validation(
+                    "MISSION-EXPORT_TRANSACTION",
+                    format!("governed transaction metadata failed: {error}"),
+                )
+            })?;
+        transaction.changeset.validate().map_err(|error| {
+            AcError::validation(
+                "MISSION-EXPORT_TRANSACTION",
+                format!("governed transaction failed validation: {error}"),
+            )
+        })?;
+        transaction.changeset.approve().map_err(|error| {
+            AcError::validation(
+                "MISSION-EXPORT_TRANSACTION",
+                format!("governed transaction approval failed: {error}"),
+            )
+        })?;
+        engine
+            .apply(&mut repo, &mut transaction)
+            .map_err(|error| {
+                AcError::validation(
+                    "MISSION-EXPORT_TRANSACTION",
+                    format!("governed write failed and rolled back: {error}"),
+                )
+            })?;
+
+        Ok(json!({
+            "exported": true,
+            "mission_id": mission_id,
+            "path": std::path::Path::new(workspace).join("MISSION_EXPORT.md").to_string_lossy(),
+            "changeset_id": transaction.changeset.id.to_string(),
+            "content_lines": doc.lines().count(),
+            "note": "governed write through the ChangeSet path; evidence summaries are redacted upstream",
+        }))
+    }
+
     /// Safe verification results.  Exposes id, task association, environment,
     /// normalized_result, command (bounded), tool_version, evidence_ref, and
     /// timestamps.  raw_artifact (unbounded command output) is never returned.

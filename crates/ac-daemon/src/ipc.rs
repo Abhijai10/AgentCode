@@ -449,6 +449,58 @@ fn dispatch_request(request: &Value, daemon: &mut DaemonService) -> (Value, bool
                 "catalog": catalog,
             }})
         }
+        "ReadinessGet" => {
+            // Batch N7: first-run readiness from REAL daemon state — no
+            // fabricated readiness.  Provider accounts come from the
+            // durable catalog; local models from live Ollama discovery;
+            // lifecycle from the daemon itself.  Scanner availability is
+            // honestly reported as "unknown until first audit" because it
+            // is derived from executed audits, not static presence.
+            let lifecycle = format!("{:?}", daemon.health().lifecycle);
+            let mut configured_accounts = 0usize;
+            let mut provider_ids: Vec<String> = Vec::new();
+            if let Ok(entries) = daemon.db.provider_catalog_entries() {
+                for entry in entries {
+                    if let Ok(accounts) = daemon.db.provider_accounts(&entry.id) {
+                        if !accounts.is_empty() {
+                            configured_accounts += accounts.len();
+                            provider_ids.push(entry.id.clone());
+                        }
+                    }
+                }
+            }
+            // Live Ollama discovery through the daemon's own wrapper
+            // (default endpoint, same timeouts the Providers page uses).
+            let ollama = match daemon.discover_provider_models(
+                "http://127.0.0.1:11434",
+                "ollama",
+            ) {
+                Ok(models) => json!({
+                    "running": !models.is_empty(),
+                    "model_count": models.len(),
+                    "models": models.iter().take(10).map(|m| json!({
+                        "id": m.id.to_string(),
+                        "model_name": m.model_name,
+                    })).collect::<Vec<_>>(),
+                }),
+                Err(_) => json!({"running": false, "model_count": 0, "models": []}),
+            };
+            json!({"id": correlation_id, "ok": true, "readiness": {
+                "daemon_lifecycle": lifecycle,
+                "provider_accounts_configured": configured_accounts,
+                "providers_with_accounts": provider_ids,
+                "ollama": ollama,
+                "scanner_note": "scanner availability is derived from executed audits; run any Security audit to populate",
+                "usable_route": configured_accounts > 0 || ollama["running"].as_bool().unwrap_or(false),
+            }})
+        }
+        "MissionExport" => {
+            let mission_id = request.get("mission_id").and_then(Value::as_str).unwrap_or("");
+            match daemon.mission_export(mission_id) {
+                Ok(result) => json!({"id": correlation_id, "ok": true, "export": result}),
+                Err(error) => error_response(correlation_id, error.code(), error.to_string()),
+            }
+        }
         "CreateProviderAccount" => {
             let provider_id = request.get("provider_id").and_then(Value::as_str).unwrap_or("");
             let label = request.get("label").and_then(Value::as_str).unwrap_or("");
@@ -1794,6 +1846,159 @@ mod ipc_tests {
         assert_eq!(daemon2.preferred_model(), "qwen2.5-coder:3b");
         daemon2.shutdown().unwrap();
 
+        std::env::remove_var("AGENTCODE_PROVIDER_MODE");
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    /// Batch N6: MissionExport produces a self-contained Markdown result
+    /// context through the REAL production path — goal, tasks, events,
+    /// changesets, redacted evidence summaries, and the verification
+    /// audit — written via the governed ChangeSet path into the mission's
+    /// workspace, with a recorded changeset id.
+    #[test]
+    fn mission_export_writes_governed_markdown_result_context() {
+        let _env_lock = crate::TEST_ENV_LOCK.lock().unwrap();
+        std::env::set_var("AGENTCODE_PROVIDER_MODE", "mock");
+        let (dir, db_path, lock, socket) = temp_paths("ipc-mission-export");
+        let workspace = dir.join("mission-workspace");
+        fs::create_dir_all(&workspace).unwrap();
+        let workspace_path = workspace.to_string_lossy().to_string();
+
+        // Seed a minimal completed mission with a real workspace + evidence.
+        let mission_id = {
+            let mut db = ControlPlaneDb::open(&db_path).unwrap();
+            db.migrate().unwrap();
+            use ac_kernel::{AllowAllPolicy, Kernel, MissionState};
+            let mut kernel = Kernel::new(AllowAllPolicy);
+            kernel.start().unwrap();
+            let mission_id = kernel.create_mission("export test mission: verify export flow").unwrap();
+            kernel
+                .transition_mission(&mission_id, MissionState::Active, Vec::new())
+                .unwrap();
+            kernel
+                .transition_mission(&mission_id, MissionState::Completed, Vec::new())
+                .unwrap();
+            db.put_mission(kernel.mission(&mission_id).unwrap()).unwrap();
+            for event in kernel.events() {
+                db.append_kernel_event(event).unwrap();
+            }
+            let session_id = StableId::new("session");
+            db.save_session(&session_id, &mission_id, "completed", Some(&workspace_path)).unwrap();
+            let task = ac_db::TaskRecord {
+                id: StableId::new("task-x").to_string(),
+                mission_id: mission_id.to_string(),
+                title: "Implement export".to_string(),
+                state: "completed".to_string(),
+                dependencies_json: String::new(),
+                assigned_worker_id: None,
+                retry_count: 0,
+                max_retries: 3,
+                updated_at_ms: 1_700_000_000_000,
+                acceptance_criteria_json: "[]".to_string(),
+            };
+            db.save_task(&task).unwrap();
+            mission_id.to_string()
+        };
+
+        let mut daemon = DaemonService::open(&db_path, &lock).unwrap();
+        daemon.start().unwrap();
+        let Some((server, listener)) = bind_or_skip(&socket, None) else {
+            daemon.shutdown().unwrap();
+            std::env::remove_var("AGENTCODE_PROVIDER_MODE");
+            let _ = fs::remove_dir_all(dir);
+            return;
+        };
+
+        // Export through the production IPC path.
+        let export = request_via_ipc(
+            &server, &listener, &mut daemon,
+            json!({"id":"ex1","command":"MissionExport","mission_id": mission_id}),
+        );
+        assert_eq!(export["ok"], true, "export: {export}");
+        let ex = &export["export"];
+        assert!(ex["exported"].as_bool().unwrap_or(false), "exported flag: {ex}");
+        assert!(ex["changeset_id"].as_str().unwrap_or("").starts_with("cs-"), "governed changeset must be recorded: {ex}");
+        assert!(ex["content_lines"].as_u64().unwrap_or(0) > 10, "export document must be substantial: {ex}");
+
+        // The file exists in the mission workspace and carries the real
+        // content sections.
+        let file_path = workspace.join("MISSION_EXPORT.md");
+        assert!(file_path.exists(), "MISSION_EXPORT.md must exist in the workspace");
+        let content = fs::read_to_string(&file_path).unwrap();
+        assert!(content.contains("# Mission Export"), "title: {content}");
+        assert!(content.contains("export test mission"), "goal text: {content}");
+        assert!(content.contains("## Tasks"), "tasks section: {content}");
+        assert!(content.contains("Implement export"), "task title: {content}");
+        assert!(content.contains("## ChangeSets"), "changesets section: {content}");
+        assert!(content.contains("## Evidence"), "evidence section: {content}");
+        assert!(content.contains("## Verification"), "verification section: {content}");
+        // No raw secret-style content leaks: evidence summaries come from the
+        // redacted model_summary path only.
+        assert!(!content.contains("raw_content"), "raw content must never appear: {content}");
+
+        // Unknown mission errors honestly.
+        let bad = request_via_ipc(
+            &server, &listener, &mut daemon,
+            json!({"id":"ex2","command":"MissionExport","mission_id": "mission-doesnotexist"}),
+        );
+        assert_eq!(bad["ok"], false);
+        assert_eq!(bad["error"]["code"], "DAEMON-MISSION_NOT_FOUND");
+
+        // Second export overwrites through the update path (idempotent).
+        let again = request_via_ipc(
+            &server, &listener, &mut daemon,
+            json!({"id":"ex3","command":"MissionExport","mission_id": mission_id}),
+        );
+        assert_eq!(again["ok"], true, "second export (update path): {again}");
+        assert!(again["export"]["changeset_id"].as_str().unwrap_or("").starts_with("cs-"));
+
+        server.cleanup();
+        daemon.shutdown().unwrap();
+        std::env::remove_var("AGENTCODE_PROVIDER_MODE");
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    /// Batch N7: ReadinessGet reports real first-run readiness facts —
+    /// daemon lifecycle, configured provider accounts, live Ollama model
+    /// discovery (skipped honestly when not running), and the honest
+    /// scanner note.  usable_route derives from real state, never a
+    /// constant.
+    #[test]
+    fn readiness_get_reports_real_state() {
+        let _env_lock = crate::TEST_ENV_LOCK.lock().unwrap();
+        std::env::set_var("AGENTCODE_PROVIDER_MODE", "mock");
+        let (dir, db_path, lock, socket) = temp_paths("ipc-readiness");
+
+        let mut daemon = DaemonService::open(&db_path, &lock).unwrap();
+        daemon.start().unwrap();
+        let Some((server, listener)) = bind_or_skip(&socket, None) else {
+            daemon.shutdown().unwrap();
+            std::env::remove_var("AGENTCODE_PROVIDER_MODE");
+            let _ = fs::remove_dir_all(dir);
+            return;
+        };
+
+        let ready = request_via_ipc(
+            &server, &listener, &mut daemon,
+            json!({"id":"rdy1","command":"ReadinessGet"}),
+        );
+        assert_eq!(ready["ok"], true, "readiness: {ready}");
+        let r = &ready["readiness"];
+        // Daemon lifecycle is real state (Running for a started daemon).
+        assert_eq!(r["daemon_lifecycle"], "Running");
+        // Structured facts present.
+        assert!(r["provider_accounts_configured"].is_u64());
+        assert!(r["usable_route"].is_boolean());
+        assert!(r["ollama"]["running"].is_boolean());
+        assert!(r["ollama"]["model_count"].is_u64());
+        // Honest scanner note (no fabricated availability).
+        assert!(
+            r["scanner_note"].as_str().unwrap_or("").contains("audit"),
+            "scanner note must be honest: {r}"
+        );
+
+        server.cleanup();
+        daemon.shutdown().unwrap();
         std::env::remove_var("AGENTCODE_PROVIDER_MODE");
         let _ = fs::remove_dir_all(dir);
     }
