@@ -1280,6 +1280,16 @@ impl ProviderRegistry {
         Ok(id)
     }
 
+    /// The context window of the model routing WOULD select for these
+    /// capabilities right now — used by callers to adapt prompt assembly
+    /// (e.g. grounding budgets) BEFORE the request.  Pure read: no
+    /// decision is recorded, no route is locked.
+    pub fn peek_context_window(&self, required: &[ProviderCapability]) -> u32 {
+        self.select_model(required)
+            .map(|m| m.context_window)
+            .unwrap_or(0)
+    }
+
     pub fn select_model(&self, required: &[ProviderCapability]) -> AcResult<&ModelCapability> {
         self.models
             .values()

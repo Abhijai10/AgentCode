@@ -410,13 +410,16 @@ impl DaemonService {
             .collect::<Vec<_>>()
             .join("\n");
         let project_hint = format!("Project: {}\n", conv.project_path);
-        let grounding =
-            crate::build_repo_grounding(&conv.project_path, content);
+        // Adaptive grounding (final-audit optimization): scale the source
+        // budget to the routed model's real window and the repo tier
+        // instead of one fixed 48KB for every model from 2K to 128K.
+        let grounding = crate::build_repo_grounding(&conv.project_path, content);
         // Batch N3: enrich the deterministic grounding with LSP
         // definition/references sources (graceful degradation; the
         // deterministic selection is never replaced).
         let (grounding, lsp_status) =
             crate::enrich_grounding_with_lsp(&conv.project_path, grounding, content);
+        let mut grounding = grounding;
         let source_block = crate::render_source_block(&grounding);
         let project_files = if source_block.is_empty() {
             // Degraded fallback, explicitly labeled for the model.
@@ -460,6 +463,16 @@ impl DaemonService {
                     format!("cannot initialize provider registry: {error}"),
                 )
             })?;
+        // Re-ground with the actual routed window now that the registry is
+        // built — the first pass used the conservative fixed budgets.
+        let peeked_window = providers.peek_context_window(&[ac_provider::ProviderCapability::Chat]);
+        if peeked_window > 0 {
+            grounding = crate::build_repo_grounding_for_window(
+                &conv.project_path,
+                content,
+                peeked_window,
+            );
+        }
         let profile = ac_provider::TaskProfile::discuss(
             ac_common::StableId::new("discuss"),
             self.preferred_routing_profile(), // N1: user-persisted routing profile

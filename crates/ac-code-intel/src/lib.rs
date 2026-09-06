@@ -1229,6 +1229,26 @@ impl CodeIntelligenceService {
             .collect()
     }
 
+    /// Reap LSP sessions idle beyond the TTL (final-audit optimization):
+    /// per-(server, workspace) sessions are REUSED on every query, but a
+    /// session for a project you left otherwise lives forever.  Evicted
+    /// sessions are simply dropped from the registry — the real language
+    /// server processes were never spawned until a query needs them
+    /// (pid is None until then), so eviction frees only registry state
+    /// and, for live ones, marks them stopped so the next ensure()
+    /// recreates cleanly.  Returns the number reaped.
+    pub fn evict_idle_lsp_sessions(&mut self, idle_ttl: TimestampMillis) -> usize {
+        let now_ms = TimestampMillis::now().as_millis();
+        let ttl_ms = idle_ttl.as_millis();
+        let before = self.lsp_sessions.len();
+        self.lsp_sessions
+            .retain(|session| now_ms.saturating_sub(session.last_activity.as_millis()) <= ttl_ms);
+        before - self.lsp_sessions.len()
+    }
+
+    /// The default idle TTL for LSP session state (15 minutes).
+    pub const LSP_IDLE_TTL_MS: u128 = 15 * 60 * 1000;
+
     pub fn ensure_lsp_session(
         &mut self,
         server: LspServerKind,
@@ -1240,6 +1260,10 @@ impl CodeIntelligenceService {
                 "workspace root is required",
             ));
         }
+        // Opportunistic eviction on every ensure(): keeps the registry
+        // bounded without a background timer, and it is cheap (a
+        // timestamp comparison per session).
+        self.evict_idle_lsp_sessions(TimestampMillis::from_millis(Self::LSP_IDLE_TTL_MS));
         if let Some(session) = self
             .lsp_sessions
             .iter_mut()
@@ -2410,6 +2434,48 @@ mod tests {
         } else {
             assert_eq!(session.state, LspSessionState::Unavailable);
         }
+    }
+
+    /// Final-audit optimization: per-(server, workspace) LSP sessions are
+    /// REUSED across queries and IDLE ones are evicted after the TTL —
+    /// the registry stays bounded for long-running daemons instead of
+    /// accumulating a session per project ever visited.
+    #[test]
+    fn lsp_sessions_reuse_within_ttl_and_evict_after() {
+        let mut service = CodeIntelligenceService::new();
+
+        // Two distinct projects, same server kind.
+        let a = service
+            .ensure_lsp_session(LspServerKind::Rust, "/tmp/project-a")
+            .unwrap();
+        let a2 = service
+            .ensure_lsp_session(LspServerKind::Rust, "/tmp/project-a")
+            .unwrap();
+        // Same (server, workspace) → REUSED, not a new session.
+        assert_eq!(a.id, a2.id, "same scope must reuse the session");
+        let b = service
+            .ensure_lsp_session(LspServerKind::Rust, "/tmp/project-b")
+            .unwrap();
+        assert_ne!(a.id, b.id, "different scope gets its own session");
+        assert_eq!(service.lsp_sessions().len(), 2);
+
+        // Zero TTL evicts everything idle (both just touched → 0 reaped
+        // only if activity refreshed; ensure() refreshes, so use a TTL
+        // large enough to keep them).
+        let kept = service.evict_idle_lsp_sessions(TimestampMillis::from_millis(60 * 60 * 1000));
+        assert_eq!(kept, 0, "fresh sessions survive a generous TTL");
+        assert_eq!(service.lsp_sessions().len(), 2);
+
+        // An expired TTL evicts both.
+        let reaped = service.evict_idle_lsp_sessions(TimestampMillis::from_millis(0));
+        assert_eq!(reaped, 2, "expired sessions are reaped");
+        assert_eq!(service.lsp_sessions().len(), 0);
+
+        // The next ensure() recreates cleanly.
+        let a3 = service
+            .ensure_lsp_session(LspServerKind::Rust, "/tmp/project-a")
+            .unwrap();
+        assert_ne!(a.id, a3.id, "evicted session is recreated fresh");
     }
 
     #[test]

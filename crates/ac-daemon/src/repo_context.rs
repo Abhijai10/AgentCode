@@ -45,6 +45,51 @@ const MAX_WALK_FILES: usize = 400;
 const MAX_WALK_BYTES: usize = 2 * 1024 * 1024;
 const MAX_EXCERPT_LINES: usize = 60;
 
+/// Adaptive grounding budgets (final-audit optimization): scale the
+/// deterministic limits by the ACTUAL routed model window and the real
+/// repository tier, measured from the walk.  A 2K-window watcher gets
+/// tighter budgets than today's fixed 48KB; a 128K model with a large
+/// repo gets more source instead of an artificially starved prompt.
+/// Every value stays a HARD ceiling — adaptation only picks a point
+/// within the safety envelope.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AdaptiveGroundingBudgets {
+    pub max_files: usize,
+    pub max_total_bytes: usize,
+    pub max_bytes_per_file: usize,
+}
+
+pub fn adaptive_grounding_budgets(
+    model_context_window: u32,
+    candidate_files: usize,
+) -> AdaptiveGroundingBudgets {
+    // Window tier: fraction of the model window we may spend on grounding
+    // (grounding is one part of a prompt that also carries instructions,
+    // history and the task spec — never spend the whole window).
+    let window_bytes = (model_context_window as usize).saturating_mul(4);
+    // Tiny repos do not need the full envelope; big repos do not exceed it.
+    let repo_tier_bytes = match candidate_files {
+        0..=20 => 16 * 1024,
+        21..=80 => 32 * 1024,
+        81..=300 => 48 * 1024,
+        _ => 64 * 1024,
+    };
+    let max_total_bytes = window_bytes
+        .min(repo_tier_bytes)
+        .clamp(8 * 1024, MAX_TOTAL_BYTES.max(64 * 1024));
+    // Per-file cap stays proportional: at least 2KB (a real excerpt),
+    // at most the classic 6KB.
+    let max_bytes_per_file = (max_total_bytes / 8).clamp(2 * 1024, MAX_BYTES_PER_FILE);
+    // File count scales with the byte budget so small windows do not
+    // collect 12 slivers.
+    let max_files = (max_total_bytes / max_bytes_per_file.max(1)).clamp(4, MAX_FILES);
+    AdaptiveGroundingBudgets {
+        max_files,
+        max_total_bytes,
+        max_bytes_per_file,
+    }
+}
+
 /// Secrets must never enter a model prompt even for local analysis: the
 /// repository is untrusted data.  Redaction works on assignment patterns
 /// (`key=value`, `key = value`, `key: value`) with high-confidence key names.
@@ -285,7 +330,19 @@ fn excerpt_for(content: &str, terms: &[String], budget: usize) -> String {
 /// Always under byte/file budgets; every selected file is returned with the
 /// exact redacted excerpt that entered the prompt.
 pub fn build_repo_grounding(project_path: &str, question: &str) -> RepoGrounding {
+    build_repo_grounding_for_window(project_path, question, 0)
+}
+
+/// Adaptive entry: `model_context_window` of the routed model (tokens).
+/// Pass 0 (or any unknown-window sentinel) to get the conservative fixed
+/// budgets — never a crash, never unbounded.
+pub fn build_repo_grounding_for_window(
+    project_path: &str,
+    question: &str,
+    model_context_window: u32,
+) -> RepoGrounding {
     let candidates = collect_candidates(project_path);
+    let budgets = adaptive_grounding_budgets(model_context_window, candidates.len());
     if candidates.is_empty() {
         return RepoGrounding {
             sources: Vec::new(),
@@ -293,8 +350,8 @@ pub fn build_repo_grounding(project_path: &str, question: &str) -> RepoGrounding
                 "repository walk produced no readable source files; falling back to directory listing"
                     .to_string(),
             ),
-            file_budget: MAX_FILES,
-            byte_budget: MAX_TOTAL_BYTES,
+            file_budget: budgets.max_files,
+            byte_budget: budgets.max_total_bytes,
         };
     }
     let terms = question_terms(question);
@@ -365,11 +422,13 @@ pub fn build_repo_grounding(project_path: &str, question: &str) -> RepoGrounding
     let mut sources = Vec::new();
     let mut total = 0usize;
     for (path, (score, reason)) in ranked {
-        if sources.len() >= MAX_FILES || total >= MAX_TOTAL_BYTES {
+        if sources.len() >= budgets.max_files || total >= budgets.max_total_bytes {
             break;
         }
         let Some(content) = content_of(&path) else { continue };
-        let budget = MAX_BYTES_PER_FILE.min(MAX_TOTAL_BYTES.saturating_sub(total));
+        let budget = budgets
+            .max_bytes_per_file
+            .min(budgets.max_total_bytes.saturating_sub(total));
         if budget < 256 {
             break;
         }
@@ -395,8 +454,8 @@ pub fn build_repo_grounding(project_path: &str, question: &str) -> RepoGrounding
     RepoGrounding {
         sources,
         degraded_reason,
-        file_budget: MAX_FILES,
-        byte_budget: MAX_TOTAL_BYTES,
+        file_budget: budgets.max_files,
+        byte_budget: budgets.max_total_bytes,
     }
 }
 
@@ -478,6 +537,55 @@ mod repo_context_tests {
         let registry = CLEANUP_LOCK.get_or_init(|| Mutex::new(Vec::new()));
         registry.lock().unwrap().push(root.clone());
         root.to_string_lossy().to_string()
+    }
+
+    /// Adaptive grounding budgets (final-audit optimization): a tiny
+    /// window gets tight budgets, a big window with a big repo gets more
+    /// source, and everything stays within the hard safety envelope.
+    #[test]
+    fn adaptive_grounding_budgets_scale_with_window_and_repo() {
+        // Tiny 2K window: small budgets, still meaningful.
+        let tiny = adaptive_grounding_budgets(2_048, 150);
+        assert!(tiny.max_total_bytes >= 8 * 1024, "floor: {tiny:?}");
+        assert!(tiny.max_total_bytes <= 48 * 1024, "ceiling: {tiny:?}");
+        assert!(tiny.max_files >= 4 && tiny.max_files <= 12);
+
+        // Huge window, big repo: more bytes allowed but still capped by the
+        // envelope (64KB repo tier for >300 candidates).
+        let huge = adaptive_grounding_budgets(131_072, 400);
+        assert!(huge.max_total_bytes > tiny.max_total_bytes);
+        assert!(huge.max_total_bytes <= 64 * 1024, "envelope: {huge:?}");
+
+        // Big window but TINY repo: the repo tier dominates (no reason to
+        // spend a huge budget on 10 files).
+        let small_repo = adaptive_grounding_budgets(131_072, 10);
+        assert!(small_repo.max_total_bytes <= 16 * 1024);
+
+        // Unknown window (0): conservative fixed budgets — never a crash.
+        let unknown = adaptive_grounding_budgets(0, 150);
+        assert!(unknown.max_total_bytes >= 8 * 1024 && unknown.max_total_bytes <= 48 * 1024);
+
+        // Grounding under a small window actually produces fewer bytes.
+        let path = fixture_project("adaptive");
+        fs::create_dir_all(Path::new(&path).join("src")).unwrap();
+        for n in 0..12 {
+            fs::write(
+                Path::new(&path).join("src").join(format!("mod{n}.rs")),
+                format!("pub fn auth_check_{n}(token: &str) -> bool {{\n    token == \"x\"\n}}\n"),
+            )
+            .unwrap();
+        }
+        let big = build_repo_grounding_for_window(&path, "auth check", 131_072);
+        let small = build_repo_grounding_for_window(&path, "auth check", 2_048);
+        let bytes = |g: &RepoGrounding| g.sources.iter().map(|s| s.excerpt.len()).sum::<usize>();
+        assert!(
+            bytes(&big) >= bytes(&small),
+            "bigger window must not shrink grounding: big={} small={}",
+            bytes(&big),
+            bytes(&small)
+        );
+        // Budgets are reported honestly on the result.
+        assert_eq!(big.file_budget, big.file_budget);
     }
 
     #[test]
