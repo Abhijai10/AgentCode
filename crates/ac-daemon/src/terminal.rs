@@ -34,6 +34,14 @@
 /// for capturing unbounded logs.
 const MAX_TERMINAL_CAPTURE_BYTES: usize = 256 * 1024;
 
+/// Ring window for the LIVE tail (final-audit optimization): keep at
+/// most this many recent lines in memory for cheap polling.  The full
+/// capture still flows to evidence (bounded by the byte cap); the ring
+/// only bounds what a poll must clone.  The dropped-line count keeps the
+/// cursor math honest: a cursor older than the ring start reports the
+/// ring head, never a silent gap.
+const MAX_TERMINAL_RING_LINES: usize = 2_000;
+
 /// Hard lifetime cap so a forgotten session cannot run forever.
 const MAX_TERMINAL_LIFETIME_SECS: u64 = 30 * 60;
 
@@ -69,6 +77,9 @@ pub struct TerminalSessionState {
     pub mission_id: Option<String>,
     pub output: Mutex<VecDeque<String>>,
     pub total_bytes: AtomicUsize,
+    /// Lines appended EVER (monotonic) — the stable cursor domain even
+    /// after ring eviction removes old lines from the window.
+    pub total_lines: AtomicUsize,
     pub child: Mutex<Option<std::process::Child>>,
     pub exit_code: Mutex<Option<i32>>,
     pub cancelled: AtomicBool,
@@ -90,6 +101,14 @@ impl TerminalSessionState {
         }
         out.push_back(line.to_string());
         self.total_bytes.fetch_add(line.len(), Ordering::SeqCst);
+        self.total_lines.fetch_add(1, Ordering::SeqCst);
+        // Ring eviction: drop the OLDEST lines beyond the window.  The
+        // caller's cursor stays valid — total_lines never decreases (see
+        // terminal_tail), and a cursor behind the window start is served
+        // from the head with an honest dropped count.
+        while out.len() > MAX_TERMINAL_RING_LINES {
+            out.pop_front();
+        }
     }
 }
 
@@ -149,6 +168,7 @@ impl crate::DaemonService {
             mission_id: mission_id.map(str::to_string),
             output: Mutex::new(VecDeque::new()),
             total_bytes: AtomicUsize::new(0),
+            total_lines: AtomicUsize::new(0),
             child: Mutex::new(Some(child)),
             exit_code: Mutex::new(None),
             cancelled: AtomicBool::new(false),
@@ -259,9 +279,21 @@ impl crate::DaemonService {
             ));
         };
         let output = state.output.lock().unwrap();
-        let total = output.len();
-        let lines: Vec<String> = if cursor < total {
-            output.iter().skip(cursor).cloned().collect()
+        // Ring-aware cursor math (final-audit optimization): the cursor
+        // domain is TOTAL lines ever (monotonic).  A cursor behind the
+        // ring start (evicted lines) is served from the head with an
+        // honest `dropped_lines` count instead of silently skipping.
+        let total_lines = state.total_lines.load(Ordering::SeqCst);
+        let ring_len = output.len();
+        let ring_start = total_lines.saturating_sub(ring_len);
+        let from = cursor.max(ring_start);
+        let dropped = from.saturating_sub(cursor);
+        let lines: Vec<String> = if from < total_lines {
+            output
+                .iter()
+                .skip(from - ring_start)
+                .cloned()
+                .collect()
         } else {
             Vec::new()
         };
@@ -269,8 +301,9 @@ impl crate::DaemonService {
         let evidence_id = state.evidence_id.lock().unwrap().clone();
         Ok(json!({
             "session_id": session_id,
-            "cursor": total,
+            "cursor": total_lines,
             "lines": lines,
+            "dropped_lines": dropped,
             "alive": exit_code.is_none(),
             "exit_code": exit_code,
             "cancelled": state.cancelled.load(Ordering::SeqCst),
@@ -434,6 +467,57 @@ mod terminal_tests {
         assert!(!terminal_argv_allowed(&[]));
     }
 
+    /// Ring window (final-audit optimization): appending past
+    /// MAX_TERMINAL_RING_LINES keeps only the newest window; the tail
+    /// reports total_lines EVER (monotonic cursor), serves from the head
+    /// when the cursor predates the ring, and reports dropped_lines
+    /// honestly instead of silently skipping.
+    #[test]
+    fn ring_window_keeps_recent_lines_and_honest_cursors() {
+        let state = TerminalSessionState {
+            id: "ring".into(),
+            argv: vec!["node".into()],
+            cwd: "/tmp".into(),
+            mission_id: None,
+            output: Mutex::new(VecDeque::new()),
+            total_bytes: AtomicUsize::new(0),
+            total_lines: AtomicUsize::new(0),
+            child: Mutex::new(None),
+            exit_code: Mutex::new(None),
+            cancelled: AtomicBool::new(false),
+            started_at_ms: 0,
+            evidence_id: Mutex::new(None),
+        };
+        for n in 0..(MAX_TERMINAL_RING_LINES + 500) {
+            state.append_output_line(&format!("line-{n}"));
+        }
+        // Window holds the newest MAX_TERMINAL_RING_LINES lines…
+        assert_eq!(state.output.lock().unwrap().len(), MAX_TERMINAL_RING_LINES);
+        // …starting at line-500 (the oldest 500 evicted).
+        assert_eq!(
+            state.output.lock().unwrap().front().unwrap().trim(),
+            "line-500"
+        );
+        // The cursor domain counts EVERY line ever.
+        let total = state.total_lines.load(Ordering::SeqCst);
+        assert_eq!(total, MAX_TERMINAL_RING_LINES + 500);
+
+        // Fresh cursor (end): nothing new.
+        // (terminal_tail serves via the daemon; here we assert the math
+        // the tail performs, on the same state.)
+        let ring_len = state.output.lock().unwrap().len();
+        let ring_start = total.saturating_sub(ring_len);
+        assert_eq!(ring_start, 500);
+        // A cursor at 500 serves the full window.
+        let from = 500usize.max(ring_start);
+        assert_eq!(from, 500);
+        // A cursor at 100 (behind the ring): served from the head with
+        // 400 dropped, never a silent gap.
+        let from_behind = 100usize.max(ring_start);
+        let dropped = from_behind.saturating_sub(100);
+        assert_eq!(dropped, 400);
+    }
+
     #[test]
     fn output_capped_at_byte_budget() {
         let state = TerminalSessionState {
@@ -443,6 +527,7 @@ mod terminal_tests {
             mission_id: None,
             output: Mutex::new(VecDeque::new()),
             total_bytes: AtomicUsize::new(0),
+            total_lines: AtomicUsize::new(0),
             child: Mutex::new(None),
             exit_code: Mutex::new(None),
             cancelled: AtomicBool::new(false),
