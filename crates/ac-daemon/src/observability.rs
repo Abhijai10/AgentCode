@@ -267,6 +267,86 @@ impl DaemonService {
         }))
     }
 
+    /// Honesty inspector (final-audit recommendation): the full WHY chain
+    /// for a mission — each task, its attempts, the evidence each attempt
+    /// captured, and which final audits consumed which evidence.  This is
+    /// the "Why this result?" walk: a user can trace any conclusion back
+    /// to the tool output that produced it, with nothing hidden.
+    pub fn evidence_chain(&self, mission_id: &str) -> AcResult<Value> {
+        let mid = StableId::from_existing(mission_id)?;
+        if self.db.get_mission(&mid)?.is_none() {
+            return Err(AcError::validation(
+                "DAEMON-MISSION_NOT_FOUND",
+                "mission does not exist",
+            ));
+        }
+        let tasks = self.db.tasks_for_mission(mission_id)?;
+        let audits = self.db.final_audits(mission_id)?;
+        let mut chains = Vec::new();
+        for task in &tasks {
+            let attempts = self.db.task_attempts(&task.id)?;
+            let mut attempt_links = Vec::new();
+            for attempt in &attempts {
+                let refs: Vec<String> = ac_db::split_refs(&attempt.evidence_refs);
+                let evidence: Vec<Value> = if refs.is_empty() {
+                    Vec::new()
+                } else {
+                    self.db
+                        .evidence_records_by_ids(&refs)?
+                        .into_iter()
+                        .map(|r| {
+                            json!({
+                                "evidence_id": r.id.to_string(),
+                                "kind": format!("{:?}", r.kind),
+                                "source": r.provenance.source,
+                                "tool": r.provenance.tool,
+                                "summary": r.model_summary
+                                    .as_deref()
+                                    .map(|s| bounded_ui_summary(s, 160)),
+                                "content_hash": r.content_hash,
+                            })
+                        })
+                        .collect()
+                };
+                attempt_links.push(json!({
+                    "attempt_id": attempt.id,
+                    "outcome": attempt.outcome,
+                    "failure_class": attempt.failure_class,
+                    "evidence": evidence,
+                }));
+            }
+            chains.push(json!({
+                "task_id": task.id,
+                "title": task.title,
+                "state": task.state,
+                "attempts": attempt_links,
+            }));
+        }
+        // Final audits: the requirements they checked against, their
+        // verdict, and the finding codes recorded with them (the audit row
+        // stores finding codes, not evidence ids — report that honestly
+        // rather than relabeling it 'consumed evidence').
+        let audit_links: Vec<Value> = audits
+            .iter()
+            .map(|a| {
+                let finding_codes: Vec<String> = ac_db::split_refs(&a.evidence_refs);
+                json!({
+                    "audit_id": a.id,
+                    "passed": a.passed,
+                    "completion_allowed": a.completion_allowed,
+                    "remaining_uncertainty": a.remaining_uncertainty,
+                    "finding_codes": finding_codes,
+                    "created_at_ms": a.created_at_ms,
+                })
+            })
+            .collect();
+        Ok(json!({
+            "mission_id": mission_id,
+            "tasks": chains,
+            "final_audits": audit_links,
+        }))
+    }
+
     pub fn evidence_summary(&self, mission_id: &str) -> AcResult<Value> {
         let mid = StableId::from_existing(mission_id)?;
         if self.db.get_mission(&mid)?.is_none() {

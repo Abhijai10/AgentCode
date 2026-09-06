@@ -102,6 +102,10 @@ export function MissionView({ missionId, onOpenSettings }: { missionId: string |
   const [events, setEvents] = useState<MissionActivityEvent[]>([]);
   const [changesets, setChangesets] = useState<ChangeSetSummary[]>([]);
   const [evidence, setEvidence] = useState<EvidenceSummaryItem[]>([]);
+  // Honesty inspector: the full task→attempt→evidence→audit chain.
+  const [whyOpen, setWhyOpen] = useState(false);
+  const [whyChain, setWhyChain] = useState<Awaited<ReturnType<typeof daemon.evidenceChain>> | null>(null);
+  const [whyBusy, setWhyBusy] = useState(false);
   const [verification, setVerification] = useState<VerificationSummary | null>(null);
   const [status, setStatus] = useState<"loading" | "no_mission" | "daemon_unavailable" | "loaded">(missionId ? "loading" : "no_mission");
   const [controlBusy, setControlBusy] = useState<"pause" | "resume" | "cancel" | null>(null);
@@ -705,7 +709,63 @@ export function MissionView({ missionId, onOpenSettings }: { missionId: string |
             <h2 className="text-lg font-semibold flex items-center gap-2 text-on-surface mb-2">
               <Icon name="inventory_2" size={20} className="text-primary" />
               Evidence
+              <button
+                onClick={async () => {
+                  if (whyOpen) {
+                    setWhyOpen(false);
+                    return;
+                  }
+                  setWhyBusy(true);
+                  const chain = await daemon.evidenceChain(missionId!);
+                  setWhyChain(chain);
+                  setWhyBusy(false);
+                  setWhyOpen(true);
+                }}
+                className="ml-auto text-xs text-primary hover:opacity-80"
+                title="Walk the full chain: every task, its attempts, the evidence captured, and the audits that consumed it"
+              >
+                {whyBusy ? "Loading chain…" : "Why this result?"}
+              </button>
             </h2>
+            {whyOpen && whyChain && (
+              <div className="rounded-xl neo-pressed p-3 mb-2 max-h-96 overflow-auto">
+                <p className="text-xs text-on-surface-variant mb-2">
+                  Task → attempt → captured evidence → consuming audits. Nothing here is a summary alone — every row traces to a recorded artifact.
+                </p>
+                {whyChain.tasks.map((t) => (
+                  <div key={t.task_id} className="mb-2">
+                    <p className="text-xs font-semibold text-on-surface">
+                      {t.title} <span className="text-[10px] text-on-surface-variant">· {t.state}</span>
+                    </p>
+                    {t.attempts.map((a) => (
+                      <div key={a.attempt_id} className="ml-3 mt-1">
+                        <p className="text-[11px] text-on-surface-variant">
+                          attempt · {a.outcome}
+                          {a.failure_class ? ` · ${a.failure_class}` : ""}
+                        </p>
+                        {a.evidence.map((ev) => (
+                          <p key={ev.evidence_id} className="ml-4 text-[10px] font-mono text-on-surface-variant">
+                            ↳ {ev.kind} · {ev.source}
+                            {ev.tool ? ` · ${ev.tool}` : ""} · {ev.content_hash.slice(0, 10)}…
+                          </p>
+                        ))}
+                      </div>
+                    ))}
+                  </div>
+                ))}
+                {whyChain.final_audits.length > 0 && (
+                  <div className="mt-2 border-t border-black/5 dark:border-white/5 pt-2">
+                    {whyChain.final_audits.map((a) => (
+                      <p key={a.audit_id} className="text-[11px] text-on-surface-variant">
+                        Final audit · {a.passed ? "PASSED" : "REJECTED"}
+                        {a.finding_codes.length > 0 ? ` · findings: ${a.finding_codes.join(", ")}` : " · no findings"}
+                        {a.remaining_uncertainty ? ` · uncertainty: ${a.remaining_uncertainty}` : ""}
+                      </p>
+                    ))}
+                  </div>
+                )}
+              </div>
+            )}
             {evidence.length === 0 ? (
               <p className="text-sm text-on-surface-variant">No evidence recorded yet.</p>
             ) : (

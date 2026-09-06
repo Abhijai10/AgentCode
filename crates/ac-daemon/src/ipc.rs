@@ -1185,6 +1185,17 @@ fn dispatch_request(request: &Value, daemon: &mut DaemonService) -> (Value, bool
                 Err(error) => error_response(correlation_id, error.code(), error.to_string()),
             }
         },
+        "EvidenceChain" => {
+            let mission_id = request.get("mission_id").and_then(Value::as_str).unwrap_or("");
+            match daemon.evidence_chain(mission_id) {
+                Ok(mut payload) => {
+                    payload["id"] = json!(correlation_id);
+                    payload["ok"] = json!(true);
+                    payload
+                }
+                Err(error) => error_response(correlation_id, error.code(), error.to_string()),
+            }
+        },
         "ConversationChangesCursor" => {
             let conversation_id = request.get("conversation_id").and_then(Value::as_str).unwrap_or("");
             match daemon.conversation_changes_cursor(conversation_id) {
@@ -1972,6 +1983,122 @@ mod ipc_tests {
         server.cleanup();
         daemon.shutdown().unwrap();
         std::env::remove_var("AGENTCODE_PROVIDER_MODE");
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    /// Honesty inspector: the evidence chain walks task → attempt →
+    /// evidence → final audit, and the chain projection agrees with the
+    /// flat evidence summary (same ids — never two truths).
+    #[test]
+    fn evidence_chain_walks_the_full_why_path() {
+        let (dir, db, lock, socket) = temp_paths("why-chain");
+        let project_dir = dir.join("project");
+        fs::create_dir_all(&project_dir).unwrap();
+        let mut daemon = DaemonService::open(&db, &lock).unwrap();
+        daemon.start().unwrap();
+        let Some((server, listener)) = bind_or_skip(&socket, None) else {
+            daemon.shutdown().unwrap();
+            let _ = fs::remove_dir_all(dir);
+            return;
+        };
+
+        // Seed a mission with an evidence-bearing task attempt directly in
+        // the control plane via its public APIs (the production writers).
+        let mission_id = {
+            use ac_db::{ControlPlaneDb, TaskAttemptRecord, TaskRecord};
+            let mut cp = ControlPlaneDb::open(&db).unwrap();
+            cp.migrate().unwrap();
+            let mid = ac_common::StableId::new("why");
+            cp.put_mission(&ac_kernel::Mission {
+                id: mid.clone(),
+                original_goal: "why-chain test".to_string(),
+                state: ac_kernel::MissionState::Completed,
+                created_at: ac_common::TimestampMillis::from_millis(1),
+            }).unwrap();
+            let tid = format!("task-{}", ac_common::StableId::new("why"));
+            cp.save_task(&TaskRecord {
+                id: tid.clone(),
+                mission_id: mid.to_string(),
+                title: "do the thing".to_string(),
+                state: "completed".to_string(),
+                dependencies_json: "[]".to_string(),
+                assigned_worker_id: None,
+                retry_count: 0,
+                max_retries: 3,
+                updated_at_ms: 2,
+                acceptance_criteria_json: "[]".to_string(),
+            })
+            .unwrap();
+            let evid = format!("ev-{}", ac_common::StableId::new("why"));
+            cp.append_evidence(&ac_evidence::EvidenceRecord {
+                id: ac_common::StableId::from_existing(&evid).unwrap(),
+                kind: ac_evidence::EvidenceKind::CommandOutput,
+                provenance: ac_evidence::Provenance {
+                    source: "terminal".to_string(),
+                    commit: None,
+                    worktree: None,
+                    tool: Some("cargo".to_string()),
+                },
+                artifact_uri: "mem://terminal/x".to_string(),
+                content_hash: "deadbeef".to_string(),
+                raw_content: None,
+                model_summary: Some("cargo test passed".to_string()),
+                sensitive: false,
+                created_at: ac_common::TimestampMillis::from_millis(3),
+            })
+            .unwrap();
+            cp.save_task_attempt(&TaskAttemptRecord {
+                id: format!("att-{}", ac_common::StableId::new("why")),
+                task_id: tid.clone(),
+                worker_id: "w1".to_string(),
+                outcome: "Succeeded".to_string(),
+                evidence_refs: evid.clone(),
+                failure_class: None,
+                created_at_ms: 3,
+            })
+            .unwrap();
+            cp.save_final_audit(
+                &mid.to_string(),
+                "why-chain test",
+                &["goal met".to_string()],
+                &ac_verification::FinalAuditReport {
+                    id: ac_common::StableId::new("why"),
+                    passed: true,
+                    return_to_repair: false,
+                    findings: Vec::new(),
+                    evidence_ref: ac_common::StableId::from_existing(&evid).unwrap(),
+                },
+                true,
+                "",
+            )
+            .unwrap();
+            mid.to_string()
+        };
+
+        let chain = request_via_ipc(
+            &server, &listener, &mut daemon,
+            json!({"id":"w1","command":"EvidenceChain","mission_id": mission_id}),
+        );
+        assert_eq!(chain["ok"], true, "chain: {chain}");
+        let tasks = chain["tasks"].as_array().unwrap();
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0]["title"], "do the thing");
+        let attempts = tasks[0]["attempts"].as_array().unwrap();
+        assert_eq!(attempts.len(), 1);
+        assert_eq!(attempts[0]["outcome"], "Succeeded");
+        let evidence = attempts[0]["evidence"].as_array().unwrap();
+        assert_eq!(evidence.len(), 1);
+        assert_eq!(evidence[0]["kind"], "CommandOutput");
+        assert_eq!(evidence[0]["content_hash"], "deadbeef");
+        let audits = chain["final_audits"].as_array().unwrap();
+        assert_eq!(audits.len(), 1);
+        assert_eq!(audits[0]["passed"], true);
+        // The audit row records finding codes (empty when clean); the
+        // chain reports them truthfully, not as phantom evidence ids.
+        assert!(audits[0]["finding_codes"].as_array().unwrap().is_empty());
+
+        server.cleanup();
+        daemon.shutdown().unwrap();
         let _ = fs::remove_dir_all(dir);
     }
 

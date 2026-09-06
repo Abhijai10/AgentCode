@@ -400,7 +400,10 @@ impl ControlPlaneDb {
     }
 }
 
-fn split_refs(value: &str) -> Vec<String> {
+/// Split a comma-joined evidence-ref list into trimmed ids.  Public: the
+/// daemon's honesty-inspector projection reuses the exact same parsing as
+/// the mission-evidence reader so chains never disagree with summaries.
+pub fn split_refs(value: &str) -> Vec<String> {
     value
         .split(',')
         .map(str::trim)

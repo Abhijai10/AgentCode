@@ -571,6 +571,36 @@ export const daemon = {
     }
   },
 
+  async evidenceChain(
+    missionId: string
+  ): Promise<{
+    mission_id: string;
+    tasks: {
+      task_id: string;
+      title: string;
+      state: string;
+      attempts: {
+        attempt_id: string;
+        outcome: string;
+        failure_class?: string | null;
+        evidence: { evidence_id: string; kind: string; source: string; tool?: string; summary?: string | null; content_hash: string }[];
+      }[];
+    }[];
+    final_audits: {
+      audit_id: string;
+      passed: boolean;
+      completion_allowed: boolean;
+      remaining_uncertainty: string;
+      finding_codes: string[];
+    }[];
+  } | null> {
+    try {
+      return await invoke("daemon_evidence_chain", { missionId });
+    } catch {
+      return null;
+    }
+  },
+
   async conversationChangesCursor(
     conversationId: string
   ): Promise<{ conversation_id: string; updated_at_ms: number; message_count: number; latest_message_id: string; missions: unknown[] } | null> {
