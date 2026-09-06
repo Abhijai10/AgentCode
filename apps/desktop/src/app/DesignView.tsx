@@ -98,6 +98,9 @@ export function DesignView({
     accessibility?: DesignQaReport;
     functional?: DesignQaReport;
   }>({});
+  // F2: the design contract (executable specification) + standalone QA runs.
+  const [contract, setContract] = useState<Record<string, unknown> | null>(null);
+  const [standaloneQa, setStandaloneQa] = useState<DesignQaReport | null>(null);
   const [panelBusy, setPanelBusy] = useState(false);
   const [rightOpen, setRightOpen] = useState(true);
   const [viewportHint, setViewportHint] = useState("desktop");
@@ -411,6 +414,26 @@ export function DesignView({
     runPanel(async () => {
       const r = await daemon.designPreviewStart(activeConvId!);
       if (!r.ok) setError(r.error || "Could not start preview");
+    });
+
+  // F2: the full design contract — the executable specification of this
+  // design conversation (tokens, layout rules, constraints) as the mission
+  // would receive it.
+  const handleContract = () =>
+    runPanel(async () => {
+      const r = await daemon.designContractGet(activeConvId!);
+      if (r.ok && r.contract) setContract(r.contract);
+      else setError(r.error || "Could not build design contract");
+    });
+
+  // F2: standalone per-kind QA runs (the layered report runs with Inspect;
+  // these run one kind deeply on the live preview URL or content).
+  const handleStandaloneQa = (kind: "responsive" | "accessibility" | "functional") =>
+    runPanel(async () => {
+      const url = browser?.url;
+      const r = await daemon.designQa(activeConvId!, kind, undefined, url, undefined, false, viewportHint);
+      if (r.ok && r.qa) setStandaloneQa(r.qa);
+      else setError(r.error || `Could not run ${kind} QA`);
     });
 
   // ── Render helpers ────────────────────────────────────────────────────
@@ -789,6 +812,38 @@ export function DesignView({
               >
                 Preview
               </button>
+              <button
+                onClick={handleContract}
+                disabled={panelBusy}
+                className="neo-button rounded-lg px-2 py-1 text-[10px] font-medium text-on-surface-variant disabled:opacity-50"
+                title="Build the executable design contract"
+              >
+                Contract
+              </button>
+              <button
+                onClick={() => handleStandaloneQa("responsive")}
+                disabled={panelBusy}
+                className="neo-button rounded-lg px-2 py-1 text-[10px] font-medium text-on-surface-variant disabled:opacity-50"
+                title="Responsive QA across real viewports"
+              >
+                QA·R
+              </button>
+              <button
+                onClick={() => handleStandaloneQa("accessibility")}
+                disabled={panelBusy}
+                className="neo-button rounded-lg px-2 py-1 text-[10px] font-medium text-on-surface-variant disabled:opacity-50"
+                title="Accessibility QA (contrast, targets, labels)"
+              >
+                QA·A11y
+              </button>
+              <button
+                onClick={() => handleStandaloneQa("functional")}
+                disabled={panelBusy}
+                className="neo-button rounded-lg px-2 py-1 text-[10px] font-medium text-on-surface-variant disabled:opacity-50"
+                title="Functional QA (interactions work)"
+              >
+                QA·F
+              </button>
             </div>
           </div>
 
@@ -1077,6 +1132,41 @@ export function DesignView({
               </p>
             )}
           </section>
+
+          <section className="neo-raised rounded-2xl p-4">
+            <div className="flex items-center justify-between mb-2">
+              <h4 className="text-sm font-semibold text-on-surface">Design Contract</h4>
+            </div>
+            {contract ? (
+              <pre className="text-[10px] font-mono text-on-surface-variant overflow-auto max-h-48 neo-pressed rounded-lg p-2">
+                {JSON.stringify(contract, null, 2)}
+              </pre>
+            ) : (
+              <p className="text-xs text-on-surface-variant">Run “Contract” to build the executable specification.</p>
+            )}
+          </section>
+
+          {standaloneQa && (
+            <section className="neo-raised rounded-2xl p-4">
+              <div className="flex items-center justify-between mb-2">
+                <h4 className="text-sm font-semibold text-on-surface">QA Report</h4>
+                <span className={`text-[10px] font-medium ${standaloneQa.passed ? "text-emerald-600" : "text-amber-600"}`}>
+                  {standaloneQa.passed ? "PASSED" : "ISSUES FOUND"}
+                </span>
+              </div>
+              <ul className="space-y-1 text-xs text-on-surface-variant">
+                {(standaloneQa.issues ?? []).map((issue, i) => (
+                  <li key={i} className="flex items-start gap-2">
+                    <span className="text-amber-600">!</span>
+                    <span className="flex-1">{issue}</span>
+                  </li>
+                ))}
+                {(standaloneQa.issues ?? []).length === 0 && (
+                  <li className="text-emerald-600">All checks passed.</li>
+                )}
+              </ul>
+            </section>
+          )}
 
           <section className="neo-raised rounded-2xl p-4">
             <div className="flex items-center justify-between mb-2">

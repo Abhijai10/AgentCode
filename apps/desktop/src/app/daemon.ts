@@ -1201,6 +1201,22 @@ export const daemon = {
     }
   },
 
+  async designContractGet(
+    conversationId: string
+  ): Promise<{ ok: boolean; contract?: Record<string, unknown>; error?: string }> {
+    try {
+      const res = await invoke<{ contract: Record<string, unknown> }>(
+        "daemon_design_contract",
+        { conversationId }
+      );
+      return { ok: true, contract: res.contract };
+    } catch (e: unknown) {
+      const message = e instanceof Error ? e.message : String(e);
+      const cleaned = message.replace(/^[A-Z0-9_-]+:\s*/, "");
+      return { ok: false, error: cleaned || message };
+    }
+  },
+
   async designExecuteContract(
     conversationId: string
   ): Promise<{ ok: boolean; missionId?: string; contractGoal?: string; error?: string }> {
