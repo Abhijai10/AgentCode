@@ -109,8 +109,12 @@ impl ControlPlaneDb {
     pub fn save_mcp_server(&self, server: &McpServerRecord) -> AcResult<()> {
         self.connection
             .execute(
-                "INSERT INTO mcp_servers VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
-                 ON CONFLICT(id) DO UPDATE SET health=excluded.health, restart_count=excluded.restart_count, trust_tier=excluded.trust_tier",
+                "INSERT INTO mcp_servers
+                 (id, name, version, transport, trust_tier, health, restart_count, expected_argv_hash)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                 ON CONFLICT(id) DO UPDATE SET health=excluded.health,
+                 restart_count=excluded.restart_count, trust_tier=excluded.trust_tier,
+                 expected_argv_hash=excluded.expected_argv_hash",
                 params![
                     server.id.to_string(),
                     server.name,
@@ -118,7 +122,8 @@ impl ControlPlaneDb {
                     format!("{:?}", server.transport),
                     format!("{:?}", server.trust_tier),
                     format!("{:?}", server.health),
-                    server.restart_count
+                    server.restart_count,
+                    server.expected_argv_hash
                 ],
             )
             .map_err(db_error)?;
@@ -166,7 +171,8 @@ impl ControlPlaneDb {
     pub fn mcp_server(&self, id: &str) -> AcResult<Option<McpServerRow>> {
         self.connection
             .query_row(
-                "SELECT id, name, health, restart_count FROM mcp_servers WHERE id=?1",
+                "SELECT id, name, health, restart_count, expected_argv_hash
+                 FROM mcp_servers WHERE id=?1",
                 params![id],
                 |row| {
                     Ok(McpServerRow {
@@ -174,6 +180,7 @@ impl ControlPlaneDb {
                         name: row.get(1)?,
                         health: row.get(2)?,
                         restart_count: row.get::<_, i64>(3)? as u32,
+                        expected_argv_hash: row.get(4)?,
                     })
                 },
             )

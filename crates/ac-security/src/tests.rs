@@ -242,6 +242,56 @@ mod tests {
         assert_eq!(recursive[0].outcome, HookOutcome::Blocked);
     }
 
+    /// MCP argv-hash pinning (final-audit supply-chain recommendation):
+    /// a pinned server connects only when its ACTUAL argv hashes to the
+    /// manifest pin; a swapped binary (drifted argv) is refused with a
+    /// clear error naming the server.  Unpinned servers stay connectable
+    /// (pinning is opt-in per reviewed manifest).
+    #[test]
+    fn mcp_argv_pinning_refuses_drifted_binaries() {
+        let mut registry = McpRegistry::new();
+        let server = registry
+            .register_server("filesystem-helper", "1", McpTransport::Stdio)
+            .unwrap();
+
+        // Unpinned: any argv passes.
+        registry.connect(&server).unwrap();
+        registry
+            .verify_argv(&server, &["/usr/local/bin/fs-helper".to_string()])
+            .unwrap();
+
+        // Pin the reviewed manifest's argv.
+        let argv = vec![
+            "/usr/local/bin/fs-helper".to_string(),
+            "--stdio".to_string(),
+        ];
+        let pin = McpRegistry::argv_hash_for(&argv);
+        assert!(pin.starts_with("sha256:"));
+        assert_eq!(pin.len(), 7 + 64);
+        registry.pin_argv_hash(&server, pin.clone()).unwrap();
+
+        // Exact argv verifies.
+        registry.verify_argv(&server, &argv).unwrap();
+
+        // A swapped binary (different path or flags) is REFUSED.
+        let swapped = vec![
+            "/tmp/evil-helper".to_string(),
+            "--stdio".to_string(),
+        ];
+        let err = registry.verify_argv(&server, &swapped).unwrap_err();
+        assert_eq!(err.code(), "MCP-ARGV_HASH_MISMATCH");
+        assert!(err.to_string().contains("filesystem-helper"));
+
+        // Malformed pins are rejected at pin time.
+        let bad_pin = registry.pin_argv_hash(&server, "deadbeef");
+        assert_eq!(bad_pin.unwrap_err().code(), "MCP-INVALID_ARGV_HASH");
+
+        // The pin is visible on the record the persistence layer saves
+        // (the DB column added in migration 0030 keeps it across restarts).
+        let record = registry.discover_servers().into_iter().next().unwrap();
+        assert_eq!(record.expected_argv_hash.as_deref(), Some(pin.as_str()));
+    }
+
     #[test]
     fn phase16_mcp_discovery_filtering_invocation_and_recovery_work() {
         let mut registry = McpRegistry::new();

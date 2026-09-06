@@ -1378,6 +1378,11 @@ mod tests {
                 trust_tier: ac_security::TrustTier::Project,
                 health: ac_security::McpHealth::Connected,
                 restart_count: 1,
+                // Migration 0030 column: a real 64-hex argv pin round-trips.
+                expected_argv_hash: Some(format!(
+                    "sha256:{}",
+                    "a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f60718293a4b5c6d7e8f90"
+                )),
             })
             .unwrap();
             db.save_mcp_tool(&McpToolRecord {
@@ -1414,6 +1419,11 @@ mod tests {
             let server = db.mcp_server(server_id.as_str()).unwrap().unwrap();
             assert_eq!(server.health, "Connected");
             assert_eq!(server.restart_count, 1);
+            // Migration 0030: the argv-hash pin survives reopen.
+            assert_eq!(
+                server.expected_argv_hash.as_deref(),
+                Some("sha256:a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f60718293a4b5c6d7e8f90")
+            );
         }
         let _ = fs::remove_file(path);
     }

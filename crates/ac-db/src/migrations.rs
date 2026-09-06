@@ -1,4 +1,4 @@
-pub const CURRENT_SCHEMA_VERSION: u32 = 29;
+pub const CURRENT_SCHEMA_VERSION: u32 = 30;
 
 impl ControlPlaneDb {
     pub fn open(path: impl AsRef<Path>) -> AcResult<Self> {
@@ -207,6 +207,17 @@ impl ControlPlaneDb {
         if current_version < 29 {
             tx.execute_batch(include_str!(
                 "../../../migrations/0027_provider_preferences.sql"
+            ))
+            .map_err(db_error)?;
+        }
+        if current_version < 30 {
+            // MCP argv-hash pinning (final-audit supply-chain
+            // recommendation) + hot-path query indices.  The version gate
+            // runs the ALTER exactly once per database; fresh databases
+            // create mcp_servers at version 11 WITHOUT the column, so
+            // they take the ALTER here too.
+            tx.execute_batch(include_str!(
+                "../../../migrations/0030_mcp_argv_pinning_query_indices.sql"
             ))
             .map_err(db_error)?;
         }

@@ -143,6 +143,9 @@ pub struct McpServerRow {
     pub name: String,
     pub health: String,
     pub restart_count: u32,
+    /// MCP argv-hash pin persisted by migration 0030 (supply-chain
+    /// posture: a swapped binary must not silently ride an admitted name).
+    pub expected_argv_hash: Option<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

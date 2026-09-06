@@ -6,6 +6,8 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+# Hash pinning for MCP argv manifests (DEP-ADM-005: sha2 already admitted)
+sha2 = "0.10.9"
 ac-common = { path = "../ac-common" }
 ac-evidence = { path = "../ac-evidence" }
 serde_json = "1.0.151"

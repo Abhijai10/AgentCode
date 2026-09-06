@@ -21,6 +21,11 @@ pub struct McpServerRecord {
     pub trust_tier: TrustTier,
     pub health: McpHealth,
     pub restart_count: u32,
+    /// Optional argv hash pin from the reviewed server manifest: when set,
+    /// connect() verifies the server's ACTUAL argv hashes to this value and
+    /// refuses to connect on mismatch (a swapped binary must not silently
+    /// ride the admitted name).
+    pub expected_argv_hash: Option<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -81,9 +86,68 @@ impl McpRegistry {
                 trust_tier: TrustTier::Untrusted,
                 health: McpHealth::Discovered,
                 restart_count: 0,
+                expected_argv_hash: None,
             },
         );
         Ok(id)
+    }
+
+    /// Pin this server's argv to a manifest hash (sha256 of the
+    /// NUL-joined argv vector).  Once pinned, connect() verifies the
+    /// actual argv and refuses mismatches — the supply-chain posture the
+    /// manifest admission promised.
+    pub fn pin_argv_hash(&mut self, id: &StableId, hash: impl Into<String>) -> AcResult<()> {
+        let hash = hash.into();
+        if !hash.starts_with("sha256:") || hash.len() != 7 + 64 {
+            return Err(AcError::validation(
+                "MCP-INVALID_ARGV_HASH",
+                "argv hash must be 'sha256:' followed by 64 hex chars",
+            ));
+        }
+        let server = self.servers.get_mut(id).ok_or_else(|| {
+            AcError::validation("MCP-SERVER_NOT_FOUND", "MCP server is not registered")
+        })?;
+        server.expected_argv_hash = Some(hash);
+        Ok(())
+    }
+
+    /// Compute the canonical argv pin for an argv vector (sha256 of the
+    /// NUL-joined argv).  Manifest authors use this to write the pin.
+    pub fn argv_hash_for(argv: &[String]) -> String {
+        use sha2::{Digest, Sha256};
+        let mut hasher = Sha256::new();
+        for arg in argv {
+            hasher.update(arg.as_bytes());
+            hasher.update([0]);
+        }
+        let digest = hasher.finalize();
+        format!("sha256:{}", digest.iter().map(|b| format!("{b:02x}")).collect::<String>())
+    }
+
+    /// Verify a server's actual argv against its pin.  Unpinned servers
+    /// pass (pinning is opt-in per manifest); pinned servers must match
+    /// EXACTLY — any drift refuses the connection.
+    pub fn verify_argv(&self, id: &StableId, argv: &[String]) -> AcResult<()> {
+        let server = self.servers.get(id).ok_or_else(|| {
+            AcError::validation("MCP-SERVER_NOT_FOUND", "MCP server is not registered")
+        })?;
+        match &server.expected_argv_hash {
+            None => Ok(()),
+            Some(expected) => {
+                let actual = Self::argv_hash_for(argv);
+                if &actual == expected {
+                    Ok(())
+                } else {
+                    Err(AcError::validation(
+                        "MCP-ARGV_HASH_MISMATCH",
+                        format!(
+                            "server '{}' argv hash drifted from the pinned manifest                              (expected {expected}, got {actual}); refusing to connect —                              re-review and re-pin the server",
+                            server.name
+                        ),
+                    ))
+                }
+            }
+        }
     }
 
     pub fn connect(&mut self, id: &StableId) -> AcResult<()> {

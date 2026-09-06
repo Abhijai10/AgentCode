@@ -197,6 +197,7 @@ dependencies = [
  "ac-common",
  "ac-evidence",
  "serde_json",
+ "sha2",
 ]
 
 [[package]]
