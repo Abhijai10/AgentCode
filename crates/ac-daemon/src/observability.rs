@@ -572,6 +572,55 @@ impl DaemonService {
     /// events, changesets, evidence, verification) — nothing is fabricated.
     /// A message whose `mission_ref` points at a real mission yields a block;
     /// messages without a mission reference are plain chat and are skipped.
+    /// F11 (final audit): a CHEAP cursor for change detection.  Polling the
+    /// heavy ConversationActivity projection every 2.5s recomputes six
+    /// mission projections; views poll this instead and only refetch the
+    /// full activity when the cursor changes.  The cursor is content-based
+    /// (message count, latest message id, per-mission state + latest event
+    /// id), so any state change moves it.
+    pub fn conversation_changes_cursor(&self, conversation_id: &str) -> AcResult<Value> {
+        let conv = self.db.conversation(conversation_id)?.ok_or_else(|| {
+            AcError::validation("CONVERSATION-NOT_FOUND", "conversation not found")
+        })?;
+        let messages = self.db.messages_for_conversation(conversation_id)?;
+        let latest_message_id = messages.last().map(|m| m.id.clone()).unwrap_or_default();
+        let mut mission_states: Vec<Value> = Vec::new();
+        let mut seen = std::collections::BTreeSet::new();
+        for message in &messages {
+            let Some(mission_ref) = &message.mission_ref else {
+                continue;
+            };
+            if !seen.insert(mission_ref.clone()) {
+                continue;
+            }
+            let mid = match StableId::from_existing(mission_ref) {
+                Ok(id) => id,
+                Err(_) => continue,
+            };
+            if self.db.get_mission(&mid)?.is_none() {
+                continue;
+            }
+            let state = self
+                .mission_status(mission_ref)
+                .map(|s| json!({"state": s.state}))
+                .unwrap_or(Value::Null);
+            let latest_event = self
+                .db
+                .mission_activity(mission_ref, 1)?
+                .first()
+                .map(|e| json!({"id": e.id, "at_ms": e.created_at_ms}))
+                .unwrap_or(Value::Null);
+            mission_states.push(json!({"mission_id": mission_ref, "state": state, "latest_event": latest_event}));
+        }
+        Ok(json!({
+            "conversation_id": conversation_id,
+            "updated_at_ms": conv.updated_at_ms,
+            "message_count": messages.len(),
+            "latest_message_id": latest_message_id,
+            "missions": mission_states,
+        }))
+    }
+
     pub fn conversation_activity(&self, conversation_id: &str) -> AcResult<Value> {
         let conv = self.db.conversation(conversation_id)?.ok_or_else(|| {
             AcError::validation("CONVERSATION-NOT_FOUND", "conversation not found")

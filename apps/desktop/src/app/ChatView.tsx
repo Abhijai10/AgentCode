@@ -516,7 +516,24 @@ export function ChatView({
     if (!activeConvId) return;
     let cancelled = false;
     let timer: ReturnType<typeof setInterval> | null = null;
+    // F11 (final audit): cursor-gated refresh — the CHEAP change cursor is
+    // polled every tick; the heavy conversation + activity projections are
+    // refetched only when the cursor moves.  Identical terminal behavior,
+    // a fraction of the daemon work per tick.
+    let lastCursor: string | null = null;
     const refresh = async () => {
+      const cursor = await daemon.conversationChangesCursor(activeConvId);
+      if (cancelled) return;
+      if (cursor) {
+        const signature = JSON.stringify([
+          cursor.updated_at_ms,
+          cursor.message_count,
+          cursor.latest_message_id,
+          cursor.missions,
+        ]);
+        if (signature === lastCursor) return; // nothing changed — skip heavy work
+        lastCursor = signature;
+      }
       const [detail, act] = await Promise.all([
         daemon.getConversation(activeConvId),
         daemon.getConversationActivity(activeConvId),

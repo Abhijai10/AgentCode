@@ -1153,6 +1153,17 @@ fn dispatch_request(request: &Value, daemon: &mut DaemonService) -> (Value, bool
                 Err(error) => error_response(correlation_id, error.code(), error.to_string()),
             }
         },
+        "ConversationChangesCursor" => {
+            let conversation_id = request.get("conversation_id").and_then(Value::as_str).unwrap_or("");
+            match daemon.conversation_changes_cursor(conversation_id) {
+                Ok(mut payload) => {
+                    payload["id"] = json!(correlation_id);
+                    payload["ok"] = json!(true);
+                    payload
+                }
+                Err(error) => error_response(correlation_id, error.code(), error.to_string()),
+            }
+        },
         "ConversationActivity" => {
             let conversation_id = request.get("conversation_id").and_then(Value::as_str).unwrap_or("");
             match daemon.conversation_activity(conversation_id) {
@@ -1811,6 +1822,69 @@ mod ipc_tests {
         });
         pump_until(server, listener, daemon, &client);
         client.join().unwrap()
+    }
+
+    /// F11: the conversation changes cursor is a CHEAP change-detection
+    /// signal — it must move when a message lands and stay stable otherwise
+    /// (so cursor-gated UI polling can skip the heavy projections).
+    #[test]
+    fn conversation_changes_cursor_moves_only_on_change() {
+        let (dir, db, lock, socket) = temp_paths("f11-cursor");
+        let project = dir.join("project");
+        fs::create_dir_all(&project).unwrap();
+        let project_path = project.to_string_lossy().to_string();
+
+        let mut daemon = DaemonService::open(&db, &lock).unwrap();
+        daemon.start().unwrap();
+        let (server, listener) = bind_or_skip(&socket, None).expect("bind");
+
+        let create = request_via_ipc(
+            &server,
+            &listener,
+            &mut daemon,
+            json!({"id":"c1","command":"ConversationCreate","project_path": project_path, "mode":"GOAL","title":"F11 Cursor"}),
+        );
+        assert_eq!(create["ok"], true);
+        let cid = create["conversation_id"].as_str().unwrap().to_string();
+
+        let cursor1 = request_via_ipc(
+            &server,
+            &listener,
+            &mut daemon,
+            json!({"id":"cur1","command":"ConversationChangesCursor","conversation_id": cid}),
+        );
+        assert_eq!(cursor1["ok"], true, "cursor1: {cursor1}");
+        assert_eq!(cursor1["message_count"], 0);
+
+        // A no-op re-read must return the SAME cursor values.
+        let cursor2 = request_via_ipc(
+            &server,
+            &listener,
+            &mut daemon,
+            json!({"id":"cur2","command":"ConversationChangesCursor","conversation_id": cid}),
+        );
+        assert_eq!(cursor2["message_count"], cursor1["message_count"]);
+        assert_eq!(cursor2["updated_at_ms"], cursor1["updated_at_ms"]);
+
+        // Send a message — the cursor must move.
+        let send = request_via_ipc(
+            &server,
+            &listener,
+            &mut daemon,
+            json!({"id":"m1","command":"MessageAppend","conversation_id": cid, "role":"user", "content":"hello cursor"}),
+        );
+        assert_eq!(send["ok"], true, "send: {send}");
+        let cursor3 = request_via_ipc(
+            &server,
+            &listener,
+            &mut daemon,
+            json!({"id":"cur3","command":"ConversationChangesCursor","conversation_id": cid}),
+        );
+        assert_eq!(cursor3["message_count"], 1, "cursor3: {cursor3}");
+        assert_ne!(cursor3["updated_at_ms"], cursor1["updated_at_ms"]);
+
+        daemon.stop().unwrap();
+        let _ = fs::remove_dir_all(&dir);
     }
 
     /// F1: project memory persists through missions and daemon restarts,

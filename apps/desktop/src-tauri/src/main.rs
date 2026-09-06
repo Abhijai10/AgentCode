@@ -973,6 +973,19 @@ fn daemon_get_evidence_summary(
 }
 
 #[tauri::command]
+fn daemon_conversation_changes_cursor(
+    state: tauri::State<DaemonClient>,
+    conversation_id: String,
+) -> Result<Value, String> {
+    request(
+        &state.0,
+        "ui",
+        "ConversationChangesCursor",
+        json!({ "conversation_id": conversation_id }),
+    )
+}
+
+#[tauri::command]
 fn daemon_project_memory_get(
     state: tauri::State<DaemonClient>,
     project_path: String,
@@ -2190,6 +2203,7 @@ fn main() {
             daemon_get_mission_events,
             daemon_get_evidence_summary,
             daemon_project_memory_get,
+            daemon_conversation_changes_cursor,
             daemon_get_verification_summary,
             daemon_list_tools,
             daemon_list_scanners,

@@ -571,6 +571,23 @@ export const daemon = {
     }
   },
 
+  async conversationChangesCursor(
+    conversationId: string
+  ): Promise<{ conversation_id: string; updated_at_ms: number; message_count: number; latest_message_id: string; missions: unknown[] } | null> {
+    try {
+      const res = await invoke<{
+        conversation_id: string;
+        updated_at_ms: number;
+        message_count: number;
+        latest_message_id: string;
+        missions: unknown[];
+      }>("daemon_conversation_changes_cursor", { conversationId });
+      return res ?? null;
+    } catch {
+      return null;
+    }
+  },
+
   async projectMemoryGet(projectPath: string): Promise<ProjectMemory | null> {
     try {
       const res = await invoke<ProjectMemory & { ok: boolean }>(
