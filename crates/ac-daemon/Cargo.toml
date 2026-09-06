@@ -9,6 +9,7 @@ ac-agent = { path = "../ac-agent" }
 ac-changeset = { path = "../ac-changeset" }
 ac-common = { path = "../ac-common" }
 ac-config = { path = "../ac-config" }
+ac-context = { path = "../ac-context" }
 ac-db = { path = "../ac-db" }
 ac-evidence = { path = "../ac-evidence" }
 ac-git = { path = "../ac-git" }

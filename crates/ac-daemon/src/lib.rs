@@ -58,6 +58,27 @@ impl SqliteAgentDurability {
     fn db(&self) -> AcResult<ControlPlaneDb> {
         ControlPlaneDb::open(&self.db_path)
     }
+
+    /// Resolve the durable repository identity for a mission: conversation's
+    /// project_path if bound, else the session workspace root.  Same
+    /// authoritative-resolution order as provider routing records (never
+    /// fabricated).
+    fn repository_identity_for_mission(&self, mission_id: &StableId) -> AcResult<String> {
+        let db = self.db()?;
+        let project_path = db
+            .conversation_for_mission(&mission_id.to_string())?
+            .map(|conversation| conversation.project_path)
+            .or_else(|| {
+                db.session_for_mission(mission_id)
+                    .ok()
+                    .flatten()
+                    .and_then(|session| session.workspace_root)
+            });
+        match project_path {
+            Some(path) => Ok(crate::project_repository_identity(&path)),
+            None => Ok(format!("repo-{}", mission_id.as_str())),
+        }
+    }
 }
 
 impl ac_agent::AgentDurabilityObserver for SqliteAgentDurability {
@@ -108,6 +129,74 @@ impl ac_agent::AgentDurabilityObserver for SqliteAgentDurability {
             .into_iter()
             .filter(|record| ids.contains(&record.id))
             .collect())
+    }
+
+    /// F1: persist a memory fact under the mission's repository identity so
+    /// project memory survives the mission and is available to every mode.
+    fn memory_fact_persisted(
+        &mut self,
+        mission_id: &StableId,
+        fact: &ac_context::MemoryFact,
+    ) -> AcResult<()> {
+        let db = self.db()?;
+        let repository_id = self.repository_identity_for_mission(mission_id)?;
+        let evidence = fact
+            .source_evidence
+            .iter()
+            .map(|reference| ac_db::MemoryEvidenceRow {
+                fact_id: fact.id.to_string(),
+                evidence_ref: reference.to_string(),
+                file_path: None,
+                symbol: None,
+                content_hash: None,
+            })
+            .collect::<Vec<_>>();
+        db.save_memory_fact(
+            &ac_db::MemoryFactRow {
+                id: fact.id.to_string(),
+                repository_id,
+                mission_id: Some(mission_id.to_string()),
+                task_id: fact.scope.task_id.as_ref().map(ToString::to_string),
+                branch: fact.scope.branch.clone(),
+                statement: fact.statement.clone(),
+                fact_type: fact.fact_type.as_str().to_string(),
+                source: fact.source.as_str().to_string(),
+                confidence: fact.confidence,
+                freshness: fact.freshness.as_str().to_string(),
+                memory_class: fact.memory_class.as_str().to_string(),
+                observed_commit: fact.observed_commit.clone(),
+                conflict_set_id: fact.conflict_set.as_ref().map(ToString::to_string),
+                valid_from_ms: fact.valid_from.as_millis() as i64,
+                valid_until_ms: fact.valid_until.as_ref().map(|t| t.as_millis() as i64),
+                superseded_by: fact.superseded_by.as_ref().map(ToString::to_string),
+                last_validation_ms: fact.last_validation.as_millis() as i64,
+            },
+            &evidence,
+        )
+    }
+
+    /// F1: persist a task memory (mission-scoped).
+    fn task_memory_persisted(
+        &mut self,
+        mission_id: &StableId,
+        memory: &ac_context::TaskMemory,
+    ) -> AcResult<()> {
+        let db = self.db()?;
+        let refs = memory
+            .evidence_refs
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(",");
+        db.save_task_memory(&ac_db::TaskMemoryRow {
+            id: memory.id.to_string(),
+            task_id: memory.task_id.to_string(),
+            summary: memory.summary.clone(),
+            evidence_refs: refs,
+            created_at_ms: memory.created_at.as_millis() as i64,
+        })?;
+        let _ = mission_id; // mission scoping lives on fact rows; task memory is task-scoped
+        Ok(())
     }
 
     fn provider_routing_recorded(
@@ -655,6 +744,75 @@ fn transition_mission_to_terminal(
     }
 }
 
+/// Convert a persisted memory-fact row into the in-process model (F1).
+/// Unknown enum strings degrade honestly to ArchitectureFact/Runtime/Fresh/
+/// TaskScoped — never fabricate a failure, never invent authority.
+fn memory_fact_row_to_model(
+    row: &ac_db::MemoryFactRow,
+    evidence: Vec<StableId>,
+) -> ac_context::MemoryFact {
+    ac_context::MemoryFact {
+        id: StableId::from_existing(&row.id).unwrap_or_else(|_| StableId::new("mem")),
+        statement: row.statement.clone(),
+        fact_type: ac_context::FactType::parse(&row.fact_type)
+            .unwrap_or(ac_context::FactType::ArchitectureFact),
+        source: ac_context::FactSource::parse(&row.source)
+            .unwrap_or(ac_context::FactSource::Runtime),
+        source_evidence: evidence,
+        confidence: row.confidence,
+        freshness: ac_context::FreshnessState::parse(&row.freshness)
+            .unwrap_or(ac_context::FreshnessState::Fresh),
+        scope: ac_context::MemoryScope {
+            repository_id: StableId::from_existing(&row.repository_id)
+                .unwrap_or_else(|_| StableId::new("repo")),
+            mission_id: row
+                .mission_id
+                .as_deref()
+                .and_then(|id| StableId::from_existing(id).ok()),
+            task_id: row
+                .task_id
+                .as_deref()
+                .and_then(|id| StableId::from_existing(id).ok()),
+            branch: row.branch.clone(),
+        },
+        memory_class: ac_context::MemoryClass::parse(&row.memory_class)
+            .unwrap_or(ac_context::MemoryClass::TaskScoped),
+        observed_commit: row.observed_commit.clone(),
+        dependencies: Vec::new(),
+        conflict_set: row
+            .conflict_set_id
+            .as_deref()
+            .and_then(|id| StableId::from_existing(id).ok()),
+        valid_from: ac_common::TimestampMillis::from_millis(row.valid_from_ms.max(0) as u128),
+        valid_until: row
+            .valid_until_ms
+            .map(|value| ac_common::TimestampMillis::from_millis(value.max(0) as u128)),
+        superseded_by: row
+            .superseded_by
+            .as_deref()
+            .and_then(|id| StableId::from_existing(id).ok()),
+        last_validation: ac_common::TimestampMillis::from_millis(
+            row.last_validation_ms.max(0) as u128
+        ),
+    }
+}
+
+/// Convert a persisted task-memory row into the in-process model (F1).
+fn task_memory_row_to_model(row: &ac_db::TaskMemoryRow) -> ac_context::TaskMemory {
+    ac_context::TaskMemory {
+        id: StableId::from_existing(&row.id).unwrap_or_else(|_| StableId::new("taskmem")),
+        task_id: StableId::from_existing(&row.task_id).unwrap_or_else(|_| StableId::new("task")),
+        summary: row.summary.clone(),
+        evidence_refs: row
+            .evidence_refs
+            .split(',')
+            .filter(|value| !value.is_empty())
+            .filter_map(|value| StableId::from_existing(value).ok())
+            .collect(),
+        created_at: ac_common::TimestampMillis::from_millis(row.created_at_ms.max(0) as u128),
+    }
+}
+
 fn execute_mission(
     db_path: &Path,
     workspace_root: &Path,
@@ -717,6 +875,44 @@ fn execute_mission(
             return Err(error);
         }
     };
+    // F1: hydrate durable project memory — facts and task memories from
+    // previous missions on this repository become AcceptedMemory context.
+    {
+        let repository_id = db
+            .conversation_for_mission(&job.mission_id.to_string())
+            .ok()
+            .flatten()
+            .map(|conversation| conversation.project_path)
+            .or_else(|| {
+                db.session_for_mission(&job.mission_id)
+                    .ok()
+                    .flatten()
+                    .and_then(|session| session.workspace_root)
+            })
+            .map(|path| crate::project_repository_identity(&path))
+            .unwrap_or_else(|| job.mission_id.to_string());
+        let facts = db
+            .memory_facts_for(&repository_id, 200)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|row| {
+                let evidence = db
+                    .memory_fact_evidence(&row.id)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .filter_map(|e| StableId::from_existing(&e.evidence_ref).ok())
+                    .collect();
+                memory_fact_row_to_model(&row, evidence)
+            })
+            .collect::<Vec<_>>();
+        let task_memories = db
+            .task_memories_newest(100)
+            .unwrap_or_default()
+            .iter()
+            .map(task_memory_row_to_model)
+            .collect::<Vec<_>>();
+        agent.hydrate_project_memory(facts, task_memories);
+    }
     let report = match agent.run_goal(ac_agent::Goal::with_attachments(
         job.goal.clone(),
         job.attachments.clone(),

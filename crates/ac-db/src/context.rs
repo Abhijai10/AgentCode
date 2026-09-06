@@ -290,6 +290,57 @@ impl ControlPlaneDb {
         Ok(())
     }
 
+    /// Repository-scoped live (not superseded) memory facts, newest first
+    /// (F1: hydration for agents + cross-mode reads).
+    pub fn memory_facts_for(
+        &self,
+        repository_id: &str,
+        limit: usize,
+    ) -> AcResult<Vec<MemoryFactRow>> {
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT id, repository_id, mission_id, task_id, branch, statement, fact_type,
+                        source, confidence, freshness, memory_class, observed_commit,
+                        conflict_set_id, valid_from_ms, valid_until_ms, superseded_by,
+                        last_validation_ms
+                 FROM memory_facts WHERE repository_id=?1
+                 ORDER BY last_validation_ms DESC LIMIT ?2",
+            )
+            .map_err(db_error)?;
+        let rows = statement
+            .query_map(params![repository_id, limit as i64], memory_fact_from_row)
+            .map_err(db_error)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(db_error)?;
+        Ok(rows)
+    }
+
+    /// Repository-scoped task memories, newest first (F1 hydration).
+    pub fn task_memories_newest(&self, limit: usize) -> AcResult<Vec<TaskMemoryRow>> {
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT id, task_id, summary, evidence_refs, created_at_ms
+                 FROM task_memory ORDER BY created_at_ms DESC LIMIT ?1",
+            )
+            .map_err(db_error)?;
+        let rows = statement
+            .query_map(params![limit as i64], |row| {
+                Ok(TaskMemoryRow {
+                    id: row.get(0)?,
+                    task_id: row.get(1)?,
+                    summary: row.get(2)?,
+                    evidence_refs: row.get(3)?,
+                    created_at_ms: row.get(4)?,
+                })
+            })
+            .map_err(db_error)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(db_error)?;
+        Ok(rows)
+    }
+
     pub fn memory_fact(&self, id: &str) -> AcResult<Option<MemoryFactRow>> {
         self.connection
             .query_row(

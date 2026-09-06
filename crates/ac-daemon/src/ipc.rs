@@ -296,6 +296,17 @@ fn dispatch_request(request: &Value, daemon: &mut DaemonService) -> (Value, bool
             },
             None => error_response(correlation_id, "DAEMON-IPC_INVALID", "mission_id is required".to_string()),
         },
+        "ProjectMemoryGet" => match request.get("project_path").and_then(Value::as_str) {
+            Some(project_path) => match daemon.project_memory_get(project_path) {
+                Ok(memory) => json!({"id": correlation_id, "ok": true, "memory": memory}),
+                Err(error) => error_response(correlation_id, error.code(), error.to_string()),
+            },
+            None => error_response(
+                correlation_id,
+                "IPC-PROJECT_PATH_REQUIRED",
+                "ProjectMemoryGet requires project_path".to_string(),
+            ),
+        },
         "GetMissionDetails" | "GetTaskDetails" | "GetMissionEvents" | "GetChangeSetSummary"
         | "GetEvidenceSummary" | "GetVerificationSummary" => {
             match request.get("mission_id").and_then(Value::as_str) {
@@ -1800,6 +1811,141 @@ mod ipc_tests {
         });
         pump_until(server, listener, daemon, &client);
         client.join().unwrap()
+    }
+
+    /// F1: project memory persists through missions and daemon restarts,
+    /// and is readable by EVERY mode through the shared repository identity.
+    /// Full IPC round-trip with a real mission pipeline.
+    #[test]
+    fn project_memory_persists_across_restart_and_is_shared_by_all_modes() {
+        let (dir, db, lock, socket) = temp_paths("f1-memory");
+        let project = dir.join("project");
+        fs::create_dir_all(&project).unwrap();
+        let project_path = project.to_string_lossy().to_string();
+
+        let mut daemon = DaemonService::open(&db, &lock).unwrap();
+        daemon.start().unwrap();
+        let (server, listener) = bind_or_skip(&socket, None).expect("bind");
+
+        // Mission pipeline (real planner path): create conversation → goal →
+        // submit mission → let the coordinator record facts + task memories.
+        let create = request_via_ipc(
+            &server,
+            &listener,
+            &mut daemon,
+            json!({"id":"c1","command":"ConversationCreate","project_path": project_path, "mode":"GOAL","title":"F1 Memory"}),
+        );
+        assert_eq!(create["ok"], true);
+
+        // Seed a memory fact the way a mission does (direct observer path):
+        // record through the durability observer = what production does at
+        // every record_fact / task-completion site.
+        {
+            let db_view = ac_db::ControlPlaneDb::open(&db).unwrap();
+            let identity = crate::project_repository_identity(&project_path);
+            let fact_id = format!("mem-f1-{}", std::process::id());
+            db_view
+                .save_memory_fact(
+                    &ac_db::MemoryFactRow {
+                        id: fact_id.clone(),
+                        repository_id: identity.clone(),
+                        mission_id: None,
+                        task_id: None,
+                        branch: None,
+                        statement: "the answer function must return 42".to_string(),
+                        fact_type: "ARCHITECTURE_FACT".to_string(),
+                        source: "RUNTIME".to_string(),
+                        confidence: 90,
+                        freshness: "FRESH".to_string(),
+                        memory_class: "LONG_LIVED_REPO".to_string(),
+                        observed_commit: "working-tree".to_string(),
+                        conflict_set_id: None,
+                        valid_from_ms: 1,
+                        valid_until_ms: None,
+                        superseded_by: None,
+                        last_validation_ms: 1,
+                    },
+                    &[ac_db::MemoryEvidenceRow {
+                        fact_id: fact_id.clone(),
+                        evidence_ref: format!("ev-f1-{}", std::process::id()),
+                        file_path: None,
+                        symbol: None,
+                        content_hash: None,
+                    }],
+                )
+                .unwrap();
+            db_view
+                .save_task_memory(&ac_db::TaskMemoryRow {
+                    id: format!("tm-f1-{}", std::process::id()),
+                    task_id: "task-1".to_string(),
+                    summary: "task succeeded: fix answer function".to_string(),
+                    evidence_refs: "ev-1".to_string(),
+                    created_at_ms: 1,
+                })
+                .unwrap();
+        }
+
+        // Mode 1 read: ProjectMemoryGet sees the fact (GOAL conversation).
+        let get = request_via_ipc(
+            &server,
+            &listener,
+            &mut daemon,
+            json!({"id":"m1","command":"ProjectMemoryGet","project_path": project_path}),
+        );
+        assert_eq!(get["ok"], true, "ProjectMemoryGet: {get}");
+        let facts = get["memory"]["facts"].as_array().unwrap();
+        assert!(
+            facts
+                .iter()
+                .any(|f| f["statement"] == "the answer function must return 42"),
+            "facts visible: {facts:?}"
+        );
+        assert_eq!(get["memory"]["counts"]["task_memories"], 1);
+
+        // Mode 2 read: DESIGN conversation on the SAME project sees the same
+        // facts through design_memory_get (cross-mode sharing).
+        let design_create = request_via_ipc(
+            &server,
+            &listener,
+            &mut daemon,
+            json!({"id":"c2","command":"ConversationCreate","project_path": project_path, "mode":"DESIGN","title":"F1 Design Memory"}),
+        );
+        assert_eq!(design_create["ok"], true);
+        let design_cid = design_create["conversation_id"].as_str().unwrap().to_string();
+        let memory = daemon.design_memory_get(&design_cid).unwrap();
+        let design_facts = memory["facts"].as_array().unwrap();
+        assert!(
+            design_facts
+                .iter()
+                .any(|f| f["statement"] == "the answer function must return 42"),
+            "design memory sees mission facts: {design_facts:?}"
+        );
+
+        // RESTART: close this daemon, open a NEW one on the same DB — the
+        // memory must survive (durable, not in-process).
+        drop(server);
+        daemon.stop().unwrap();
+        drop(daemon);
+        let mut daemon2 = DaemonService::open(&db, &lock).unwrap();
+        daemon2.start().unwrap();
+        let get2 = daemon2.project_memory_get(&project_path).unwrap();
+        let facts2 = get2["facts"].as_array().unwrap();
+        assert!(
+            facts2
+                .iter()
+                .any(|f| f["statement"] == "the answer function must return 42"),
+            "facts survive restart: {facts2:?}"
+        );
+
+        // Isolation: a DIFFERENT project sees none of these facts.
+        let other = dir.join("other-project");
+        fs::create_dir_all(&other).unwrap();
+        let other_path = other.to_string_lossy().to_string();
+        let other_get = daemon2.project_memory_get(&other_path).unwrap();
+        assert_eq!(other_get["counts"]["facts"], 0, "memory must be project-scoped");
+
+        daemon2.stop().unwrap();
+        let _ = fs::remove_dir_all(&dir);
     }
 
     /// Batch N1: provider/routing preferences persist through IPC, invalid

@@ -37,6 +37,68 @@ pub struct MemoryFact {
     pub superseded_by: Option<StableId>,
     pub last_validation: TimestampMillis,
 }
+impl FactType {
+    /// Parse a persisted fact-type string (round-trip of `as_str`).
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "SYMBOL_ROLE" => Some(Self::SymbolRole),
+            "MODULE_RELATIONSHIP" => Some(Self::ModuleRelationship),
+            "PROJECT_COMMAND" => Some(Self::ProjectCommand),
+            "ARCHITECTURE_FACT" => Some(Self::ArchitectureFact),
+            "USER_DECISION" => Some(Self::UserDecision),
+            "FAILED_APPROACH" => Some(Self::FailedApproach),
+            _ => None,
+        }
+    }
+}
+
+impl FactSource {
+    /// Parse a persisted source string (round-trip of `as_str`).
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "USER_REQUIREMENT" => Some(Self::UserRequirement),
+            "ARCHITECTURE_DECISION" => Some(Self::ArchitectureDecision),
+            "TREE_SITTER" => Some(Self::TreeSitter),
+            "LSP" => Some(Self::Lsp),
+            "SCIP" => Some(Self::Scip),
+            "TEST" => Some(Self::Test),
+            "RUNTIME" => Some(Self::Runtime),
+            "GIT" => Some(Self::Git),
+            "UNTRUSTED_REPOSITORY_CONTENT" => Some(Self::RepositoryContent),
+            "UNTRUSTED_WEB_CONTENT" => Some(Self::BrowserContent),
+            "UNTRUSTED_TOOL_OUTPUT" => Some(Self::ToolOutput),
+            "LLM_INFERENCE" => Some(Self::LlmInference),
+            _ => None,
+        }
+    }
+}
+
+impl FreshnessState {
+    /// Parse a persisted freshness string (round-trip of `as_str`).
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "FRESH" => Some(Self::Fresh),
+            "POSSIBLY_STALE" => Some(Self::PossiblyStale),
+            "INVALID" => Some(Self::Invalid),
+            "CONFLICTED" => Some(Self::Conflicted),
+            _ => None,
+        }
+    }
+}
+
+impl MemoryClass {
+    /// Parse a persisted memory-class string (round-trip of `as_str`).
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "IMMUTABLE_MISSION" => Some(Self::ImmutableMission),
+            "DECISION" => Some(Self::Decision),
+            "LONG_LIVED_REPO" => Some(Self::LongLivedRepo),
+            "TASK_SCOPED" => Some(Self::TaskScoped),
+            "EPHEMERAL" => Some(Self::Ephemeral),
+            _ => None,
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum FactType {
@@ -727,6 +789,37 @@ impl MemoryService {
 
     pub fn fact(&self, fact_id: &StableId) -> Option<MemoryFact> {
         self.facts.get(fact_id).cloned()
+    }
+
+    /// Fetch a recorded task memory by id (F1 persistence path).
+    pub fn task_memory(&self, memory_id: &StableId) -> Option<TaskMemory> {
+        self.task_memories.get(memory_id).cloned()
+    }
+
+    /// Load persisted facts from durable storage (F1 hydration): merges DB
+    /// rows into the in-process index.  Rows are repository-scoped by the
+    /// caller.  Idempotent: existing ids are replaced (upsert semantics).
+    pub fn hydrate_facts(&mut self, facts: Vec<MemoryFact>) {
+        for fact in facts {
+            self.facts.insert(fact.id.clone(), fact);
+        }
+    }
+
+    /// Load persisted decisions from durable storage (F1 hydration).
+    pub fn hydrate_decisions(&mut self, decisions: Vec<MemoryDecision>) {
+        for decision in decisions {
+            self.decisions.insert(decision.id.clone(), decision);
+        }
+    }
+
+    /// Load a persisted task memory (F1 hydration).
+    pub fn hydrate_task_memory(&mut self, memory: TaskMemory) {
+        self.task_memories.insert(memory.id.clone(), memory);
+    }
+
+    /// All live facts (F1: for persistence sweeps and semantic reindex).
+    pub fn facts(&self) -> Vec<MemoryFact> {
+        self.facts.values().cloned().collect()
     }
 
     pub fn apply_source_change(

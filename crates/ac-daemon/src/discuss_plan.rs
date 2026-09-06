@@ -476,7 +476,10 @@ impl DaemonService {
 
 /// Deterministic project identity: decisions stored under this id belong to
 /// this exact project path.  Two projects can never share decision rows.
-fn project_repository_identity(project_path: &str) -> String {
+/// Canonical durable repository identity for a project path (F1: shared by
+/// mission memory facts, discuss decisions, design memory, and every mode —
+/// ONE scheme, never two).
+pub(crate) fn project_repository_identity(project_path: &str) -> String {
     let hash = fnv1a64_hash(project_path.as_bytes());
     format!("repo-{hash}")
 }

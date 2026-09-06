@@ -15,7 +15,8 @@ use ac_code_intel::{
 };
 use ac_common::{AcError, AcResult, StableId, TimestampMillis};
 use ac_context::{
-    AuthorityClass, ContextEngine, ContextNode, ContextPack, EmbeddingAvailability, MemoryService,
+    AuthorityClass, ContextEngine, ContextNode, ContextPack, EmbeddingAvailability, MemoryFact,
+    MemoryService, TaskMemory,
 };
 use ac_evidence::{EvidenceKind, EvidenceRecord, EvidenceStore, Provenance};
 use ac_git::{GitCoordinator, WorktreeRecord};
@@ -836,6 +837,26 @@ pub trait AgentDurabilityObserver: Send {
         Ok(Vec::new())
     }
 
+    /// Persist a memory fact immediately when it is recorded, scoped to the
+    /// repository the mission is working on.  Implementors map the mission
+    /// to its repository identity (F1: durable project memory).
+    fn memory_fact_persisted(
+        &mut self,
+        _mission_id: &StableId,
+        _fact: &MemoryFact,
+    ) -> AcResult<()> {
+        Ok(())
+    }
+
+    /// Persist a task memory immediately when it is recorded (F1).
+    fn task_memory_persisted(
+        &mut self,
+        _mission_id: &StableId,
+        _memory: &TaskMemory,
+    ) -> AcResult<()> {
+        Ok(())
+    }
+
     /// Persist a provider/model routing decision.  The record is a minimal
     /// factual summary: provider & model identities, routing mode, attempt
     /// number, success/failure, failure classification, and timestamp.
@@ -912,6 +933,21 @@ impl<P: PolicyBoundary> AutonomousAgent<P> {
     /// diagnostics: verifying registered tool ids without executing).
     pub fn tools(&self) -> &ToolBroker {
         &self.tools
+    }
+
+    /// F1: hydrate durable project memory into this mission's context —
+    /// facts and task memories persisted by previous missions on the same
+    /// repository.  Called by the daemon before `run_goal` so prior work is
+    /// visible as AcceptedMemory context nodes (search + semantic paths).
+    pub fn hydrate_project_memory(
+        &mut self,
+        facts: Vec<MemoryFact>,
+        task_memories: Vec<TaskMemory>,
+    ) {
+        self.memory.hydrate_facts(facts);
+        for memory in task_memories {
+            self.memory.hydrate_task_memory(memory);
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1049,6 +1085,33 @@ impl<P: PolicyBoundary> AutonomousAgent<P> {
         if let Some(observer) = &mut self.durability {
             if let Some(record) = self.evidence.get(evidence_id) {
                 observer.evidence_persisted(record)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Persist a memory fact to durable storage (F1: project memory survives
+    /// the mission).  Called at every production record_fact site.
+    fn persist_memory_fact(&mut self, fact_id: &StableId) -> AcResult<()> {
+        if let Some(observer) = &mut self.durability {
+            if let Some(fact) = self.memory.fact(fact_id) {
+                let mission = self.bound_mission_id.clone();
+                if let Some(mission_id) = &mission {
+                    observer.memory_fact_persisted(mission_id, &fact)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Persist a task memory to durable storage (F1).
+    fn persist_task_memory(&mut self, memory_id: &StableId) -> AcResult<()> {
+        if let Some(observer) = &mut self.durability {
+            let mission = self.bound_mission_id.clone();
+            if let Some(mission_id) = &mission {
+                if let Some(record) = self.memory.task_memory(memory_id) {
+                    observer.task_memory_persisted(mission_id, &record)?;
+                }
             }
         }
         Ok(())
@@ -1303,6 +1366,15 @@ impl<P: PolicyBoundary> AutonomousAgent<P> {
                     self.persist_graph(&graph)?;
                     completed_tasks.insert(task.id.clone());
                     completed_task_titles.insert(task.title.clone());
+                    // F1: record a durable task memory so future missions
+                    // and every mode can see what this task accomplished.
+                    if let Ok(memory_id) = self.memory.record_task_memory(
+                        task.id.clone(),
+                        format!("task succeeded: {}", task.title),
+                        task_observation_refs(&self.observations, &task.id),
+                    ) {
+                        let _ = self.persist_task_memory(&memory_id);
+                    }
                 }
                 Ok(TaskProgress::NeedsReplan(reason)) => {
                     graph.finish(
@@ -1756,11 +1828,14 @@ impl<P: PolicyBoundary> AutonomousAgent<P> {
             format!("mem://agent/{}/provider/{role}", goal.id),
             format!("role:{role};events:{};text:{}", events.len(), text.len()),
         )?;
-        self.memory.record_fact(
+        let fact_id = self.memory.record_fact(
             format!("provider produced {role} proposal"),
             vec![evidence],
             70,
         )?;
+        // F1: persist project memory immediately so facts survive the
+        // mission and are available to every mode after restart.
+        self.persist_memory_fact(&fact_id)?;
         Ok(ProviderReasoning { text, events })
     }
 

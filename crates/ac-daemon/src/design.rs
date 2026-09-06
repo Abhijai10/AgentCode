@@ -1205,6 +1205,37 @@ Rules: describe only what is actually visible in the image. Findings must be con
         let constraints = self.design_constraints_get(conversation_id)?;
         // Project-scoped accepted decisions: authoritative memory_decisions.
         let identity = crate::project_repository_identity(&conv.project_path);
+        // F1: project memory facts from previous missions (all modes share
+        // the same durable repository-scoped store).
+        let facts: Vec<Value> = self
+            .db
+            .memory_facts_for(&identity, 20)?
+            .iter()
+            .filter(|row| row.valid_until_ms.is_none())
+            .map(|row| {
+                json!({
+                    "id": row.id,
+                    "statement": row.statement,
+                    "fact_type": row.fact_type,
+                    "confidence": row.confidence,
+                    "freshness": row.freshness,
+                    "last_validation_ms": row.last_validation_ms,
+                })
+            })
+            .collect();
+        let task_memories: Vec<Value> = self
+            .db
+            .task_memories_newest(10)?
+            .iter()
+            .map(|row| {
+                json!({
+                    "id": row.id,
+                    "task_id": row.task_id,
+                    "summary": row.summary,
+                    "created_at_ms": row.created_at_ms,
+                })
+            })
+            .collect();
         let decisions: Vec<Value> = self
             .db
             .memory_decisions_for(&identity, 20)?
@@ -1235,6 +1266,8 @@ Rules: describe only what is actually visible in the image. Findings must be con
                 .and_then(|row| serde_json::from_str::<Value>(&row.content_json).ok())
         };
         let memory = json!({
+            "facts": facts,
+            "task_memories": task_memories,
             "conversation_id": conversation_id,
             "project_path": conv.project_path,
             "inherited_from_conversation": latest.map(|c| c.id.clone()),

@@ -196,6 +196,77 @@ impl DaemonService {
     /// metadata.  Raw content is never returned.  Mission association is
     /// derived from the durable reference graph (task attempts, verification
     /// runs, and final audits) — see mission_evidence_ids.
+    /// F1: project memory for ANY mode and the UI — repository-scoped facts,
+    /// decisions, and task memories persisted by previous missions.  The
+    /// repository identity is derived from the project path (same
+    /// deterministic identity as mission persistence), so memory is shared
+    /// across all modes working on the same project and never leaks across
+    /// projects.
+    pub fn project_memory_get(&self, project_path: &str) -> AcResult<Value> {
+        if project_path.trim().is_empty() {
+            return Err(AcError::validation(
+                "MEMORY-PROJECT_PATH_REQUIRED",
+                "project path is required to read project memory",
+            ));
+        }
+        let identity = crate::project_repository_identity(project_path);
+        let facts: Vec<Value> = self
+            .db
+            .memory_facts_for(&identity, 100)?
+            .iter()
+            .filter(|row| row.valid_until_ms.is_none())
+            .map(|row| {
+                json!({
+                    "id": row.id,
+                    "statement": row.statement,
+                    "fact_type": row.fact_type,
+                    "source": row.source,
+                    "confidence": row.confidence,
+                    "freshness": row.freshness,
+                    "memory_class": row.memory_class,
+                    "last_validation_ms": row.last_validation_ms,
+                })
+            })
+            .collect();
+        let decisions: Vec<Value> = self
+            .db
+            .memory_decisions_for(&identity, 50)?
+            .iter()
+            .map(|row| {
+                json!({
+                    "id": row.id,
+                    "decision": row.decision,
+                    "rationale": row.rationale,
+                    "created_at_ms": row.created_at_ms,
+                })
+            })
+            .collect();
+        let task_memories: Vec<Value> = self
+            .db
+            .task_memories_newest(50)?
+            .iter()
+            .map(|row| {
+                json!({
+                    "id": row.id,
+                    "task_id": row.task_id,
+                    "summary": row.summary,
+                    "created_at_ms": row.created_at_ms,
+                })
+            })
+            .collect();
+        Ok(json!({
+            "project_path": project_path,
+            "facts": facts,
+            "decisions": decisions,
+            "task_memories": task_memories,
+            "counts": {
+                "facts": facts.len(),
+                "decisions": decisions.len(),
+                "task_memories": task_memories.len(),
+            },
+        }))
+    }
+
     pub fn evidence_summary(&self, mission_id: &str) -> AcResult<Value> {
         let mid = StableId::from_existing(mission_id)?;
         if self.db.get_mission(&mid)?.is_none() {
