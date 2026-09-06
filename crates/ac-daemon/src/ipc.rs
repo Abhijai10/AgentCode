@@ -892,6 +892,22 @@ fn dispatch_request(request: &Value, daemon: &mut DaemonService) -> (Value, bool
                 Err(error) => error_response(correlation_id, error.code(), error.to_string()),
             }
         },
+        "BrowserPanel" => {
+            let action = request.get("action").and_then(Value::as_str).unwrap_or("navigate");
+            let url = request.get("url").and_then(Value::as_str).unwrap_or("");
+            let viewport_hint = request.get("viewport_hint").and_then(Value::as_str).unwrap_or("desktop");
+            match daemon.browser_panel(action, url, viewport_hint) {
+                Ok(result) => json!({"id": correlation_id, "ok": true, "panel": result}),
+                Err(error) => error_response(correlation_id, error.code(), error.to_string()),
+            }
+        },
+        "BrowserScreenshot" => {
+            let artifact_uri = request.get("artifact_uri").and_then(Value::as_str).unwrap_or("");
+            match daemon.browser_screenshot_png(artifact_uri) {
+                Ok(result) => json!({"id": correlation_id, "ok": true, "screenshot": result}),
+                Err(error) => error_response(correlation_id, error.code(), error.to_string()),
+            }
+        },
         "DesignQAResponsive" => {
             let conversation_id = request.get("conversation_id").and_then(Value::as_str).unwrap_or("");
             let content = request.get("content").and_then(Value::as_str).unwrap_or("");
@@ -2705,6 +2721,81 @@ mod ipc_tests {
         );
         assert_eq!(again["ok"], true, "second export (update path): {again}");
         assert!(again["export"]["changeset_id"].as_str().unwrap_or("").starts_with("cs-"));
+
+        server.cleanup();
+        daemon.shutdown().unwrap();
+        std::env::remove_var("AGENTCODE_PROVIDER_MODE");
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    /// Inbuilt browser panel (Codex-style): BrowserScreenshot serves ONLY
+    /// artifacts under the agentcode-browser-artifacts temp dir — an
+    /// arbitrary path probe is refused outright (this test is
+    /// deterministic; the panel's Chrome surfaces are covered by the
+    /// env-gated live tests).
+    #[test]
+    fn browser_screenshot_refuses_paths_outside_artifacts_dir() {
+        let _env_lock = crate::TEST_ENV_LOCK.lock().unwrap();
+        std::env::set_var("AGENTCODE_PROVIDER_MODE", "mock");
+        let (dir, db_path, lock, socket) = temp_paths("ipc-browserpanel");
+
+        let mut daemon = DaemonService::open(&db_path, &lock).unwrap();
+        daemon.start().unwrap();
+        let Some((server, listener)) = bind_or_skip(&socket, None) else {
+            daemon.shutdown().unwrap();
+            std::env::remove_var("AGENTCODE_PROVIDER_MODE");
+            let _ = fs::remove_dir_all(dir);
+            return;
+        };
+
+        // 1) Relative path: refused.
+        let rel = request_via_ipc(
+            &server, &listener, &mut daemon,
+            json!({"id":"bp1","command":"BrowserScreenshot","artifact_uri": "evil.png"}),
+        );
+        assert_eq!(rel["ok"], false);
+        assert_eq!(rel["error"]["code"], "BROWSER-SCREENSHOT_INVALID_URI");
+
+        // 2) Absolute path outside the artifacts dir: refused (system file
+        //    probe must never be served).
+        let outside = request_via_ipc(
+            &server, &listener, &mut daemon,
+            json!({"id":"bp2","command":"BrowserScreenshot","artifact_uri": "/etc/passwd"}),
+        );
+        assert_eq!(outside["ok"], false);
+        assert_eq!(outside["error"]["code"], "BROWSER-SCREENSHOT_INVALID_URI");
+
+        // 3) Non-png inside the dir: refused by extension.
+        let inside_non_png = std::env::temp_dir()
+            .join("agentcode-browser-artifacts")
+            .join("probe.txt");
+        let probe_uri = inside_non_png.to_string_lossy().to_string();
+        let bad_ext = request_via_ipc(
+            &server, &listener, &mut daemon,
+            json!({"id":"bp3","command":"BrowserScreenshot","artifact_uri": probe_uri}),
+        );
+        assert_eq!(bad_ext["ok"], false);
+        assert_eq!(bad_ext["error"]["code"], "BROWSER-SCREENSHOT_INVALID_URI");
+
+        // 4) Unknown panel action: honest error, not a silent no-op.  With
+        //    no panel open yet the closed-guard fires first (correct
+        //    ordering), so assert the closed guard here; the action guard is
+        //    exercised by the same handler's match arm on the daemon fn.
+        let unknown = request_via_ipc(
+            &server, &listener, &mut daemon,
+            json!({"id":"bp4","command":"BrowserPanel","action": "sideways"}),
+        );
+        assert_eq!(unknown["ok"], false);
+        assert_eq!(unknown["error"]["code"], "BROWSER-PANEL_CLOSED");
+
+        // 5) Panel "close" is always valid and reports honestly even when
+        //    nothing is open (idempotent teardown).
+        let close = request_via_ipc(
+            &server, &listener, &mut daemon,
+            json!({"id":"bp4b","command":"BrowserPanel","action": "close"}),
+        );
+        assert_eq!(close["ok"], true);
+        assert_eq!(close["panel"]["closed"], true);
 
         server.cleanup();
         daemon.shutdown().unwrap();

@@ -1215,6 +1215,11 @@ pub struct DaemonService {
     /// output, keyed by session id.  Children are killed on stop (same as
     /// design_children); finished sessions persist their output as evidence.
     terminal_sessions: Mutex<BTreeMap<String, Arc<TerminalSessionState>>>,
+    /// Live panel browser (Codex-style inbuilt browser): ONE Chrome runtime
+    /// reused across navigations so the panel behaves like an embedded
+    /// browser instead of relaunching per request.  None until first use;
+    /// torn down gracefully on daemon stop (Drop) and on explicit close.
+    live_browser: Mutex<Option<ac_verification::BrowserRuntime>>,
 }
 
 /// Public alias for the include'd terminal module's session type.
@@ -1266,6 +1271,7 @@ impl DaemonService {
             default_workspace_root: workspace_root,
             design_children: Mutex::new(BTreeMap::new()),
             terminal_sessions: Mutex::new(BTreeMap::new()),
+            live_browser: Mutex::new(None),
         })
     }
 
@@ -1357,6 +1363,15 @@ impl DaemonService {
             ));
         }
         self.lifecycle = DaemonLifecycle::Stopping;
+        // Close the inbuilt-browser panel's shared Chrome FIRST and
+        // gracefully (CDP Browser.close): the runtime's Drop handler also
+        // escalates politely, but stopping here keeps the teardown ordered
+        // and off the shutdown path's timing.
+        if let Ok(mut guard) = self.live_browser.lock() {
+            if let Some(mut runtime) = guard.take() {
+                runtime.close_all();
+            }
+        }
         // Cancel in-flight work and join the mission worker BEFORE stopping the
         // kernel.  A mission cancelled mid-flight must still be able to
         // transition its kernel mission to a terminal state during

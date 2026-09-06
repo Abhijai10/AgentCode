@@ -17,6 +17,7 @@ import type {
   DesignRepair,
   DesignMemory,
   DesignBrowserResult,
+  BrowserPanelResult,
   DesignQaReport,
   VisualCritique,
   DesignConstraint,
@@ -90,6 +91,7 @@ export function DesignView({
   const [critique, setCritique] = useState<DesignCritique | null>(null);
   const [repair, setRepair] = useState<DesignRepair | null>(null);
   const [browser, setBrowser] = useState<DesignBrowserResult | null>(null);
+
   const [visualCritique, setVisualCritique] = useState<VisualCritique | null>(null);
   const [constraints, setConstraints] = useState<DesignConstraint[]>([]);
   const [constraintDraft, setConstraintDraft] = useState("");
@@ -110,9 +112,45 @@ export function DesignView({
   } | null>(null);
   const [exportTarget, setExportTarget] = useState("src/pages/GeneratedLanding.tsx");
   const [exportResult, setExportResult] = useState<{ missionId: string; target: string } | null>(null);
-  const [panelBusy, setPanelBusy] = useState(false);
-  const [rightOpen, setRightOpen] = useState(true);
   const [viewportHint, setViewportHint] = useState("desktop");
+  // ── Inbuilt browser panel (Codex-style): one persistent Chrome, framed
+  //    screenshots, URL bar, history. Lives in DesignView because the panel
+  //    exists to browse the live preview; it navigates any http(s) URL.
+  const [panelOpen, setPanelOpen] = useState(false);
+  const [panelUrl, setPanelUrl] = useState("");
+  const [panelImg, setPanelImg] = useState<string | null>(null);
+  const [panelMeta, setPanelMeta] = useState<BrowserPanelResult | null>(null);
+  const [panelBusy, setPanelBusy] = useState(false);
+  const [panelError, setPanelError] = useState<string | null>(null);
+
+  const panelNavigate = useCallback(
+    async (action: "navigate" | "back" | "forward" | "reload" | "close", url?: string) => {
+      if (action !== "close" && !panelOpen) setPanelOpen(true);
+      setPanelBusy(true);
+      setPanelError(null);
+      const res = await daemon.browserPanel(action, url, viewportHint);
+      setPanelBusy(false);
+      if (!res.ok) {
+        setPanelError(res.error ?? "browser panel unavailable");
+        setPanelImg(null);
+        return;
+      }
+      if (action === "close") {
+        setPanelOpen(false);
+        setPanelImg(null);
+        setPanelMeta(null);
+        return;
+      }
+      const panel = res.panel;
+      if (panel) {
+        setPanelMeta(panel);
+        setPanelUrl(panel.url);
+        if (panel.png_base64) setPanelImg(`data:image/png;base64,${panel.png_base64}`);
+      }
+    },
+    [panelOpen, viewportHint]
+  );
+  const [rightOpen, setRightOpen] = useState(true);
 
   const messagesEndRef = useRef<HTMLDivElement>(null);
 
@@ -1129,6 +1167,112 @@ export function DesignView({
               <p className="text-xs text-on-surface-variant">
                 Inspect the running application: navigate, read the DOM, capture console and
                 network diagnostics, and produce screenshot evidence.
+              </p>
+            )}
+          </section>
+
+          <section className="neo-raised rounded-2xl p-4">
+            <div className="flex items-center justify-between mb-2">
+              <h4 className="text-sm font-semibold text-on-surface">Inbuilt Browser</h4>
+              <button
+                onClick={() => (panelOpen ? panelNavigate("close") : setPanelOpen(true))}
+                className="text-[10px] text-primary hover:opacity-80"
+              >
+                {panelOpen ? "Close browser" : "Open browser"}
+              </button>
+            </div>
+            {panelOpen ? (
+              <div className="space-y-2">
+                {/* URL bar + controls — familiar browser chrome, no reinvention */}
+                <div className="flex items-center gap-1">
+                  <button
+                    onClick={() => panelNavigate("back")}
+                    disabled={panelBusy}
+                    title="Back"
+                    aria-label="Back"
+                    className="neo-btn rounded-lg px-2 py-1 text-[11px] text-on-surface-variant disabled:opacity-50"
+                  >
+                    ←
+                  </button>
+                  <button
+                    onClick={() => panelNavigate("forward")}
+                    disabled={panelBusy}
+                    title="Forward"
+                    aria-label="Forward"
+                    className="neo-btn rounded-lg px-2 py-1 text-[11px] text-on-surface-variant disabled:opacity-50"
+                  >
+                    →
+                  </button>
+                  <button
+                    onClick={() => panelNavigate("reload")}
+                    disabled={panelBusy}
+                    title="Reload"
+                    aria-label="Reload"
+                    className="neo-btn rounded-lg px-2 py-1 text-[11px] text-on-surface-variant disabled:opacity-50"
+                  >
+                    ⟳
+                  </button>
+                  <form
+                    className="flex-1 flex items-center gap-1"
+                    onSubmit={(e) => {
+                      e.preventDefault();
+                      panelNavigate("navigate", panelUrl);
+                    }}
+                  >
+                    <input
+                      value={panelUrl}
+                      onChange={(e) => setPanelUrl(e.target.value)}
+                      placeholder="http://127.0.0.1:5173"
+                      aria-label="Browser address"
+                      className="neo-input flex-1 rounded-lg px-2 py-1 text-[11px] font-mono bg-transparent text-on-surface"
+                    />
+                    <button
+                      type="submit"
+                      disabled={panelBusy}
+                      className="text-[10px] text-primary hover:opacity-80 disabled:opacity-50"
+                    >
+                      Go
+                    </button>
+                  </form>
+                </div>
+                {panelBusy && (
+                  <p className="text-[10px] text-on-surface-variant">Loading…</p>
+                )}
+                {panelError && (
+                  <p className="text-[11px] text-red-600 dark:text-red-400" role="alert">
+                    {panelError}
+                  </p>
+                )}
+                {/* The live page: framed screenshot from the persistent Chrome */}
+                {panelImg ? (
+                  <div className="rounded-xl overflow-hidden border border-outline-variant bg-white">
+                    <img
+                      src={panelImg}
+                      alt={`Browser view of ${panelMeta?.url ?? panelUrl}`}
+                      className="w-full h-auto block"
+                    />
+                  </div>
+                ) : !panelBusy && !panelError ? (
+                  <p className="text-xs text-on-surface-variant">
+                    Enter a URL and press Go — AgentCode keeps one Chrome alive for the
+                    panel and renders the live page here.
+                  </p>
+                ) : null}
+                {panelMeta && (
+                  <p className="text-[10px] text-on-surface-variant">
+                    HTTP {panelMeta.diagnostics.http_status} · console errors{" "}
+                    {panelMeta.diagnostics.console_errors.length} · network failures{" "}
+                    {panelMeta.diagnostics.network_failures.length}
+                    {panelMeta.viewport
+                      ? ` · ${panelMeta.viewport.width}×${panelMeta.viewport.height}`
+                      : ""}
+                  </p>
+                )}
+              </div>
+            ) : (
+              <p className="text-xs text-on-surface-variant">
+                An embedded browser like Codex: one persistent Chrome, address bar,
+                back/forward, live screenshot rendering with console + network diagnostics.
               </p>
             )}
           </section>

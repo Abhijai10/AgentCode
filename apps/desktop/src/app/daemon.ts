@@ -51,6 +51,7 @@ import type {
   DesignPreview,
   DesignPreviewStatus,
   DesignBrowserResult,
+  BrowserPanelResult,
   DesignQaReport,
   VisualCritique,
   DesignConstraint,
@@ -1168,6 +1169,41 @@ export const daemon = {
         viewportHint: viewportHint ?? "desktop",
       });
       return { ok: true, browser: res.browser };
+    } catch (e: unknown) {
+      const message = e instanceof Error ? e.message : String(e);
+      const cleaned = message.replace(/^[A-Z0-9_-]+:\s*/, "");
+      return { ok: false, error: cleaned || message };
+    }
+  },
+
+  async browserPanel(
+    action: "navigate" | "back" | "forward" | "reload" | "screenshot" | "close",
+    url?: string,
+    viewportHint?: string
+  ): Promise<{ ok: boolean; panel?: BrowserPanelResult; error?: string }> {
+    try {
+      const res = await invoke<{ panel: BrowserPanelResult }>("daemon_browser_panel", {
+        action,
+        url: url ?? "",
+        viewportHint: viewportHint ?? "desktop",
+      });
+      return { ok: true, panel: res.panel };
+    } catch (e: unknown) {
+      const message = e instanceof Error ? e.message : String(e);
+      const cleaned = message.replace(/^[A-Z0-9_-]+:\s*/, "");
+      return { ok: false, error: cleaned || message };
+    }
+  },
+
+  async browserScreenshot(
+    artifactUri: string
+  ): Promise<{ ok: boolean; screenshot?: { png_base64: string; bytes: number }; error?: string }> {
+    try {
+      const res = await invoke<{ screenshot: { png_base64: string; bytes: number } }>(
+        "daemon_browser_screenshot",
+        { artifactUri }
+      );
+      return { ok: true, screenshot: res.screenshot };
     } catch (e: unknown) {
       const message = e instanceof Error ? e.message : String(e);
       const cleaned = message.replace(/^[A-Z0-9_-]+:\s*/, "");

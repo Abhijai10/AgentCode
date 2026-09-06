@@ -1789,6 +1789,40 @@ fn daemon_design_preview_stop(
 }
 
 #[tauri::command]
+fn daemon_browser_panel(
+    state: tauri::State<DaemonClient>,
+    action: String,
+    url: String,
+    viewport_hint: String,
+) -> Result<Value, String> {
+    request(
+        &state.0,
+        "ui",
+        "BrowserPanel",
+        json!({
+            "action": action,
+            "url": url,
+            "viewport_hint": viewport_hint,
+        }),
+    )
+}
+
+#[tauri::command]
+fn daemon_browser_screenshot(
+    state: tauri::State<DaemonClient>,
+    artifact_uri: String,
+) -> Result<Value, String> {
+    request(
+        &state.0,
+        "ui",
+        "BrowserScreenshot",
+        json!({
+            "artifact_uri": artifact_uri,
+        }),
+    )
+}
+
+#[tauri::command]
 fn daemon_design_browser(
     state: tauri::State<DaemonClient>,
     conversation_id: String,
@@ -2288,6 +2322,8 @@ fn main() {
             daemon_design_preview_start,
             daemon_design_preview_status,
             daemon_design_preview_stop,
+            daemon_browser_panel,
+            daemon_browser_screenshot,
             daemon_design_browser,
             daemon_design_qa_responsive,
             daemon_design_qa_report,

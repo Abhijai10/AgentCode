@@ -626,6 +626,27 @@ export interface DesignBrowserResult {
   screenshot_evidence_ref: string;
 }
 
+/** Inbuilt browser panel (Codex-style): one persistent Chrome shared
+ *  across navigations; the panel renders framed screenshots + live
+ *  diagnostics for the current page. */
+export interface BrowserPanelResult {
+  url: string;
+  title: string;
+  viewport?: {
+    name: string;
+    width: number;
+    height: number;
+  };
+  diagnostics: {
+    console_errors: string[];
+    page_errors: string[];
+    network_failures: string[];
+    http_status: number;
+  };
+  visible_text_preview: string;
+  png_base64: string;
+}
+
 export interface DesignQaReport {
   passed: boolean;
   issues: string[];

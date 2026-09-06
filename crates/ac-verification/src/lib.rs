@@ -476,6 +476,9 @@ pub struct BrowserRuntime {
     pages: BTreeMap<StableId, PageState>,
     real_processes: BTreeMap<StableId, RealBrowserProcess>,
     real_pages: BTreeMap<StableId, RealBrowserPage>,
+    /// Inbuilt-browser panel: the single page session the panel reuses
+    /// across navigations (Codex-style embedded browser).
+    panel_session: Option<StableId>,
 }
 
 struct RealBrowserProcess {
@@ -1308,6 +1311,7 @@ impl BrowserRuntime {
             pages: BTreeMap::new(),
             real_processes: BTreeMap::new(),
             real_pages: BTreeMap::new(),
+            panel_session: None,
         }
     }
 
@@ -1320,6 +1324,7 @@ impl BrowserRuntime {
             pages: BTreeMap::new(),
             real_processes: BTreeMap::new(),
             real_pages: BTreeMap::new(),
+            panel_session: None,
         }
     }
 
@@ -2021,8 +2026,11 @@ impl BrowserRuntime {
         })?;
         process.state = BrowserProcessState::Crashed;
         if let Some(mut real_process) = self.real_processes.remove(process_id) {
-            let _ = real_process.child.kill();
-            let _ = real_process.child.wait();
+            // Chrome-crash-dialog fix: never SIGKILL a live Chrome from a
+            // crash LABEL alone (a stale websocket is not proof the process
+            // is dead).  Escalate Browser.close -> SIGTERM -> SIGKILL and
+            // let the graceful path delete the temp profile.
+            let _ = terminate_browser_process_gracefully(&mut real_process);
         }
         Ok(())
     }
@@ -2162,8 +2170,7 @@ impl BrowserRuntime {
                 match wait_for_devtools_port(profile_dir.path(), &mut child) {
                     Ok(found) => found,
                     Err(err) => {
-                        let _ = child.kill();
-                        let _ = child.wait();
+                        terminate_untracked_chrome(&mut child);
                         return Err(err);
                     }
                 };
@@ -2178,8 +2185,7 @@ impl BrowserRuntime {
         // DevTools session dies when a page session attaches).  Relaunch once
         // with Chrome's internal sandbox disabled; AgentCode's own
         // process-restricted sandbox boundary still wraps the browser.
-        let _ = child.kill();
-        let _ = child.wait();
+        terminate_untracked_chrome(&mut child);
         let (child, profile_dir, port, browser_ws_path) = attempt(&["--no-sandbox"])?;
         probe_chrome_browser_endpoint(port, &browser_ws_path).map_err(|_| {
             AcError::new(
@@ -2392,6 +2398,86 @@ impl BrowserRuntime {
     }
 }
 
+impl BrowserRuntime {
+    /// The panel's persistent page session id, if the panel is open.
+    pub fn panel_session(&self) -> Option<StableId> {
+        self.panel_session.clone()
+    }
+
+    /// Remember (or clear) the panel's persistent page session.
+    pub fn set_panel_session(&mut self, session_id: &StableId) {
+        self.panel_session = Some(session_id.clone());
+    }
+
+    /// Gracefully close every live process (panel shutdown + daemon stop).
+    pub fn close_all(&mut self) {
+        let ids: Vec<StableId> = self.processes.keys().cloned().collect();
+        for id in ids {
+            let _ = self.close_process(&id);
+        }
+        self.panel_session = None;
+    }
+
+    /// CDP history traversal for the inbuilt browser panel ("back"/
+    /// "forward").  Uses Page.getNavigationHistory + Page.navigateToHistoryEntry.
+    pub fn traverse_history(&mut self, session_id: &StableId, direction: &str) -> AcResult<String> {
+        if self.mode != BrowserAdapterMode::ChromiumCdp {
+            return Err(AcError::validation(
+                "BROWSER-HISTORY_UNSUPPORTED",
+                "history traversal requires the real Chrome runtime",
+            ));
+        }
+        let page = self.real_page_mut(session_id)?;
+        let value = page
+            .client
+            .call("Page.getNavigationHistory", json!({}))
+            .map_err(|err| AcError::validation("BROWSER-HISTORY_READ", err.to_string()))?;
+        let index = value
+            .get("currentIndex")
+            .and_then(Value::as_i64)
+            .unwrap_or(0);
+        let total = value
+            .get("entries")
+            .and_then(|e| e.as_array())
+            .map(|a| a.len())
+            .unwrap_or(0);
+        let target = if direction == "back" {
+            index - 1
+        } else {
+            index + 1
+        };
+        if target < 0 || target as usize >= total {
+            return Err(AcError::validation(
+                "BROWSER-HISTORY_AT_EDGE",
+                format!("cannot go {direction}: no further history entry"),
+            ));
+        }
+        let entry_id = value
+            .get("entries")
+            .and_then(|e| e.as_array())
+            .and_then(|entries| entries.get(target as usize))
+            .and_then(|entry| entry.get("id"))
+            .and_then(Value::as_i64)
+            .ok_or_else(|| {
+                AcError::validation("BROWSER-HISTORY_ENTRY", "history entry id missing")
+            })?;
+        let url = page
+            .client
+            .call(
+                "Page.navigateToHistoryEntry",
+                json!({ "entryId": entry_id }),
+            )
+            .map_err(|err| AcError::validation("BROWSER-HISTORY_NAVIGATE", err.to_string()))?;
+        let final_url = url
+            .get("frame")
+            .and_then(|f| f.get("url"))
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        Ok(final_url)
+    }
+}
+
 impl Drop for BrowserRuntime {
     fn drop(&mut self) {
         for process in self.processes.values_mut() {
@@ -2469,6 +2555,28 @@ fn terminate_browser_process_gracefully(process: &mut RealBrowserProcess) -> boo
     let _ = process.child.kill();
     let _ = process.child.wait();
     false
+}
+
+/// Tear down a Chrome child that is not yet registered in the runtime
+/// (launch-failure cleanup).  Chrome-crash-dialog fix: SIGKILL'ing Chrome is
+/// exactly what makes macOS show its "Chrome quit unexpectedly" dialogs, so
+/// send SIGTERM first and wait for a real exit; SIGKILL is the last resort
+/// only when the process refuses to die.
+fn terminate_untracked_chrome(child: &mut Child) {
+    #[cfg(unix)]
+    {
+        let pid = child.id().to_string();
+        let _ = std::process::Command::new("kill")
+            .args(["-TERM", &pid])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    }
+    if !wait_child_exit(child, Duration::from_secs(3)) {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
 }
 
 /// Poll the child for full exit up to `deadline`.  Returns true when it

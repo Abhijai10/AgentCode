@@ -1954,6 +1954,195 @@ port: port.map(|p| p as i64),
         Ok(result)
     }
 
+    /// Codex-style inbuilt browser panel: navigate (or go back/forward)
+    /// ONE persistent Chrome and return a framed screenshot with live
+    /// diagnostics.  The runtime is shared across calls (`live_browser`), so
+    /// the panel behaves like an embedded browser — Chrome starts once and
+    /// stays up while the user browses.
+    pub fn browser_panel(
+        &self,
+        action: &str,
+        url: &str,
+        viewport_hint: &str,
+    ) -> AcResult<Value> {
+        // Only http(s) and the local dev preview are navigable from the
+        // panel; file:// and other schemes are refused outright.
+        let validate_url = |u: &str| -> AcResult<String> {
+            if u.starts_with("http://") || u.starts_with("https://") {
+                Ok(u.to_string())
+            } else {
+                Err(AcError::validation(
+                    "BROWSER-PANEL_URL_REFUSED",
+                    "panel navigation allows http(s) URLs only",
+                ))
+            }
+        };
+
+        let mut guard = self
+            .live_browser
+            .lock()
+            .map_err(|_| AcError::validation("BROWSER-PANEL_LOCK", "browser panel lock poisoned"))?;
+        let task_id = StableId::new("panel");
+        // A "close" action tears the runtime down gracefully and reports
+        // honestly (including when nothing is open — idempotent teardown).
+        // Handled BEFORE the closed-guard so close is always valid.
+        if action == "close" {
+            let runtime = guard.take();
+            drop(guard);
+            if let Some(mut runtime) = runtime {
+                runtime.close_all();
+            }
+            return Ok(json!({"closed": true}));
+        }
+        let runtime_slot = guard
+            .as_mut()
+            .ok_or_else(|| AcError::validation("BROWSER-PANEL_CLOSED", "panel browser is closed"))?;
+
+        // The panel keeps exactly one page session alive; its id is stable
+        // per runtime instance.
+        let session_id = match runtime_slot.panel_session() {
+            Some(id) => id,
+            None => {
+                let process = runtime_slot.launch(task_id.clone())?;
+                let session = runtime_slot.create_session(task_id.clone(), process.id.clone())?;
+                runtime_slot.set_panel_session(&session.id);
+                session.id
+            }
+        };
+
+        let viewport = match viewport_hint {
+            "compact" => ac_verification::ViewportProfile {
+                name: "compact",
+                width: 1024,
+                height: 768,
+            },
+            "wide" => ac_verification::ViewportProfile {
+                name: "wide",
+                width: 1920,
+                height: 1080,
+            },
+            _ => ac_verification::ViewportProfile {
+                name: "desktop",
+                width: 1440,
+                height: 900,
+            },
+        };
+
+        let mut evidence_store = EvidenceStore::new();
+        let mut final_url = String::new();
+        match action {
+            "navigate" | "reload" => {
+                let target = validate_url(url)?;
+                runtime_slot.act(
+                    &session_id,
+                    ac_verification::BrowserAction::Navigate {
+                        url: target.clone(),
+                    },
+                    &mut evidence_store,
+                )?;
+                final_url = target;
+            }
+            "back" | "forward" => {
+                // History traversal via CDP page history.
+                runtime_slot.traverse_history(&session_id, action)?;
+            }
+            "screenshot" => {}
+            other => {
+                return Err(AcError::validation(
+                    "BROWSER-PANEL_ACTION",
+                    format!("unknown browser panel action: {other}"),
+                ));
+            }
+        }
+        runtime_slot.act(
+            &session_id,
+            ac_verification::BrowserAction::Wait { millis: 400 },
+            &mut evidence_store,
+        )?;
+
+        let dom = runtime_slot.inspect_dom(&session_id, &mut evidence_store)?;
+        let diag = runtime_slot.diagnostics(&session_id, &mut evidence_store)?;
+        if final_url.is_empty() {
+            final_url = dom
+                .accessibility_tree
+                .first()
+                .map(|s| s.to_string())
+                .unwrap_or_default();
+        }
+        let screenshot = runtime_slot.capture_screenshot(
+            &session_id,
+            task_id,
+            "browser-panel",
+            viewport,
+            &mut evidence_store,
+        )?;
+        let png = self.browser_screenshot_png(&screenshot.artifact_uri)?;
+        Ok(json!({
+            "url": final_url,
+            "title": dom.visible_text.lines().next().unwrap_or("").trim().to_string(),
+            "viewport": {"name": viewport.name, "width": viewport.width, "height": viewport.height},
+            "diagnostics": {
+                "console_errors": diag.console_errors,
+                "page_errors": diag.page_errors,
+                "network_failures": diag.network_failures,
+                "http_status": diag.http_status,
+            },
+            "visible_text_preview": dom.visible_text.chars().take(400).collect::<String>(),
+            "png_base64": png["png_base64"],
+        }))
+    }
+
+    /// Serve a captured screenshot's PNG bytes as base64 (inbuilt-browser
+    /// panel rendering).  Only paths under the agentcode-browser-artifacts
+    /// temp dir are served — an arbitrary path probe is refused.
+    pub fn browser_screenshot_png(&self, artifact_uri: &str) -> AcResult<Value> {
+        let path = std::path::Path::new(artifact_uri);
+        if !path.is_absolute() {
+            return Err(AcError::validation(
+                "BROWSER-SCREENSHOT_INVALID_URI",
+                "screenshot uri must be an absolute artifacts path",
+            ));
+        }
+        if !path.extension().map(|ext| ext == "png").unwrap_or(false) {
+            return Err(AcError::validation(
+                "BROWSER-SCREENSHOT_INVALID_URI",
+                "screenshot artifact must be a png",
+            ));
+        }
+        let allowed = std::env::temp_dir().join("agentcode-browser-artifacts");
+        let canonical = path.canonicalize().map_err(|err| {
+            AcError::validation(
+                "BROWSER-SCREENSHOT_READ",
+                format!("screenshot artifact not found: {err}"),
+            )
+        })?;
+        if !canonical.starts_with(&allowed) {
+            return Err(AcError::validation(
+                "BROWSER-SCREENSHOT_INVALID_URI",
+                "screenshot uri must point into the agentcode browser artifacts dir",
+            ));
+        }
+        let bytes = std::fs::read(&canonical).map_err(|err| {
+            AcError::validation(
+                "BROWSER-SCREENSHOT_READ",
+                format!("cannot read screenshot artifact: {err}"),
+            )
+        })?;
+        const MAX_SERVE_BYTES: usize = 12 * 1024 * 1024;
+        if bytes.len() > MAX_SERVE_BYTES {
+            return Err(AcError::validation(
+                "BROWSER-SCREENSHOT_TOO_LARGE",
+                "screenshot exceeds the 12 MiB serve limit",
+            ));
+        }
+        use base64::Engine as _;
+        let bytes_len = bytes.len();
+        Ok(json!({
+            "png_base64": base64::engine::general_purpose::STANDARD.encode(bytes),
+            "bytes": bytes_len,
+        }))
+    }
+
     /// Real design QA driven by a live browser session (Doc 06 §49-50).
     ///
     /// This is the shared engine behind design_qa_responsive/accessibility/
@@ -2135,6 +2324,11 @@ port: port.map(|p| p as i64),
         let task_id = StableId::new("design");
         let mut evidence_store = EvidenceStore::new();
         let mut scored: Vec<Value> = Vec::new();
+        // Chrome-crash-dialog fix: launch ONE browser process for the whole
+        // run and reuse it across variants (the per-variant launch + never
+        // closed loop leaked a Chrome per mockup and left them to be
+        // SIGKILLed later — the source of "Chrome quit unexpectedly").
+        let mut shared_process: Option<ac_verification::BrowserProcessRecord> = None;
         for variant in &variants {
             let html = variant["html"].as_str().unwrap_or("").to_string();
             let url = format!("mockup-variant-{}", variant["variant"].as_i64().unwrap_or(0));
@@ -2145,8 +2339,12 @@ port: port.map(|p| p as i64),
                     "notes": "deterministic harness: structural score, no pixels",
                 })
             } else {
-                match browser.launch(task_id.clone()) {
-                    Ok(process) => {
+                // Reuse the shared process: launch only on the first variant.
+                if shared_process.is_none() {
+                    shared_process = browser.launch(task_id.clone()).ok();
+                }
+                match &shared_process {
+                    Some(process) => {
                         let rendered = browser
                             .create_session(task_id.clone(), process.id.clone())
                             .and_then(|session| {
@@ -2170,13 +2368,22 @@ port: port.map(|p| p as i64),
                                     "visible_chars": visible.len(),
                                 })
                             }
-                            Err(_) => json!({
-                                "source": "unavailable",
-                                "notes": "browser could not render variant; score unavailable",
-                            }),
+                            Err(_) => {
+                                // The shared browser is no longer trusted
+                                // for further variants; close it gracefully
+                                // and mark the rest unavailable rather than
+                                // reusing a broken session.
+                                if let Some(process) = shared_process.take() {
+                                    let _ = browser.close_process(&process.id);
+                                }
+                                json!({
+                                    "source": "unavailable",
+                                    "notes": "browser could not render variant; score unavailable",
+                                })
+                            }
                         }
                     }
-                    Err(_) => json!({
+                    None => json!({
                         "source": "unavailable",
                         "notes": "browser could not launch; score unavailable",
                     }),
@@ -2185,6 +2392,11 @@ port: port.map(|p| p as i64),
             let mut v = variant.clone();
             v["score"] = score;
             scored.push(v);
+        }
+        // Close the shared browser exactly once, gracefully (CDP
+        // Browser.close), after every variant is scored.
+        if let Some(process) = shared_process.take() {
+            let _ = browser.close_process(&process.id);
         }
 
         // 4. Winner: the variant whose real evidence is strongest — real
