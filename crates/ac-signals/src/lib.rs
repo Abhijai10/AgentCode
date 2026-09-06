@@ -25,8 +25,14 @@ pub fn install_shutdown_handler() {
     // only).  `signal` itself is thread-safe with respect to handler
     // registration at startup before worker threads exist.
     unsafe {
-        libc::signal(libc::SIGTERM, mark_shutdown as *const () as libc::sighandler_t);
-        libc::signal(libc::SIGINT, mark_shutdown as *const () as libc::sighandler_t);
+        libc::signal(
+            libc::SIGTERM,
+            mark_shutdown as *const () as libc::sighandler_t,
+        );
+        libc::signal(
+            libc::SIGINT,
+            mark_shutdown as *const () as libc::sighandler_t,
+        );
     }
 }
 
