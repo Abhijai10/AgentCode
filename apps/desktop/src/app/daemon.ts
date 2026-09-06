@@ -1218,6 +1218,41 @@ export const daemon = {
     }
   },
 
+  async designGenerateMockups(
+    conversationId: string,
+    prompt: string,
+    variantCount?: number,
+    deterministic?: boolean
+  ): Promise<{
+    ok: boolean;
+    prompt?: string;
+    spec?: Record<string, unknown>;
+    spec_parse_failed?: boolean;
+    variants?: { variant: number; layout: string; palette_intent: string; html: string; score?: Record<string, unknown> }[];
+    winner?: number;
+    error?: string;
+  }> {
+    try {
+      const res = await invoke<{
+        prompt: string;
+        spec: Record<string, unknown>;
+        spec_parse_failed: boolean;
+        variants: { variant: number; layout: string; palette_intent: string; html: string; score?: Record<string, unknown> }[];
+        winner: number;
+      }>("daemon_design_generate_mockups", {
+        conversationId,
+        prompt,
+        variantCount: variantCount ?? 3,
+        deterministic: deterministic ?? false,
+      });
+      return { ok: true, ...res };
+    } catch (e: unknown) {
+      const message = e instanceof Error ? e.message : String(e);
+      const cleaned = message.replace(/^[A-Z0-9_-]+:\s*/, "");
+      return { ok: false, error: cleaned || message };
+    }
+  },
+
   async designContractGet(
     conversationId: string
   ): Promise<{ ok: boolean; contract?: Record<string, unknown>; error?: string }> {

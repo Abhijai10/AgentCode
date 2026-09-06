@@ -1916,6 +1916,27 @@ fn daemon_design_visual_critique(
 }
 
 #[tauri::command]
+fn daemon_design_generate_mockups(
+    state: tauri::State<DaemonClient>,
+    conversation_id: String,
+    prompt: String,
+    variant_count: Option<u32>,
+    deterministic: Option<bool>,
+) -> Result<Value, String> {
+    request(
+        &state.0,
+        "ui",
+        "DesignGenerateMockups",
+        json!({
+            "conversation_id": conversation_id,
+            "prompt": prompt,
+            "variant_count": variant_count.unwrap_or(3),
+            "deterministic": deterministic.unwrap_or(false),
+        }),
+    )
+}
+
+#[tauri::command]
 fn daemon_design_contract(
     state: tauri::State<DaemonClient>,
     conversation_id: String,
@@ -2244,6 +2265,7 @@ fn main() {
             daemon_design_qa_report,
             daemon_design_visual_critique,
             daemon_design_contract,
+            daemon_design_generate_mockups,
             daemon_design_execute_contract,
             daemon_design_constraints_set,
             daemon_design_constraints_get,

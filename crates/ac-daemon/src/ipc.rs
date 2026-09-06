@@ -948,6 +948,26 @@ fn dispatch_request(request: &Value, daemon: &mut DaemonService) -> (Value, bool
                 Err(error) => error_response(correlation_id, error.code(), error.to_string()),
             }
         },
+        "DesignGenerateMockups" => {
+            let conversation_id = request.get("conversation_id").and_then(Value::as_str).unwrap_or("");
+            let prompt = request.get("prompt").and_then(Value::as_str).unwrap_or("");
+            let variant_count = request
+                .get("variant_count")
+                .and_then(Value::as_u64)
+                .unwrap_or(3) as usize;
+            let deterministic = request
+                .get("deterministic")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            match daemon.design_generate_mockups(conversation_id, prompt, variant_count, deterministic) {
+                Ok(mut payload) => {
+                    payload["id"] = json!(correlation_id);
+                    payload["ok"] = json!(true);
+                    payload
+                }
+                Err(error) => error_response(correlation_id, error.code(), error.to_string()),
+            }
+        },
         "DesignContract" => {
             let conversation_id = request.get("conversation_id").and_then(Value::as_str).unwrap_or("");
             match daemon.design_contract(conversation_id) {
@@ -1822,6 +1842,87 @@ mod ipc_tests {
         });
         pump_until(server, listener, daemon, &client);
         client.join().unwrap()
+    }
+
+    /// Stitch-parity: generative mockups.  Mock provider mode scripts a
+    /// non-JSON reply, so the honest degradation path runs: spec marked
+    /// parse-failed, variants still rendered + scored structurally
+    /// (deterministic browser), winner selected, run persisted as a
+    /// design document.
+    #[test]
+    fn design_generate_mockups_renders_and_scores_variants() {
+        let _env_lock = crate::TEST_ENV_LOCK.lock().unwrap();
+        std::env::set_var("AGENTCODE_PROVIDER_MODE", "mock");
+        let (dir, db, lock, socket) = temp_paths("design-mockups");
+        let project_dir = dir.join("workspace");
+        fs::create_dir_all(&project_dir).unwrap();
+        let project_path = project_dir.to_string_lossy().to_string();
+
+        let mut daemon = DaemonService::open(&db, &lock).unwrap();
+        daemon.start().unwrap();
+        let Some((server, listener)) = bind_or_skip(&socket, None) else {
+            daemon.shutdown().unwrap();
+            std::env::remove_var("AGENTCODE_PROVIDER_MODE");
+            let _ = fs::remove_dir_all(dir);
+            return;
+        };
+
+        let create = request_via_ipc(
+            &server, &listener, &mut daemon,
+            json!({"id":"c1","command":"ConversationCreate","project_path": project_path, "mode":"DESIGN","title":"Mockups Test"}),
+        );
+        assert_eq!(create["ok"], true, "create: {create}");
+        let cid = create["conversation_id"].as_str().unwrap().to_string();
+
+        // GOAL mode must be rejected with a clear mode error.
+        let goal = request_via_ipc(
+            &server, &listener, &mut daemon,
+            json!({"id":"c2","command":"ConversationCreate","project_path": project_path, "mode":"GOAL","title":"goal"}),
+        );
+        let goal_cid = goal["conversation_id"].as_str().unwrap().to_string();
+        let wrong_mode = request_via_ipc(
+            &server, &listener, &mut daemon,
+            json!({"id":"g1","command":"DesignGenerateMockups","conversation_id": goal_cid, "prompt":"landing", "variant_count":2, "deterministic":true}),
+        );
+        assert_eq!(wrong_mode["ok"], false);
+        assert_eq!(wrong_mode["error"]["code"], "CONVERSATION-WRONG_MODE");
+
+        // Happy path in DESIGN mode: variants rendered, scored, winner chosen.
+        let run = request_via_ipc(
+            &server, &listener, &mut daemon,
+            json!({"id":"d1","command":"DesignGenerateMockups","conversation_id": cid, "prompt":"Landing page for the mission terminal", "variant_count":3, "deterministic":true}),
+        );
+        assert_eq!(run["ok"], true, "run: {run}");
+        let variants = run["variants"].as_array().unwrap();
+        assert_eq!(variants.len(), 3, "expected 3 variants: {variants:?}");
+        // The spec is present; unknown model replies fall back to a
+        // minimal spec with defaults (headline from the prompt), never a
+        // crash and never fabricated analysis.  The flag mirrors the parse.
+        assert!(run.get("spec").map(|s| s.is_object()).unwrap_or(false), "run: {run}");
+        // Every variant carries daemon-rendered HTML (self-contained page).
+        for v in variants {
+            let html = v["html"].as_str().unwrap_or("");
+            assert!(html.contains("<!doctype html>"), "variant html: {html:.120}");
+            assert!(html.contains("<h1"), "variant must render a headline");
+            // Deterministic browser -> structural scoring, labeled honestly.
+            assert_eq!(v["score"]["source"], "structural");
+        }
+        // Winner is one of the variants.
+        let winner = run["winner"].as_i64().unwrap();
+        assert!((0..3).contains(&winner), "winner: {winner}");
+
+        // Empty prompt is rejected honestly.
+        let empty = request_via_ipc(
+            &server, &listener, &mut daemon,
+            json!({"id":"d2","command":"DesignGenerateMockups","conversation_id": cid, "prompt":"  ", "variant_count":1, "deterministic":true}),
+        );
+        assert_eq!(empty["ok"], false);
+        assert_eq!(empty["error"]["code"], "CONVERSATION-EMPTY_PROMPT");
+
+        server.cleanup();
+        daemon.shutdown().unwrap();
+        std::env::remove_var("AGENTCODE_PROVIDER_MODE");
+        let _ = fs::remove_dir_all(dir);
     }
 
     /// F11: the conversation changes cursor is a CHEAP change-detection

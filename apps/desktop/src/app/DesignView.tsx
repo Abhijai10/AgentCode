@@ -101,6 +101,13 @@ export function DesignView({
   // F2: the design contract (executable specification) + standalone QA runs.
   const [contract, setContract] = useState<Record<string, unknown> | null>(null);
   const [standaloneQa, setStandaloneQa] = useState<DesignQaReport | null>(null);
+  // Stitch-parity: generative mockups (prompt -> variants -> winner).
+  const [mockupPrompt, setMockupPrompt] = useState("");
+  const [mockups, setMockups] = useState<{
+    variants: { variant: number; layout: string; palette_intent: string; html: string; score?: Record<string, unknown> }[];
+    winner: number;
+    spec_parse_failed?: boolean;
+  } | null>(null);
   const [panelBusy, setPanelBusy] = useState(false);
   const [rightOpen, setRightOpen] = useState(true);
   const [viewportHint, setViewportHint] = useState("desktop");
@@ -414,6 +421,23 @@ export function DesignView({
     runPanel(async () => {
       const r = await daemon.designPreviewStart(activeConvId!);
       if (!r.ok) setError(r.error || "Could not start preview");
+    });
+
+  // Stitch-parity: generate candidate mockup variants from a prompt.  The
+  // model fills a constrained spec; the daemon renders real variants and
+  // scores them in the real browser; the winner is highlighted here.
+  const handleGenerateMockups = () =>
+    runPanel(async () => {
+      if (!mockupPrompt.trim()) {
+        setError("Describe the screen you want (e.g. 'landing page for the terminal app').");
+        return;
+      }
+      const r = await daemon.designGenerateMockups(activeConvId!, mockupPrompt, 3, false);
+      if (r.ok && r.variants) {
+        setMockups({ variants: r.variants, winner: r.winner ?? 0, spec_parse_failed: r.spec_parse_failed });
+      } else {
+        setError(r.error || "Could not generate mockups");
+      }
     });
 
   // F2: the full design contract — the executable specification of this
@@ -1130,6 +1154,62 @@ export function DesignView({
                 An independent vision model critiques the real screenshot — a separate
                 signal from the deterministic anti-slop critique.
               </p>
+            )}
+          </section>
+
+          <section className="neo-raised rounded-2xl p-4">
+            <div className="flex items-center justify-between mb-2">
+              <h4 className="text-sm font-semibold text-on-surface">Generate Mockups</h4>
+              <span className="text-[10px] text-on-surface-variant">prompt → variants → scored winner</span>
+            </div>
+            <textarea
+              value={mockupPrompt}
+              onChange={(e) => setMockupPrompt(e.target.value)}
+              placeholder="Describe the screen (e.g. “landing page for the mission terminal”)"
+              rows={2}
+              className="w-full neo-pressed rounded-lg p-2 text-xs text-on-surface bg-transparent resize-none focus:outline-none"
+            />
+            <button
+              onClick={handleGenerateMockups}
+              disabled={panelBusy}
+              className="mt-2 neo-button rounded-lg px-3 py-1.5 text-[11px] font-medium text-on-surface-variant disabled:opacity-50"
+              title="Generate candidate mockups, rendered and scored in the real browser"
+            >
+              Generate variants
+            </button>
+            {mockups && (
+              <div className="mt-3 space-y-2">
+                {mockups.spec_parse_failed && (
+                  <p className="text-[10px] text-amber-600">
+                    The model's spec could not be parsed — a minimal spec was used honestly.
+                  </p>
+                )}
+                {mockups.variants.map((v) => (
+                  <div key={v.variant} className="neo-pressed rounded-lg p-2">
+                    <div className="flex items-center justify-between mb-1">
+                      <span className="text-[10px] font-medium text-on-surface">
+                        Variant {v.variant + 1} · {v.layout} · {v.palette_intent}
+                      </span>
+                      {v.variant === mockups.winner && (
+                        <span className="text-[10px] font-medium text-emerald-600">★ WINNER</span>
+                      )}
+                      <span className="text-[10px] text-on-surface-variant">
+                        {v.score?.source === "real-browser"
+                          ? `browser ✓ ${v.score?.visible_chars ?? 0} chars`
+                          : v.score?.source === "structural"
+                            ? "structural"
+                            : "unavailable"}
+                      </span>
+                    </div>
+                    <iframe
+                      title={`Mockup variant ${v.variant + 1}`}
+                      srcDoc={v.html}
+                      sandbox=""
+                      className="w-full h-40 rounded border-0 bg-white"
+                    />
+                  </div>
+                ))}
+              </div>
             )}
           </section>
 

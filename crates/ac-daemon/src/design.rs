@@ -1799,6 +1799,270 @@ port: port.map(|p| p as i64),
     /// `deterministic` runs the deterministic harness with `html` — used by
     /// tests and recorded as NEEDS_MANUAL_REVIEW for layout metrics, never
     /// a fabricated pass.
+    /// ── Stitch-parity: generative mockups ──────────────────────────────
+    ///
+    /// The full Stitch flow: prompt -> multiple candidate variants ->
+    /// real rendering -> visual scoring -> a winner.  Honest to the small
+    /// local models we run: the model does NOT write whole HTML files
+    /// (3-4B models produce broken markup); it fills a tightly-constrained
+    /// JSON spec (layout, section copy, palette intent) and the DAEMON
+    /// renders variants deterministically from that spec.  Every variant is
+    /// then scored by the REAL browser (rendered text presence) and the
+    /// winning variant is persisted as a design document the user can
+    /// critique further; nothing is ever fabricated.
+    pub fn design_generate_mockups(
+        &mut self,
+        conversation_id: &str,
+        prompt: &str,
+        variant_count: usize,
+        deterministic: bool,
+    ) -> AcResult<Value> {
+        self.ensure_running()?;
+        let conv = self.db.conversation(conversation_id)?.ok_or_else(|| {
+            AcError::validation("CONVERSATION-NOT_FOUND", "conversation not found")
+        })?;
+        if conv.mode != "DESIGN" {
+            return Err(AcError::validation(
+                "CONVERSATION-WRONG_MODE",
+                "design_generate_mockups requires a DESIGN conversation",
+            ));
+        }
+        if prompt.trim().is_empty() {
+            return Err(AcError::validation(
+                "CONVERSATION-EMPTY_PROMPT",
+                "mockup prompt must not be empty",
+            ));
+        }
+        let variant_count = variant_count.clamp(1, 4);
+
+        // 1. Model fills a constrained spec.  The schema is tiny and every
+        //    field is optional-with-default so a weak model still yields a
+        //    usable spec; the DAEMON owns all rendering decisions.
+        let spec_prompt = format!(
+            "You are filling a JSON spec for a UI mockup generator.\n\
+             Request: {}\n\
+             Reply with ONLY a JSON object with these optional fields:\n\
+             {{\"headline\": string (max 60 chars), \"subheadline\": string (max 120 chars),\n\
+             \"primary_cta\": string (max 24 chars), \"secondary_cta\": string (max 24 chars),\n\
+             \"hero_image_idea\": string (max 60 chars), \"section_ideas\": array of 1-3 strings (max 40 chars each),\n\
+             \"palette_intent\": \"light\"|\"dark\"|\"warm\"|\"cool\"|\"high_contrast\",\n\
+             \"layout\": \"hero_left\"|\"hero_center\"|\"hero_split\"}}\n\
+             Keep copy concrete and product-specific to this project: {}\n\
+             Output JSON only, no prose.",
+            bounded_ui_summary(prompt, 512),
+            bounded_project_listing(&conv.project_path, 20),
+        );
+
+        let db_path = self.db_path.clone();
+        let mut providers = crate::daemon_provider_registry(&self.db, &db_path).map_err(|error| {
+            AcError::validation(
+                "DESIGN-PROVIDER_SETUP",
+                format!("cannot initialize provider registry: {error}"),
+            )
+        })?;
+        let mut profile = ac_provider::TaskProfile::discuss(
+            ac_common::StableId::new("design"),
+            self.preferred_routing_profile(),
+        );
+        profile.required_context = 2048;
+        let cancel = Arc::new(AtomicBool::new(false));
+        let result = providers.request_model(&profile, spec_prompt, 1024, &|| {
+            cancel.load(Ordering::Relaxed)
+        });
+
+        // The model's raw reply is recorded as evidence even when parsing
+        // fails — honest failure, never a fabricated spec.
+        let raw_reply = match result {
+            Ok(ref execution) => provider_events_text(&execution.events),
+            Err(error) => {
+                return Err(AcError::validation(
+                    "DESIGN-GENERATE_PROVIDER_FAILED",
+                    format!("no provider could produce a spec: {error:?}"),
+                ))
+            }
+        };
+        let spec = parse_reference_json(&raw_reply).unwrap_or_else(|| {
+            // Honest degradation: a deterministic minimal spec, clearly
+            // marked that the model's output could not be parsed.
+            json!({
+                "headline": bounded_ui_summary(prompt, 48),
+                "subheadline": "Generated from your prompt",
+                "primary_cta": "Get started",
+                "secondary_cta": "Learn more",
+                "hero_image_idea": "",
+                "section_ideas": [],
+                "palette_intent": "light",
+                "layout": "hero_center",
+                "_model_spec_parse_failed": true,
+            })
+        });
+
+        // 2. Render variants deterministically from the spec: layout and
+        //    palette vary independently so the candidates genuinely differ,
+        //    not cosmetic jitter.
+        let layouts = ["hero_left", "hero_center", "hero_split"];
+        let palettes: [(&str, &str, &str, &str); 4] = [
+            ("light", "#ffffff", "#0f172a", "#2563eb"),
+            ("dark", "#0b1120", "#e2e8f0", "#38bdf8"),
+            ("warm", "#fffaf5", "#292018", "#ea580c"),
+            ("high_contrast", "#ffffff", "#000000", "#0047ab"),
+        ];
+        let spec_layout = spec
+            .get("layout")
+            .and_then(Value::as_str)
+            .unwrap_or("hero_center")
+            .to_string();
+        let intent = spec
+            .get("palette_intent")
+            .and_then(Value::as_str)
+            .unwrap_or("light")
+            .to_string();
+        let base_layout_idx = layouts
+            .iter()
+            .position(|l| *l == spec_layout)
+            .unwrap_or(1);
+        let variants: Vec<Value> = (0..variant_count)
+            .map(|i| {
+                // Variant 0 honors the spec exactly; later variants rotate
+                // layout + palette so the user compares true alternatives.
+                let idx = (base_layout_idx + i) % layouts.len();
+                let (palette_name, bg, fg, accent) = if i == 0 {
+                    let p = palettes
+                        .iter()
+                        .find(|(name, _, _, _)| *name == intent)
+                        .unwrap_or(&palettes[0]);
+                    (p.0, p.1, p.2, p.3)
+                } else {
+                    let p = &palettes[i % palettes.len()];
+                    (p.0, p.1, p.2, p.3)
+                };
+                let layout = if i == 0 {
+                    layouts[base_layout_idx]
+                } else {
+                    layouts[idx]
+                };
+                json!({
+                    "variant": i,
+                    "layout": layout,
+                    "palette_intent": palette_name,
+                    "html": render_mockup_html(&spec, layout, bg, fg, accent),
+                })
+            })
+            .collect();
+
+        // 3. Score every variant with the REAL browser when available:
+        //    OpenHtmlForTest + snapshot gives the true rendered text.
+        //    Deterministic harness (no pixels) gets a clearly labeled
+        //    structural score instead — never fabricated pixels.
+        let policy = ac_security::CapabilityPolicy::new()
+            .allow(ac_security::Capability::BrowserAutomation);
+        let mut browser = if deterministic {
+            ac_verification::BrowserRuntime::deterministic_harness_for_tests(policy)
+        } else {
+            ac_verification::BrowserRuntime::new(policy)
+        };
+        let task_id = StableId::new("design");
+        let mut evidence_store = EvidenceStore::new();
+        let mut scored: Vec<Value> = Vec::new();
+        for variant in &variants {
+            let html = variant["html"].as_str().unwrap_or("").to_string();
+            let url = format!("mockup-variant-{}", variant["variant"].as_i64().unwrap_or(0));
+            let score = if deterministic {
+                json!({
+                    "source": "structural",
+                    "text_present": html.contains("<h1"),
+                    "notes": "deterministic harness: structural score, no pixels",
+                })
+            } else {
+                match browser.launch(task_id.clone()) {
+                    Ok(process) => {
+                        let rendered = browser
+                            .create_session(task_id.clone(), process.id.clone())
+                            .and_then(|session| {
+                                browser
+                                    .act(
+                                        &session.id,
+                                        ac_verification::BrowserAction::OpenHtmlForTest {
+                                            url,
+                                            html: html.clone(),
+                                        },
+                                        &mut evidence_store,
+                                    )
+                                    .and_then(|_| browser.inspect_dom(&session.id, &mut evidence_store))
+                            });
+                        match rendered {
+                            Ok(snapshot) => {
+                                let visible = snapshot.visible_text.trim();
+                                json!({
+                                    "source": "real-browser",
+                                    "text_present": visible.len() > 10,
+                                    "visible_chars": visible.len(),
+                                })
+                            }
+                            Err(_) => json!({
+                                "source": "unavailable",
+                                "notes": "browser could not render variant; score unavailable",
+                            }),
+                        }
+                    }
+                    Err(_) => json!({
+                        "source": "unavailable",
+                        "notes": "browser could not launch; score unavailable",
+                    }),
+                }
+            };
+            let mut v = variant.clone();
+            v["score"] = score;
+            scored.push(v);
+        }
+
+        // 4. Winner: the variant whose real evidence is strongest — real
+        //    browser renders with text beat structural scores beat
+        //    unavailable.  Ties break by variant order (stable, first wins).
+        let rank = |v: &Value| -> i32 {
+            match v["score"]["source"].as_str().unwrap_or("") {
+                "real-browser" => {
+                    2 + i32::from(v["score"]["text_present"].as_bool().unwrap_or(false))
+                }
+                "structural" => 1,
+                _ => 0,
+            }
+        };
+        let winner = scored
+            .iter()
+            .enumerate()
+            .max_by_key(|(i, v)| (rank(v), std::cmp::Reverse(*i)))
+            .map(|(_, v)| v.clone())
+            .ok_or_else(|| {
+                AcError::validation("DESIGN-GENERATE_NO_VARIANTS", "no variants were produced")
+            })?;
+
+        // 5. Persist the run as a design document (survives restarts,
+        //    feeds design memory + downstream contract).
+        let now = TimestampMillis::now().as_millis() as i64;
+        let run = json!({
+            "prompt": prompt,
+            "spec": spec,
+            "spec_parse_failed": spec.get("_model_spec_parse_failed").is_some(),
+            "variants": scored,
+            "winner": winner["variant"],
+            "created_at_ms": now,
+        });
+        let id = format!("dgen-{}", StableId::new("mockups"));
+        self.db.save_design_document(&DesignDocumentRow {
+            id,
+            conversation_id: conversation_id.to_string(),
+            doc_type: "generated_mockups".to_string(),
+            content_json: run.to_string(),
+            version: 1,
+            evidence_refs: String::new(),
+            created_at_ms: now,
+            updated_at_ms: now,
+        })?;
+
+        Ok(run)
+    }
+
     pub fn design_qa_run(
         &self,
         conversation_id: &str,
@@ -2347,6 +2611,142 @@ fn detect_port_from_line(line: &str) -> Option<u16> {
         }
     }
     None
+}
+
+/// Escape text for safe embedding in generated mockup HTML.
+fn mockup_escape(text: &str) -> String {
+    text.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&#39;")
+}
+
+/// Deterministically render a self-contained mockup page from the model
+/// spec.  Pure function of (spec, layout, palette) — no model HTML ever
+/// runs; the daemon owns every tag it emits.
+fn render_mockup_html(
+    spec: &Value,
+    layout: &str,
+    bg: &str,
+    fg: &str,
+    accent: &str,
+) -> String {
+    let str_field = |name: &str, fallback: &str| -> String {
+        let value = spec
+            .get(name)
+            .and_then(Value::as_str)
+            .map(|s| s.trim())
+            .unwrap_or("");
+        let bounded: String = value.chars().take(if name == "subheadline" { 140 } else { 70 }).collect();
+        if bounded.is_empty() {
+            fallback.to_string()
+        } else {
+            bounded
+        }
+    };
+    let headline = str_field("headline", "Your product, clearly stated");
+    let subheadline = str_field(
+        "subheadline",
+        "A concrete sentence about what this does and for whom.",
+    );
+    let primary_cta = str_field("primary_cta", "Get started");
+    let secondary_cta = str_field("secondary_cta", "Learn more");
+    let hero_image = str_field("hero_image_idea", "");
+    let sections: Vec<String> = spec
+        .get("section_ideas")
+        .and_then(Value::as_array)
+        .map(|arr| {
+            arr.iter()
+                .filter_map(Value::as_str)
+                .map(|s| mockup_escape(&s.chars().take(60).collect::<String>()))
+                .take(3)
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let section_cards = sections
+        .iter()
+        .map(|s| {
+            format!(
+                "<div style=\"min-width:220px;flex:1;padding:20px;border:1px solid {fg}22;\
+                 border-radius:12px;background:{bg}\"><p style=\"margin:0;font-size:14px;\
+                 color:{fg};opacity:0.85\">{s}</p></div>"
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n      ");
+    let sections_block = if section_cards.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "<div style=\"display:flex;gap:16px;flex-wrap:wrap;max-width:960px;\
+             margin:48px auto;padding:0 24px\">{}</div>",
+            section_cards
+        )
+    };
+    let hero_visual = if hero_image.is_empty() {
+        format!(
+            "<div style=\"width:280px;height:180px;border-radius:12px;\
+             background:linear-gradient(135deg,{accent},{fg});opacity:0.9\" aria-hidden=\"true\"></div>"
+        )
+    } else {
+        format!(
+            "<div style=\"width:280px;height:180px;border-radius:12px;background:{accent}1a;\
+             border:1px dashed {accent};display:flex;align-items:center;justify-content:center;\
+             padding:12px\"><span style=\"font-size:12px;color:{fg};opacity:0.7\">{}</span></div>",
+            hero_image
+        )
+    };
+
+    let hero_inner = format!(
+        "<h1 style=\"margin:0 0 16px;font-size:44px;line-height:1.15;color:{fg}\">{}</h1>\n\
+         <p style=\"margin:0 0 28px;font-size:18px;line-height:1.6;color:{fg};opacity:0.75;\
+         max-width:34rem\">{}</p>\n\
+         <div style=\"display:flex;gap:12px;flex-wrap:wrap\">\n\
+           <span style=\"display:inline-block;padding:12px 24px;border-radius:10px;\
+           background:{accent};color:{bg};font-weight:600;font-size:15px\">{}</span>\n\
+           <span style=\"display:inline-block;padding:12px 24px;border-radius:10px;\
+           border:1px solid {fg}55;color:{fg};font-size:15px\">{}</span>\n\
+         </div>\n\
+         {}",
+        mockup_escape(&headline),
+        mockup_escape(&subheadline),
+        mockup_escape(&primary_cta),
+        mockup_escape(&secondary_cta),
+        hero_visual,
+    );
+
+    // Layout = how the hero text and visual share the row.
+    let (hero_style, hero_wrap) = match layout {
+        "hero_left" => (
+            "display:flex;flex-direction:column;justify-content:center;text-align:left",
+            "display:flex;gap:48px;align-items:center;justify-content:center",
+        ),
+        "hero_split" => (
+            "display:flex;flex-direction:column;justify-content:center;text-align:center;flex:1",
+            "display:flex;gap:48px;align-items:center;justify-content:center",
+        ),
+        _ => (
+            "display:flex;flex-direction:column;justify-content:center;align-items:center;text-align:center;max-width:44rem",
+            "display:block;padding:0 24px",
+        ),
+    };
+
+    format!(
+        "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">\n\
+         <meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"></head>\n\
+         <body style=\"margin:0;font-family:ui-sans-serif,system-ui,-apple-system,'Segoe UI',\
+         sans-serif;background:{bg};min-height:100vh\">\n\
+         <main style=\"padding:64px 0\"><div style=\"{hero_wrap}\">\n\
+         <div style=\"{hero_style}\">{hero_inner}</div></div>{sections_block}</main>\n\
+         </body></html>",
+        hero_style = hero_style,
+        hero_wrap = hero_wrap,
+        hero_inner = hero_inner,
+        sections_block = sections_block,
+        bg = bg,
+    )
 }
 
 fn test_http_ready(port: u16) -> bool {
