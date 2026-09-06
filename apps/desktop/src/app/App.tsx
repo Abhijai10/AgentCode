@@ -1,4 +1,4 @@
-import { useEffect, useState, useCallback } from "react";
+import { useEffect, useState, useCallback, Component, type ReactNode } from "react";
 import { ThemeProvider } from "./ThemeContext";
 import { ProjectProvider, useProject, type Project } from "./ProjectContext";
 import { Sidebar } from "./Sidebar";
@@ -17,6 +17,48 @@ import { daemon } from "./daemon";
 import type { View, MissionSummary, DaemonStatus } from "./types";
 
 const PROJECT_REQUIRED_VIEWS: View[] = ["mission", "chat", "discuss", "design", "security"];
+
+/// F5 (final audit): top-level error boundary — a thrown render error shows
+/// a recovery screen with reload + error detail instead of white-screening
+/// the whole window. State lives nowhere but this component; the daemon is
+/// unaffected (the failure is renderer-side by construction).
+class AppErrorBoundary extends Component<
+  { children: ReactNode },
+  { error: Error | null }
+> {
+  state: { error: Error | null } = { error: null };
+
+  static getDerivedStateFromError(error: Error) {
+    return { error };
+  }
+
+  render() {
+    if (this.state.error) {
+      return (
+        <div className="h-screen w-screen flex items-center justify-center bg-background p-8">
+          <div className="neo-raised rounded-2xl p-6 max-w-lg text-center space-y-4">
+            <Icon name="error" size={32} className="text-primary mx-auto" />
+            <h2 className="text-lg font-semibold text-on-surface">Something broke in the interface</h2>
+            <p className="text-xs text-on-surface-variant">
+              The agent daemon is unaffected — this is a renderer error. Reload the
+              window to reconnect; all state lives durably in the daemon.
+            </p>
+            <pre className="text-[10px] font-mono text-left text-on-surface-variant neo-pressed rounded-lg p-3 overflow-auto max-h-40">
+              {String(this.state.error?.message ?? this.state.error)}
+            </pre>
+            <button
+              className="neo-button px-4 py-2 rounded-lg text-sm text-primary font-medium"
+              onClick={() => window.location.reload()}
+            >
+              Reload AgentCode
+            </button>
+          </div>
+        </div>
+      );
+    }
+    return this.props.children;
+  }
+}
 
 function AppShell() {
   const [view, setView] = useState<View>("home");
@@ -269,9 +311,11 @@ function AppShell() {
 export function App() {
   return (
     <ThemeProvider>
-      <ProjectProvider>
-        <AppShell />
-      </ProjectProvider>
+      <AppErrorBoundary>
+        <ProjectProvider>
+          <AppShell />
+        </ProjectProvider>
+      </AppErrorBoundary>
     </ThemeProvider>
   );
 }

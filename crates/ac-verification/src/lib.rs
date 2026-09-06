@@ -4417,7 +4417,11 @@ mod tests {
         // dispatched.  Under full-suite contention the event can arrive late,
         // so poll with a deadline instead of relying on a single fixed sleep.
         // The assertion below is unchanged and remains strict.
-        let wait_deadline = Instant::now() + Duration::from_secs(10);
+        // F6 (final audit): under full-suite parallelism Chrome's CDP
+            // Network.responseReceived event can arrive well past 10s on a
+            // contended 8GB machine; 30s removes the flake while keeping the
+            // assertion strict (poll, not sleep).
+            let wait_deadline = Instant::now() + Duration::from_secs(30);
         let mut diagnostics = runtime.diagnostics(&session.id, &mut evidence).unwrap();
         while !diagnostics
             .network_failures
