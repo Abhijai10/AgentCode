@@ -1,0 +1,46 @@
+{
+  "phase": "P09",
+  "status": "COMPLETE",
+  "accepted_commit": "712d57b",
+  "work_packages": [
+    "P09-WP01",
+    "P09-WP02",
+    "P09-WP03",
+    "P09-WP04",
+    "P09-WP05",
+    "P09-WP06",
+    "P09-WP07",
+    "P09-WP08",
+    "P09-WP09",
+    "P09-WP10",
+    "P09-WP11",
+    "P09-WP12",
+    "P09-WP13",
+    "P09-WP14"
+  ],
+  "migration": "0004_semantic_repository_graph",
+  "gates": {
+    "P9-G1": "PASS",
+    "P9-G2": "PASS",
+    "P9-G3": "PASS",
+    "P9-G4": "PASS",
+    "P9-G5": "PASS",
+    "P9-G6": "PASS",
+    "P9-G7": "PASS",
+    "P9-G8": "PASS",
+    "P9-G9": "PASS",
+    "P9-G10": "PASS"
+  },
+  "validation": [
+    "cargo fmt --all",
+    "cargo check --workspace --all-targets",
+    "cargo test --workspace",
+    "cargo clippy --workspace --all-targets -- -D warnings",
+    "find docs -name '*.json' ! -name '._*' -print0 | xargs -0 -n1 jq empty",
+    "git diff --check"
+  ],
+  "optional_indexes": {
+    "scip": "optional-disabled",
+    "zoekt": "threshold-gated"
+  }
+}

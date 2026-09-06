@@ -1,0 +1,54 @@
+{
+  "phase": "P25",
+  "name": "AgentCode Dogfooding",
+  "status": "COMPLETE",
+  "starting_commit": "3cef3d317c77038698c0c5bcb6cf78ec1c58dfbc",
+  "schema_version": 16,
+  "migration": "migrations/0016_chaos_dogfood.sql",
+  "workpackages": [
+    "P25-WP01",
+    "P25-WP02",
+    "P25-WP03",
+    "P25-WP04",
+    "P25-WP05",
+    "P25-WP06",
+    "P25-WP07",
+    "P25-WP08",
+    "P25-WP09",
+    "P25-WP10",
+    "P25-WP11",
+    "P25-WP12"
+  ],
+  "gates": [
+    "P25-G1",
+    "P25-G2",
+    "P25-G3",
+    "P25-G4",
+    "P25-G5",
+    "P25-G6",
+    "P25-G7",
+    "P25-G8",
+    "P25-G9",
+    "P25-G10",
+    "P25-G11",
+    "P25-G12",
+    "P25-G13",
+    "P25-G14"
+  ],
+  "evidence": [
+    "crates/ac-agent/src/dogfood.rs",
+    "crates/ac-db/src/chaos_dogfood.rs",
+    "tests/integration/chaos_dogfood_flow.rs"
+  ],
+  "validation": [
+    "cargo fmt --all",
+    "cargo check --workspace --all-targets",
+    "cargo test --workspace",
+    "cargo clippy --workspace --all-targets -- -D warnings",
+    "JSON validation",
+    "git diff --check"
+  ],
+  "limitations": [
+    "Dogfood missions are deterministic production-facing harness runs; longer real-time unattended artifacts can be attached in later phases."
+  ]
+}

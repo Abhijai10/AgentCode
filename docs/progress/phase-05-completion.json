@@ -1,0 +1,10 @@
+{
+  "phase": "P05",
+  "name": "Native Tool Runtime Foundation",
+  "status": "COMPLETE",
+  "work_packages": ["P05-WP01", "P05-WP02", "P05-WP03", "P05-WP04", "P05-WP05", "P05-WP06", "P05-WP07", "P05-WP08", "P05-WP09", "P05-WP10", "P05-WP11"],
+  "gates": {"P5-G1": "PASS", "P5-G2": "PASS", "P5-G3": "PASS", "P5-G4": "PASS", "P5-G5": "PASS", "P5-G6": "PASS", "P5-G7": "PASS", "P5-G8": "PASS", "P5-G9": "PASS", "P5-G10": "PASS", "P5-G11": "PASS", "P5-G12": "PASS"},
+  "migration": "0001_kernel_schema.sql: tool_execution_records",
+  "validation": ["cargo fmt --all", "cargo check --workspace --all-targets", "cargo test --workspace", "cargo clippy --workspace --all-targets -- -D warnings"],
+  "known_limitations": ["direct-child process cancellation only", "literal search without ripgrep acceleration", "in-memory secret broker backing"]
+}

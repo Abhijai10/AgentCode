@@ -1,0 +1,30 @@
+# macOS junk
+._*
+.DS_Store
+
+# Rust build artifacts
+target/
+**/target/
+
+# Node
+node_modules/
+**/node_modules/
+dist/
+dist-ssr/
+*.local
+
+# Tauri
+apps/desktop/src-tauri/target/
+apps/desktop/src-tauri/gen/
+
+# Editor
+.idea/
+.vscode/
+*.swp
+
+# Local runtime state (never committed)
+.agentcode/
+logs/
+
+# Test scratch
+tests/**/scratch/

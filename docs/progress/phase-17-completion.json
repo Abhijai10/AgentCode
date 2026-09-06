@@ -1,0 +1,54 @@
+{
+  "phase": "P17",
+  "name": "Baseline Security Platform",
+  "status": "COMPLETE",
+  "starting_commit": "db8199c",
+  "implementation_commit": "7f15db2",
+  "workpackages": [
+    "P17-WP01",
+    "P17-WP02",
+    "P17-WP03",
+    "P17-WP04",
+    "P17-WP05",
+    "P17-WP06",
+    "P17-WP07",
+    "P17-WP08",
+    "P17-WP09",
+    "P17-WP10",
+    "P17-WP11",
+    "P17-WP12",
+    "P17-WP13",
+    "P17-WP14"
+  ],
+  "gates": {
+    "P17-G1": "PASS",
+    "P17-G2": "PASS",
+    "P17-G3": "PASS",
+    "P17-G4": "PASS",
+    "P17-G5": "PASS",
+    "P17-G6": "PASS",
+    "P17-G7": "PASS",
+    "P17-G8": "PASS",
+    "P17-G9": "PASS",
+    "P17-G10": "PASS",
+    "P17-G11": "PASS",
+    "P17-G12": "PASS",
+    "P17-G13": "PASS",
+    "P17-G14": "PASS",
+    "P17-G15": "PASS"
+  },
+  "migrations": [
+    "migrations/0012_baseline_security.sql"
+  ],
+  "validation": [
+    "cargo fmt --all -- --check",
+    "cargo check --workspace --all-targets",
+    "cargo test --workspace",
+    "cargo clippy --workspace --all-targets -- -D warnings",
+    "JSON validation",
+    "git diff --check"
+  ],
+  "limitations": [
+    "External scanner binaries are represented by deterministic local adapter fallbacks in this phase. Missing external scanners do not become zero findings; adapter availability is explicit in scan reports."
+  ]
+}

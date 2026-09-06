@@ -1,0 +1,48 @@
+{
+  "phase": "P13",
+  "name": "Advanced Edit Engine",
+  "status": "COMPLETE",
+  "starting_commit": "7c6bc57",
+  "implementation_commit": "9fb1a8d",
+  "workpackages": [
+    "P13-WP01",
+    "P13-WP02",
+    "P13-WP03",
+    "P13-WP04",
+    "P13-WP05",
+    "P13-WP06",
+    "P13-WP07",
+    "P13-WP08",
+    "P13-WP09",
+    "P13-WP10",
+    "P13-WP11",
+    "P13-WP12",
+    "P13-WP13"
+  ],
+  "gates": {
+    "P13-G1": "PASS",
+    "P13-G2": "PASS",
+    "P13-G3": "PASS",
+    "P13-G4": "PASS",
+    "P13-G5": "PASS",
+    "P13-G6": "PASS",
+    "P13-G7": "PASS",
+    "P13-G8": "PASS",
+    "P13-G9": "PASS",
+    "P13-G10": "PASS"
+  },
+  "migrations": [
+    "migrations/0008_advanced_edit_engine.sql"
+  ],
+  "validation": [
+    "cargo fmt --all",
+    "cargo check --workspace --all-targets",
+    "cargo test --workspace",
+    "cargo clippy --workspace --all-targets -- -D warnings",
+    "JSON validation",
+    "git diff --check"
+  ],
+  "limitations": [
+    "External ast-grep and live LSP servers are optional; deterministic in-process fallback adapters are implemented and documented."
+  ]
+}

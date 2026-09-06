@@ -1,0 +1,53 @@
+{
+  "phase": "P16",
+  "name": "Skills, Hooks & MCP",
+  "status": "COMPLETE",
+  "starting_commit": "6264cd3",
+  "implementation_commit": "7abea9b",
+  "workpackages": [
+    "P16-WP01",
+    "P16-WP02",
+    "P16-WP03",
+    "P16-WP04",
+    "P16-WP05",
+    "P16-WP06",
+    "P16-WP07",
+    "P16-WP08",
+    "P16-WP09",
+    "P16-WP10",
+    "P16-WP11",
+    "P16-WP12",
+    "P16-WP13"
+  ],
+  "gates": {
+    "P16-G1": "PASS",
+    "P16-G2": "PASS",
+    "P16-G3": "PASS",
+    "P16-G4": "PASS",
+    "P16-G5": "PASS",
+    "P16-G6": "PASS",
+    "P16-G7": "PASS",
+    "P16-G8": "PASS",
+    "P16-G9": "PASS",
+    "P16-G10": "PASS",
+    "P16-G11": "PASS",
+    "P16-G12": "PASS",
+    "P16-G13": "PASS",
+    "P16-G14": "PASS",
+    "P16-G15": "PASS"
+  },
+  "migrations": [
+    "migrations/0011_extensions_skills_hooks_mcp.sql"
+  ],
+  "validation": [
+    "cargo fmt --all -- --check",
+    "cargo check --workspace --all-targets",
+    "cargo test --workspace",
+    "cargo clippy --workspace --all-targets -- -D warnings",
+    "JSON validation",
+    "git diff --check"
+  ],
+  "limitations": [
+    "External MCP transports are represented by typed lifecycle records and deterministic local broker routing in this phase; unavailable external runtime clients degrade to explicit metadata/lifecycle state rather than synthetic success."
+  ]
+}

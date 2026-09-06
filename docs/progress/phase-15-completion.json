@@ -1,0 +1,47 @@
+{
+  "phase": "P15",
+  "name": "Browser Runtime & Visual Verification",
+  "status": "COMPLETE",
+  "starting_commit": "fd49e70",
+  "implementation_commit": "ac47d08",
+  "workpackages": [
+    "P15-WP01",
+    "P15-WP02",
+    "P15-WP03",
+    "P15-WP04",
+    "P15-WP05",
+    "P15-WP06",
+    "P15-WP07",
+    "P15-WP08",
+    "P15-WP09",
+    "P15-WP10",
+    "P15-WP11"
+  ],
+  "gates": {
+    "P15-G1": "PASS",
+    "P15-G2": "PASS",
+    "P15-G3": "PASS",
+    "P15-G4": "PASS",
+    "P15-G5": "PASS",
+    "P15-G6": "PASS",
+    "P15-G7": "PASS",
+    "P15-G8": "PASS",
+    "P15-G9": "PASS",
+    "P15-G10": "PASS",
+    "P15-G11": "PASS"
+  },
+  "migrations": [
+    "migrations/0010_browser_runtime.sql"
+  ],
+  "validation": [
+    "cargo fmt --all -- --check",
+    "cargo check --workspace --all-targets",
+    "cargo test --workspace",
+    "cargo clippy --workspace --all-targets -- -D warnings",
+    "JSON validation",
+    "git diff --check"
+  ],
+  "limitations": [
+    "Playwright is represented by an adapter mode; when the external runtime is unavailable the deterministic local harness preserves the same evidence and persistence contract."
+  ]
+}

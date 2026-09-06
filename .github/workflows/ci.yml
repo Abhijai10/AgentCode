@@ -1,0 +1,35 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  rust:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # v1/master
+        with:
+          toolchain: stable
+      - name: Install bubblewrap for Linux sandbox tests
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y bubblewrap
+          echo "bwrap version:"
+          bwrap --version
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo test --workspace
+      - run: cargo build -p ac-daemon
+      - run: cargo build -p ac-desktop-placeholder
+
+  macos-daemon-e2e:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # v1/master
+        with:
+          toolchain: stable
+      - run: cargo build -p ac-daemon
+      - run: cargo test -p agentcode-integration-tests --test daemon_process_boundary -- --ignored --nocapture

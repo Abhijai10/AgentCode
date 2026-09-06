@@ -1,0 +1,53 @@
+{
+  "phase": "P14",
+  "name": "Verification & Evidence Engine",
+  "status": "COMPLETE",
+  "starting_commit": "9ffe487",
+  "implementation_commit": "4770724",
+  "workpackages": [
+    "P14-WP01",
+    "P14-WP02",
+    "P14-WP03",
+    "P14-WP04",
+    "P14-WP05",
+    "P14-WP06",
+    "P14-WP07",
+    "P14-WP08",
+    "P14-WP09",
+    "P14-WP10",
+    "P14-WP11",
+    "P14-WP12",
+    "P14-WP13",
+    "P14-WP14"
+  ],
+  "gates": {
+    "P14-G1": "PASS",
+    "P14-G2": "PASS",
+    "P14-G3": "PASS",
+    "P14-G4": "PASS",
+    "P14-G5": "PASS",
+    "P14-G6": "PASS",
+    "P14-G7": "PASS",
+    "P14-G8": "PASS",
+    "P14-G9": "PASS",
+    "P14-G10": "PASS",
+    "P14-G11": "PASS",
+    "P14-G12": "PASS",
+    "P14-G13": "PASS",
+    "P14-G14": "PASS"
+  },
+  "migrations": [
+    "migrations/0009_verification_evidence_engine.sql"
+  ],
+  "validation": [
+    "cargo fmt --all",
+    "cargo check --workspace --all-targets",
+    "cargo test --workspace",
+    "cargo clippy --workspace --all-targets -- -D warnings",
+    "JSON validation",
+    "git diff --check"
+  ],
+  "limitations": [
+    "External browser/security tools are capability-gated optional paths; unavailable tools normalize explicitly rather than passing."
+  ]
+}

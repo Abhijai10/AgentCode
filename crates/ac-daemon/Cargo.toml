@@ -1,0 +1,33 @@
+[package]
+name = "ac-daemon"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+ac-agent = { path = "../ac-agent" }
+ac-changeset = { path = "../ac-changeset" }
+ac-common = { path = "../ac-common" }
+ac-config = { path = "../ac-config" }
+ac-context = { path = "../ac-context" }
+ac-signals = { path = "../ac-signals" }
+ac-db = { path = "../ac-db" }
+ac-evidence = { path = "../ac-evidence" }
+ac-git = { path = "../ac-git" }
+ac-kernel = { path = "../ac-kernel" }
+ac-logging = { path = "../ac-logging" }
+ac-provider = { path = "../ac-provider" }
+ac-runtime = { path = "../ac-runtime" }
+ac-sandbox = { path = "../ac-sandbox" }
+ac-code-intel = { path = "../ac-code-intel" }
+ac-security = { path = "../ac-security" }
+ac-tool = { path = "../ac-tool" }
+ac-verification = { path = "../ac-verification" }
+base64 = "0.23.1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1.0.151"
+url = "2"
+tokio = { version = "1.53.1", features = ["net", "rt"] }
+
+[lints]
+workspace = true

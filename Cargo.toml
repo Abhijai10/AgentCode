@@ -1,0 +1,35 @@
+[workspace]
+members = [
+    "crates/ac-common",
+    "crates/ac-config",
+    "crates/ac-logging",
+    "crates/ac-evidence",
+    "crates/ac-changeset",
+    "crates/ac-migrations",
+    "crates/ac-db",
+    "crates/ac-kernel",
+    "crates/ac-security",
+    "crates/ac-signals",
+    "crates/ac-sandbox",
+    "crates/ac-provider",
+    "crates/ac-tool",
+    "crates/ac-git",
+    "crates/ac-code-intel",
+    "crates/ac-context",
+    "crates/ac-verification",
+    "crates/ac-agent",
+    "crates/ac-runtime",
+    "crates/ac-daemon",
+    "apps/desktop-placeholder",
+    "apps/desktop/src-tauri",
+    "tests/integration",
+]
+resolver = "2"
+
+[workspace.package]
+edition = "2021"
+license = "UNLICENSED"
+repository = "https://example.invalid/AgentCode"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"

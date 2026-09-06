@@ -1,0 +1,66 @@
+[package]
+name = "agentcode-integration-tests"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[test]]
+name = "autonomous_flow"
+path = "autonomous_flow.rs"
+
+[[test]]
+name = "security_boundary"
+path = "security_boundary.rs"
+
+[[test]]
+name = "recovery_flow"
+path = "recovery_flow.rs"
+
+[[test]]
+name = "chaos_dogfood_flow"
+path = "chaos_dogfood_flow.rs"
+
+[[test]]
+name = "security_release_flow"
+path = "security_release_flow.rs"
+
+[[test]]
+name = "final_release_flow"
+path = "final_release_flow.rs"
+
+[[test]]
+name = "daemon_process_boundary"
+path = "daemon_process_boundary.rs"
+
+[[test]]
+name = "realtime_conversation_e2e"
+path = "realtime_conversation_e2e.rs"
+
+[[test]]
+name = "security_mode_flow"
+path = "security_mode_flow.rs"
+
+[[test]]
+name = "orphan_guard"
+path = "orphan_guard.rs"
+
+[[test]]
+name = "design_reference_vision_e2e"
+path = "design_reference_vision_e2e.rs"
+
+[dev-dependencies]
+ac-agent = { path = "../../crates/ac-agent" }
+ac-changeset = { path = "../../crates/ac-changeset" }
+ac-common = { path = "../../crates/ac-common" }
+ac-daemon = { path = "../../crates/ac-daemon" }
+ac-db = { path = "../../crates/ac-db" }
+ac-evidence = { path = "../../crates/ac-evidence" }
+ac-kernel = { path = "../../crates/ac-kernel" }
+ac-runtime = { path = "../../crates/ac-runtime" }
+ac-sandbox = { path = "../../crates/ac-sandbox" }
+ac-security = { path = "../../crates/ac-security" }
+ac-tool = { path = "../../crates/ac-tool" }
+ac-verification = { path = "../../crates/ac-verification" }
+serde_json = "1"
+url = "2"

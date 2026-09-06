@@ -1,0 +1,502 @@
+{
+  "schema_version": 1,
+  "generated_at": "2026-08-19T19:59:24.589Z",
+  "repos": [
+    {
+      "catalog_id": "REF-001",
+      "directory": "agent-framework",
+      "head_sha": "2213ef8493eb9e568d3d002def70ecee97ec743c",
+      "license_spdx": "MIT",
+      "license_file": "LICENSE",
+      "priority": "P1"
+    },
+    {
+      "catalog_id": "REF-002",
+      "directory": "aider",
+      "head_sha": "5dc9490bb35f9729ef2c95d00a19ccd30c26339c",
+      "license_spdx": "Apache-2.0",
+      "license_file": "LICENSE.txt",
+      "priority": "P0"
+    },
+    {
+      "catalog_id": "REF-003",
+      "directory": "ast-grep",
+      "head_sha": "0eb08389b6c4c5f3e19f90efbcb726fc413ca63d",
+      "license_spdx": "MIT",
+      "license_file": "LICENSE",
+      "priority": "P0"
+    },
+    {
+      "catalog_id": "REF-004",
+      "directory": "bolt.diy",
+      "head_sha": "2e254ac19a696394030601bc602f54945b12bfc4",
+      "license_spdx": "MIT",
+      "license_file": "LICENSE",
+      "priority": "P1"
+    },
+    {
+      "catalog_id": "REF-005",
+      "directory": "browser-harness",
+      "head_sha": "41108b8676d4bdb58b26ab3b079c0b7b0f8f3926",
+      "license_spdx": "MIT",
+      "license_file": "LICENSE",
+      "priority": "P3"
+    },
+    {
+      "catalog_id": "REF-006",
+      "directory": "browser-use",
+      "head_sha": "898f23f0b672ef44b4a01835ff4b3368e91812fd",
+      "license_spdx": "MIT",
+      "license_file": "LICENSE",
+      "priority": "P3"
+    },
+    {
+      "catalog_id": "REF-007",
+      "directory": "caveman",
+      "head_sha": "ed48ec44b7596ff2faa33e70218003a3cc1d8896",
+      "license_spdx": "MIT",
+      "license_file": "LICENSE",
+      "priority": "P3"
+    },
+    {
+      "catalog_id": "REF-008",
+      "directory": "checkov",
+      "head_sha": "5458c889320a19ccf2e2eed54beb4c661c70f67a",
+      "license_spdx": "Apache-2.0",
+      "license_file": "LICENSE",
+      "priority": "P2"
+    },
+    {
+      "catalog_id": "REF-009",
+      "directory": "cline",
+      "head_sha": "8a038022a439f401d78764a059e1561578848e81",
+      "license_spdx": "Apache-2.0",
+      "license_file": "LICENSE",
+      "priority": "P1"
+    },
+    {
+      "catalog_id": "REF-010",
+      "directory": "cloudgoat",
+      "head_sha": "abf1ba8f5e47d7ced750fdfa025d51c99f1a43ed",
+      "license_spdx": "BSD-3-Clause",
+      "license_file": "LICENSE",
+      "priority": "P2"
+    },
+    {
+      "catalog_id": "REF-011",
+      "directory": "cloudsploit",
+      "head_sha": "43e27a7e0ceec5b20356f9b0d142813e14bf0f2c",
+      "license_spdx": "GPL-3.0-or-later",
+      "license_file": "LICENSE",
+      "priority": "P2"
+    },
+    {
+      "catalog_id": "REF-012",
+      "directory": "codeql",
+      "head_sha": "05c40eafe6fb4cc88c764703a855714c281bf1e1",
+      "license_spdx": "MIT",
+      "license_file": "LICENSE",
+      "priority": "P2"
+    },
+    {
+      "catalog_id": "REF-013",
+      "directory": "codex",
+      "head_sha": "77e688960196dbc82bbeb00c844d2555a61925aa",
+      "license_spdx": "Apache-2.0",
+      "license_file": "LICENSE",
+      "priority": "P0"
+    },
+    {
+      "catalog_id": "REF-014",
+      "directory": "compound-engineering-plugin",
+      "head_sha": "8b2a7d2dee98ed33c2d19d4474da98dcb2cbd11c",
+      "license_spdx": "MIT",
+      "license_file": "LICENSE",
+      "priority": "P1"
+    },
+    {
+      "catalog_id": "REF-015",
+      "directory": "continue",
+      "head_sha": "5522c6f44ca0ac3528b37244818fbfa39b5af470",
+      "license_spdx": "Apache-2.0",
+      "license_file": "LICENSE",
+      "priority": "P2"
+    },
+    {
+      "catalog_id": "REF-016",
+      "directory": "ctags",
+      "head_sha": "b0615e08c94166267669bd2292647470fff5daac",
+      "license_spdx": "GPL-2.0-or-later",
+      "license_file": "COPYING",
+      "priority": "P3"
+    },
+    {
+      "catalog_id": "REF-017",
+      "directory": "daytona",
+      "head_sha": "ec4c21b2d597091ac09ecc278f3bcc172575a987",
+      "license_spdx": "UNKNOWN",
+      "license_file": null,
+      "priority": "P2"
+    },
+    {
+      "catalog_id": "REF-018",
+      "directory": "dyad",
+      "head_sha": "22de43cf0d165a9557830656b1cc63a0e036f58b",
+      "license_spdx": "Apache-2.0",
+      "license_file": "LICENSE",
+      "priority": "P1"
+    },
+    {
+      "catalog_id": "REF-019",
+      "directory": "garak",
+      "head_sha": "7ff1f2778e4d6ca6dc25ba8e17d8dfa520003ee0",
+      "license_spdx": "Apache-2.0",
+      "license_file": "LICENSE",
+      "priority": "P2"
+    },
+    {
+      "catalog_id": "REF-020",
+      "directory": "gemini-cli",
+      "head_sha": "571851b1077a51cef757146ce13f9da887326bec",
+      "license_spdx": "Apache-2.0",
+      "license_file": "LICENSE",
+      "priority": "P0"
+    },
+    {
+      "catalog_id": "REF-021",
+      "directory": "gitleaks",
+      "head_sha": "b58d3f102cf3a2c84cb7f923d05c25c9b1aed84b",
+      "license_spdx": "MIT",
+      "license_file": "LICENSE",
+      "priority": "P2"
+    },
+    {
+      "catalog_id": "REF-022",
+      "directory": "goose",
+      "head_sha": "935a37a68482ed0a94be3a49e2285309bd863c65",
+      "license_spdx": "Apache-2.0",
+      "license_file": "LICENSE",
+      "priority": "P1"
+    },
+    {
+      "catalog_id": "REF-023",
+      "directory": "graphiti",
+      "head_sha": "10374d6044f91b9ecae3586828abb1ecbf022c4f",
+      "license_spdx": "Apache-2.0",
+      "license_file": "LICENSE",
+      "priority": "P1"
+    },
+    {
+      "catalog_id": "REF-024",
+      "directory": "langgraph",
+      "head_sha": "644815f9e5bc52ad8f7a5227a456227e9c3e639b",
+      "license_spdx": "MIT",
+      "license_file": "LICENSE",
+      "priority": "P1"
+    },
+    {
+      "catalog_id": "REF-025",
+      "directory": "letta",
+      "head_sha": "87fd37aab68c7bdd0d66fe63751553756f6af3e5",
+      "license_spdx": "Apache-2.0",
+      "license_file": "LICENSE",
+      "priority": "P3"
+    },
+    {
+      "catalog_id": "REF-026",
+      "directory": "letta-code",
+      "head_sha": "5786193dd10dadde88a761f2f44bf3e7d4e5639e",
+      "license_spdx": "Apache-2.0",
+      "license_file": "LICENSE",
+      "priority": "P0"
+    },
+    {
+      "catalog_id": "REF-027",
+      "directory": "letta-skills",
+      "head_sha": "16352df0a3ce49c321281d9b45f73462bda582e5",
+      "license_spdx": "MIT",
+      "license_file": "LICENSE",
+      "priority": "P3"
+    },
+    {
+      "catalog_id": "REF-028",
+      "directory": "mini-swe-agent",
+      "head_sha": "25941c89cfbc91eb40b3f8756348c91d9977d57e",
+      "license_spdx": "MIT",
+      "license_file": "LICENSE.md",
+      "priority": "P0"
+    },
+    {
+      "catalog_id": "REF-029",
+      "directory": "munder-difflin",
+      "head_sha": "5fb93721030b222b3925b45be93f912b2c8dc065",
+      "license_spdx": "MIT",
+      "license_file": "LICENSE",
+      "priority": "P3"
+    },
+    {
+      "catalog_id": "REF-030",
+      "directory": "nuclei",
+      "head_sha": "34866efc227451780062ea7d069d04fa137bc825",
+      "license_spdx": "MIT",
+      "license_file": "LICENSE.md",
+      "priority": "P2"
+    },
+    {
+      "catalog_id": "REF-031",
+      "directory": "nuclei-templates",
+      "head_sha": "55cce9268a5f2e23832b80fae368ecbadf308b7c",
+      "license_spdx": "MIT",
+      "license_file": "LICENSE.md",
+      "priority": "P3"
+    },
+    {
+      "catalog_id": "REF-032",
+      "directory": "OmniRoute",
+      "head_sha": "df905914154b0d082c2bf34198ffad9656df9ec7",
+      "license_spdx": "MIT",
+      "license_file": "LICENSE",
+      "priority": "P0"
+    },
+    {
+      "catalog_id": "REF-033",
+      "directory": "onlook",
+      "head_sha": "423e2e924366419e418ee049093872d535eea41a",
+      "license_spdx": "Apache-2.0",
+      "license_file": "LICENSE.md",
+      "priority": "P1"
+    },
+    {
+      "catalog_id": "REF-034",
+      "directory": "opencode",
+      "head_sha": "9b0dd36cda0b9accb429a7f9f9ad9b054a27d04a",
+      "license_spdx": "MIT",
+      "license_file": "LICENSE",
+      "priority": "P1"
+    },
+    {
+      "catalog_id": "REF-035",
+      "directory": "openhack",
+      "head_sha": "87481e9f374e9b44be7a6cf52d30a0589df3d408",
+      "license_spdx": "MIT",
+      "license_file": "LICENSE",
+      "priority": "P0"
+    },
+    {
+      "catalog_id": "REF-036",
+      "directory": "OpenHands",
+      "head_sha": "b25f9b3969f924f37440fee908ff35309ec6eea2",
+      "license_spdx": "MIT",
+      "license_file": "LICENSE",
+      "priority": "P0"
+    },
+    {
+      "catalog_id": "REF-037",
+      "directory": "osv-scanner",
+      "head_sha": "c84fa4568f2526d0333e9a914ea8a0a5f74ad68b",
+      "license_spdx": "Apache-2.0",
+      "license_file": "LICENSE",
+      "priority": "P2"
+    },
+    {
+      "catalog_id": "REF-038",
+      "directory": "pacu",
+      "head_sha": "e597f23ecfb88b82f706c5f0cac9d4577c2af262",
+      "license_spdx": "BSD-2-Clause",
+      "license_file": "LICENSE",
+      "priority": "P2"
+    },
+    {
+      "catalog_id": "REF-039",
+      "directory": "playwright",
+      "head_sha": "5f8e7eac83052e2602faec430adf54dd55d63611",
+      "license_spdx": "Apache-2.0",
+      "license_file": "LICENSE",
+      "priority": "P0"
+    },
+    {
+      "catalog_id": "REF-040",
+      "directory": "promptfoo",
+      "head_sha": "c149fcf36c2aeaac83a215906c2caa659cafecff",
+      "license_spdx": "MIT",
+      "license_file": "LICENSE",
+      "priority": "P2"
+    },
+    {
+      "catalog_id": "REF-041",
+      "directory": "prowler",
+      "head_sha": "0b9791ffdc6eae51a1176efc1e9cb426ba293ddd",
+      "license_spdx": "Apache-2.0",
+      "license_file": "LICENSE",
+      "priority": "P1"
+    },
+    {
+      "catalog_id": "REF-042",
+      "directory": "PyRIT",
+      "head_sha": "4598a40aca7db2f4ddd83d43b812a200dc5b3c64",
+      "license_spdx": "MIT",
+      "license_file": "LICENSE",
+      "priority": "P2"
+    },
+    {
+      "catalog_id": "REF-043",
+      "directory": "ripgrep",
+      "head_sha": "3fce3b5bb0236da2df6d99672afb8a719642eca7",
+      "license_spdx": "Unlicense OR MIT",
+      "license_file": "COPYING",
+      "priority": "P0"
+    },
+    {
+      "catalog_id": "REF-044",
+      "directory": "Roo-Code",
+      "head_sha": "b867ec9145750d0ae1ff7f02d35406e9bf2a0b16",
+      "license_spdx": "Apache-2.0",
+      "license_file": "LICENSE",
+      "priority": "P2"
+    },
+    {
+      "catalog_id": "REF-045",
+      "directory": "rtk",
+      "head_sha": "ba7a9ce0d92a46f2458b82b1fcdd000f887f651a",
+      "license_spdx": "Apache-2.0",
+      "license_file": "LICENSE",
+      "priority": "P0"
+    },
+    {
+      "catalog_id": "REF-046",
+      "directory": "scip",
+      "head_sha": "8b8c4fc0dea66a4592f03c0d81b632780d49eed0",
+      "license_spdx": "Apache-2.0",
+      "license_file": "LICENSE",
+      "priority": "P1"
+    },
+    {
+      "catalog_id": "REF-047",
+      "directory": "scorecard",
+      "head_sha": "d1fab88f54636ff366076edfc5c239f97b3c8e66",
+      "license_spdx": "Apache-2.0",
+      "license_file": "LICENSE",
+      "priority": "P3"
+    },
+    {
+      "catalog_id": "REF-048",
+      "directory": "ScoutSuite",
+      "head_sha": "7909f2fc6186063e5c9e7ddef8c4d7d1072c8f3d",
+      "license_spdx": "GPL-2.0-or-later",
+      "license_file": "LICENSE",
+      "priority": "P2"
+    },
+    {
+      "catalog_id": "REF-049",
+      "directory": "semgrep",
+      "head_sha": "808ee51cda4f91d118fab80a411522e2cbbdc2fe",
+      "license_spdx": "LGPL-2.1-or-later",
+      "license_file": "LICENSE",
+      "priority": "P2"
+    },
+    {
+      "catalog_id": "REF-050",
+      "directory": "servers",
+      "head_sha": "599dafc1054550a6eeb87a6545c1e1b03b3ca827",
+      "license_spdx": "MIT",
+      "license_file": "LICENSE",
+      "priority": "P3"
+    },
+    {
+      "catalog_id": "REF-051",
+      "directory": "smolagents",
+      "head_sha": "e3a5b8994b301983b91c0325546e9dc82eab8cf0",
+      "license_spdx": "Apache-2.0",
+      "license_file": "LICENSE",
+      "priority": "P3"
+    },
+    {
+      "catalog_id": "REF-052",
+      "directory": "software-agent-sdk",
+      "head_sha": "98338ff37aea6627777b9978963ab727f51e4f40",
+      "license_spdx": "MIT",
+      "license_file": "LICENSE",
+      "priority": "P0"
+    },
+    {
+      "catalog_id": "REF-053",
+      "directory": "stack-graphs",
+      "head_sha": "fcb7705d5b38ae13b3665a9b2c882e5a97243d44",
+      "license_spdx": "Apache-2.0",
+      "license_file": "LICENSE-APACHE",
+      "priority": "P3"
+    },
+    {
+      "catalog_id": "REF-054",
+      "directory": "stratus-red-team",
+      "head_sha": "c12d6654bce9d8ceeeb61a146eaffe8ab2aef69a",
+      "license_spdx": "Apache-2.0",
+      "license_file": "LICENSE",
+      "priority": "P2"
+    },
+    {
+      "catalog_id": "REF-055",
+      "directory": "superpowers",
+      "head_sha": "b36e0829c6d0140e93cfef2ca599b1b07d4a7797",
+      "license_spdx": "MIT",
+      "license_file": "LICENSE",
+      "priority": "P1"
+    },
+    {
+      "catalog_id": "REF-056",
+      "directory": "SWE-bench",
+      "head_sha": "87ab1f6ced28f75ba73ca899dc759b019310944a",
+      "license_spdx": "MIT",
+      "license_file": "LICENSE",
+      "priority": "P2"
+    },
+    {
+      "catalog_id": "REF-057",
+      "directory": "SWE-ReX",
+      "head_sha": "5c995c365dfb1fd5bc56fda688be5d8538f9931f",
+      "license_spdx": "MIT",
+      "license_file": "LICENSE.txt",
+      "priority": "P0"
+    },
+    {
+      "catalog_id": "REF-058",
+      "directory": "trailofbits-skills",
+      "head_sha": "a551f0b5f76d25d5090fac080a06d620829ef4e4",
+      "license_spdx": "CC-BY-SA-4.0",
+      "license_file": "LICENSE",
+      "priority": "P1"
+    },
+    {
+      "catalog_id": "REF-059",
+      "directory": "tree-sitter",
+      "head_sha": "f235c2f1c39901dc23eb08f35040386250411078",
+      "license_spdx": "MIT",
+      "license_file": "LICENSE",
+      "priority": "P0"
+    },
+    {
+      "catalog_id": "REF-060",
+      "directory": "trivy",
+      "head_sha": "dcbadb7b15076c405ce7d59f04cde9991b90da22",
+      "license_spdx": "Apache-2.0",
+      "license_file": "LICENSE",
+      "priority": "P2"
+    },
+    {
+      "catalog_id": "REF-061",
+      "directory": "zaproxy",
+      "head_sha": "e3793d73d04f51b0dd0df6acbb60671935323d48",
+      "license_spdx": "Apache-2.0",
+      "license_file": "LICENSE",
+      "priority": "P2"
+    },
+    {
+      "catalog_id": "REF-062",
+      "directory": "zoekt",
+      "head_sha": "dcd8c9ca9b84436970d150f95ebe69106f5cd646",
+      "license_spdx": "Apache-2.0",
+      "license_file": "LICENSE",
+      "priority": "P1"
+    }
+  ]
+}

@@ -1,0 +1,23 @@
+[package]
+name = "ac-code-intel"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+ac-common = { path = "../ac-common" }
+lsp-types = "0.97.0"
+serde = "1.0.229"
+serde_json = "1.0.151"
+tree-sitter = "0.26.13"
+tree-sitter-go = "0.25.0"
+tree-sitter-javascript = "0.25.0"
+tree-sitter-python = "0.25.0"
+tree-sitter-rust = "0.24.2"
+tree-sitter-typescript = "0.23.2"
+ac-sandbox = { path = "../ac-sandbox" }
+ac-security = { path = "../ac-security" }
+
+[lints]
+workspace = true

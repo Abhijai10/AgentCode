@@ -1,0 +1,112 @@
+{
+  "schema_version": 1,
+  "phase": "P19",
+  "name": "AI Security",
+  "status": "COMPLETE",
+  "base_commit": "5df5bcba794186790b61fafd12459259b7d0b068",
+  "workpackages": [
+    {
+      "id": "P19-WP01",
+      "name": "AI attack-surface detector",
+      "status": "ACCEPTED"
+    },
+    {
+      "id": "P19-WP02",
+      "name": "AI threat model and trust-boundary graph",
+      "status": "ACCEPTED"
+    },
+    {
+      "id": "P19-WP03",
+      "name": "Direct and indirect prompt-injection fixtures",
+      "status": "ACCEPTED"
+    },
+    {
+      "id": "P19-WP04",
+      "name": "RAG poisoning and retrieval-trust tests",
+      "status": "ACCEPTED"
+    },
+    {
+      "id": "P19-WP05",
+      "name": "Tool and MCP abuse tests",
+      "status": "ACCEPTED"
+    },
+    {
+      "id": "P19-WP06",
+      "name": "Secret and sensitive-output leakage tests",
+      "status": "ACCEPTED"
+    },
+    {
+      "id": "P19-WP07",
+      "name": "Excessive-agency and cross-agent tests",
+      "status": "ACCEPTED"
+    },
+    {
+      "id": "P19-WP08",
+      "name": "Promptfoo adapter",
+      "status": "ACCEPTED"
+    },
+    {
+      "id": "P19-WP09",
+      "name": "Garak adapter",
+      "status": "ACCEPTED"
+    },
+    {
+      "id": "P19-WP10",
+      "name": "PyRIT optional advanced adapter",
+      "status": "ACCEPTED"
+    },
+    {
+      "id": "P19-WP11",
+      "name": "AI-security finding normalization",
+      "status": "ACCEPTED"
+    },
+    {
+      "id": "P19-WP12",
+      "name": "AI-security remediation and self-regression suite",
+      "status": "ACCEPTED"
+    }
+  ],
+  "gates": "P19-G1..P19-G10",
+  "implementation_files": [
+    "crates/ac-security/src/active.rs",
+    "crates/ac-security/src/ai.rs",
+    "crates/ac-security/src/scanner.rs",
+    "crates/ac-security/src/tests.rs",
+    "crates/ac-verification/src/lib.rs",
+    "crates/ac-db/src/security.rs",
+    "crates/ac-db/src/models.rs",
+    "crates/ac-db/src/migrations.rs",
+    "crates/ac-db/src/tests.rs",
+    "crates/ac-migrations/src/lib.rs",
+    "migrations/0013_advanced_ai_security.sql",
+    "tests/integration/security_boundary.rs"
+  ],
+  "migration": "migrations/0013_advanced_ai_security.sql",
+  "tests": [
+    "cargo fmt --all",
+    "cargo check --workspace --all-targets",
+    "cargo test --workspace",
+    "cargo clippy --workspace --all-targets -- -D warnings",
+    "JSON validation",
+    "git diff --check"
+  ],
+  "evidence": [
+    "docs/progress/workpackages/WP-P19-WP01.md",
+    "docs/progress/workpackages/WP-P19-WP02.md",
+    "docs/progress/workpackages/WP-P19-WP03.md",
+    "docs/progress/workpackages/WP-P19-WP04.md",
+    "docs/progress/workpackages/WP-P19-WP05.md",
+    "docs/progress/workpackages/WP-P19-WP06.md",
+    "docs/progress/workpackages/WP-P19-WP07.md",
+    "docs/progress/workpackages/WP-P19-WP08.md",
+    "docs/progress/workpackages/WP-P19-WP09.md",
+    "docs/progress/workpackages/WP-P19-WP10.md",
+    "docs/progress/workpackages/WP-P19-WP11.md",
+    "docs/progress/workpackages/WP-P19-WP12.md",
+    "docs/progress/phase-19-completion.md",
+    "docs/progress/phase-19-completion.json"
+  ],
+  "limitations": [
+    "External advanced scanners/harnesses are represented by native deterministic fallback/degraded adapter records until admitted by ADR-0008 dependency/tool policy."
+  ]
+}

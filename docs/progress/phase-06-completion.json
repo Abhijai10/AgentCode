@@ -1,0 +1,10 @@
+{
+  "phase": "P06",
+  "name": "Basic Worker Agent Loop",
+  "status": "COMPLETE",
+  "work_packages": ["P06-WP01", "P06-WP02", "P06-WP03", "P06-WP04", "P06-WP05", "P06-WP06", "P06-WP07", "P06-WP08", "P06-WP09"],
+  "gates": {"P6-G1": "PASS", "P6-G2": "PASS", "P6-G3": "PASS", "P6-G4": "PASS", "P6-G5": "PASS", "P6-G6": "PASS", "P6-G7": "PASS", "P6-G8": "PASS"},
+  "migration": "0001_kernel_schema.sql: workers, tasks, task_attempts",
+  "validation": ["cargo fmt --all", "cargo check --workspace --all-targets", "cargo test --workspace", "cargo clippy --workspace --all-targets -- -D warnings"],
+  "limitations": ["single-worker deterministic scheduler", "one deterministic provider class in CI"]
+}

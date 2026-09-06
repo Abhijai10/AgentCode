@@ -1,0 +1,335 @@
+use std::collections::BTreeMap;
+
+use ac_common::{AcError, AcResult, StableId, TimestampMillis};
+use serde::{Deserialize, Serialize};
+
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+pub enum EvidenceKind {
+    CommandOutput,
+    FileSnapshot,
+    BrowserScreenshot,
+    TestReport,
+    DerivedContext,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+pub struct Provenance {
+    pub source: String,
+    pub commit: Option<String>,
+    pub worktree: Option<String>,
+    pub tool: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EvidenceRecord {
+    pub id: StableId,
+    pub kind: EvidenceKind,
+    pub provenance: Provenance,
+    pub artifact_uri: String,
+    pub content_hash: String,
+    pub raw_content: Option<String>,
+    pub model_summary: Option<String>,
+    pub sensitive: bool,
+    pub created_at: TimestampMillis,
+}
+
+#[derive(Default)]
+pub struct EvidenceStore {
+    records: BTreeMap<StableId, EvidenceRecord>,
+}
+
+impl EvidenceStore {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn append(
+        &mut self,
+        kind: EvidenceKind,
+        provenance: Provenance,
+        artifact_uri: impl Into<String>,
+        content_hash: impl Into<String>,
+    ) -> AcResult<StableId> {
+        let artifact_uri = artifact_uri.into();
+        let content_hash = content_hash.into();
+        if artifact_uri.trim().is_empty() || content_hash.trim().is_empty() {
+            return Err(AcError::validation(
+                "EVIDENCE-MISSING_ARTIFACT",
+                "artifact uri and content hash are required",
+            ));
+        }
+        let id = StableId::new("ev");
+        let record = EvidenceRecord {
+            id: id.clone(),
+            kind,
+            provenance,
+            artifact_uri,
+            content_hash,
+            raw_content: None,
+            model_summary: None,
+            sensitive: false,
+            created_at: TimestampMillis::now(),
+        };
+        self.records.insert(id.clone(), record);
+        Ok(id)
+    }
+
+    pub fn append_tool_output(
+        &mut self,
+        provenance: Provenance,
+        artifact_uri: impl Into<String>,
+        raw_content: impl Into<String>,
+        secrets: &[String],
+    ) -> AcResult<StableId> {
+        let raw_content = raw_content.into();
+        let redacted = redact(&raw_content, secrets);
+        let id = self.append(
+            EvidenceKind::CommandOutput,
+            provenance,
+            artifact_uri,
+            content_hash(&raw_content),
+        )?;
+        let record = self.records.get_mut(&id).expect("new evidence exists");
+        record.raw_content = Some(raw_content);
+        record.model_summary = Some(bounded_summary(&redacted));
+        record.sensitive = !secrets.is_empty();
+        Ok(id)
+    }
+
+    pub fn get(&self, id: &StableId) -> Option<&EvidenceRecord> {
+        self.records.get(id)
+    }
+
+    pub fn records(&self) -> impl Iterator<Item = &EvidenceRecord> {
+        self.records.values()
+    }
+
+    pub fn from_records(records: impl IntoIterator<Item = EvidenceRecord>) -> Self {
+        Self {
+            records: records
+                .into_iter()
+                .map(|record| (record.id.clone(), record))
+                .collect(),
+        }
+    }
+
+    /// Restore a persisted evidence record with its original ID.
+    /// Used during crash recovery to re-populate the in-memory store
+    /// from durable records so that lookups by ID succeed.
+    pub fn restore(&mut self, record: EvidenceRecord) {
+        self.records.entry(record.id.clone()).or_insert(record);
+    }
+
+    pub fn replace(&mut self, _id: &StableId, _record: EvidenceRecord) -> AcResult<()> {
+        Err(AcError::policy_denied(
+            "EVIDENCE-APPEND_ONLY",
+            "evidence records are append-only",
+        ))
+    }
+
+    pub fn len(&self) -> usize {
+        self.records.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.records.is_empty()
+    }
+}
+
+fn content_hash(content: &str) -> String {
+    // A deterministic FNV-1a fingerprint is sufficient for local evidence tamper checks.
+    let hash = content
+        .as_bytes()
+        .iter()
+        .fold(0xcbf29ce484222325_u64, |hash, byte| {
+            (hash ^ u64::from(*byte)).wrapping_mul(0x100000001b3)
+        });
+    format!("fnv1a64:{hash:016x}")
+}
+
+fn redact(value: &str, secrets: &[String]) -> String {
+    secrets
+        .iter()
+        .filter(|secret| !secret.is_empty())
+        .fold(value.to_string(), |redacted, secret| {
+            redacted.replace(secret, "[REDACTED]")
+        })
+}
+
+fn bounded_summary(value: &str) -> String {
+    const LIMIT: usize = 4096;
+    if value.len() <= LIMIT {
+        value.to_string()
+    } else {
+        let boundary = value
+            .char_indices()
+            .map(|(index, _)| index)
+            .take_while(|index| *index <= LIMIT)
+            .last()
+            .unwrap_or(0);
+        format!("{}\n[output truncated]", &value[..boundary])
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn provenance() -> Provenance {
+        Provenance {
+            source: "unit-test".to_string(),
+            commit: Some("abc".to_string()),
+            worktree: None,
+            tool: None,
+        }
+    }
+
+    #[test]
+    fn evidence_is_append_only() {
+        let mut store = EvidenceStore::new();
+        let id = store
+            .append(
+                EvidenceKind::CommandOutput,
+                provenance(),
+                "mem://one",
+                "hash",
+            )
+            .unwrap();
+        let record = store.get(&id).unwrap().clone();
+        let err = store.replace(&id, record).unwrap_err();
+        assert_eq!(err.code(), "EVIDENCE-APPEND_ONLY");
+        assert_eq!(store.len(), 1);
+    }
+
+    #[test]
+    fn tool_output_keeps_raw_evidence_but_redacts_model_summary() {
+        let mut store = EvidenceStore::new();
+        let id = store
+            .append_tool_output(
+                provenance(),
+                "mem://tool/output",
+                "token=canary-secret\nerror: failed",
+                &["canary-secret".to_string()],
+            )
+            .unwrap();
+        let record = store.get(&id).unwrap();
+        assert!(record
+            .raw_content
+            .as_ref()
+            .unwrap()
+            .contains("canary-secret"));
+        assert!(!record
+            .model_summary
+            .as_ref()
+            .unwrap()
+            .contains("canary-secret"));
+        assert!(record
+            .model_summary
+            .as_ref()
+            .unwrap()
+            .contains("error: failed"));
+    }
+
+    #[test]
+    fn bounded_summary_keeps_ascii_below_limit_unchanged() {
+        let value = "a".repeat(4096);
+        assert_eq!(bounded_summary(&value), value);
+    }
+
+    #[test]
+    fn bounded_summary_truncates_ascii_above_limit_with_marker() {
+        let value = "a".repeat(4097);
+        let summary = bounded_summary(&value);
+        assert!(summary.starts_with(&"a".repeat(4096)));
+        assert!(summary.ends_with("\n[output truncated]"));
+    }
+
+    #[test]
+    fn bounded_summary_does_not_split_multibyte_boundary() {
+        let value = format!("{}étail", "a".repeat(4095));
+        let summary = bounded_summary(&value);
+        assert!(summary.starts_with(&"a".repeat(4095)));
+        assert!(!summary.contains('é'));
+        assert!(summary.ends_with("\n[output truncated]"));
+    }
+
+    #[test]
+    fn bounded_summary_handles_emoji_and_cjk_boundary() {
+        let value = format!("{}😀漢字", "a".repeat(4094));
+        let summary = bounded_summary(&value);
+        assert!(summary.starts_with(&"a".repeat(4094)));
+        assert!(!summary.contains('😀'));
+        assert!(!summary.contains('漢'));
+        assert!(summary.ends_with("\n[output truncated]"));
+    }
+
+    #[test]
+    fn tool_output_records_large_unicode_without_panic() {
+        let mut store = EvidenceStore::new();
+        let raw = format!("{}😀漢字-secret", "界".repeat(1500));
+        let id = store
+            .append_tool_output(
+                provenance(),
+                "mem://tool/unicode-output",
+                raw.clone(),
+                &["unicode-secret".to_string()],
+            )
+            .unwrap();
+        let record = store.get(&id).unwrap();
+        assert_eq!(record.raw_content.as_deref(), Some(raw.as_str()));
+        let summary = record.model_summary.as_ref().unwrap();
+        assert!(summary.ends_with("\n[output truncated]"));
+        assert!(!summary.contains("unicode-secret"));
+    }
+
+    #[test]
+    fn bounded_summary_cjk_starting_exactly_at_limit_byte_is_excluded() {
+        // 4095 ASCII bytes + a 3-byte CJK char whose first byte lands exactly
+        // on the 4096th byte.  The char must be excluded whole and the slice
+        // must stay on a character boundary.
+        let value = format!("{}界x", "a".repeat(4095));
+        assert!(value.len() > 4096);
+        let summary = bounded_summary(&value);
+        assert!(summary.starts_with(&"a".repeat(4095)));
+        assert!(!summary.contains('界'));
+        assert!(summary.ends_with("\n[output truncated]"));
+    }
+
+    #[test]
+    fn bounded_summary_emoji_spanning_limit_byte_is_excluded_whole() {
+        // 4094 ASCII bytes + a 4-byte emoji that starts at byte 4094 and would
+        // straddle the 4096-byte boundary.  It must be excluded entirely.
+        let value = format!("{}😀", "a".repeat(4094));
+        assert!(value.len() > 4096);
+        let summary = bounded_summary(&value);
+        assert!(summary.starts_with(&"a".repeat(4094)));
+        assert!(!summary.contains('😀'));
+        assert!(summary.ends_with("\n[output truncated]"));
+    }
+
+    #[test]
+    fn bounded_summary_exact_boundary_ascii_keeps_full_limit() {
+        // Exactly LIMIT ASCII bytes must be retained in full even when more
+        // non-ASCII content follows the boundary.
+        let value = format!("{}漢字", "a".repeat(4096));
+        let summary = bounded_summary(&value);
+        assert!(summary.starts_with(&"a".repeat(4096)));
+        assert!(!summary.contains('漢'));
+        assert!(summary.ends_with("\n[output truncated]"));
+    }
+
+    #[test]
+    fn bounded_summary_multibyte_never_panics_across_all_boundary_offsets() {
+        // Walk every possible leading byte count around the 4096-byte limit
+        // with a 4-byte emoji to prove no slice can land inside a character.
+        for prefix in 4092..=4096 {
+            let value = format!("{}😀{}", "a".repeat(prefix), "b".repeat(3));
+            assert!(value.len() > 4096);
+            let summary = bounded_summary(&value);
+            assert!(summary.ends_with("\n[output truncated]"));
+            // The result must be valid UTF-8; String already guarantees this,
+            // and a panic here would fail the test.
+            assert!(summary.is_char_boundary(summary.len()));
+        }
+    }
+}

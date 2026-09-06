@@ -1,0 +1,185 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  --background: 232 234 240;
+  --surface: 232 234 240;
+  --surface-bright: 237 238 244;
+  --surface-container: 226 228 234;
+  --surface-container-high: 220 222 228;
+  --surface-container-highest: 214 216 222;
+  --surface-container-low: 229 231 237;
+  --surface-container-lowest: 240 242 248;
+  --surface-dim: 212 214 220;
+  --surface-variant: 220 222 228;
+  --on-background: 46 48 64;
+  --on-surface: 46 48 64;
+  --on-surface-variant: 88 90 104;
+  --outline: 138 140 154;
+  --outline-variant: 208 210 220;
+  --primary: 99 102 241;
+  --primary-container: 129 140 248;
+  --on-primary: 255 255 255;
+  --on-primary-container: 224 226 255;
+  --tertiary: 124 58 237;
+  --tertiary-container: 167 139 250;
+  --on-tertiary: 255 255 255;
+  --on-tertiary-container: 59 31 99;
+  --secondary: 108 110 126;
+  --secondary-container: 216 218 230;
+  --on-secondary: 255 255 255;
+  --on-secondary-container: 88 90 104;
+  --error: 220 38 38;
+  --error-container: 254 226 226;
+  --on-error: 255 255 255;
+  --on-error-container: 153 27 27;
+  --inverse-surface: 46 48 64;
+  --inverse-on-surface: 232 234 240;
+  --inverse-primary: 165 180 252;
+  --surface-tint: 99 102 241;
+  --primary-fixed: 224 226 255;
+  --primary-fixed-dim: 165 180 252;
+  --on-primary-fixed: 30 27 75;
+  --on-primary-fixed-variant: 67 56 202;
+  --secondary-fixed: 216 218 230;
+  --secondary-fixed-dim: 184 186 202;
+  --on-secondary-fixed: 26 27 38;
+  --on-secondary-fixed-variant: 64 66 82;
+  --tertiary-fixed: 237 233 254;
+  --tertiary-fixed-dim: 196 181 253;
+  --on-tertiary-fixed: 46 16 101;
+  --on-tertiary-fixed-variant: 91 33 182;
+}
+
+.dark {
+  --background: 30 30 36;
+  --surface: 30 30 36;
+  --surface-bright: 237 238 244;
+  --surface-container: 26 28 38;
+  --surface-container-high: 26 28 38;
+  --surface-container-highest: 26 28 38;
+  --surface-container-low: 26 28 38;
+  --surface-container-lowest: 18 20 28;
+  --surface-dim: 18 20 28;
+  --surface-variant: 26 28 38;
+  --on-background: 240 242 248;
+  --on-surface: 240 242 248;
+  --on-surface-variant: 156 163 175;
+  --outline: 120 122 134;
+  --outline-variant: 48 50 58;
+  --primary: 129 140 248;
+  --primary-container: 129 140 248;
+  --on-primary: 30 27 75;
+  --on-primary-container: 224 226 255;
+  --tertiary: 167 139 250;
+  --tertiary-container: 167 139 250;
+  --on-tertiary: 46 16 101;
+  --on-tertiary-container: 59 31 99;
+  --secondary: 156 163 175;
+  --secondary-container: 26 28 38;
+  --on-secondary: 26 27 38;
+  --on-secondary-container: 156 163 175;
+  --error: 248 113 113;
+  --error-container: 127 29 29;
+  --on-error: 255 255 255;
+  --on-error-container: 254 202 202;
+  --inverse-surface: 232 234 240;
+  --inverse-on-surface: 30 30 36;
+  --inverse-primary: 99 102 241;
+  --surface-tint: 129 140 248;
+  --primary-fixed: 224 226 255;
+  --primary-fixed-dim: 165 180 252;
+  --on-primary-fixed: 30 27 75;
+  --on-primary-fixed-variant: 67 56 202;
+  --secondary-fixed: 216 218 230;
+  --secondary-fixed-dim: 184 186 202;
+  --on-secondary-fixed: 26 27 38;
+  --on-secondary-fixed-variant: 64 66 82;
+  --tertiary-fixed: 237 233 254;
+  --tertiary-fixed-dim: 196 181 253;
+  --on-tertiary-fixed: 46 16 101;
+  --on-tertiary-fixed-variant: 91 33 182;
+}
+
+.neo-raised {
+  box-shadow: 6px 6px 12px rgba(0,0,0,0.08), -6px -6px 12px rgba(255,255,255,0.6);
+  background-color: rgb(var(--surface));
+}
+.dark .neo-raised {
+  box-shadow: 6px 6px 12px rgba(0,0,0,0.4), -6px -6px 12px rgba(255,255,255,0.05);
+  background-color: rgb(var(--surface));
+}
+
+.neo-pressed {
+  box-shadow: inset 4px 4px 8px rgba(0,0,0,0.06), inset -4px -4px 8px rgba(255,255,255,0.5);
+  background-color: rgb(var(--surface));
+}
+.dark .neo-pressed {
+  box-shadow: inset 4px 4px 8px rgba(0,0,0,0.5), inset -4px -4px 8px rgba(255,255,255,0.05);
+  background-color: rgb(var(--surface-container));
+}
+
+.neo-button {
+  box-shadow: 6px 6px 12px rgba(0,0,0,0.08), -6px -6px 12px rgba(255,255,255,0.6);
+  background-color: rgb(var(--surface));
+  transition: all 0.2s ease;
+}
+.neo-button:focus-visible, .neo-raised:focus-visible, .neo-pressed:focus-visible {
+  outline: 2px solid rgb(var(--primary));
+  outline-offset: 2px;
+}
+button:focus-visible, a:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-visible {
+  outline: 2px solid rgb(var(--primary));
+  outline-offset: 2px;
+}
+.neo-button:active {
+  box-shadow: inset 4px 4px 8px rgba(0,0,0,0.06), inset -4px -4px 8px rgba(255,255,255,0.5);
+}
+.dark .neo-button {
+  box-shadow: 6px 6px 12px rgba(0,0,0,0.4), -6px -6px 12px rgba(255,255,255,0.05);
+  background-color: rgb(var(--surface));
+}
+.dark .neo-button:active {
+  box-shadow: inset 4px 4px 8px rgba(0,0,0,0.5), inset -4px -4px 8px rgba(255,255,255,0.05);
+}
+
+.neo-input {
+  box-shadow: inset 4px 4px 8px rgba(0,0,0,0.06), inset -4px -4px 8px rgba(255,255,255,0.5);
+  background-color: rgb(var(--surface));
+  border: none;
+  outline: none;
+}
+.neo-input:focus {
+  box-shadow: inset 4px 4px 8px rgba(0,0,0,0.1), inset -4px -4px 8px rgba(255,255,255,0.7);
+}
+.dark .neo-input {
+  box-shadow: inset 4px 4px 8px rgba(0,0,0,0.5), inset -4px -4px 8px rgba(255,255,255,0.05);
+  background-color: rgb(var(--surface-container));
+  color: rgb(var(--on-surface));
+}
+
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: rgba(138, 140, 154, 0.2);
+  border-radius: 9999px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: rgba(138, 140, 154, 0.4);
+}
+.dark ::-webkit-scrollbar-thumb {
+  background: rgba(255, 255, 255, 0.15);
+}
+.dark ::-webkit-scrollbar-thumb:hover {
+  background: rgba(255, 255, 255, 0.25);
+}
+
+.material-symbols-outlined {
+  font-variation-settings: 'FILL' 0, 'wght' 400, 'GRAD' 0, 'opsz' 24;
+}

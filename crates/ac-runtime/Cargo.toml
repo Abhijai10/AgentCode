@@ -1,0 +1,22 @@
+[package]
+name = "ac-runtime"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+ac-common = { path = "../ac-common" }
+ac-db = { path = "../ac-db" }
+ac-context = { path = "../ac-context" }
+ac-git = { path = "../ac-git" }
+ac-provider = { path = "../ac-provider" }
+ac-tool = { path = "../ac-tool" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1.0.151"
+
+[dev-dependencies]
+ac-evidence = { path = "../ac-evidence" }
+ac-security = { path = "../ac-security" }
+
+[lints]
+workspace = true
