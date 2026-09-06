@@ -5,12 +5,26 @@ import { Sidebar } from "./Sidebar";
 import { TopBar } from "./TopBar";
 import { Footer } from "./Footer";
 import { HomeView } from "./HomeView";
-import { MissionView } from "./MissionView";
-import { ChatView } from "./ChatView";
-import { DiscussView } from "./DiscussView";
-import { DesignView } from "./DesignView";
-import { SecurityView } from "./SecurityView";
-import { SettingsView } from "./SettingsView";
+// Final-audit optimization: code-split the heavy views — each is only
+// loaded when its tab is first opened, so startup ships just the shell +
+// Home.  Suspense fallback keeps the layout stable while a chunk loads.
+import { lazy, Suspense } from "react";
+const MissionView = lazy(() =>
+  import("./MissionView").then((m) => ({ default: m.MissionView }))
+);
+const ChatView = lazy(() => import("./ChatView").then((m) => ({ default: m.ChatView })));
+const DiscussView = lazy(() =>
+  import("./DiscussView").then((m) => ({ default: m.DiscussView }))
+);
+const DesignView = lazy(() =>
+  import("./DesignView").then((m) => ({ default: m.DesignView }))
+);
+const SecurityView = lazy(() =>
+  import("./SecurityView").then((m) => ({ default: m.SecurityView }))
+);
+const SettingsView = lazy(() =>
+  import("./SettingsView").then((m) => ({ default: m.SettingsView }))
+);
 import { ProjectModal } from "./ProjectModal";
 import { Icon } from "./Icon";
 import { daemon } from "./daemon";
@@ -204,8 +218,9 @@ function AppShell() {
               }}
             />
           )}
-          {view === "mission" && <MissionView missionId={activeMission} onOpenSettings={() => setView("settings")} />}
+          {view === "mission" && <Suspense fallback={<ViewLoading />}><MissionView missionId={activeMission} onOpenSettings={() => setView("settings")} /></Suspense>}
           {view === "chat" && (
+            <Suspense fallback={<ViewLoading />}>
             <ChatView
               project={project}
               onOpenMission={(missionId) => {
@@ -214,8 +229,10 @@ function AppShell() {
               }}
               daemonConnected={daemonConnected}
             />
+            </Suspense>
           )}
           {view === "discuss" && (
+            <Suspense fallback={<ViewLoading />}>
             <DiscussView
               project={project}
               daemonConnected={daemonConnected}
@@ -224,8 +241,10 @@ function AppShell() {
                 setView("mission");
               }}
             />
+            </Suspense>
           )}
           {view === "design" && (
+            <Suspense fallback={<ViewLoading />}>
             <DesignView
               project={project}
               missionId={activeMission}
@@ -235,8 +254,10 @@ function AppShell() {
                 setView("mission");
               }}
             />
+            </Suspense>
           )}
           {view === "security" && (
+            <Suspense fallback={<ViewLoading />}>
             <SecurityView
               project={project}
               daemonConnected={daemonConnected}
@@ -246,8 +267,9 @@ function AppShell() {
               }}
               onOpenSettings={() => setView("settings")}
             />
+            </Suspense>
           )}
-          {view === "settings" && <SettingsView />}
+          {view === "settings" && <Suspense fallback={<ViewLoading />}><SettingsView /></Suspense>}
           <Footer
             daemonConnected={daemonConnected}
             modelLabel="Model: daemon-managed"
@@ -304,6 +326,16 @@ function AppShell() {
           {notice}
         </div>
       )}
+    </div>
+  );
+}
+
+/// Code-split fallback: keeps the layout stable while a lazy view chunk
+/// loads (same visual language as the loading states inside views).
+function ViewLoading() {
+  return (
+    <div className="flex-1 flex items-center justify-center text-sm text-on-surface-variant">
+      Loading…
     </div>
   );
 }
