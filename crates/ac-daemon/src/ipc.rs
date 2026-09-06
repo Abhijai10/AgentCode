@@ -1993,7 +1993,7 @@ mod ipc_tests {
     /// control plane.  Each drill asserts the HONEST outcome (recorded
     /// failure, clean error, intact state) — never a hang or a silent
     /// corruption.
-
+    ///
     /// WAL crash-recovery: a control plane dropped mid-write (no clean
     /// close — the process died) reopens, migrates, and reads back every
     /// committed mission intact.  Committed means committed.
