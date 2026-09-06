@@ -373,6 +373,22 @@ export interface ChangeSetSummary {
   files: ChangeSetFile[];
 }
 
+export interface ProjectMemory {
+  project_path: string;
+  facts: Array<{
+    id: string;
+    statement: string;
+    fact_type: string;
+    source: string;
+    confidence: number;
+    freshness: string;
+    memory_class: string;
+    last_validation_ms: number;
+  }>;
+  decisions: Array<{ id: string; decision: string; rationale: string; created_at_ms: number }>;
+  task_memories: Array<{ id: string; task_id: string; summary: string; created_at_ms: number }>;
+  counts: { facts: number; decisions: number; task_memories: number };
+}
 export interface EvidenceSummaryItem {
   evidence_id: string;
   kind: string;

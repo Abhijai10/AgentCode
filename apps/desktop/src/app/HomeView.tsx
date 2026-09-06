@@ -2,6 +2,7 @@ import { useState, useEffect, useRef } from "react";
 import { Icon } from "./Icon";
 import { daemon } from "./daemon";
 import type { Project } from "./ProjectContext";
+import type { ProjectMemory } from "./types";
 
 export function HomeView({
   project,
@@ -30,6 +31,23 @@ export function HomeView({
   const [readinessDismissed, setReadinessDismissed] = useState(false);
   const [submitting, setSubmitting] = useState(false);
   const [submitError, setSubmitError] = useState<string | null>(null);
+  // F1: durable project memory (facts/decisions/task memories persisted by
+  // previous missions — shared by every mode).
+  const [memory, setMemory] = useState<ProjectMemory | null>(null);
+  useEffect(() => {
+    if (!project) {
+      setMemory(null);
+      return;
+    }
+    let cancelled = false;
+    (async () => {
+      const result = await daemon.projectMemoryGet(project.path);
+      if (!cancelled) setMemory(result);
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [project]);
   // Batch N7: the whole composer surface reads as the input — clicking
   // anywhere focuses the editor instead of only the textarea itself.
   const composerRef = useRef<HTMLTextAreaElement>(null);
@@ -133,6 +151,48 @@ export function HomeView({
           <p className="text-on-surface-variant text-lg max-w-xl mx-auto">Working in <span className="font-semibold text-primary">{project.name}</span>. Describe your vision — the agent will orchestrate design, logic, and infrastructure to bring it to life.</p>
           <p className="text-xs text-on-surface-variant font-mono max-w-xl mx-auto truncate">{project.path}</p>
         </div>
+
+        {memory && (memory.counts.facts > 0 || memory.counts.task_memories > 0) && (
+          <details className="neo-raised rounded-2xl px-4 py-3 group" open>
+            <summary className="cursor-pointer text-sm font-medium text-on-surface flex items-center gap-2 list-none">
+              <Icon name="brain" size={16} />
+              Project memory
+              <span className="text-xs text-on-surface-variant">
+                {memory.counts.facts} facts · {memory.counts.task_memories} task notes
+                {memory.counts.decisions > 0 ? ` · ${memory.counts.decisions} decisions` : ""}
+              </span>
+            </summary>
+            <div className="mt-3 space-y-3 text-left">
+              {memory.facts.length > 0 && (
+                <div>
+                  <p className="text-xs font-medium text-on-surface-variant mb-1">Learned facts</p>
+                  <ul className="space-y-1">
+                    {memory.facts.slice(0, 5).map((f) => (
+                      <li key={f.id} className="text-xs text-on-surface flex items-start gap-2">
+                        <span className="text-primary mt-0.5">•</span>
+                        <span className="flex-1">{f.statement}</span>
+                        <span className="opacity-60 font-mono text-[10px]">{f.confidence}%</span>
+                      </li>
+                    ))}
+                  </ul>
+                </div>
+              )}
+              {memory.task_memories.length > 0 && (
+                <div>
+                  <p className="text-xs font-medium text-on-surface-variant mb-1">Recent task outcomes</p>
+                  <ul className="space-y-1">
+                    {memory.task_memories.slice(0, 3).map((t) => (
+                      <li key={t.id} className="text-xs text-on-surface flex items-start gap-2">
+                        <span className="text-primary mt-0.5">•</span>
+                        <span className="flex-1">{t.summary}</span>
+                      </li>
+                    ))}
+                  </ul>
+                </div>
+              )}
+            </div>
+          </details>
+        )}
 
         {readiness && !readinessDismissed && !readiness.usable_route && (
           <div className="neo-raised rounded-2xl p-4 mb-4 flex items-start justify-between gap-3">

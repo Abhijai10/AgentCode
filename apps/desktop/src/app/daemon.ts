@@ -57,6 +57,7 @@ import type {
   VisualCritique,
   DesignConstraint,
   DesignConstraints,
+  ProjectMemory,
 } from "./types";
 
 function toDaemonStatus(h: DaemonHealth): DaemonStatus {
@@ -567,6 +568,19 @@ export const daemon = {
         limit: limit ?? undefined,
       });
       return res.events ?? null;
+    } catch {
+      return null;
+    }
+  },
+
+  async projectMemoryGet(projectPath: string): Promise<ProjectMemory | null> {
+    try {
+      const res = await invoke<ProjectMemory & { ok: boolean }>(
+        "daemon_project_memory_get",
+        { projectPath }
+      );
+      if (res?.ok === false) return null;
+      return res;
     } catch {
       return null;
     }

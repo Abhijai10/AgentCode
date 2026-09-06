@@ -973,6 +973,19 @@ fn daemon_get_evidence_summary(
 }
 
 #[tauri::command]
+fn daemon_project_memory_get(
+    state: tauri::State<DaemonClient>,
+    project_path: String,
+) -> Result<Value, String> {
+    request(
+        &state.0,
+        "ui",
+        "ProjectMemoryGet",
+        json!({ "project_path": project_path }),
+    )
+}
+
+#[tauri::command]
 fn daemon_get_verification_summary(
     state: tauri::State<DaemonClient>,
     mission_id: String,
@@ -2084,6 +2097,7 @@ fn main() {
             daemon_get_task_details,
             daemon_get_mission_events,
             daemon_get_evidence_summary,
+            daemon_project_memory_get,
             daemon_get_verification_summary,
             daemon_list_tools,
             daemon_list_scanners,
