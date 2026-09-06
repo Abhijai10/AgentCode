@@ -1086,6 +1086,177 @@ Rules: describe only what is actually visible in the image. Findings must be con
     /// sentence).  The contract text becomes the mission goal so the
     /// mission retains product analysis, constraints, QA findings, and the
     /// design state.
+    /// ── Stitch-parity: design → code export ────────────────────────────
+    ///
+    /// Promotes the WINNING mockup variant into a real implementation
+    /// mission.  The mission goal embeds the winner's exact, already-scored
+    /// properties (layout, palette hexes, copy, accessibility posture) so
+    /// the implementing agent reproduces the scored artifact — not a vague
+    /// description of it.  Everything goes through goal_submit: governed
+    /// tasks, Tool Broker writes, ChangeSets, and verification evidence,
+    /// exactly like every other mission; no bare filesystem writes.
+    pub fn design_export_winner(
+        &mut self,
+        conversation_id: &str,
+        target_path: &str,
+    ) -> AcResult<Value> {
+        self.ensure_running()?;
+        let conv = self.db.conversation(conversation_id)?.ok_or_else(|| {
+            AcError::validation("CONVERSATION-NOT_FOUND", "conversation not found")
+        })?;
+        if conv.mode != "DESIGN" {
+            return Err(AcError::validation(
+                "CONVERSATION-WRONG_MODE",
+                "design_export_winner requires a DESIGN conversation",
+            ));
+        }
+        if target_path.trim().is_empty() {
+            return Err(AcError::validation(
+                "DESIGN-EXPORT_TARGET_REQUIRED",
+                "target component path is required (e.g. src/pages/Landing.tsx)",
+            ));
+        }
+        // Boundary check before anything runs: the target must be a clean
+        // RELATIVE path inside the project.  We never silently rewrite an
+        // escaping path — `..` or absolute targets are refused outright so
+        // the goal always names exactly what the user asked for.
+        let project = std::path::PathBuf::from(&conv.project_path);
+        if std::path::Path::new(target_path).is_absolute() {
+            return Err(AcError::validation(
+                "DESIGN-EXPORT_TARGET_OUTSIDE_PROJECT",
+                "target path must be relative to the project directory",
+            ));
+        }
+        if std::path::Path::new(target_path)
+            .components()
+            .any(|c| c == std::path::Component::ParentDir)
+        {
+            return Err(AcError::validation(
+                "DESIGN-EXPORT_TARGET_OUTSIDE_PROJECT",
+                "target path must not contain '..' — it must stay inside the project directory",
+            ));
+        }
+        let normalized = project.join(target_path);
+        let rel_target = normalized
+            .strip_prefix(&project)
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap_or_else(|_| target_path.to_string());
+
+        // The latest generated-mockups run for this conversation.
+        let doc = self
+            .db
+            .design_documents(conversation_id)?
+            .into_iter()
+            .filter(|d| d.doc_type == "generated_mockups")
+            .max_by_key(|d| d.updated_at_ms)
+            .ok_or_else(|| {
+                AcError::validation(
+                    "DESIGN-EXPORT_NO_MOCKUPS",
+                    "generate mockups first — there is no scored mockup run to export",
+                )
+            })?;
+        let run: Value = serde_json::from_str(&doc.content_json).map_err(|_| {
+            AcError::validation("DESIGN-EXPORT_DOC_CORRUPT", "mockup run document is corrupt")
+        })?;
+        let winner_idx = run["winner"].as_u64().unwrap_or(0) as usize;
+        let variants = run["variants"].as_array().cloned().unwrap_or_default();
+        let winner = variants
+            .get(winner_idx)
+            .ok_or_else(|| {
+                AcError::validation(
+                    "DESIGN-EXPORT_WINNER_MISSING",
+                    "the recorded winner variant no longer exists",
+                )
+            })?
+            .clone();
+        let spec = run["spec"].clone();
+
+        let layout = winner["layout"].as_str().unwrap_or("hero_center");
+        let palette = winner["palette_intent"].as_str().unwrap_or("light");
+        let str_field = |name: &str, fallback: &str| -> String {
+            spec.get(name)
+                .and_then(Value::as_str)
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| fallback.to_string())
+        };
+        let headline = str_field("headline", "Your product, clearly stated");
+        let subheadline = str_field(
+            "subheadline",
+            "A concrete sentence about what this does and for whom.",
+        );
+        let primary_cta = str_field("primary_cta", "Get started");
+        let secondary_cta = str_field("secondary_cta", "Learn more");
+        let sections: Vec<String> = spec
+            .get("section_ideas")
+            .and_then(Value::as_array)
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(Value::as_str)
+                    .map(|s| format!("- {s}"))
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        let goal = format!(
+            "GOAL: Implement the winning design mockup as a real React component.\n\n\
+             TARGET FILE: {rel_target} (create or replace through the governed ChangeSet path only)\n\n\
+             This mission was promoted from a scored generative-mockup run in the \
+             Design Studio.  The winning variant (variant {winner_idx}, layout '{layout}', \
+             palette '{palette}') was rendered and verified in the real browser.  \
+             Reproduce exactly these scored properties:\n\n\
+             HERO:\n\
+             - headline: {headline}\n\
+             - subheadline: {subheadline}\n\
+             - primary CTA label: {primary_cta}\n\
+             - secondary CTA label: {secondary_cta}\n\
+             - layout: {layout} (hero_left = text left + visual right; hero_center = \
+             centered single column; hero_split = text and visual side by side)\n\n\
+             STYLE TOKENS (use these exact values as inline styles or a styled wrapper):\n\
+             - palette '{palette}': see the variant's recorded HTML in the design memory \
+             document 'generated_mockups' of this conversation for the exact hex values\n\
+             - typography: ui-sans-serif/system-ui stack, headline 44px/1.15, subheadline \
+             18px/1.6 at 75% opacity\n\
+             - CTAs: rounded-10px pills, primary solid accent, secondary 55%-opacity border\n\n\
+             SECTIONS:\n{}\n\n\
+             REQUIREMENTS:\n\
+             1. Self-contained component: no new runtime dependencies.\n\
+             2. Accessibility is non-negotiable: semantic landmarks (main, h1), sufficient \
+             contrast per the scored palette, aria-hidden on decorative visuals.\n\
+             3. All write operations through the Tool Broker (PrepareEdit/ApplyEdit) — \
+             no bare filesystem writes.\n\
+             4. Verify with the project's dev/test tooling and record evidence.\n",
+            sections
+                .iter()
+                .map(|s| s.as_str())
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
+
+        let (mission_id, _session_id) = self.goal_submit(conversation_id, &goal, &[])?;
+        let now = TimestampMillis::now().as_millis() as i64;
+        let mut promoted = run;
+        promoted["promoted_mission_id"] = json!(mission_id.to_string());
+        promoted["exported_target"] = json!(rel_target);
+        self.db.save_design_document(&DesignDocumentRow {
+            id: doc.id,
+            conversation_id: conversation_id.to_string(),
+            doc_type: "generated_mockups".to_string(),
+            content_json: promoted.to_string(),
+            version: doc.version + 1,
+            evidence_refs: String::new(),
+            created_at_ms: doc.created_at_ms,
+            updated_at_ms: now,
+        })?;
+
+        Ok(json!({
+            "mission_id": mission_id.to_string(),
+            "target": rel_target,
+            "winner": winner_idx,
+            "conversation_id": conversation_id,
+        }))
+    }
+
     pub fn design_execute_contract(&mut self, conversation_id: &str) -> AcResult<Value> {
         self.ensure_running()?;
         let contract = self.design_contract(conversation_id)?;

@@ -108,6 +108,8 @@ export function DesignView({
     winner: number;
     spec_parse_failed?: boolean;
   } | null>(null);
+  const [exportTarget, setExportTarget] = useState("src/pages/GeneratedLanding.tsx");
+  const [exportResult, setExportResult] = useState<{ missionId: string; target: string } | null>(null);
   const [panelBusy, setPanelBusy] = useState(false);
   const [rightOpen, setRightOpen] = useState(true);
   const [viewportHint, setViewportHint] = useState("desktop");
@@ -437,6 +439,18 @@ export function DesignView({
         setMockups({ variants: r.variants, winner: r.winner ?? 0, spec_parse_failed: r.spec_parse_failed });
       } else {
         setError(r.error || "Could not generate mockups");
+      }
+    });
+
+  // Stitch-parity: export the winner as a real React component through a
+  // governed mission (Tool Broker writes + ChangeSets + verification).
+  const handleExportWinner = () =>
+    runPanel(async () => {
+      const r = await daemon.designExportWinner(activeConvId!, exportTarget);
+      if (r.ok && r.missionId) {
+        setExportResult({ missionId: r.missionId, target: r.target ?? exportTarget });
+      } else {
+        setError(r.error || "Could not export the winner");
       }
     });
 
@@ -1209,6 +1223,27 @@ export function DesignView({
                     />
                   </div>
                 ))}
+                <div className="mt-2 flex items-center gap-2">
+                  <input
+                    value={exportTarget}
+                    onChange={(e) => setExportTarget(e.target.value)}
+                    placeholder="src/pages/GeneratedLanding.tsx"
+                    className="flex-1 neo-pressed rounded-lg px-2 py-1 text-[11px] text-on-surface bg-transparent focus:outline-none"
+                  />
+                  <button
+                    onClick={handleExportWinner}
+                    disabled={panelBusy}
+                    className="neo-button rounded-lg px-3 py-1.5 text-[11px] font-medium text-on-surface-variant disabled:opacity-50"
+                    title="Promote the winning mockup to a governed implementation mission"
+                  >
+                    Export winner → mission
+                  </button>
+                </div>
+                {exportResult && (
+                  <p className="mt-2 text-[10px] text-emerald-600">
+                    Mission {exportResult.missionId.slice(0, 18)}… implementing {exportResult.target} — watch it in Missions.
+                  </p>
+                )}
               </div>
             )}
           </section>

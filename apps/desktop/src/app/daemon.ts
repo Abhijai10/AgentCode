@@ -1253,6 +1253,23 @@ export const daemon = {
     }
   },
 
+  async designExportWinner(
+    conversationId: string,
+    targetPath: string
+  ): Promise<{ ok: boolean; missionId?: string; target?: string; winner?: number; error?: string }> {
+    try {
+      const res = await invoke<{ mission_id: string; target: string; winner: number }>(
+        "daemon_design_export_winner",
+        { conversationId, targetPath }
+      );
+      return { ok: true, missionId: res.mission_id, target: res.target, winner: res.winner };
+    } catch (e: unknown) {
+      const message = e instanceof Error ? e.message : String(e);
+      const cleaned = message.replace(/^[A-Z0-9_-]+:\s*/, "");
+      return { ok: false, error: cleaned || message };
+    }
+  },
+
   async designContractGet(
     conversationId: string
   ): Promise<{ ok: boolean; contract?: Record<string, unknown>; error?: string }> {

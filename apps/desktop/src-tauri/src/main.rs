@@ -1916,6 +1916,20 @@ fn daemon_design_visual_critique(
 }
 
 #[tauri::command]
+fn daemon_design_export_winner(
+    state: tauri::State<DaemonClient>,
+    conversation_id: String,
+    target_path: String,
+) -> Result<Value, String> {
+    request(
+        &state.0,
+        "ui",
+        "DesignExportWinner",
+        json!({ "conversation_id": conversation_id, "target_path": target_path }),
+    )
+}
+
+#[tauri::command]
 fn daemon_design_generate_mockups(
     state: tauri::State<DaemonClient>,
     conversation_id: String,
@@ -2266,6 +2280,7 @@ fn main() {
             daemon_design_visual_critique,
             daemon_design_contract,
             daemon_design_generate_mockups,
+            daemon_design_export_winner,
             daemon_design_execute_contract,
             daemon_design_constraints_set,
             daemon_design_constraints_get,

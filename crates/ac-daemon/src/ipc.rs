@@ -948,6 +948,18 @@ fn dispatch_request(request: &Value, daemon: &mut DaemonService) -> (Value, bool
                 Err(error) => error_response(correlation_id, error.code(), error.to_string()),
             }
         },
+        "DesignExportWinner" => {
+            let conversation_id = request.get("conversation_id").and_then(Value::as_str).unwrap_or("");
+            let target_path = request.get("target_path").and_then(Value::as_str).unwrap_or("");
+            match daemon.design_export_winner(conversation_id, target_path) {
+                Ok(mut payload) => {
+                    payload["id"] = json!(correlation_id);
+                    payload["ok"] = json!(true);
+                    payload
+                }
+                Err(error) => error_response(correlation_id, error.code(), error.to_string()),
+            }
+        },
         "DesignGenerateMockups" => {
             let conversation_id = request.get("conversation_id").and_then(Value::as_str).unwrap_or("");
             let prompt = request.get("prompt").and_then(Value::as_str).unwrap_or("");
@@ -1918,6 +1930,44 @@ mod ipc_tests {
         );
         assert_eq!(empty["ok"], false);
         assert_eq!(empty["error"]["code"], "CONVERSATION-EMPTY_PROMPT");
+
+        // ── Export the winner as a governed mission ──────────────────────
+        // No mockups yet in the GOAL conversation -> honest refusal.
+        let no_mockups = request_via_ipc(
+            &server, &listener, &mut daemon,
+            json!({"id":"x1","command":"DesignExportWinner","conversation_id": goal_cid, "target_path":"src/pages/L.tsx"}),
+        );
+        assert_eq!(no_mockups["ok"], false);
+        assert_eq!(no_mockups["error"]["code"], "CONVERSATION-WRONG_MODE");
+
+        // Target outside the project -> boundary refusal before any mission.
+        let escape = request_via_ipc(
+            &server, &listener, &mut daemon,
+            json!({"id":"x2","command":"DesignExportWinner","conversation_id": cid, "target_path":"../outside/L.tsx"}),
+        );
+        assert_eq!(escape["ok"], false, "escape: {escape}");
+        assert_eq!(escape["error"]["code"], "DESIGN-EXPORT_TARGET_OUTSIDE_PROJECT");
+
+        // Happy path: winner promoted into a real mission with the scored
+        // properties embedded in the goal, doc version bumped.
+        let export = request_via_ipc(
+            &server, &listener, &mut daemon,
+            json!({"id":"x3","command":"DesignExportWinner","conversation_id": cid, "target_path":"src/pages/GeneratedLanding.tsx"}),
+        );
+        assert_eq!(export["ok"], true, "export: {export}");
+        let mission_id = export["mission_id"].as_str().unwrap().to_string();
+        assert!(!mission_id.is_empty());
+        assert_eq!(export["target"], "src/pages/GeneratedLanding.tsx");
+
+        // The mission exists and its goal names the target + winner layout.
+        let details = request_via_ipc(
+            &server, &listener, &mut daemon,
+            json!({"id":"x4","command":"GetMissionDetails","mission_id": mission_id}),
+        );
+        assert_eq!(details["ok"], true, "details: {details}");
+        let goal_text = details["goal"].as_str().unwrap_or("");
+        assert!(goal_text.contains("src/pages/GeneratedLanding.tsx"), "goal: {goal_text:.200}");
+        assert!(goal_text.contains("winning design mockup"), "goal must name its provenance");
 
         server.cleanup();
         daemon.shutdown().unwrap();
