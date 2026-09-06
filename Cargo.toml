@@ -9,6 +9,7 @@ members = [
     "crates/ac-db",
     "crates/ac-kernel",
     "crates/ac-security",
+    "crates/ac-signals",
     "crates/ac-sandbox",
     "crates/ac-provider",
     "crates/ac-tool",

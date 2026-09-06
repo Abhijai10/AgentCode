@@ -1573,7 +1573,7 @@ Rules: describe only what is actually visible in the image. Findings must be con
         }
         if port.is_none() {
             for candidate in DEFAULT_DEV_PORTS {
-                if test_http_ready(candidate) {
+                if test_http_ready(candidate) && port_owned_by_process(pid, candidate) {
                     port = Some(candidate);
                     break;
                 }
@@ -2356,4 +2356,24 @@ fn test_http_ready(port: u16) -> bool {
         .ok()
         .and_then(|a| TcpStream::connect_timeout(&a, Duration::from_millis(150)).ok())
         .is_some()
+}
+
+/// F10 (final audit): does OUR spawned child own the listener on this port?
+/// Prevents recording a foreign dev server's port as this design's preview
+/// (the default-port probe alone can bind the WRONG server when the real
+/// dev server is slow and another process listens on a default port).
+/// Uses `lsof -a -d tcp -p <pid>` and checks the port appears in the
+/// output; honest fallback: if lsof is unavailable we return true (probe
+/// only) — availability checks are advisory, not blocking.
+fn port_owned_by_process(pid: u32, port: u16) -> bool {
+    let output = std::process::Command::new("lsof")
+        .args(["-a", "-d", "tcp", "-P", "-n", "-p", &pid.to_string()])
+        .output();
+    match output {
+        Ok(output) if output.status.success() => {
+            let text = String::from_utf8_lossy(&output.stdout);
+            text.contains(&format!(":{port}"))
+        }
+        _ => true, // lsof unavailable or denied: cannot disprove ownership
+    }
 }

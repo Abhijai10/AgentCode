@@ -77,6 +77,7 @@ dependencies = [
  "ac-code-intel",
  "ac-common",
  "ac-config",
+ "ac-context",
  "ac-db",
  "ac-evidence",
  "ac-git",
@@ -86,6 +87,7 @@ dependencies = [
  "ac-runtime",
  "ac-sandbox",
  "ac-security",
+ "ac-signals",
  "ac-tool",
  "ac-verification",
  "base64 0.23.1",
@@ -195,6 +197,13 @@ dependencies = [
  "ac-common",
  "ac-evidence",
  "serde_json",
+]
+
+[[package]]
+name = "ac-signals"
+version = "0.1.0"
+dependencies = [
+ "libc",
 ]
 
 [[package]]

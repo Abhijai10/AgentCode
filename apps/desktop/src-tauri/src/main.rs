@@ -2056,7 +2056,99 @@ fn chrono_like_id() -> String {
     )
 }
 
+/// F7 (final audit): the app must not require a terminal running the
+/// daemon.  If the socket is dead, spawn a daemon as a detached child:
+///  1. the binary bundled beside the app (packaged builds),
+///  2. the workspace target dir (dev runs: `cargo tauri dev` runs from
+///     apps/desktop/src-tauri, the workspace target/ is four levels up).
+///
+/// Honest on failure: log to stderr and continue — the UI already shows a
+/// clean daemon-down state and the user can start one manually; the shell
+/// never crashes on a spawn problem.
+fn ensure_daemon_running() {
+    let socket = match socket_path() {
+        Ok(path) => path,
+        Err(_) => return,
+    };
+    // Alive probe: a successful connect means a daemon is serving.
+    if std::os::unix::net::UnixStream::connect(&socket).is_ok() {
+        return;
+    }
+    // Stale socket file from a dead daemon: remove it so the new daemon can
+    // bind (mirrors the daemon's own stale-socket recovery).
+    let _ = std::fs::remove_file(&socket);
+    let exe_dir = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(std::path::Path::to_path_buf));
+    let Some(exe_dir) = exe_dir else {
+        return;
+    };
+    let candidates = [
+        exe_dir.join("ac-daemon"),
+        exe_dir
+            .join("../../../../..")
+            .join("target")
+            .join("debug")
+            .join("ac-daemon"),
+        exe_dir
+            .join("../../../../..")
+            .join("target")
+            .join("release")
+            .join("ac-daemon"),
+    ];
+    let binary = candidates
+        .into_iter()
+        .find(|p| p.exists())
+        .map(|p| p.canonicalize().unwrap_or(p));
+    let Some(binary) = binary else {
+        eprintln!(
+            "AgentCode: no daemon serving at {} and no ac-daemon binary found beside the app or in the workspace target dir",
+            socket.display()
+        );
+        return;
+    };
+    match std::process::Command::new(&binary)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+    {
+        Ok(child) => {
+            // Hold the handle on a parked thread so the daemon is not reaped
+            // into a zombie while the app runs; never wait() — the app must
+            // outlive daemon restarts.
+            std::thread::spawn(move || {
+                let _ = child;
+                std::thread::park();
+            });
+            // Give the daemon a moment to bind before the first health poll.
+            for _ in 0..50 {
+                if std::os::unix::net::UnixStream::connect(&socket).is_ok() {
+                    eprintln!("AgentCode: spawned daemon at {}", binary.display());
+                    return;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+            eprintln!(
+                "AgentCode: daemon spawned but socket {} did not become ready",
+                socket.display()
+            );
+        }
+        Err(error) => {
+            eprintln!(
+                "AgentCode: could not spawn daemon {}: {error}",
+                binary.display()
+            );
+        }
+    }
+}
+
 fn main() {
+    // F7 (final audit): sidecar daemon lifecycle — if no daemon is serving
+    // the socket, spawn one (dev builds: the cargo-built binary next to the
+    // app; packaged builds: the bundled binary).  This closes the launch
+    // gap where users had to run `cargo run -p ac-daemon` in a terminal.
+    ensure_daemon_running();
     let client =
         UnixIpcClient::new(socket_path().unwrap_or_else(|_| PathBuf::from("/tmp/agentcode.sock")));
     tauri::Builder::default()
