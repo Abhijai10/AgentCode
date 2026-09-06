@@ -1822,17 +1822,73 @@ impl<P: PolicyBoundary> AutonomousAgent<P> {
         };
         let events = execution.events;
         let text = provider_events_text(&events);
+        // Provider streaming into evidence (final-audit optimization):
+        // the delta stream is captured CHUNK-BY-CHUNK as bounded evidence
+        // records, so long generations are inspectable mid-flight in the
+        // mission view (each chunk is its own evidence row with an index +
+        // byte range, redacted through the evidence layer).  The summary
+        // record below remains the role-level pointer.
+        let mut stream_evidence: Vec<StableId> = Vec::new();
+        {
+            const STREAM_CHUNK_BYTES: usize = 2 * 1024;
+            const STREAM_CHUNKS_MAX: usize = 16;
+            let mut buffer = String::new();
+            let mut chunk_index: usize = 0;
+            for event in &events {
+                if let ProviderStreamEvent::Delta(delta) = event {
+                    buffer.push_str(delta);
+                    while buffer.len() >= STREAM_CHUNK_BYTES
+                        && stream_evidence.len() < STREAM_CHUNKS_MAX
+                    {
+                        // Drain at most STREAM_CHUNK_BYTES without splitting
+                        // a char boundary (bytes vs chars: char_indices is
+                        // the safe cut point).
+                        let mut boundary = 0;
+                        for (offset, _) in buffer.char_indices() {
+                            if offset <= STREAM_CHUNK_BYTES {
+                                boundary = offset;
+                            } else {
+                                break;
+                            }
+                        }
+                        if boundary == 0 {
+                            break;
+                        }
+                        let chunk: String = buffer.drain(..boundary).collect();
+                        match self.evidence.append(
+                            EvidenceKind::DerivedContext,
+                            provenance(&format!("agent.provider.{role}.stream")),
+                            format!(
+                                "mem://agent/{}/provider/{}/stream/{chunk_index}",
+                                goal.id, role
+                            ),
+                            format!("role:{role};chunk:{chunk_index};bytes:{}", chunk.len()),
+                        ) {
+                            Ok(id) => stream_evidence.push(id),
+                            Err(_) => break,
+                        }
+                        chunk_index += 1;
+                    }
+                    if stream_evidence.len() >= STREAM_CHUNKS_MAX {
+                        break;
+                    }
+                }
+            }
+        }
         let evidence = self.evidence.append(
             EvidenceKind::DerivedContext,
             provenance(&format!("agent.provider.{role}")),
             format!("mem://agent/{}/provider/{role}", goal.id),
             format!("role:{role};events:{};text:{}", events.len(), text.len()),
         )?;
-        let fact_id = self.memory.record_fact(
-            format!("provider produced {role} proposal"),
-            vec![evidence],
-            70,
-        )?;
+        // The role fact cites the summary AND the stream chunks: the
+        // evidence chain can walk from the conclusion to every captured
+        // generation fragment.
+        let mut fact_refs = stream_evidence.clone();
+        fact_refs.push(evidence);
+        let fact_id =
+            self.memory
+                .record_fact(format!("provider produced {role} proposal"), fact_refs, 70)?;
         // F1: persist project memory immediately so facts survive the
         // mission and are available to every mode after restart.
         self.persist_memory_fact(&fact_id)?;
@@ -7000,6 +7056,30 @@ mod tests {
             std::fs::read_to_string(source.join("src/lib.rs")).unwrap(),
             "pub fn fixture_answer() -> u32 {\n    42\n}"
         );
+        // Provider streaming into evidence (final-audit optimization): the
+        // mock planner bundle is > 2KB, so the run must have captured the
+        // delta stream as CHUNKED evidence rows (agent.provider.<role>.stream
+        // provenance, chunk-indexed URIs) alongside the role summary rows.
+        {
+            let stream_records: Vec<&ac_evidence::EvidenceRecord> = agent
+                .evidence
+                .records()
+                .filter(|r| r.provenance.source.starts_with("agent.provider."))
+                .filter(|r| r.provenance.source.ends_with(".stream"))
+                .collect();
+            assert!(
+                !stream_records.is_empty(),
+                "expected chunked stream evidence from the scripted provider"
+            );
+            for record in &stream_records {
+                assert!(
+                    record.artifact_uri.contains("/stream/"),
+                    "chunk uri: {}",
+                    record.artifact_uri
+                );
+                assert!(record.content_hash.starts_with("role:"));
+            }
+        }
         let _ = std::fs::remove_dir_all(source);
     }
 
