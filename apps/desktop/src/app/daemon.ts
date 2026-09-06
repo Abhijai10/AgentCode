@@ -9,11 +9,9 @@ import type {
   TerminalSessionInfo,
   TerminalTail,
   TerminalListItem,
-  DiscussSession,
   DiscussMessage,
   DiscussPlan,
   DiscussDecisionRecord,
-  DesignSession,
   SettingsState,
   MissionProgress,
   ToolInfo,
@@ -612,22 +610,6 @@ export const daemon = {
     }
   },
 
-  async discussListSessions(): Promise<DiscussSession[]> {
-    try {
-      return await invoke<DiscussSession[]>("daemon_discuss_sessions");
-    } catch {
-      return [];
-    }
-  },
-
-  async discussGetMessages(sessionId: string): Promise<DiscussMessage[]> {
-    try {
-      return await invoke<DiscussMessage[]>("daemon_discuss_messages", { sessionId });
-    } catch {
-      return [];
-    }
-  },
-
   async discussSendMessage(
     sessionId: string,
     content: string
@@ -639,21 +621,9 @@ export const daemon = {
     }
   },
 
-  async designListSessions(): Promise<DesignSession[]> {
-    try {
-      return await invoke<DesignSession[]>("daemon_design_sessions");
-    } catch {
-      return [];
-    }
-  },
 
-  async designGetSession(sessionId: string): Promise<DesignSession | null> {
-    try {
-      return await invoke<DesignSession>("daemon_design_session", { sessionId });
-    } catch {
-      return null;
-    }
-  },
+
+
 
   // ── Conversations (real, project-bound chat) ────────────────────────────
 

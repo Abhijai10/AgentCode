@@ -1545,7 +1545,7 @@ Rules: describe only what is actually visible in the image. Findings must be con
             .name("design-preview-reader".to_string())
             .spawn(move || {
                 for line in BufReader::new(stdout).lines().map_while(Result::ok) {
-                    let mut guard = signal.lock().unwrap();
+                    let mut guard = signal.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
                     if guard.is_none() {
                         *guard = detect_port_from_line(&line);
                     }
@@ -1565,7 +1565,7 @@ Rules: describe only what is actually visible in the image. Findings must be con
         let mut port = None;
         let start = Instant::now();
         while start.elapsed() < Duration::from_secs(4) {
-            if let Some(p) = *port_signal.lock().unwrap() {
+            if let Some(p) = *port_signal.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) {
                 port = Some(p);
                 break;
             }
@@ -1595,7 +1595,7 @@ Rules: describe only what is actually visible in the image. Findings must be con
             });
             self.design_children
                 .lock()
-                .unwrap()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .insert(conversation_id.to_string(), child);
             return Ok(json!({
                 "status": "launched",
@@ -1607,7 +1607,10 @@ Rules: describe only what is actually visible in the image. Findings must be con
             }));
         }
 
-        let ready_url = format!("http://127.0.0.1:{}", port.unwrap());
+        // port is Some here by the is_none early-return above; avoid a panic
+            // path regardless (poisoned-mutex / re-entrancy hardening).
+            let ready_port = port.unwrap_or(0);
+            let ready_url = format!("http://127.0.0.1:{ready_port}");
         let now = TimestampMillis::now().as_millis() as i64;
         let preview = DesignPreviewRow {
             id: StableId::new("dpreview").to_string(),
@@ -1624,8 +1627,8 @@ port: port.map(|p| p as i64),
         self.db.save_design_preview(&preview)?;
         self.design_children
             .lock()
-            .unwrap()
-            .insert(conversation_id.to_string(), child);
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .insert(conversation_id.to_string(), child);
 
         Ok(json!({
             "status": "launched",
@@ -1659,7 +1662,7 @@ port: port.map(|p| p as i64),
     }
 
     pub fn design_preview_stop(&self, conversation_id: &str) -> AcResult<Value> {
-        let mut children = self.design_children.lock().unwrap();
+        let mut children = self.design_children.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         if let Some(mut child) = children.remove(conversation_id) {
             let _ = child.kill();
             let _ = child.wait();
