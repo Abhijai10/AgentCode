@@ -2446,6 +2446,117 @@ port: port.map(|p| p as i64),
         Ok(run)
     }
 
+    /// Multi-screen Stitch flow (Doc 06 / Stitch parity): generate a mockup
+    /// run for EACH screen prompt (1–4 screens) through the exact
+    /// single-screen machinery, then group the winners into a FLOW design
+    /// document with shared lineage.  A flow is an app skeleton: the
+    /// screens belong together (one product, one palette family), and the
+    /// flow document records every per-screen winner for export.
+    pub fn design_generate_flow(
+        &mut self,
+        conversation_id: &str,
+        screens: &[String],
+        variants_per_screen: usize,
+        deterministic: bool,
+    ) -> AcResult<Value> {
+        self.ensure_running()?;
+        if screens.is_empty() {
+            return Err(AcError::validation(
+                "DESIGN-FLOW_NO_SCREENS",
+                "a flow needs at least one screen prompt",
+            ));
+        }
+        if screens.len() > 4 {
+            return Err(AcError::validation(
+                "DESIGN-FLOW_TOO_MANY_SCREENS",
+                "a flow supports at most 4 screens per run",
+            ));
+        }
+        if screens.iter().any(|s| s.trim().is_empty()) {
+            return Err(AcError::validation(
+                "DESIGN-FLOW_EMPTY_SCREEN",
+                "every screen prompt must be non-empty",
+            ));
+        }
+
+        let flow_id = format!("flow-{}", StableId::new("flow"));
+        let mut per_screen: Vec<Value> = Vec::new();
+        let mut failed: Vec<Value> = Vec::new();
+        for (index, screen) in screens.iter().enumerate() {
+            let run = self
+                .design_generate_mockups(
+                    conversation_id,
+                    &format!("Screen {index} of the flow: {screen}"),
+                    variants_per_screen,
+                    deterministic,
+                )
+                .map_err(|error| {
+                    // Wrap so a single-screen failure names the screen.
+                    AcError::validation(
+                        "DESIGN-FLOW_SCREEN_FAILED",
+                        format!("screen {index} ({screen}) failed: {error}"),
+                    )
+                });
+            match run {
+                Ok(run) => {
+                    let entry = json!({
+                        "index": index,
+                        "screen": screen,
+                        "run": run,
+                        "winner": run["winner"],
+                        "winner_html": run["variants"]
+                            .as_array()
+                            .and_then(|variants| {
+                                variants
+                                    .iter()
+                                    .find(|v| v["variant"] == run["winner"])
+                                    .and_then(|v| v["html"].as_str())
+                            })
+                            .unwrap_or("")
+                            .to_string(),
+                    });
+                    per_screen.push(entry);
+                }
+                Err(error) => {
+                    // Honest per-screen failure record: the flow continues
+                    // with the remaining screens, and the failure is named.
+                    failed.push(json!({
+                        "index": index,
+                        "screen": screen,
+                        "error": error.to_string(),
+                    }));
+                }
+            }
+        }
+        if per_screen.is_empty() {
+            return Err(AcError::validation(
+                "DESIGN-FLOW_ALL_SCREENS_FAILED",
+                "every screen in the flow failed; see the mockup run errors",
+            ));
+        }
+        let flow = json!({
+            "flow_id": flow_id,
+            "conversation_id": conversation_id,
+            "screen_count": per_screen.len(),
+            "failed_screens": failed,
+            "screens": per_screen,
+            "deterministic": deterministic,
+        });
+        let now = TimestampMillis::now().as_millis() as i64;
+        let id = StableId::new("flow").to_string();
+        self.db.save_design_document(&DesignDocumentRow {
+            id,
+            conversation_id: conversation_id.to_string(),
+            doc_type: "generated_flow".to_string(),
+            content_json: flow.to_string(),
+            version: 1,
+            evidence_refs: String::new(),
+            created_at_ms: now,
+            updated_at_ms: now,
+        })?;
+        Ok(flow)
+    }
+
     pub fn design_qa_run(
         &self,
         conversation_id: &str,

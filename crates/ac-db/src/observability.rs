@@ -4,6 +4,17 @@ use std::collections::BTreeSet;
 /// evidence_refs).
 type KernelEventProjection = (String, String, String, i64, String);
 
+/// Doc 06 H4 event-stream item: one kernel event for the subscribe
+/// protocol (crosses the IPC boundary as JSON).
+#[derive(Clone, Debug)]
+pub struct KernelEventStreamItem {
+    pub id: String,
+    pub decision_kind: String,
+    pub subject_id: String,
+    pub created_at_ms: i64,
+    pub evidence_refs: String,
+}
+
 impl ControlPlaneDb {
     /// Mission-level timestamps (created_at_ms, updated_at_ms) from the
     /// authoritative missions row.  `updated_at_ms` is not exposed by
@@ -350,6 +361,57 @@ impl ControlPlaneDb {
         events.sort_by_key(|b| std::cmp::Reverse(b.created_at_ms));
         events.truncate(limit);
         Ok(events)
+    }
+
+    /// Doc 06 H4 event stream: all kernel events STRICTLY AFTER the cursor
+    /// (created_at_ms, id), ascending.  Used by the daemon's
+    /// EventsSubscribe long-poll so the UI receives a monotonic event
+    /// stream instead of polling projections.
+    pub fn kernel_events_after(
+        &self,
+        after_created_at_ms: i64,
+        after_id: &str,
+        limit: usize,
+    ) -> AcResult<Vec<KernelEventStreamItem>> {
+        let mut stmt = self
+            .connection
+            .prepare(
+                "SELECT id, decision_kind, subject_id, created_at_ms, evidence_refs
+                 FROM kernel_events
+                 WHERE created_at_ms > ?1
+                    OR (created_at_ms = ?1 AND id > ?2)
+                 ORDER BY created_at_ms ASC, id ASC
+                 LIMIT ?3",
+            )
+            .map_err(db_error)?;
+        let rows = stmt
+            .query_map(
+                rusqlite::params![after_created_at_ms, after_id, limit as i64],
+                |row| {
+                    Ok(KernelEventStreamItem {
+                        id: row.get(0)?,
+                        decision_kind: row.get(1)?,
+                        subject_id: row.get(2)?,
+                        created_at_ms: row.get(3)?,
+                        evidence_refs: row.get(4)?,
+                    })
+                },
+            )
+            .map_err(db_error)?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(db_error)
+    }
+
+    /// The CURRENT tail cursor (latest event): an EventsSubscribe caller
+    /// that has never subscribed starts here (snapshot revision head).
+    pub fn kernel_events_tail_cursor(&self) -> AcResult<(i64, String)> {
+        self.connection
+            .query_row(
+                "SELECT created_at_ms, id FROM kernel_events
+                 ORDER BY created_at_ms DESC, id DESC LIMIT 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .map_err(db_error)
     }
 
     /// Kernel events whose subject is the mission (mission lifecycle) or one

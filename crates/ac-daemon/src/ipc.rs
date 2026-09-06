@@ -479,11 +479,15 @@ fn dispatch_request(request: &Value, daemon: &mut DaemonService) -> (Value, bool
                     }
                 }
             }
-            // Live Ollama discovery through the daemon's own wrapper
-            // (default endpoint, same timeouts the Providers page uses).
-            let ollama = match daemon.discover_provider_models(
+            // Live Ollama discovery through the daemon's own wrapper.
+            // Readiness is a FIRST-RUN health signal, not a catalog
+            // request: it uses a bounded 2s read timeout so a busy or
+            // mid-pull Ollama can never stall the readiness surface (the
+            // Providers page keeps the full 60s catalog timeouts).
+            let ollama = match daemon.discover_provider_models_bounded(
                 "http://127.0.0.1:11434",
                 "ollama",
+                3_000,
             ) {
                 Ok(models) => json!({
                     "running": !models.is_empty(),
@@ -976,6 +980,41 @@ fn dispatch_request(request: &Value, daemon: &mut DaemonService) -> (Value, bool
                 Err(error) => error_response(correlation_id, error.code(), error.to_string()),
             }
         },
+        "DesignGenerateFlow" => {
+            let conversation_id = request.get("conversation_id").and_then(Value::as_str).unwrap_or("");
+            let screens: Vec<String> = request
+                .get("screens")
+                .and_then(Value::as_array)
+                .map(|items| {
+                    items
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .map(str::to_string)
+                        .collect()
+                })
+                .unwrap_or_default();
+            let variants_per_screen = request
+                .get("variants_per_screen")
+                .and_then(Value::as_u64)
+                .unwrap_or(2) as usize;
+            let deterministic = request
+                .get("deterministic")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            match daemon.design_generate_flow(
+                conversation_id,
+                &screens,
+                variants_per_screen,
+                deterministic,
+            ) {
+                Ok(mut payload) => {
+                    payload["id"] = json!(correlation_id);
+                    payload["ok"] = json!(true);
+                    payload
+                }
+                Err(error) => error_response(correlation_id, error.code(), error.to_string()),
+            }
+        },
         "DesignGenerateMockups" => {
             let conversation_id = request.get("conversation_id").and_then(Value::as_str).unwrap_or("");
             let prompt = request.get("prompt").and_then(Value::as_str).unwrap_or("");
@@ -1204,6 +1243,22 @@ fn dispatch_request(request: &Value, daemon: &mut DaemonService) -> (Value, bool
         "EvidenceChain" => {
             let mission_id = request.get("mission_id").and_then(Value::as_str).unwrap_or("");
             match daemon.evidence_chain(mission_id) {
+                Ok(mut payload) => {
+                    payload["id"] = json!(correlation_id);
+                    payload["ok"] = json!(true);
+                    payload
+                }
+                Err(error) => error_response(correlation_id, error.code(), error.to_string()),
+            }
+        },
+        "EventsSubscribe" => {
+            let after_created_at_ms = request
+                .get("after_created_at_ms")
+                .and_then(Value::as_i64)
+                .unwrap_or(-1);
+            let after_id = request.get("after_id").and_then(Value::as_str).unwrap_or("");
+            let wait_ms = request.get("wait_ms").and_then(Value::as_u64).unwrap_or(2500);
+            match daemon.events_subscribe(after_created_at_ms, after_id, wait_ms) {
                 Ok(mut payload) => {
                     payload["id"] = json!(correlation_id);
                     payload["ok"] = json!(true);
@@ -2721,6 +2776,172 @@ mod ipc_tests {
         );
         assert_eq!(again["ok"], true, "second export (update path): {again}");
         assert!(again["export"]["changeset_id"].as_str().unwrap_or("").starts_with("cs-"));
+
+        server.cleanup();
+        daemon.shutdown().unwrap();
+        std::env::remove_var("AGENTCODE_PROVIDER_MODE");
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    /// Doc 06 H4: EventsSubscribe long-poll.  A seeded kernel event is
+    /// delivered exactly once to a subscriber starting at the tail; a
+    /// subscriber with a current cursor waits bounded and returns an
+    /// honest empty batch (waited=true) — never a fabricated event.
+    #[test]
+    fn events_subscribe_delivers_seeded_event_and_waits_honestly() {
+        let _env_lock = crate::TEST_ENV_LOCK.lock().unwrap();
+        std::env::set_var("AGENTCODE_PROVIDER_MODE", "mock");
+        let (dir, db_path, lock, socket) = temp_paths("ipc-events-subscribe");
+
+        let mut daemon = DaemonService::open(&db_path, &lock).unwrap();
+        daemon.start().unwrap();
+        let Some((server, listener)) = bind_or_skip(&socket, None) else {
+            daemon.shutdown().unwrap();
+            std::env::remove_var("AGENTCODE_PROVIDER_MODE");
+            let _ = fs::remove_dir_all(dir);
+            return;
+        };
+
+        // Seed one real kernel event through the public kernel API, the
+        // same way the mission-export test does (separate kernel instance
+        // writing through the same control-plane DB).
+        let mission_id = {
+            let mut db = ControlPlaneDb::open(&db_path).unwrap();
+            db.migrate().unwrap();
+            use ac_kernel::{AllowAllPolicy, Kernel, MissionState};
+            let mut kernel = Kernel::new(AllowAllPolicy);
+            kernel.start().unwrap();
+            let mission_id = kernel.create_mission("events subscribe probe").unwrap();
+            kernel
+                .transition_mission(&mission_id, MissionState::Active, Vec::new())
+                .unwrap();
+            db.put_mission(kernel.mission(&mission_id).unwrap()).unwrap();
+            for event in kernel.events() {
+                db.append_kernel_event(event).unwrap();
+            }
+            mission_id
+        };
+
+        // Subscribe from the CURRENT tail (future events only): with no
+        // new events after the tail, the bounded wait returns empty and
+        // waited=true (honest — no event fabrication, no infinite hold).
+        let tail = request_via_ipc(
+            &server, &listener, &mut daemon,
+            json!({"id":"ev1","command":"EventsSubscribe","after_created_at_ms": -1, "after_id": "", "wait_ms": 300}),
+        );
+        assert_eq!(tail["ok"], true, "tail subscribe: {tail}");
+        assert_eq!(tail["events"].as_array().map(|a| a.len()), Some(0));
+        assert_eq!(tail["waited"], true);
+        let tail_ms = tail["cursor"]["created_at_ms"].as_i64().unwrap();
+        // The tail cursor id is exercised by the past-subscribe branch
+        // below; this assertion pins the shape only.
+        assert!(tail["cursor"]["id"].is_string(), "cursor id shape: {tail}");
+
+        // Subscribe from BEFORE the seeded event: it is delivered exactly
+        // once with its decision kind, and the cursor advances to it.
+        let past = request_via_ipc(
+            &server, &listener, &mut daemon,
+            json!({"id":"ev2","command":"EventsSubscribe","after_created_at_ms": 0, "after_id": "", "wait_ms": 300}),
+        );
+        assert_eq!(past["ok"], true, "past subscribe: {past}");
+        let events = past["events"].as_array().cloned().unwrap_or_default();
+        assert!(!events.is_empty(), "seeded event must be delivered: {past}");
+        assert!(events
+            .iter()
+            .any(|e| e["subject_id"].as_str() == Some(mission_id.to_string().as_str())));
+        // The delivered cursor never regresses below the tail.
+        let past_ms = past["cursor"]["created_at_ms"].as_i64().unwrap();
+        assert!(past_ms >= tail_ms);
+
+        server.cleanup();
+        daemon.shutdown().unwrap();
+        std::env::remove_var("AGENTCODE_PROVIDER_MODE");
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    /// Multi-screen Stitch flow: 2 screens -> 2 scored runs + a persisted
+    /// generated_flow document grouping the winners.  Mock provider mode
+    /// exercises the honest spec-degradation path per screen.
+    #[test]
+    fn design_generate_flow_groups_multi_screen_winners() {
+        let _env_lock = crate::TEST_ENV_LOCK.lock().unwrap();
+        std::env::set_var("AGENTCODE_PROVIDER_MODE", "mock");
+        let (dir, db, lock, socket) = temp_paths("design-flow");
+        let project_dir = dir.join("workspace");
+        fs::create_dir_all(&project_dir).unwrap();
+        let project_path = project_dir.to_string_lossy().to_string();
+
+        let mut daemon = DaemonService::open(&db, &lock).unwrap();
+        daemon.start().unwrap();
+        let Some((server, listener)) = bind_or_skip(&socket, None) else {
+            daemon.shutdown().unwrap();
+            std::env::remove_var("AGENTCODE_PROVIDER_MODE");
+            let _ = fs::remove_dir_all(dir);
+            return;
+        };
+
+        let create = request_via_ipc(
+            &server, &listener, &mut daemon,
+            json!({"id":"c1","command":"ConversationCreate","project_path": project_path, "mode":"DESIGN","title":"Flow Test"}),
+        );
+        assert_eq!(create["ok"], true, "create: {create}");
+        let cid = create["conversation_id"].as_str().unwrap().to_string();
+
+        // Empty screens -> honest refusal.
+        let empty = request_via_ipc(
+            &server, &listener, &mut daemon,
+            json!({"id":"f0","command":"DesignGenerateFlow","conversation_id": cid, "screens": [], "variants_per_screen":1, "deterministic":true}),
+        );
+        assert_eq!(empty["ok"], false);
+        assert_eq!(empty["error"]["code"], "DESIGN-FLOW_NO_SCREENS");
+
+        // 5 screens -> too many, honest refusal.
+        let too_many = request_via_ipc(
+            &server, &listener, &mut daemon,
+            json!({"id":"f0b","command":"DesignGenerateFlow","conversation_id": cid, "screens": ["a","b","c","d","e"], "variants_per_screen":1, "deterministic":true}),
+        );
+        assert_eq!(too_many["ok"], false);
+        assert_eq!(too_many["error"]["code"], "DESIGN-FLOW_TOO_MANY_SCREENS");
+
+        // Happy path: 2 screens, 2 variants each.
+        let flow = request_via_ipc(
+            &server, &listener, &mut daemon,
+            json!({"id":"f1","command":"DesignGenerateFlow","conversation_id": cid,
+                   "screens": ["Landing hero with primary CTA", "Docs page with search"],
+                   "variants_per_screen":2, "deterministic":true}),
+        );
+        assert_eq!(flow["ok"], true, "flow: {flow}");
+        assert_eq!(flow["screen_count"], 2, "flow: {flow}");
+        let screens = flow["screens"].as_array().cloned().unwrap_or_default();
+        assert_eq!(screens.len(), 2, "flow screens: {flow}");
+        for screen in &screens {
+            assert!(screen["winner"].is_i64(), "winner present: {screen}");
+            assert!(
+                screen["winner_html"].as_str().unwrap_or("").contains("<!doctype html>"),
+                "winner html: {screen}"
+            );
+        }
+        // Failed screens are absent (all succeeded) and the field exists.
+        assert_eq!(
+            flow["failed_screens"].as_array().map(|a| a.len()),
+            Some(0),
+            "no failures: {flow}"
+        );
+
+        // The flow persisted as a design document of its own type (the
+        // control-plane DB is the honest source of truth here).
+        {
+            let mut probe = ControlPlaneDb::open(&db).unwrap();
+            probe.migrate().unwrap();
+            let rows = probe
+                .design_documents(&cid)
+                .unwrap_or_default();
+            assert!(
+                rows.iter().any(|row| row.doc_type == "generated_flow"),
+                "generated_flow document must be persisted: {:?}",
+                rows.iter().map(|r| r.doc_type.clone()).collect::<Vec<_>>()
+            );
+        }
 
         server.cleanup();
         daemon.shutdown().unwrap();

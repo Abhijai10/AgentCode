@@ -228,6 +228,7 @@ export function MissionView({ missionId, onOpenSettings }: { missionId: string |
       return;
     }
     let cancelled = false;
+    let sawTerminal = false;
     setStatus("loading");
     setControlError(null);
 
@@ -261,13 +262,35 @@ export function MissionView({ missionId, onOpenSettings }: { missionId: string |
 // Once the mission reaches a terminal state, stop polling but keep the
     // final snapshot rendered.  Terminal data is authoritative from SQLite.
     if (d?.terminal) {
+      sawTerminal = true;
       stopPolling();
     }
   };
 
   refresh();
   stopPolling();
-  timerRef.current = window.setInterval(refresh, POLL_INTERVAL_MS);
+  // Doc 06 H4 event-push: while this mission is live, EventsSubscribe
+  // long-polls the kernel event stream — each returned batch triggers one
+  // heavy refresh.  Falls back to the interval poll when the stream is
+  // unavailable; stops on terminal state exactly as before.
+  const subscribeLoop = async (cursorMs: number, cursorId: string) => {
+    if (cancelled) return;
+    const res = await daemon.eventsSubscribe(cursorMs, cursorId, 5000);
+    if (cancelled) return;
+    if (!res) {
+      timerRef.current = window.setInterval(refresh, POLL_INTERVAL_MS);
+      return;
+    }
+    if (res.events.length > 0) {
+      await refresh();
+      if (cancelled || sawTerminal) return;
+    }
+    timerRef.current = window.setTimeout(
+      () => void subscribeLoop(res.cursor.created_at_ms, res.cursor.id),
+      50
+    );
+  };
+  void subscribeLoop(-1, "");
   return () => {
     cancelled = true;
     stopPolling();

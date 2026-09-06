@@ -652,6 +652,65 @@ impl DaemonService {
     /// events, changesets, evidence, verification) — nothing is fabricated.
     /// A message whose `mission_ref` points at a real mission yields a block;
     /// messages without a mission reference are plain chat and are skipped.
+    /// Doc 06 H4: the event-push subscribe protocol.  Long-poll semantics:
+    /// returns immediately when events exist after the caller's cursor;
+    /// otherwise holds the request (bounded by wait_ms, polled server-side
+    /// at 250ms) until a new kernel event lands.  The UI therefore issues
+    /// ONE cheap blocked request instead of hammering projections on a
+    /// timer — idle cost drops to zero per 10s window.
+    pub fn events_subscribe(
+        &self,
+        after_created_at_ms: i64,
+        after_id: &str,
+        wait_ms: u64,
+    ) -> AcResult<Value> {
+        const MAX_WAIT_MS: u64 = 10_000;
+        const POLL_INTERVAL_MS: u64 = 250;
+        const MAX_EVENTS: usize = 200;
+        let bounded_wait = wait_ms.min(MAX_WAIT_MS);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(bounded_wait);
+        let (mut cursor_ms, mut cursor_id) = (after_created_at_ms, after_id.to_string());
+        // First subscriber without a cursor starts at the CURRENT tail: it
+        // gets events from NOW on, never the full history replay (the
+        // caller fetches a snapshot separately per H4).
+        if cursor_ms < 0 {
+            let (ms, id) = self.db.kernel_events_tail_cursor()?;
+            cursor_ms = ms;
+            cursor_id = id;
+        }
+        let events = loop {
+            let batch = self.db.kernel_events_after(cursor_ms, &cursor_id, MAX_EVENTS)?;
+            if !batch.is_empty() {
+                break batch;
+            }
+            if std::time::Instant::now() >= deadline {
+                break Vec::new();
+            }
+            std::thread::sleep(std::time::Duration::from_millis(POLL_INTERVAL_MS));
+        };
+        let items: Vec<Value> = events
+            .iter()
+            .map(|event| {
+                json!({
+                    "id": event.id,
+                    "decision_kind": event.decision_kind,
+                    "subject_id": event.subject_id,
+                    "created_at_ms": event.created_at_ms,
+                    "evidence_refs": event.evidence_refs,
+                })
+            })
+            .collect();
+        let (tail_ms, tail_id) = match events.last() {
+            Some(last) => (last.created_at_ms, last.id.clone()),
+            None => self.db.kernel_events_tail_cursor()?,
+        };
+        Ok(json!({
+            "events": items,
+            "cursor": {"created_at_ms": tail_ms, "id": tail_id},
+            "waited": events.is_empty(),
+        }))
+    }
+
     /// F11 (final audit): a CHEAP cursor for change detection.  Polling the
     /// heavy ConversationActivity projection every 2.5s recomputes six
     /// mission projections; views poll this instead and only refetch the

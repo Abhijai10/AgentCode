@@ -105,6 +105,14 @@ export function DesignView({
   const [standaloneQa, setStandaloneQa] = useState<DesignQaReport | null>(null);
   // Stitch-parity: generative mockups (prompt -> variants -> winner).
   const [mockupPrompt, setMockupPrompt] = useState("");
+  // Multi-screen flow (Stitch parity): one prompt per line = one screen.
+  const [flowScreens, setFlowScreens] = useState("");
+  const [flow, setFlow] = useState<{
+    flow_id?: string;
+    screen_count?: number;
+    failed_screens?: { index: number; screen: string; error: string }[];
+    screens?: { index: number; screen: string; winner?: number; winner_html?: string; run?: Record<string, unknown> }[];
+  } | null>(null);
   const [mockups, setMockups] = useState<{
     variants: { variant: number; layout: string; palette_intent: string; html: string; score?: Record<string, unknown> }[];
     winner: number;
@@ -477,6 +485,27 @@ export function DesignView({
         setMockups({ variants: r.variants, winner: r.winner ?? 0, spec_parse_failed: r.spec_parse_failed });
       } else {
         setError(r.error || "Could not generate mockups");
+      }
+    });
+
+  // Multi-screen Stitch flow: generate a mockup run per screen prompt
+  // (one per line) and group the winners into one flow document — the
+  // app-skeleton step toward full Stitch parity.
+  const handleGenerateFlow = () =>
+    runPanel(async () => {
+      const screens = flowScreens
+        .split("\n")
+        .map((line) => line.trim())
+        .filter((line) => line.length > 0);
+      if (screens.length === 0) {
+        setError("Enter one screen prompt per line (e.g. 'landing', 'pricing', 'docs').");
+        return;
+      }
+      const r = await daemon.designGenerateFlow(activeConvId!, screens, 2, false);
+      if (r.ok && r.screens) {
+        setFlow({ flow_id: r.flow_id, screen_count: r.screen_count, failed_screens: r.failed_screens, screens: r.screens });
+      } else {
+        setError(r.error || "Could not generate the flow");
       }
     });
 
@@ -1388,6 +1417,65 @@ export function DesignView({
                     Mission {exportResult.missionId.slice(0, 18)}… implementing {exportResult.target} — watch it in Missions.
                   </p>
                 )}
+              </div>
+            )}
+          </section>
+
+          <section className="neo-raised rounded-2xl p-4">
+            <div className="flex items-center justify-between mb-2">
+              <h4 className="text-sm font-semibold text-on-surface">Multi-Screen Flow</h4>
+              <span className="text-[10px] text-on-surface-variant">
+                one prompt per line → one scored screen each
+              </span>
+            </div>
+            <textarea
+              value={flowScreens}
+              onChange={(e) => setFlowScreens(e.target.value)}
+              placeholder={"Landing — hero + primary CTA\nPricing — three tiers\nDocs — search + nav"}
+              rows={3}
+              className="w-full neo-pressed rounded-lg p-2 text-xs text-on-surface bg-transparent resize-none focus:outline-none"
+            />
+            <button
+              onClick={handleGenerateFlow}
+              disabled={panelBusy}
+              className="mt-2 neo-button rounded-lg px-3 py-1.5 text-[11px] font-medium text-on-surface-variant disabled:opacity-50"
+              title="Generate one scored mockup run per screen and group the winners into a flow"
+            >
+              Generate flow
+            </button>
+            {flow && (
+              <div className="mt-3 space-y-2">
+                <p className="text-[10px] text-on-surface-variant">
+                  Flow {flow.flow_id?.slice(0, 18)}… · {flow.screen_count} screen(s)
+                </p>
+                {(flow.failed_screens ?? []).length > 0 && (
+                  <p className="text-[10px] text-amber-600">
+                    {flow.failed_screens?.length} screen(s) failed honestly — see their errors below.
+                  </p>
+                )}
+                {(flow.screens ?? []).map((s) => (
+                  <div key={s.index} className="neo-pressed rounded-lg p-2">
+                    <div className="flex items-center justify-between mb-1">
+                      <span className="text-[10px] font-medium text-on-surface">
+                        Screen {s.index + 1} · {s.screen.slice(0, 50)}
+                      </span>
+                      <span className="text-[10px] text-emerald-600">★ winner #{(s.winner ?? 0) + 1}</span>
+                    </div>
+                    {s.winner_html && (
+                      <iframe
+                        title={`Flow screen ${s.index + 1} winner`}
+                        srcDoc={s.winner_html}
+                        sandbox=""
+                        className="w-full h-32 rounded border-0 bg-white"
+                      />
+                    )}
+                  </div>
+                ))}
+                {(flow.failed_screens ?? []).map((f) => (
+                  <p key={`failed-${f.index}`} className="text-[10px] text-red-600">
+                    Screen {f.index + 1} ({f.screen.slice(0, 30)}): {f.error}
+                  </p>
+                ))}
               </div>
             )}
           </section>

@@ -293,6 +293,64 @@ mod tests {
     }
 
     #[test]
+    fn mcp_manifest_roundtrip_and_tamper_refusal() {
+        let mut registry = McpRegistry::new();
+        let server = registry
+            .register_server("filesystem-helper", "1", McpTransport::Stdio)
+            .unwrap();
+        let argv = vec![
+            "/usr/local/bin/fs-helper".to_string(),
+            "--stdio".to_string(),
+        ];
+        let pin = McpRegistry::argv_hash_for(&argv);
+        registry.pin_argv_hash(&server, pin.clone()).unwrap();
+
+        // Export -> contains the pinned entry + integrity digest.
+        let manifest = registry.export_manifest().unwrap();
+        assert!(manifest.contains("filesystem-helper"), "manifest: {manifest}");
+        assert!(manifest.contains("# integrity:"), "manifest: {manifest}");
+
+        // A second registry imports it and applies the pin by NAME.
+        let mut second = McpRegistry::new();
+        let server2 = second
+            .register_server("filesystem-helper", "1", McpTransport::Stdio)
+            .unwrap();
+        let applied = second.import_manifest(&manifest).unwrap();
+        assert_eq!(applied, 1, "one entry applied");
+        second.verify_argv(&server2, &argv).unwrap();
+        let drifted = second.verify_argv(
+            &server2,
+            &["/tmp/evil-helper".to_string(), "--stdio".to_string()],
+        );
+        assert_eq!(drifted.unwrap_err().code(), "MCP-ARGV_HASH_MISMATCH");
+
+        // Tampering with the manifest body breaks the digest -> refused.
+        let tampered = manifest.replace("/usr/local/bin", "/tmp/evil");
+        // (entry hashes are values, so tamper with a structural char instead)
+        let tampered = if tampered == manifest {
+            manifest.replace("\"version\": 1", "\"version\": 2")
+        } else {
+            tampered
+        };
+        let err = second.import_manifest(&tampered).unwrap_err();
+        assert_eq!(err.code(), "MCP-MANIFEST_INTEGRITY_MISMATCH", "tampered: {tampered}");
+
+        // A manifest naming an unknown server is refused whole.
+        let unknown = manifest.replace("filesystem-helper", "not-registered");
+        let err = second.import_manifest(&unknown).unwrap_err();
+        assert!(
+            err.code() == "MCP-MANIFEST_INTEGRITY_MISMATCH"
+                || err.code() == "MCP-MANIFEST_UNKNOWN_SERVER",
+            "unknown-server manifest must refuse: {err}"
+        );
+
+        // Manifest without an integrity digest is refused outright.
+        let bare = manifest.split("# integrity:").next().unwrap_or("").to_string();
+        let err = second.import_manifest(&bare).unwrap_err();
+        assert_eq!(err.code(), "MCP-MANIFEST_MISSING_INTEGRITY");
+    }
+
+    #[test]
     fn phase16_mcp_discovery_filtering_invocation_and_recovery_work() {
         let mut registry = McpRegistry::new();
         let server = registry

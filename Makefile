@@ -1,4 +1,4 @@
-.PHONY: bootstrap format format-check lint typecheck test build daemon-build validate clean
+.PHONY: bootstrap format format-check lint typecheck test build daemon-build validate clean app
 
 bootstrap:
 	cargo --version
@@ -34,3 +34,9 @@ validate: format-check lint typecheck test
 
 clean:
 	cargo clean
+
+# The ONE command that puts the latest app on this Mac: release build +
+# .app bundle (daemon sidecar inside) + DMG (hdiutil, no create-dmg) +
+# install to /Applications.
+app:
+	./scripts/bundle-mac.sh

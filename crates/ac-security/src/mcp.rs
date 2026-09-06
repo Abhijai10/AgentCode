@@ -12,6 +12,8 @@ pub enum McpHealth {
     Degraded,
 }
 
+use serde_json::json;
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct McpServerRecord {
     pub id: StableId,
@@ -122,6 +124,114 @@ impl McpRegistry {
         }
         let digest = hasher.finalize();
         format!("sha256:{}", digest.iter().map(|b| format!("{b:02x}")).collect::<String>())
+    }
+
+    /// Signed-manifest layer (Doc 05 N5, final-audit recommendation): a
+    /// project's MCP trust manifest is a JSON map of server name -> expected
+    /// argv hash, plus its own integrity digest.  Import pins every named
+    /// server BY NAME (repointing a name to a new argv/hash is exactly the
+    /// attack this closes); export emits the manifest of currently-pinned
+    /// servers so a reviewed set can be committed and re-imported on any
+    /// machine.  A manifest that names an UNREGISTERED server is refused
+    /// outright (no silent partial import), and every entry must be a
+    /// well-formed sha256 pin.
+    pub fn export_manifest(&self) -> AcResult<String> {
+        let mut entries: BTreeMap<String, String> = BTreeMap::new();
+        for server in self.servers.values() {
+            if let Some(hash) = &server.expected_argv_hash {
+                entries.insert(server.name.clone(), hash.clone());
+            }
+        }
+        let manifest = json!({
+            "version": 1,
+            "kind": "agentcode-mcp-manifest",
+            "entries": entries,
+        });
+        let body = serde_json::to_string_pretty(&manifest).map_err(|error| {
+            AcError::validation("MCP-MANIFEST_SERIALIZE", error.to_string())
+        })?;
+        // The digest rides as a trailing comment line AFTER the JSON body,
+        // so both export and import hash the exact same bytes: the pretty
+        // JSON exactly as serialized.
+        let digest = Self::manifest_digest(&body);
+        Ok(format!("{body}\n# integrity: {digest}\n"))
+    }
+
+    /// The manifest integrity digest: sha256 over the canonical body
+    /// (version + kind + entries).  Any tampering with a committed
+    /// manifest changes this value.
+    pub fn manifest_digest(body: &str) -> String {
+        use sha2::{Digest, Sha256};
+        let digest = Sha256::digest(body.as_bytes());
+        format!("sha256:{}", digest.iter().map(|b| format!("{b:02x}")).collect::<String>())
+    }
+
+    /// Import a manifest body (as produced by export_manifest).  Verifies
+    /// the integrity digest FIRST, then pins every named server.
+    pub fn import_manifest(&mut self, body: &str) -> AcResult<usize> {
+        // The manifest is `<pretty JSON>\n# integrity: sha256:<64hex>\n`.
+        // The hashed part is the JSON body EXACTLY as serialized (the
+        // comment line is not part of the digest).
+        let (manifest_body, integrity) = match body.split_once("# integrity:") {
+            Some((head, tail)) => (head, tail.trim()),
+            None => {
+                return Err(AcError::validation(
+                    "MCP-MANIFEST_MISSING_INTEGRITY",
+                    "manifest has no integrity digest",
+                ));
+            }
+        };
+        let claimed = integrity.trim().to_string();
+        // Byte-stability: export hashed the pretty JSON exactly as
+        // serialized; the comment line split leaves a trailing newline on
+        // the body which was NOT part of the hashed bytes — trim it.
+        let actual = Self::manifest_digest(manifest_body.trim_end());
+        if claimed != actual {
+            return Err(AcError::validation(
+                "MCP-MANIFEST_INTEGRITY_MISMATCH",
+                format!("manifest digest mismatch (expected in-file {claimed}, computed {actual}); refusing to import a tampered manifest"),
+            ));
+        }
+        let manifest: serde_json::Value = serde_json::from_str(manifest_body.trim_end()).map_err(|error| {
+            AcError::validation("MCP-MANIFEST_PARSE", error.to_string())
+        })?;
+        let entries = manifest
+            .get("entries")
+            .and_then(|value| value.as_object())
+            .ok_or_else(|| {
+                AcError::validation(
+                    "MCP-MANIFEST_NO_ENTRIES",
+                    "manifest must carry an entries object",
+                )
+            })?;
+        // Name -> id resolution FIRST (all-or-nothing import).
+        let mut resolutions: Vec<(StableId, String)> = Vec::new();
+        for (name, hash) in entries {
+            let hash = hash.as_str().unwrap_or_default().to_string();
+            if !hash.starts_with("sha256:") || hash.len() != 7 + 64 {
+                return Err(AcError::validation(
+                    "MCP-MANIFEST_INVALID_HASH",
+                    format!("manifest entry '{name}' does not carry a sha256 argv pin"),
+                ));
+            }
+            let id = self
+                .servers
+                .values()
+                .find(|server| server.name == *name)
+                .map(|server| server.id.clone())
+                .ok_or_else(|| {
+                    AcError::validation(
+                        "MCP-MANIFEST_UNKNOWN_SERVER",
+                        format!("manifest names server '{name}' which is not registered; refusing the whole manifest"),
+                    )
+                })?;
+            resolutions.push((id, hash));
+        }
+        let count = resolutions.len();
+        for (id, hash) in resolutions {
+            self.pin_argv_hash(&id, hash)?;
+        }
+        Ok(count)
     }
 
     /// Verify a server's actual argv against its pin.  Unpinned servers

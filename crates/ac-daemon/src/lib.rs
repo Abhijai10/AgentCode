@@ -1789,6 +1789,41 @@ impl DaemonService {
         discover_models(endpoint_base, discovery_kind, 5000, 10000)
     }
 
+    /// Bounded discovery for FIRST-RUN health surfaces (ReadinessGet): a
+    /// busy or mid-pull Ollama must never stall readiness.  The read
+    /// timeout honors the provider layer's 5s floor; the connect timeout
+    /// is capped tight so a dead port answers fast.
+    pub fn discover_provider_models_bounded(
+        &self,
+        endpoint_base: &str,
+        kind: &str,
+        hard_deadline_ms: u64,
+    ) -> AcResult<Vec<ac_provider::catalog::DiscoveredModel>> {
+        let endpoint = endpoint_base.to_string();
+        let discovery_kind = match kind {
+            "ollama" => ModelDiscoveryKind::Ollama,
+            _ => ModelDiscoveryKind::OpenAiCompatible,
+        };
+        // Readiness must answer fast even when Ollama is mid-pull (its
+        // /api/tags can block on the registry lock for many seconds).  The
+        // probe runs on a detached worker that reports through a channel;
+        // the caller waits at most the hard deadline.  A slow-but-live
+        // Ollama surfaces as an honest timeout error, never a stall (the
+        // worker finishes on its own and drops cleanly).
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(discover_models(&endpoint, discovery_kind, 1000, 5000));
+        });
+        let deadline = std::time::Duration::from_millis(hard_deadline_ms.max(1000));
+        match rx.recv_timeout(deadline) {
+            Ok(result) => result,
+            Err(_) => Err(AcError::validation(
+                "PROVIDER-DISCOVERY_SLOW",
+                "model discovery exceeded the readiness deadline; the provider may be starting or busy",
+            )),
+        }
+    }
+
     // ── Backend-Owned Credential Store ─────────────────────────────────────────
 
     /// Store a raw credential value into the single backend-owned secret store

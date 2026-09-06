@@ -619,6 +619,31 @@ export const daemon = {
     }
   },
 
+  async eventsSubscribe(
+    afterCreatedAtMs: number,
+    afterId: string,
+    waitMs: number
+  ): Promise<{
+    events: { id: string; decision_kind: string; subject_id: string; created_at_ms: number; evidence_refs: string }[];
+    cursor: { created_at_ms: number; id: string };
+    waited: boolean;
+  } | null> {
+    try {
+      const res = await invoke<{
+        events: { id: string; decision_kind: string; subject_id: string; created_at_ms: number; evidence_refs: string }[];
+        cursor: { created_at_ms: number; id: string };
+        waited: boolean;
+      }>("daemon_events_subscribe", {
+        afterCreatedAtMs,
+        afterId,
+        waitMs,
+      });
+      return res ?? null;
+    } catch {
+      return null;
+    }
+  },
+
   async projectMemoryGet(projectPath: string): Promise<ProjectMemory | null> {
     try {
       const res = await invoke<ProjectMemory & { ok: boolean }>(
@@ -1277,6 +1302,51 @@ export const daemon = {
         { conversationId, url: url ?? "", deterministic: deterministic ?? false }
       );
       return { ok: true, visualCritique: res.visual_critique };
+    } catch (e: unknown) {
+      const message = e instanceof Error ? e.message : String(e);
+      const cleaned = message.replace(/^[A-Z0-9_-]+:\s*/, "");
+      return { ok: false, error: cleaned || message };
+    }
+  },
+
+  async designGenerateFlow(
+    conversationId: string,
+    screens: string[],
+    variantsPerScreen?: number,
+    deterministic?: boolean
+  ): Promise<{
+    ok: boolean;
+    flow_id?: string;
+    screen_count?: number;
+    failed_screens?: { index: number; screen: string; error: string }[];
+    screens?: {
+      index: number;
+      screen: string;
+      winner?: number;
+      winner_html?: string;
+      run?: Record<string, unknown>;
+    }[];
+    error?: string;
+  }> {
+    try {
+      const res = await invoke<{
+        flow_id: string;
+        screen_count: number;
+        failed_screens: { index: number; screen: string; error: string }[];
+        screens: {
+          index: number;
+          screen: string;
+          winner?: number;
+          winner_html?: string;
+          run?: Record<string, unknown>;
+        }[];
+      }>("daemon_design_generate_flow", {
+        conversationId,
+        screens,
+        variantsPerScreen: variantsPerScreen ?? 2,
+        deterministic: deterministic ?? false,
+      });
+      return { ok: true, ...res };
     } catch (e: unknown) {
       const message = e instanceof Error ? e.message : String(e);
       const cleaned = message.replace(/^[A-Z0-9_-]+:\s*/, "");

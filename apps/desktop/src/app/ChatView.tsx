@@ -509,21 +509,23 @@ export function ChatView({
     messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [convDetail?.messages?.length]);
 
-  // Live refresh: poll while any mission in this conversation is non-terminal.
-  // Stops polling after all referenced missions reach a terminal state; the
-  // terminal result remains visible from the last poll.
+  // Live refresh while any mission in this conversation is non-terminal.
+  // Doc 06 H4 event-push: EventsSubscribe LONG-POLLS the daemon — one
+  // cheap blocked request that returns the moment a kernel event lands,
+  // instead of a timer hammering the cursor.  Each event batch triggers
+  // exactly one heavy refetch (cursor still gates the payload work);
+  // when the stream is unavailable (older daemon) the loop falls back to
+  // the F11 cursor interval.  Stops when all missions reach a terminal
+  // state; the terminal result stays visible from the last refresh.
   useEffect(() => {
     if (!activeConvId) return;
     let cancelled = false;
-    let timer: ReturnType<typeof setInterval> | null = null;
-    // F11 (final audit): cursor-gated refresh — the CHEAP change cursor is
-    // polled every tick; the heavy conversation + activity projections are
-    // refetched only when the cursor moves.  Identical terminal behavior,
-    // a fraction of the daemon work per tick.
+    let timer: ReturnType<typeof setTimeout> | null = null;
     let lastCursor: string | null = null;
-    const refresh = async () => {
+
+    const refetchHeavy = async () => {
       const cursor = await daemon.conversationChangesCursor(activeConvId);
-      if (cancelled) return;
+      if (cancelled) return false;
       if (cursor) {
         const signature = JSON.stringify([
           cursor.updated_at_ms,
@@ -531,37 +533,65 @@ export function ChatView({
           cursor.latest_message_id,
           cursor.missions,
         ]);
-        if (signature === lastCursor) return; // nothing changed — skip heavy work
+        if (signature === lastCursor) return false; // nothing changed — skip heavy work
         lastCursor = signature;
       }
       const [detail, act] = await Promise.all([
         daemon.getConversation(activeConvId),
         daemon.getConversationActivity(activeConvId),
       ]);
-      if (cancelled) return;
+      if (cancelled) return false;
       if (detail) {
         setConvDetail(detail);
         setAttachments(detail.attachments ?? []);
       }
       setActivity(act);
       const anyRunning = (act?.missions ?? []).some((m) => !isTerminalState(m.status ?? m.details?.state));
-      if (anyRunning) {
-        timer = setInterval(refresh, POLL_INTERVAL_MS);
-      }
+      return anyRunning;
     };
+
+    // Fallback path: the interval-poll of the F11 cursor (older daemons
+    // without EventsSubscribe, or a subscribe error).
+    const cursorLoop = async () => {
+      const anyRunning = await refetchHeavy();
+      if (cancelled || !anyRunning) return;
+      timer = setTimeout(cursorLoop, POLL_INTERVAL_MS);
+    };
+
+    // Primary path: subscribe to the kernel event stream.
+    const subscribeLoop = async (cursorMs: number, cursorId: string) => {
+      if (cancelled) return;
+      const res = await daemon.eventsSubscribe(cursorMs, cursorId, 5000);
+      if (cancelled) return;
+      if (!res) {
+        // Stream unavailable — fall back to the interval path, forever.
+        cursorLoop();
+        return;
+      }
+      if (res.events.length > 0) {
+        const anyRunning = await refetchHeavy();
+        if (cancelled) return;
+        if (!anyRunning) return; // all terminal — stop streaming
+      }
+      timer = setTimeout(
+        () => subscribeLoop(res.cursor.created_at_ms, res.cursor.id),
+        50
+      );
+    };
+
     const run = async () => {
       const act = await daemon.getConversationActivity(activeConvId);
       if (cancelled) return;
       setActivity(act);
       const anyRunning = (act?.missions ?? []).some((m) => !isTerminalState(m.status ?? m.details?.state));
-      if (anyRunning) {
-        timer = setInterval(refresh, POLL_INTERVAL_MS);
-      }
+      if (!anyRunning) return;
+      // Start at the current tail: events from now on.
+      subscribeLoop(-1, "");
     };
     run();
     return () => {
       cancelled = true;
-      if (timer) clearInterval(timer);
+      if (timer) clearTimeout(timer);
     };
   }, [activeConvId]);
 

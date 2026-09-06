@@ -999,6 +999,25 @@ fn daemon_conversation_changes_cursor(
 }
 
 #[tauri::command]
+fn daemon_events_subscribe(
+    state: tauri::State<DaemonClient>,
+    after_created_at_ms: i64,
+    after_id: String,
+    wait_ms: u64,
+) -> Result<Value, String> {
+    request(
+        &state.0,
+        "ui",
+        "EventsSubscribe",
+        json!({
+            "after_created_at_ms": after_created_at_ms,
+            "after_id": after_id,
+            "wait_ms": wait_ms,
+        }),
+    )
+}
+
+#[tauri::command]
 fn daemon_project_memory_get(
     state: tauri::State<DaemonClient>,
     project_path: String,
@@ -1977,6 +1996,27 @@ fn daemon_design_export_winner(
 }
 
 #[tauri::command]
+fn daemon_design_generate_flow(
+    state: tauri::State<DaemonClient>,
+    conversation_id: String,
+    screens: Vec<String>,
+    variants_per_screen: Option<u32>,
+    deterministic: Option<bool>,
+) -> Result<Value, String> {
+    request(
+        &state.0,
+        "ui",
+        "DesignGenerateFlow",
+        json!({
+            "conversation_id": conversation_id,
+            "screens": screens,
+            "variants_per_screen": variants_per_screen.unwrap_or(2),
+            "deterministic": deterministic.unwrap_or(false),
+        }),
+    )
+}
+
+#[tauri::command]
 fn daemon_design_generate_mockups(
     state: tauri::State<DaemonClient>,
     conversation_id: String,
@@ -2286,6 +2326,7 @@ fn main() {
             daemon_get_evidence_summary,
             daemon_project_memory_get,
             daemon_conversation_changes_cursor,
+            daemon_events_subscribe,
             daemon_evidence_chain,
             daemon_get_verification_summary,
             daemon_list_tools,
@@ -2330,6 +2371,7 @@ fn main() {
             daemon_design_visual_critique,
             daemon_design_contract,
             daemon_design_generate_mockups,
+            daemon_design_generate_flow,
             daemon_design_export_winner,
             daemon_design_execute_contract,
             daemon_design_constraints_set,
