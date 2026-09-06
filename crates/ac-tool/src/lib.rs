@@ -8,6 +8,8 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use ac_common::{AcError, AcResult, StableId, TimestampMillis};
+
+pub mod mcp;
 use ac_evidence::{EvidenceStore, Provenance};
 use ac_sandbox::{ExecRequest, SandboxEvidence, SandboxManager, SandboxPolicy, SecretBroker};
 use ac_security::{
