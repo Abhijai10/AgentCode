@@ -60,11 +60,17 @@ export function DesignView({
   project,
   onOpenMission,
   daemonConnected = false,
+  browserOpen: browserOpenProp,
+  onBrowserOpenChange,
   ...props
 }: {
   project: Project | null;
   missionId: string | null;
   daemonConnected?: boolean;
+  /** Sidebar rail control: the inbuilt-browser panel's open state is lifted
+   *  so the global browser toggle (watch-the-agent) can drive it. */
+  browserOpen?: boolean;
+  onBrowserOpenChange?(open: boolean): void;
   onOpenMission(missionId: string): void;
 }) {
   void props.missionId;
@@ -124,7 +130,15 @@ export function DesignView({
   // ── Inbuilt browser panel (Codex-style): one persistent Chrome, framed
   //    screenshots, URL bar, history. Lives in DesignView because the panel
   //    exists to browse the live preview; it navigates any http(s) URL.
-  const [panelOpen, setPanelOpen] = useState(false);
+  //    Open state is lifted to the app shell when the sidebar rail drives
+  //    it (watch-the-agent toggle); the in-view button uses the same truth.
+  const [panelOpenLocal, setPanelOpenLocal] = useState(false);
+  const panelOpen = browserOpenProp ?? panelOpenLocal;
+  const setPanelOpen = (open: boolean | ((prev: boolean) => boolean)) => {
+    const next = typeof open === "function" ? open(panelOpen) : open;
+    setPanelOpenLocal(next);
+    onBrowserOpenChange?.(next);
+  };
   const [panelUrl, setPanelUrl] = useState("");
   const [panelImg, setPanelImg] = useState<string | null>(null);
   const [panelMeta, setPanelMeta] = useState<BrowserPanelResult | null>(null);
@@ -614,17 +628,148 @@ export function DesignView({
     );
   }
 
+  // Inbuilt browser panel (watch-the-agent): extracted so it renders in
+  // the loaded view AND the no-project state — the sidebar rail toggle
+  // always has a real surface.
+  const browserPanelSection = (
+      <section className="neo-raised rounded-2xl p-4">
+        <div className="flex items-center justify-between mb-2">
+          <h4 className="text-sm font-semibold text-on-surface">Inbuilt Browser</h4>
+          {agentViewing && (
+            <div className="flex items-center gap-1.5 text-[10px] text-primary bg-primary/5 rounded-full px-2 py-0.5">
+              <span className="w-1.5 h-1.5 rounded-full bg-primary animate-pulse" />
+              Agent viewing: {agentViewing.label}
+            </div>
+          )}
+          <button
+            onClick={() => (panelOpen ? panelNavigate("close") : setPanelOpen(true))}
+            className="text-[10px] text-primary hover:opacity-80"
+          >
+            {panelOpen ? "Close browser" : "Open browser"}
+          </button>
+        </div>
+        {panelOpen ? (
+          <div className="space-y-2">
+            {/* URL bar + controls — familiar browser chrome, no reinvention */}
+            <div className="flex items-center gap-1">
+              <button
+                onClick={() => panelNavigate("back")}
+                disabled={panelBusy}
+                title="Back"
+                aria-label="Back"
+                className="neo-btn rounded-lg px-2 py-1 text-[11px] text-on-surface-variant disabled:opacity-50"
+              >
+                ←
+              </button>
+              <button
+                onClick={() => panelNavigate("forward")}
+                disabled={panelBusy}
+                title="Forward"
+                aria-label="Forward"
+                className="neo-btn rounded-lg px-2 py-1 text-[11px] text-on-surface-variant disabled:opacity-50"
+              >
+                →
+              </button>
+              <button
+                onClick={() => panelNavigate("reload")}
+                disabled={panelBusy}
+                title="Reload"
+                aria-label="Reload"
+                className="neo-btn rounded-lg px-2 py-1 text-[11px] text-on-surface-variant disabled:opacity-50"
+              >
+                ⟳
+              </button>
+              <form
+                className="flex-1 flex items-center gap-1"
+                onSubmit={(e) => {
+                  e.preventDefault();
+                  panelNavigate("navigate", panelUrl);
+                }}
+              >
+                <input
+                  value={panelUrl}
+                  onChange={(e) => setPanelUrl(e.target.value)}
+                  placeholder="http://127.0.0.1:5173"
+                  aria-label="Browser address"
+                  className="neo-input flex-1 rounded-lg px-2 py-1 text-[11px] font-mono bg-transparent text-on-surface"
+                />
+                <button
+                  type="submit"
+                  disabled={panelBusy}
+                  className="text-[10px] text-primary hover:opacity-80 disabled:opacity-50"
+                >
+                  Go
+                </button>
+              </form>
+            </div>
+            {panelBusy && (
+              <p className="text-[10px] text-on-surface-variant">Loading…</p>
+            )}
+            {panelError && (
+              <p className="text-[11px] text-red-600 dark:text-red-400" role="alert">
+                {panelError}
+              </p>
+            )}
+            {/* The live page: framed screenshot from the persistent Chrome */}
+            {panelImg ? (
+              <div className="rounded-xl overflow-hidden border border-outline-variant bg-white">
+                <img
+                  src={panelImg}
+                  alt={`Browser view of ${panelMeta?.url ?? panelUrl}`}
+                  className="w-full h-auto block"
+                />
+              </div>
+            ) : !panelBusy && !panelError ? (
+              <p className="text-xs text-on-surface-variant">
+                Enter a URL and press Go — AgentCode keeps one Chrome alive for the
+                panel and renders the live page here.
+              </p>
+            ) : null}
+            {panelMeta && (
+              <p className="text-[10px] text-on-surface-variant">
+                HTTP {panelMeta.diagnostics.http_status} · console errors{" "}
+                {panelMeta.diagnostics.console_errors.length} · network failures{" "}
+                {panelMeta.diagnostics.network_failures.length}
+                {panelMeta.viewport
+                  ? ` · ${panelMeta.viewport.width}×${panelMeta.viewport.height}`
+                  : ""}
+              </p>
+            )}
+          </div>
+        ) : (
+          <p className="text-xs text-on-surface-variant">
+            An embedded browser like Codex: one persistent Chrome, address bar,
+            back/forward, live screenshot rendering with console + network diagnostics.
+          </p>
+        )}
+      </section>
+  );
+
   if (status === "no_project") {
     return (
-      <main className="flex-1 flex items-center justify-center">
-        <div className="text-center neo-pressed rounded-2xl p-8 max-w-sm">
-          <Icon name="design_services" size={40} className="text-primary mx-auto mb-4" />
-          <h3 className="text-lg font-semibold text-on-surface mb-2">Open a Project</h3>
-          <p className="text-sm text-on-surface-variant">
-            Select a project to design, preview, critique, and verify its interface.
-          </p>
-        </div>
-      </main>
+      <div className="flex-1 flex overflow-hidden">
+        <main className="flex-1 flex items-center justify-center">
+          <div className="text-center neo-pressed rounded-2xl p-8 max-w-sm">
+            <Icon name="design_services" size={40} className="text-primary mx-auto mb-4" />
+            <h3 className="text-lg font-semibold text-on-surface mb-2">Open a Project</h3>
+            <p className="text-sm text-on-surface-variant">
+              Select a project to design, preview, critique, and verify its interface.
+            </p>
+          </div>
+        </main>
+        {/* Watch-the-agent: the inbuilt browser is standalone (any http(s)
+            URL) — the sidebar rail toggle always has a real surface, even
+            before a project is opened. */}
+        {panelOpen && (
+          <aside className="w-96 shrink-0 border-l border-outline-variant/40 dark:border-white/5 bg-surface/50 overflow-y-auto p-4">
+            {browserPanelSection}
+            <p className="mt-3 text-[10px] text-on-surface-variant px-1">
+              Open a project to unlock design conversations, previews, and QA — the browser
+              itself works anywhere.
+            </p>
+          </aside>
+        )}
+      </div>
     );
   }
 
@@ -912,8 +1057,11 @@ export function DesignView({
         )}
       </div>
 
-      {/* Right contextual design panel */}
-      {activeConvId && rightOpen && (
+      {/* Right contextual design panel — also shown when the inbuilt
+          browser is toggled open from the sidebar rail (watch-the-agent),
+          even before any design conversation exists: the panel is a
+          standalone surface that navigates any http(s) URL. */}
+      {(activeConvId || panelOpen) && rightOpen && (
         <aside className="w-80 shrink-0 border-l border-outline-variant/40 dark:border-white/5 bg-surface/50 overflow-y-auto p-4 space-y-4">
           <div className="flex items-center justify-between">
             <h3 className="text-xs font-bold uppercase tracking-wider text-on-surface-variant">
@@ -1219,117 +1367,7 @@ export function DesignView({
             )}
           </section>
 
-          <section className="neo-raised rounded-2xl p-4">
-            <div className="flex items-center justify-between mb-2">
-              <h4 className="text-sm font-semibold text-on-surface">Inbuilt Browser</h4>
-              {agentViewing && (
-                <div className="flex items-center gap-1.5 text-[10px] text-primary bg-primary/5 rounded-full px-2 py-0.5">
-                  <span className="w-1.5 h-1.5 rounded-full bg-primary animate-pulse" />
-                  Agent viewing: {agentViewing.label}
-                </div>
-              )}
-              <button
-                onClick={() => (panelOpen ? panelNavigate("close") : setPanelOpen(true))}
-                className="text-[10px] text-primary hover:opacity-80"
-              >
-                {panelOpen ? "Close browser" : "Open browser"}
-              </button>
-            </div>
-            {panelOpen ? (
-              <div className="space-y-2">
-                {/* URL bar + controls — familiar browser chrome, no reinvention */}
-                <div className="flex items-center gap-1">
-                  <button
-                    onClick={() => panelNavigate("back")}
-                    disabled={panelBusy}
-                    title="Back"
-                    aria-label="Back"
-                    className="neo-btn rounded-lg px-2 py-1 text-[11px] text-on-surface-variant disabled:opacity-50"
-                  >
-                    ←
-                  </button>
-                  <button
-                    onClick={() => panelNavigate("forward")}
-                    disabled={panelBusy}
-                    title="Forward"
-                    aria-label="Forward"
-                    className="neo-btn rounded-lg px-2 py-1 text-[11px] text-on-surface-variant disabled:opacity-50"
-                  >
-                    →
-                  </button>
-                  <button
-                    onClick={() => panelNavigate("reload")}
-                    disabled={panelBusy}
-                    title="Reload"
-                    aria-label="Reload"
-                    className="neo-btn rounded-lg px-2 py-1 text-[11px] text-on-surface-variant disabled:opacity-50"
-                  >
-                    ⟳
-                  </button>
-                  <form
-                    className="flex-1 flex items-center gap-1"
-                    onSubmit={(e) => {
-                      e.preventDefault();
-                      panelNavigate("navigate", panelUrl);
-                    }}
-                  >
-                    <input
-                      value={panelUrl}
-                      onChange={(e) => setPanelUrl(e.target.value)}
-                      placeholder="http://127.0.0.1:5173"
-                      aria-label="Browser address"
-                      className="neo-input flex-1 rounded-lg px-2 py-1 text-[11px] font-mono bg-transparent text-on-surface"
-                    />
-                    <button
-                      type="submit"
-                      disabled={panelBusy}
-                      className="text-[10px] text-primary hover:opacity-80 disabled:opacity-50"
-                    >
-                      Go
-                    </button>
-                  </form>
-                </div>
-                {panelBusy && (
-                  <p className="text-[10px] text-on-surface-variant">Loading…</p>
-                )}
-                {panelError && (
-                  <p className="text-[11px] text-red-600 dark:text-red-400" role="alert">
-                    {panelError}
-                  </p>
-                )}
-                {/* The live page: framed screenshot from the persistent Chrome */}
-                {panelImg ? (
-                  <div className="rounded-xl overflow-hidden border border-outline-variant bg-white">
-                    <img
-                      src={panelImg}
-                      alt={`Browser view of ${panelMeta?.url ?? panelUrl}`}
-                      className="w-full h-auto block"
-                    />
-                  </div>
-                ) : !panelBusy && !panelError ? (
-                  <p className="text-xs text-on-surface-variant">
-                    Enter a URL and press Go — AgentCode keeps one Chrome alive for the
-                    panel and renders the live page here.
-                  </p>
-                ) : null}
-                {panelMeta && (
-                  <p className="text-[10px] text-on-surface-variant">
-                    HTTP {panelMeta.diagnostics.http_status} · console errors{" "}
-                    {panelMeta.diagnostics.console_errors.length} · network failures{" "}
-                    {panelMeta.diagnostics.network_failures.length}
-                    {panelMeta.viewport
-                      ? ` · ${panelMeta.viewport.width}×${panelMeta.viewport.height}`
-                      : ""}
-                  </p>
-                )}
-              </div>
-            ) : (
-              <p className="text-xs text-on-surface-variant">
-                An embedded browser like Codex: one persistent Chrome, address bar,
-                back/forward, live screenshot rendering with console + network diagnostics.
-              </p>
-            )}
-          </section>
+          {browserPanelSection}
 
           <section className="neo-raised rounded-2xl p-4">
             <div className="flex items-center justify-between mb-2">

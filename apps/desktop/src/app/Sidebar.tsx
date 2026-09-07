@@ -18,6 +18,10 @@ export function Sidebar({
   recoveredSessions,
   project,
   onOpenProject,
+  browserOpen,
+  onToggleBrowser,
+  terminalOpen,
+  onToggleTerminal,
 }: {
   view: View;
   setView(v: View): void;
@@ -25,6 +29,10 @@ export function Sidebar({
   recoveredSessions: number;
   project: Project | null;
   onOpenProject(): void;
+  browserOpen: boolean;
+  onToggleBrowser(): void;
+  terminalOpen: boolean;
+  onToggleTerminal(): void;
 }) {
   return (
     <aside className="w-64 h-full shrink-0 flex flex-col py-6 bg-surface-container-low border-r border-outline-variant/40 dark:bg-surface-container-low dark:border-white/5">
@@ -73,6 +81,43 @@ export function Sidebar({
           </button>
         ))}
       </nav>
+
+      {/* Watch-the-agent surfaces: browser + terminal toggles.  Icon-first
+          (Codex-style rail): always visible, one tap to open the inbuilt
+          browser or the terminal drawer on their owning views. */}
+      <div className="px-4 mt-4 pt-4 border-t border-outline-variant/40 dark:border-white/5">
+        <p className="px-2 mb-2 text-[10px] font-semibold uppercase tracking-wider text-on-surface-variant">
+          Watch surfaces
+        </p>
+        <div className="grid grid-cols-2 gap-2">
+          <button
+            onClick={onToggleBrowser}
+            title={browserOpen ? "Hide the inbuilt browser" : "Show the inbuilt browser"}
+            aria-pressed={browserOpen}
+            className={`flex flex-col items-center gap-1 px-2 py-3 rounded-xl transition-colors duration-150 ${
+              browserOpen
+                ? "text-primary font-semibold bg-primary/5 neo-pressed"
+                : "text-on-surface-variant hover:text-on-surface hover:bg-surface-variant/40 dark:hover:bg-white/5"
+            }`}
+          >
+            <Icon name="language" fill={browserOpen} />
+            <span className="text-xs">Browser</span>
+          </button>
+          <button
+            onClick={onToggleTerminal}
+            title={terminalOpen ? "Hide the terminal" : "Show the terminal"}
+            aria-pressed={terminalOpen}
+            className={`flex flex-col items-center gap-1 px-2 py-3 rounded-xl transition-colors duration-150 ${
+              terminalOpen
+                ? "text-primary font-semibold bg-primary/5 neo-pressed"
+                : "text-on-surface-variant hover:text-on-surface hover:bg-surface-variant/40 dark:hover:bg-white/5"
+            }`}
+          >
+            <Icon name="terminal" fill={terminalOpen} />
+            <span className="text-xs">Terminal</span>
+          </button>
+        </div>
+      </div>
 
       <div className="px-4 mt-auto">
         <button

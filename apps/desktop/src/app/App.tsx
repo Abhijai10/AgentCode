@@ -79,6 +79,12 @@ function AppShell() {
   const [daemonStatus, setDaemonStatus] = useState<DaemonStatus | null>(null);
   const [missions, setMissions] = useState<MissionSummary[]>([]);
   const [activeMission, setActiveMission] = useState<string | null>(null);
+  // Watch-the-agent surfaces: inbuilt browser + terminal toggles live in
+  // the sidebar rail (always reachable, like Codex).  The browser panel is
+  // owned by DesignView; the terminal drawer by MissionView — the toggles
+  // navigate to the owning view and open/close the surface.
+  const [browserOpen, setBrowserOpen] = useState(false);
+  const [terminalOpen, setTerminalOpen] = useState(false);
   const [notice, setNotice] = useState<string | null>(null);
   const [projectModal, setProjectModal] = useState<null | "open" | "new" | "choose">(null);
   const [projectAlert, setProjectAlert] = useState(false);
@@ -188,6 +194,17 @@ function AppShell() {
           recoveredSessions={daemonStatus?.recovered_sessions ?? 0}
           project={project}
           onOpenProject={() => setProjectModal(project ? "open" : "choose")}
+          browserOpen={browserOpen}
+          onToggleBrowser={() => {
+            // Navigate to the panel's owning view, then flip the surface.
+            setBrowserOpen((open) => !open);
+            if (view !== "design") setView("design");
+          }}
+          terminalOpen={terminalOpen}
+          onToggleTerminal={() => {
+            setTerminalOpen((open) => !open);
+            if (view !== "mission") setView("mission");
+          }}
         />
         <div className="flex-1 flex flex-col overflow-hidden">
           <TopBar
@@ -218,7 +235,7 @@ function AppShell() {
               }}
             />
           )}
-          {view === "mission" && <Suspense fallback={<ViewLoading />}><MissionView missionId={activeMission} onOpenSettings={() => setView("settings")} /></Suspense>}
+          {view === "mission" && <Suspense fallback={<ViewLoading />}><MissionView missionId={activeMission} onOpenSettings={() => setView("settings")} terminalOpen={terminalOpen} onTerminalOpenChange={setTerminalOpen} /></Suspense>}
           {view === "chat" && (
             <Suspense fallback={<ViewLoading />}>
             <ChatView
@@ -249,6 +266,8 @@ function AppShell() {
               project={project}
               missionId={activeMission}
               daemonConnected={daemonConnected}
+              browserOpen={browserOpen}
+              onBrowserOpenChange={setBrowserOpen}
               onOpenMission={(missionId) => {
                 setActiveMission(missionId);
                 setView("mission");
