@@ -600,6 +600,37 @@ export interface DesignMemory {
   recent_qa: unknown | null;
 }
 
+export interface E2EStepResult {
+  step: string;
+  url: string;
+  console_errors: number;
+  page_errors: number;
+  network_failures: number;
+  evidence_count: number;
+  evidence_last: string;
+}
+
+export interface E2ERunResult {
+  status?: string;
+  report_id?: string;
+  base_url?: string;
+  bug_count?: number;
+  console_errors?: string[];
+  page_errors?: string[];
+  network_failures?: string[];
+  steps?: E2EStepResult[];
+  report?: string;
+  detail?: string;
+}
+
+export interface E2EReportSummary {
+  id: string;
+  base_url: string;
+  bug_count: number;
+  mission_ref?: string | null;
+  created_at_ms: number;
+}
+
 export interface DesignPreview {
   status: string;
   port?: number | null;

@@ -51,6 +51,8 @@ import type {
   DesignPreview,
   DesignPreviewStatus,
   DesignBrowserResult,
+  E2ERunResult,
+  E2EReportSummary,
   BrowserPanelResult,
   DesignQaReport,
   VisualCritique,
@@ -1178,6 +1180,56 @@ export const daemon = {
     try {
       await invoke("daemon_design_preview_stop", { conversationId });
       return { ok: true };
+    } catch (e: unknown) {
+      const message = e instanceof Error ? e.message : String(e);
+      const cleaned = message.replace(/^[A-Z0-9_-]+:\s*/, "");
+      return { ok: false, error: cleaned || message };
+    }
+  },
+
+  // E2E testing mode: AI-driven end-to-end runs over the project's live app.
+  // The daemon launches the dev server, drives the real app in Chrome,
+  // collects console/page/network failures, and produces a bug report.
+  async e2eRun(
+    conversationId: string
+  ): Promise<{ ok: boolean; e2e?: E2ERunResult; error?: string }> {
+    try {
+      const res = await invoke<{ e2e: E2ERunResult }>("daemon_e2e_run", { conversationId });
+      return { ok: true, e2e: res.e2e };
+    } catch (e: unknown) {
+      const message = e instanceof Error ? e.message : String(e);
+      const cleaned = message.replace(/^[A-Z0-9_-]+:\s*/, "");
+      return { ok: false, error: cleaned || message };
+    }
+  },
+
+  async e2eFix(
+    conversationId: string,
+    reportId: string,
+    approved: boolean
+  ): Promise<{ ok: boolean; e2e?: { mission_id: string; report_id: string }; error?: string }> {
+    try {
+      const res = await invoke<{ e2e: { mission_id: string; report_id: string } }>(
+        "daemon_e2e_fix",
+        { conversationId, reportId, approved }
+      );
+      return { ok: true, e2e: res.e2e };
+    } catch (e: unknown) {
+      const message = e instanceof Error ? e.message : String(e);
+      const cleaned = message.replace(/^[A-Z0-9_-]+:\s*/, "");
+      return { ok: false, error: cleaned || message };
+    }
+  },
+
+  async e2eReports(
+    conversationId: string
+  ): Promise<{ ok: boolean; e2e?: { reports: E2EReportSummary[] }; error?: string }> {
+    try {
+      const res = await invoke<{ e2e: { reports: E2EReportSummary[] } }>(
+        "daemon_e2e_reports",
+        { conversationId }
+      );
+      return { ok: true, e2e: res.e2e };
     } catch (e: unknown) {
       const message = e instanceof Error ? e.message : String(e);
       const cleaned = message.replace(/^[A-Z0-9_-]+:\s*/, "");

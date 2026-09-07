@@ -1139,6 +1139,7 @@ include!("conversation.rs");
 include!("discuss_plan.rs");
 include!("design.rs");
 include!("security.rs");
+include!("e2e.rs");
 include!("terminal.rs");
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2681,7 +2682,7 @@ pub mod ac_tool_mirror_for_test {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
 
@@ -2690,7 +2691,7 @@ mod tests {
         f()
     }
 
-    fn temp_paths() -> (PathBuf, PathBuf, PathBuf) {
+    pub(crate) fn temp_paths() -> (PathBuf, PathBuf, PathBuf) {
         let dir = std::env::temp_dir().join(format!("agentcode-daemon-{}", StableId::new("tmp")));
         fs::create_dir_all(&dir).unwrap();
         let (db, lock) = default_paths(&dir);

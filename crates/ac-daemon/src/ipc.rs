@@ -27,7 +27,8 @@ fn command_response_timeout(command: &str) -> Duration {
         | "DesignVisualCritique"
         | "DesignQAReport"
         | "SecuritySend"
-        | "SecurityAudit" => PROVIDER_COMMAND_TIMEOUT,
+        | "SecurityAudit"
+        | "E2ERun" => PROVIDER_COMMAND_TIMEOUT,
         _ => FRAME_TIMEOUT,
     }
 }
@@ -886,6 +887,29 @@ fn dispatch_request(request: &Value, daemon: &mut DaemonService) -> (Value, bool
             let conversation_id = request.get("conversation_id").and_then(Value::as_str).unwrap_or("");
             match daemon.design_preview_stop(conversation_id) {
                 Ok(result) => json!({"id": correlation_id, "ok": true, "preview": result}),
+                Err(error) => error_response(correlation_id, error.code(), error.to_string()),
+            }
+        },
+        "E2ERun" => {
+            let conversation_id = request.get("conversation_id").and_then(Value::as_str).unwrap_or("");
+            match daemon.e2e_run(conversation_id) {
+                Ok(result) => json!({"id": correlation_id, "ok": true, "e2e": result}),
+                Err(error) => error_response(correlation_id, error.code(), error.to_string()),
+            }
+        },
+        "E2EFix" => {
+            let conversation_id = request.get("conversation_id").and_then(Value::as_str).unwrap_or("");
+            let report_id = request.get("report_id").and_then(Value::as_str).unwrap_or("");
+            let approved = request.get("approved").and_then(Value::as_bool).unwrap_or(false);
+            match daemon.e2e_fix(conversation_id, report_id, approved) {
+                Ok(result) => json!({"id": correlation_id, "ok": true, "e2e": result}),
+                Err(error) => error_response(correlation_id, error.code(), error.to_string()),
+            }
+        },
+        "E2EReports" => {
+            let conversation_id = request.get("conversation_id").and_then(Value::as_str).unwrap_or("");
+            match daemon.e2e_reports(conversation_id) {
+                Ok(result) => json!({"id": correlation_id, "ok": true, "e2e": result}),
                 Err(error) => error_response(correlation_id, error.code(), error.to_string()),
             }
         },

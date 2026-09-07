@@ -187,6 +187,33 @@ fn main() {
                 // (matching the daemon_health pattern); daemon-shaped
                 // responses keep their own {ok,...} envelope.
                 "user_home_dir" => json!(std::env::var("HOME").unwrap_or_default()),
+                "daemon_e2e_run" => {
+                    let mut f = json!({"command": "E2ERun"});
+                    if let Some(v) = args.get("conversationId") {
+                        f["conversation_id"] = v.clone();
+                    }
+                    handle_invoke(&client, f)
+                }
+                "daemon_e2e_fix" => {
+                    let mut f = json!({"command": "E2EFix"});
+                    if let Some(v) = args.get("conversationId") {
+                        f["conversation_id"] = v.clone();
+                    }
+                    if let Some(v) = args.get("reportId") {
+                        f["report_id"] = v.clone();
+                    }
+                    if let Some(v) = args.get("approved") {
+                        f["approved"] = v.clone();
+                    }
+                    handle_invoke(&client, f)
+                }
+                "daemon_e2e_reports" => {
+                    let mut f = json!({"command": "E2EReports"});
+                    if let Some(v) = args.get("conversationId") {
+                        f["conversation_id"] = v.clone();
+                    }
+                    handle_invoke(&client, f)
+                }
                 "daemon_terminal_start" => {
                     let mut f = json!({"command": "TerminalStart"});
                     if let Some(v) = args.get("missionId") {

@@ -21,6 +21,7 @@ import type {
   DesignQaReport,
   VisualCritique,
   DesignConstraint,
+  E2ERunResult,
 } from "./types";
 
 function formatTime(ms: number): string {
@@ -110,6 +111,8 @@ export function DesignView({
   // F2: the design contract (executable specification) + standalone QA runs.
   const [contract, setContract] = useState<Record<string, unknown> | null>(null);
   const [standaloneQa, setStandaloneQa] = useState<DesignQaReport | null>(null);
+  // E2E testing mode: AI drives the live app in Chrome and reports bugs.
+  const [e2eReport, setE2eReport] = useState<E2ERunResult | null>(null);
   // Stitch-parity: generative mockups (prompt -> variants -> winner).
   const [mockupPrompt, setMockupPrompt] = useState("");
   // Multi-screen flow (Stitch parity): one prompt per line = one screen.
@@ -503,6 +506,31 @@ export function DesignView({
     runPanel(async () => {
       const r = await daemon.designPreviewStart(activeConvId!);
       if (!r.ok) setError(r.error || "Could not start preview");
+    });
+
+  // E2E testing (Codex-Playwright parity): launch the dev server, drive the
+  // real app through its interactive controls in headless Chrome, collect
+  // console/page/network failures with evidence, and report honestly.
+  const handleE2eRun = () =>
+    runPanel(async () => {
+      const r = await daemon.e2eRun(activeConvId!);
+      if (r.ok && r.e2e) {
+        if (r.e2e.status === "E2E_NO_SERVER") {
+          setError(r.e2e.detail || "No dev server detected for this project");
+          return;
+        }
+        setE2eReport(r.e2e);
+      } else {
+        setError(r.error || "E2E run failed");
+      }
+    });
+
+  // Hand the report to a mission — explicit approval, through the normal
+  // GoalSubmit/Kernel path (E2E mode never bypasses engineering authority).
+  const handleE2eFix = (reportId: string) =>
+    runPanel(async () => {
+      const r = await daemon.e2eFix(activeConvId!, reportId, true);
+      if (!r.ok) setError(r.error || "Could not create the fix mission");
     });
 
   // Stitch-parity: generate candidate mockup variants from a prompt.  The
@@ -1103,6 +1131,14 @@ export function DesignView({
                 Preview
               </button>
               <button
+                onClick={handleE2eRun}
+                disabled={panelBusy}
+                className="neo-button rounded-lg px-2 py-1 text-[10px] font-medium text-on-surface-variant disabled:opacity-50"
+                title="AI end-to-end test: launch the app, click through it in real Chrome, and report bugs"
+              >
+                E2E Test
+              </button>
+              <button
                 onClick={handleContract}
                 disabled={panelBusy}
                 className="neo-button rounded-lg px-2 py-1 text-[10px] font-medium text-on-surface-variant disabled:opacity-50"
@@ -1136,6 +1172,63 @@ export function DesignView({
               </button>
             </div>
           </div>
+
+          {e2eReport && (
+            <section className="neo-raised rounded-2xl p-4">
+              <div className="flex items-center justify-between mb-2">
+                <h4 className="text-sm font-semibold text-on-surface">
+                  E2E Test Report
+                  <span
+                    className={`ml-2 text-[10px] px-2 py-0.5 rounded-full font-medium ${
+                      (e2eReport.bug_count ?? 0) === 0
+                        ? "bg-emerald-500/10 text-emerald-600"
+                        : "bg-red-500/10 text-red-600"
+                    }`}
+                  >
+                    {(e2eReport.bug_count ?? 0) === 0
+                      ? "no bugs found"
+                      : `${e2eReport.bug_count} issues`}
+                  </span>
+                </h4>
+                {e2eReport.report_id && (
+                  <button
+                    onClick={() => handleE2eFix(e2eReport.report_id!)}
+                    disabled={panelBusy}
+                    className="neo-button rounded-lg px-2 py-1 text-[10px] font-medium text-primary disabled:opacity-50"
+                    title="Give the fixes to a mission (through the normal governed path)"
+                  >
+                    Send fixes to mission →
+                  </button>
+                )}
+              </div>
+              <p className="text-xs text-on-surface-variant mb-2">
+                Drove the app at <span className="font-mono">{e2eReport.base_url}</span> through{" "}
+                {(e2eReport.steps?.length ?? 0)} steps in real Chrome.
+              </p>
+              <div className="space-y-1 text-xs">
+                {e2eReport.console_errors?.slice(0, 6).map((e, i) => (
+                  <p key={`c${i}`} className="text-red-600 dark:text-red-400 font-mono text-[10px] truncate">
+                    console: {e}
+                  </p>
+                ))}
+                {e2eReport.page_errors?.slice(0, 6).map((e, i) => (
+                  <p key={`p${i}`} className="text-red-600 dark:text-red-400 font-mono text-[10px] truncate">
+                    page: {e}
+                  </p>
+                ))}
+                {e2eReport.network_failures?.slice(0, 6).map((e, i) => (
+                  <p key={`n${i}`} className="text-red-600 dark:text-red-400 font-mono text-[10px] truncate">
+                    network: {e}
+                  </p>
+                ))}
+                {(e2eReport.bug_count ?? 0) === 0 && (
+                  <p className="text-emerald-600 dark:text-emerald-400">
+                    Clean pass — no console, page, or network failures captured.
+                  </p>
+                )}
+              </div>
+            </section>
+          )}
 
           <section className="neo-raised rounded-2xl p-4">
             <div className="flex items-center justify-between mb-2">

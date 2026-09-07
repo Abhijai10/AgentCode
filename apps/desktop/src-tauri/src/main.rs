@@ -1789,6 +1789,47 @@ fn daemon_design_preview_start(
 }
 
 #[tauri::command]
+fn daemon_e2e_run(
+    state: tauri::State<DaemonClient>,
+    conversation_id: String,
+) -> Result<Value, String> {
+    request(
+        &state.0,
+        "ui",
+        "E2ERun",
+        json!({ "conversation_id": conversation_id }),
+    )
+}
+
+#[tauri::command]
+fn daemon_e2e_fix(
+    state: tauri::State<DaemonClient>,
+    conversation_id: String,
+    report_id: String,
+    approved: bool,
+) -> Result<Value, String> {
+    request(
+        &state.0,
+        "ui",
+        "E2EFix",
+        json!({ "conversation_id": conversation_id, "report_id": report_id, "approved": approved }),
+    )
+}
+
+#[tauri::command]
+fn daemon_e2e_reports(
+    state: tauri::State<DaemonClient>,
+    conversation_id: String,
+) -> Result<Value, String> {
+    request(
+        &state.0,
+        "ui",
+        "E2EReports",
+        json!({ "conversation_id": conversation_id }),
+    )
+}
+
+#[tauri::command]
 fn daemon_design_preview_status(
     state: tauri::State<DaemonClient>,
     conversation_id: String,
@@ -2377,6 +2418,9 @@ fn main() {
             daemon_design_state,
             daemon_design_critique,
             daemon_design_repair,
+            daemon_e2e_run,
+            daemon_e2e_fix,
+            daemon_e2e_reports,
             daemon_design_preview_start,
             daemon_design_preview_status,
             daemon_design_preview_stop,

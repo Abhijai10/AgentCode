@@ -341,6 +341,17 @@ pub struct DesignPreviewRow {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct E2EReportRow {
+    pub id: String,
+    pub conversation_id: String,
+    pub base_url: String,
+    pub bug_count: i64,
+    pub report_json: String,
+    pub mission_ref: Option<String>,
+    pub created_at_ms: i64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DesignCritiqueRow {
     pub id: String,
     pub conversation_id: String,

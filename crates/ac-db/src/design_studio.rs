@@ -208,3 +208,94 @@ impl ControlPlaneDb {
         rows.collect::<Result<Vec<_>, _>>().map_err(db_error)
     }
 }
+
+impl ControlPlaneDb {
+    // ── E2E testing mode (bug reports → missions) ───────────────────
+    pub fn save_e2e_report(&self, row: &E2EReportRow) -> AcResult<()> {
+        self.connection
+            .execute(
+                "INSERT OR REPLACE INTO e2e_reports
+                 (id, conversation_id, base_url, bug_count, report_json, mission_ref, created_at_ms)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                rusqlite::params![
+                    row.id,
+                    row.conversation_id,
+                    row.base_url,
+                    row.bug_count,
+                    row.report_json,
+                    row.mission_ref,
+                    row.created_at_ms
+                ],
+            )
+            .map_err(db_error)?;
+        Ok(())
+    }
+
+    pub fn e2e_report(&self, id: &str) -> AcResult<Option<E2EReportRow>> {
+        let row = self
+            .connection
+            .query_row(
+                "SELECT id, conversation_id, base_url, bug_count, report_json, mission_ref, created_at_ms
+                 FROM e2e_reports WHERE id = ?1",
+                rusqlite::params![id],
+                |row| {
+                    Ok(E2EReportRow {
+                        id: row.get(0)?,
+                        conversation_id: row.get(1)?,
+                        base_url: row.get(2)?,
+                        bug_count: row.get(3)?,
+                        report_json: row.get(4)?,
+                        mission_ref: row.get(5)?,
+                        created_at_ms: row.get(6)?,
+                    })
+                },
+            )
+            .map_err(|e| match e {
+                rusqlite::Error::QueryReturnedNoRows => rusqlite::Error::QueryReturnedNoRows,
+                other => other,
+            });
+        match row {
+            Ok(parsed) => Ok(Some(parsed)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(other) => Err(db_error(other)),
+        }
+    }
+
+    pub fn e2e_reports_for_conversation(&self, conversation_id: &str) -> AcResult<Vec<E2EReportRow>> {
+        let mut stmt = self
+            .connection
+            .prepare(
+                "SELECT id, conversation_id, base_url, bug_count, report_json, mission_ref, created_at_ms
+                 FROM e2e_reports WHERE conversation_id = ?1 ORDER BY created_at_ms DESC",
+            )
+            .map_err(db_error)?;
+        let rows = stmt
+            .query_map(rusqlite::params![conversation_id], |row| {
+                Ok(E2EReportRow {
+                    id: row.get(0)?,
+                    conversation_id: row.get(1)?,
+                    base_url: row.get(2)?,
+                    bug_count: row.get(3)?,
+                    report_json: row.get(4)?,
+                    mission_ref: row.get(5)?,
+                    created_at_ms: row.get(6)?,
+                })
+            })
+            .map_err(db_error)?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row.map_err(db_error)?);
+        }
+        Ok(out)
+    }
+
+    pub fn set_e2e_report_mission(&self, id: &str, mission_ref: &str) -> AcResult<()> {
+        self.connection
+            .execute(
+                "UPDATE e2e_reports SET mission_ref = ?2 WHERE id = ?1",
+                rusqlite::params![id, mission_ref],
+            )
+            .map_err(db_error)?;
+        Ok(())
+    }
+}

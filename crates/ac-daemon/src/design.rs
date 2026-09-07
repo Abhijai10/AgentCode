@@ -1724,10 +1724,20 @@ Rules: describe only what is actually visible in the image. Findings must be con
             })
             .map_err(|e| AcError::validation("DESIGN-PREVIEW_READER", e.to_string()))?;
         if let Some(stderr) = stderr_reader {
+            // Many dev servers (python http.server, cargo run builds, some
+            // node stacks) print their startup banner on STDERR — the port
+            // must be detected on BOTH streams, never just stdout.
+            let signal = Arc::clone(&port_signal);
             std::thread::Builder::new()
                 .name("design-preview-stderr".to_string())
                 .spawn(move || {
-                    for _line in BufReader::new(stderr).lines().map_while(Result::ok) {}
+                    for line in BufReader::new(stderr).lines().map_while(Result::ok) {
+                        let mut guard =
+                            signal.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+                        if guard.is_none() {
+                            *guard = detect_port_from_line(&line);
+                        }
+                    }
                 })
                 .map_err(|e| AcError::validation("DESIGN-PREVIEW_READER", e.to_string()))?;
         }
@@ -1747,6 +1757,25 @@ Rules: describe only what is actually visible in the image. Findings must be con
                 if test_http_ready(candidate) && port_owned_by_process(pid, candidate) {
                     port = Some(candidate);
                     break;
+                }
+            }
+        }
+        // Fallback 2: dev servers that stay silent on piped stdio (python
+        // http.server under npm run suppresses its banner) — probe any
+        // explicit port literal in the dev command itself, plus the port
+        // the process actually listens on (lsof).
+        if port.is_none() {
+            for candidate in ports_from_command(&dev_command) {
+                if test_http_ready(candidate) && port_owned_by_process(pid, candidate) {
+                    port = Some(candidate);
+                    break;
+                }
+            }
+        }
+        if port.is_none() {
+            if let Some(candidate) = first_listener_port_of(pid) {
+                if test_http_ready(candidate) {
+                    port = Some(candidate);
                 }
             }
         }
@@ -3294,6 +3323,68 @@ fn detect_dev_command(project_path: &str) -> String {    let dir = Path::new(pro
     String::new()
 }
 
+/// Explicit port literals in a dev command: "http.server 8099", "--port 3000".
+fn ports_from_command(dev_command: &str) -> Vec<u16> {
+    dev_command
+        .split_whitespace()
+        .filter_map(|word| {
+            let digits = word
+                .strip_prefix("--port=")
+                .unwrap_or(word)
+                .trim_matches(':');
+            digits.parse::<u16>().ok().filter(|p| *p > 1024 && *p < 65535)
+        })
+        .collect()
+}
+
+/// First TCP listening port owned by the process or ANY of its descendants
+/// (npm -> sh -> python): dev servers listen on a grandchild, not the
+/// spawned pid.  Walks the tree bottom-up via pgrep -P.
+fn first_listener_port_of(pid: u32) -> Option<u16> {
+    let mut descendants: Vec<u32> = vec![pid];
+    let mut queue: std::collections::VecDeque<u32> = std::collections::VecDeque::new();
+    queue.push_back(pid);
+    while let Some(current) = queue.pop_front() {
+        let out = std::process::Command::new("pgrep")
+            .args(["-P", &current.to_string()])
+            .output()
+            .ok()?;
+        for line in String::from_utf8_lossy(&out.stdout).lines() {
+            if let Ok(child) = line.trim().parse::<u32>() {
+                if !descendants.contains(&child) {
+                    descendants.push(child);
+                    queue.push_back(child);
+                }
+            }
+        }
+    }
+    for candidate in descendants {
+        let output = std::process::Command::new("lsof")
+            .args([
+                "-nP",
+                "-a",
+                "-p",
+                &candidate.to_string(),
+                "-iTCP",
+                "-sTCP:LISTEN",
+            ])
+            .output()
+            .ok()?;
+        let text = String::from_utf8_lossy(&output.stdout);
+        for line in text.lines().skip(1) {
+            let cols: Vec<&str> = line.split_whitespace().collect();
+            let Some(addr) = cols.get(8) else { continue };
+            let Some(port) = addr.rsplit(':').next()?.parse::<u16>().ok() else {
+                continue;
+            };
+            if port > 0 {
+                return Some(port);
+            }
+        }
+    }
+    None
+}
+
 fn detect_port_from_line(line: &str) -> Option<u16> {
     let line_lower = line.to_ascii_lowercase();
     for word in line_lower.split_whitespace() {
@@ -3315,7 +3406,20 @@ fn detect_port_from_line(line: &str) -> Option<u16> {
             }
         }
     }
-    // Match "port 3000" or "Local: http://localhost:5173/"
+    // Match "port 3000" / "Serving HTTP on :: port 8099" (python http.server,
+    // many rust/node servers) or "Local: http://localhost:5173/"
+    if let Some(idx) = line_lower.find(" port ") {
+        let tail = &line_lower[idx + " port ".len()..];
+        let port_str = tail
+            .chars()
+            .take_while(|c| c.is_ascii_digit())
+            .collect::<String>();
+        if let Ok(port) = port_str.parse::<u16>() {
+            if port > 0 {
+                return Some(port);
+            }
+        }
+    }
     if let Some(idx) = line_lower.find("http://localhost:") {
         let tail = &line_lower[idx + "http://localhost:".len()..];
         let port_str = tail
@@ -3865,14 +3969,47 @@ fn test_http_ready(port: u16) -> bool {
 /// output; honest fallback: if lsof is unavailable we return true (probe
 /// only) — availability checks are advisory, not blocking.
 fn port_owned_by_process(pid: u32, port: u16) -> bool {
-    let output = std::process::Command::new("lsof")
-        .args(["-a", "-d", "tcp", "-P", "-n", "-p", &pid.to_string()])
-        .output();
-    match output {
-        Ok(output) if output.status.success() => {
-            let text = String::from_utf8_lossy(&output.stdout);
-            text.contains(&format!(":{port}"))
+    // The dev server listens on a DESCENDANT of the spawned pid (npm -> sh
+    // -> python), so ownership must consider the whole tree.
+    let mut descendants: Vec<u32> = vec![pid];
+    let mut queue: std::collections::VecDeque<u32> = std::collections::VecDeque::new();
+    queue.push_back(pid);
+    while let Some(current) = queue.pop_front() {
+        let Ok(out) = std::process::Command::new("pgrep")
+            .args(["-P", &current.to_string()])
+            .output()
+        else {
+            return true; // cannot walk: cannot disprove ownership
+        };
+        for line in String::from_utf8_lossy(&out.stdout).lines() {
+            if let Ok(child) = line.trim().parse::<u32>() {
+                if !descendants.contains(&child) {
+                    descendants.push(child);
+                    queue.push_back(child);
+                }
+            }
         }
-        _ => true, // lsof unavailable or denied: cannot disprove ownership
     }
+    for candidate in descendants {
+        let output = std::process::Command::new("lsof")
+            .args([
+                "-nP",
+                "-a",
+                "-p",
+                &candidate.to_string(),
+                "-iTCP",
+                &format!(":{port}"),
+            ])
+            .output();
+        match output {
+            Ok(output) if output.status.success() => {
+                let text = String::from_utf8_lossy(&output.stdout);
+                if text.contains("LISTEN") {
+                    return true;
+                }
+            }
+            _ => return true, // lsof unavailable or denied: cannot disprove
+        }
+    }
+    false
 }
