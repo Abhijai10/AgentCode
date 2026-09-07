@@ -2706,7 +2706,14 @@ mod tests {
             .iter()
             .map(|entry| entry.id.to_string())
             .collect::<Vec<_>>();
-        for expected in ["omnirouter", "openai", "anthropic", "gemini", "ollama", "lm-studio"] {
+        for expected in [
+            "omnirouter",
+            "openai",
+            "anthropic",
+            "gemini",
+            "ollama",
+            "lm-studio",
+        ] {
             assert!(
                 ids.contains(&expected.to_string()),
                 "catalog must contain {expected}, got {ids:?}"
