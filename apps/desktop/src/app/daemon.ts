@@ -1209,7 +1209,7 @@ export const daemon = {
   },
 
   async browserPanel(
-    action: "navigate" | "back" | "forward" | "reload" | "screenshot" | "close",
+    action: "navigate" | "back" | "forward" | "reload" | "screenshot" | "close" | "interact",
     url?: string,
     viewportHint?: string
   ): Promise<{ ok: boolean; panel?: BrowserPanelResult; error?: string }> {

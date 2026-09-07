@@ -321,6 +321,23 @@ pub enum BrowserAction {
     Click {
         selector: String,
     },
+    /// Click at raw page VIEWPORT coordinates (interactive inbuilt browser).
+    ClickAt {
+        x: i32,
+        y: i32,
+    },
+    /// Type a single key event into the focused element (interactive
+    /// inbuilt browser) — key is a key literal like "a", "Enter", "Tab".
+    PressKey {
+        key: String,
+    },
+    /// Wheel scroll by (dx, dy) at viewport coordinates.
+    ScrollBy {
+        dx: i32,
+        dy: i32,
+        x: i32,
+        y: i32,
+    },
     Type {
         selector: String,
         text: String,
@@ -1450,6 +1467,9 @@ impl BrowserRuntime {
                 page.html = html.clone();
                 "open-html-for-test"
             }
+            BrowserAction::ClickAt { .. } => "click_at",
+            BrowserAction::PressKey { .. } => "press_key",
+            BrowserAction::ScrollBy { .. } => "scroll_by",
             BrowserAction::Click { selector } => {
                 require_selector(&page.html, selector)?;
                 page.clicked.push(selector.clone());
@@ -2266,6 +2286,18 @@ impl BrowserRuntime {
                     page.click(selector)?;
                     "click"
                 }
+                BrowserAction::ClickAt { x, y } => {
+                    page.click_at(*x, *y)?;
+                    "click_at"
+                }
+                BrowserAction::PressKey { key } => {
+                    page.press_key(key)?;
+                    "press_key"
+                }
+                BrowserAction::ScrollBy { dx, dy, x, y } => {
+                    page.scroll_by(*dx, *dy, *x, *y)?;
+                    "scroll_by"
+                }
                 BrowserAction::Type { selector, text } => {
                     page.type_text(selector, text)?;
                     "type"
@@ -2731,6 +2763,64 @@ impl RealBrowserPage {
             .current_url_hint
             .clone()
             .unwrap_or_else(|| url.to_string());
+        Ok(())
+    }
+
+    /// Click raw page coordinates via CDP Input.dispatchMouseEvent (real
+    /// trusted event — the inbuilt browser's interactive surface).
+    fn click_at(&mut self, x: i32, y: i32) -> AcResult<()> {
+        let params = json!({
+            "type": "mousePressed",
+            "x": x,
+            "y": y,
+            "button": "left",
+            "clickCount": 1,
+        });
+        self.client.call("Input.dispatchMouseEvent", params)?;
+        let params = json!({
+            "type": "mouseReleased",
+            "x": x,
+            "y": y,
+            "button": "left",
+            "clickCount": 1,
+        });
+        self.client.call("Input.dispatchMouseEvent", params)?;
+        self.client.drain_events(Duration::from_millis(250))?;
+        self.url = self.current_url()?;
+        Ok(())
+    }
+
+    /// Send a key event via CDP Input.dispatchKeyEvent.  `key` is a literal
+    /// like "a", "Enter", "ArrowLeft", "Backspace".
+    fn press_key(&mut self, key: &str) -> AcResult<()> {
+        let text = if key.chars().count() == 1 {
+            key.to_string()
+        } else {
+            String::new()
+        };
+        let params = json!({
+            "type": if text.is_empty() { "keyDown" } else { "char" },
+            "key": key,
+            "text": text,
+            "unmodifiedText": text,
+            "nativeVirtualKeyCode": 0,
+        });
+        self.client.call("Input.dispatchKeyEvent", params)?;
+        self.client.drain_events(Duration::from_millis(150))?;
+        Ok(())
+    }
+
+    /// Wheel scroll via CDP Input.dispatchMouseEvent at viewport coords.
+    fn scroll_by(&mut self, dx: i32, dy: i32, x: i32, y: i32) -> AcResult<()> {
+        let params = json!({
+            "type": "mouseWheel",
+            "x": x,
+            "y": y,
+            "deltaX": dx,
+            "deltaY": dy,
+        });
+        self.client.call("Input.dispatchMouseEvent", params)?;
+        self.client.drain_events(Duration::from_millis(150))?;
         Ok(())
     }
 

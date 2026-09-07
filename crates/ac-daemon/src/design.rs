@@ -1989,17 +1989,45 @@ port: port.map(|p| p as i64),
                 }));
             }
         }
-        // Only http(s) and the local dev preview are navigable from the
-        // panel; file:// and other schemes are refused outright.
+        // Address-bar semantics (real browser parity): http(s) URLs pass
+        // through; anything else that LOOKS like a host ("example.com",
+        // "localhost:3000") gets https:// prefixed; plain words become a
+        // DuckDuckGo search.  file:// and other schemes are refused.
         let validate_url = |u: &str| -> AcResult<String> {
-            if u.starts_with("http://") || u.starts_with("https://") {
-                Ok(u.to_string())
-            } else {
-                Err(AcError::validation(
+            let raw = u.trim();
+            if raw.is_empty() {
+                return Err(AcError::validation(
+                    "BROWSER-PANEL_URL_REFUSED",
+                    "empty address",
+                ));
+            }
+            if raw.starts_with("http://") || raw.starts_with("https://") {
+                return Ok(raw.to_string());
+            }
+            // Reject other schemes outright (file:, javascript:, …).
+            if raw.contains("://") || raw.starts_with("data:") {
+                return Err(AcError::validation(
                     "BROWSER-PANEL_URL_REFUSED",
                     "panel navigation allows http(s) URLs only",
-                ))
+                ));
             }
+            // Contains whitespace and no dot — treat as a search query.
+            let looks_like_host = !raw.contains(char::is_whitespace)
+                && raw.contains('.')
+                && !raw.ends_with('.')
+                && raw.split('.').count() >= 2
+                && raw.split('.').all(|part| {
+                    !part.is_empty()
+                        && part
+                            .chars()
+                            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == ':')
+                });
+            if looks_like_host {
+                return Ok(format!("https://{raw}"));
+            }
+            // Search query — DuckDuckGo needs no API key.
+            let encoded = raw.replace(' ', "+");
+            Ok(format!("https://duckduckgo.com/?q={encoded}"))
         };
 
         let mut guard = self
@@ -2080,6 +2108,47 @@ port: port.map(|p| p as i64),
                 runtime_slot.traverse_history(&session_id, action)?;
             }
             "screenshot" => {}
+            // Interactive inbuilt browser: raw CDP input at the page
+            // coordinates the UI derived from its screenshot.  The payload
+            // travels in `url` as compact JSON: {"x":..,"y":..} (click),
+            // {"key":"Enter"} (press), {"dx":0,"dy":-360,"x":..,"y":..} (wheel).
+            "interact" => {
+                let payload: serde_json::Value = serde_json::from_str(url)
+                    .map_err(|err| {
+                        AcError::validation(
+                            "BROWSER-PANEL_INTERACT_INVALID",
+                            format!("interact payload must be compact JSON: {err}"),
+                        )
+                    })?;
+                if let Some(key) = payload.get("key").and_then(|k| k.as_str()) {
+                    runtime_slot.act(
+                        &session_id,
+                        ac_verification::BrowserAction::PressKey {
+                            key: key.to_string(),
+                        },
+                        &mut evidence_store,
+                    )?;
+                } else if payload.get("dx").is_some() || payload.get("dy").is_some() {
+                    runtime_slot.act(
+                        &session_id,
+                        ac_verification::BrowserAction::ScrollBy {
+                            dx: payload.get("dx").and_then(|v| v.as_i64()).unwrap_or(0) as i32,
+                            dy: payload.get("dy").and_then(|v| v.as_i64()).unwrap_or(0) as i32,
+                            x: payload.get("x").and_then(|v| v.as_i64()).unwrap_or(0) as i32,
+                            y: payload.get("y").and_then(|v| v.as_i64()).unwrap_or(0) as i32,
+                        },
+                        &mut evidence_store,
+                    )?;
+                } else {
+                    let x = payload.get("x").and_then(|v| v.as_i64()).unwrap_or(0) as i32;
+                    let y = payload.get("y").and_then(|v| v.as_i64()).unwrap_or(0) as i32;
+                    runtime_slot.act(
+                        &session_id,
+                        ac_verification::BrowserAction::ClickAt { x, y },
+                        &mut evidence_store,
+                    )?;
+                }
+            }
             other => {
                 return Err(AcError::validation(
                     "BROWSER-PANEL_ACTION",
@@ -2102,6 +2171,27 @@ port: port.map(|p| p as i64),
                 .map(|s| s.to_string())
                 .unwrap_or_default();
         }
+        // Page geometry for the interactive inbuilt browser: the viewport
+        // size plus scroll offsets let the UI map a click on the rendered
+        // screenshot to true CDP page coordinates.
+        let geometry = runtime_slot
+            .act(
+                &session_id,
+                ac_verification::BrowserAction::Evaluate {
+                    script: r#"(() => JSON.stringify({
+                        scrollX: Math.round(window.scrollX || 0),
+                        scrollY: Math.round(window.scrollY || 0),
+                        innerW: window.innerWidth,
+                        innerH: window.innerHeight,
+                    }))()"#
+                        .to_string(),
+                },
+                &mut evidence_store,
+            )
+            .ok()
+            .and_then(|r| r.value)
+            .and_then(|v| serde_json::from_str::<serde_json::Value>(v.as_str().unwrap_or("")).ok())
+            .unwrap_or(serde_json::json!({}));
         let screenshot = runtime_slot.capture_screenshot(
             &session_id,
             task_id,
@@ -2114,6 +2204,7 @@ port: port.map(|p| p as i64),
             "url": final_url,
             "title": dom.visible_text.lines().next().unwrap_or("").trim().to_string(),
             "viewport": {"name": viewport.name, "width": viewport.width, "height": viewport.height},
+            "geometry": geometry,
             "diagnostics": {
                 "console_errors": diag.console_errors,
                 "page_errors": diag.page_errors,

@@ -439,6 +439,7 @@ export function ChatView({
   daemonConnected: boolean;
 }) {
   const [conversations, setConversations] = useState<Conversation[]>([]);
+  const [listCollapsed, setListCollapsed] = useState(false);
   const [activeConvId, setActiveConvId] = useState<string | null>(null);
   const [convDetail, setConvDetail] = useState<ConversationDetail | null>(null);
   const [activity, setActivity] = useState<ConversationActivity | null>(null);
@@ -829,7 +830,23 @@ export function ChatView({
   return (
     <main className="flex-1 flex overflow-hidden">
       {/* Conversation List */}
-      <aside className="w-64 shrink-0 flex flex-col border-r border-outline-variant/40 dark:border-white/5 bg-surface/50">
+      {listCollapsed ? (
+      <button
+        onClick={() => setListCollapsed(false)}
+        title="Show list"
+        className="shrink-0 w-8 border-r border-outline-variant/40 dark:border-white/5 bg-surface/50 flex items-center justify-center text-on-surface-variant hover:text-primary"
+      >
+        <Icon name="arrow_forward" size={16} />
+      </button>
+    ) : (
+    <aside className="w-64 shrink-0 flex flex-col border-r border-outline-variant/40 dark:border-white/5 bg-surface/50 relative">
+        <button
+          onClick={() => setListCollapsed(true)}
+          title="Collapse list"
+          className="absolute top-2 right-2 z-10 p-1 rounded-lg text-on-surface-variant hover:bg-surface-variant/40 dark:hover:bg-white/5"
+        >
+          <Icon name="arrow_back" size={14} className="rotate-180" />
+        </button>
         <div className="p-3 border-b border-outline-variant/40 dark:border-white/5">
           <button
             onClick={handleNewChat}
@@ -909,6 +926,7 @@ export function ChatView({
           )}
         </div>
       </aside>
+    )}
 
       {/* Chat Area */}
       <div className="flex-1 flex flex-col overflow-hidden">

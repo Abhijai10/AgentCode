@@ -2,22 +2,37 @@ import { useState, useEffect, useRef } from "react";
 import { Icon } from "./Icon";
 import { daemon } from "./daemon";
 import type { Project } from "./ProjectContext";
-import type { ProjectMemory } from "./types";
+import type { ProjectMemory, ConversationMode, Attachment } from "./types";
+
+// The home screen IS the chat (user-confirmed direction): one composer,
+// a mode selector routing work to the right surface, attachments, and a
+// compact typing area with zero dead space.
+const MODES: { id: ConversationMode; label: string; icon: string; hint: string; accent: string }[] = [
+  { id: "GOAL", label: "Goal", icon: "flag", hint: "Give work — the agent plans & builds it", accent: "text-primary" },
+  { id: "DISCUSS", label: "Discuss", icon: "forum", hint: "Talk it through with plans & decisions", accent: "text-violet-600 dark:text-violet-400" },
+  { id: "DESIGN", label: "Design", icon: "draw", hint: "Iterate UI with live previews", accent: "text-amber-600 dark:text-amber-400" },
+  { id: "SECURITY", label: "Security", icon: "security", hint: "Audit, harden, and review risk", accent: "text-emerald-600 dark:text-emerald-400" },
+];
 
 export function HomeView({
   project,
-  onOpenProject,
   onSubmit,
+  onOpenProject,
   onConfigureProviders,
   onNavigate,
+  onOpenConversation,
 }: {
   project: Project | null;
-  onOpenProject(): void;
   onSubmit(goal: string): Promise<{ ok: boolean; error?: string }>;
+  onOpenProject(): void;
   onConfigureProviders(): void;
-  onNavigate(view: "design" | "mission" | "settings"): void;
+  onNavigate(view: "design" | "mission" | "settings" | "chat" | "discuss" | "security"): void;
+  onOpenConversation(mode: ConversationMode): void;
 }) {
   const [goal, setGoal] = useState("");
+  const [mode, setMode] = useState<ConversationMode>("GOAL");
+  const [attachments, setAttachments] = useState<Attachment[]>([]);
+  const [attachBusy, setAttachBusy] = useState(false);
   const [hasUsableRoute, setHasUsableRoute] = useState(true);
   const [routeCheckDone, setRouteCheckDone] = useState(false);
   // Batch N7: real first-run readiness from the daemon (dismissible).
@@ -124,18 +139,61 @@ export function HomeView({
     );
   }
 
+  // Attach a file (photos, videos, zips — anything) to the next message.
+  const attach = async () => {
+    if (!project) return;
+    // A conversation is created lazily on first send; attachments ride the
+    // GOAL mission when that is the active mode.
+    setAttachBusy(true);
+    const created = await daemon.createConversation(project.path, mode, "Home");
+    if (!created.ok || !created.conversation_id) {
+      setSubmitError(created.error || "Could not start conversation for attachments");
+      setAttachBusy(false);
+      return;
+    }
+    const res = await daemon.addAttachment(created.conversation_id, project.path);
+    setAttachBusy(false);
+    if (res.ok && res.attachment) {
+      setAttachments((prev) => [...prev, res.attachment!]);
+      onOpenConversation(mode);
+    } else {
+      setSubmitError(res.error || "Could not attach file");
+    }
+  };
+
   const send = async () => {
     const trimmed = goal.trim();
     if (!trimmed || submitting) return;
     setSubmitting(true);
     setSubmitError(null);
-    const result = await onSubmit(trimmed);
-    if (result.ok) {
-      setGoal("");
+    if (mode === "GOAL") {
+      // GOAL mode hands work to a mission (with any attachments noted).
+      const payload = attachments.length > 0
+        ? `${trimmed}\n\n[attached files: ${attachments.map((a) => a.filename).join(", ")}]`
+        : trimmed;
+      const result = await onSubmit(payload);
+      if (result.ok) {
+        setGoal("");
+        setAttachments([]);
+      } else {
+        setSubmitError(result.error || "Mission submission failed.");
+      }
     } else {
-      // Surface the real backend error (e.g. a rejected workspace_root or a
-      // provider/down-daemon failure) instead of a generic placeholder.
-      setSubmitError(result.error || "Mission submission failed.");
+      // DISCUSS / DESIGN / SECURITY open a conversation in its view with
+      // the first message — the user keeps talking there.
+      const created = await daemon.createConversation(project.path, mode, trimmed.slice(0, 60) || "Home");
+      if (created.ok && created.conversation_id) {
+        const sent = await daemon.appendMessage(created.conversation_id, "user", trimmed);
+        if (sent.ok) {
+          setGoal("");
+          setAttachments([]);
+          onOpenConversation(mode);
+        } else {
+          setSubmitError(sent.error || "Could not send message");
+        }
+      } else {
+        setSubmitError(created.error || "Could not start conversation");
+      }
     }
     setSubmitting(false);
   };
@@ -254,44 +312,94 @@ export function HomeView({
         )}
 
         {submitError && (
-  <div className="flex items-center gap-2 text-sm text-red-600 dark:text-red-400 font-medium px-2">
-    <Icon name="error" size={16} fill /> {submitError}
-  </div>
-)}
-<div
-          className="neo-raised rounded-[24px] p-2 flex flex-col relative cursor-text"
+          <div className="flex items-center gap-2 text-sm text-red-600 dark:text-red-400 font-medium px-2">
+            <Icon name="error" size={16} fill /> {submitError}
+          </div>
+        )}
+
+        {/* Mode selector — the user's work is routed to the chosen mode */}
+        <div className="flex flex-wrap items-center gap-1.5 justify-center">
+          {MODES.map((m) => (
+            <button
+              key={m.id}
+              onClick={() => setMode(m.id)}
+              title={m.hint}
+              aria-pressed={mode === m.id}
+              className={`flex items-center gap-1.5 px-3.5 py-1.5 rounded-full text-xs font-medium transition-all ${
+                mode === m.id
+                  ? `bg-primary/10 neo-pressed ${m.accent}`
+                  : "text-on-surface-variant hover:bg-surface-variant/40 dark:hover:bg-white/5"
+              }`}
+            >
+              <Icon name={m.icon} size={14} />
+              {m.label}
+            </button>
+          ))}
+        </div>
+        <p className="text-center text-[11px] text-on-surface-variant -mt-5">
+          {MODES.find((m) => m.id === mode)?.hint}
+        </p>
+
+        {/* Composer — the usable area IS the typing area */}
+        <div className="neo-raised rounded-2xl p-2 flex flex-col cursor-text"
           onClick={(e) => {
-            // Click anywhere in the intended input area focuses the editor.
-            // Don't steal focus from interactive children (buttons/links).
             if (!(e.target instanceof HTMLElement && e.target.closest("button, a, input, select"))) {
               composerRef.current?.focus();
             }
           }}
         >
-          <div className="neo-pressed rounded-[20px] p-6 min-h-[160px] flex flex-col">
-<textarea
-                ref={composerRef}
-                className="w-full bg-transparent border-none outline-none resize-none text-on-surface placeholder:text-on-surface-variant/50 text-lg flex-1 focus:ring-0 p-0 disabled:opacity-50"
-                placeholder={`e.g., Build a real-time dashboard in ${project.name} for monitoring satellite telemetry data...`}
-                value={goal}
-                disabled={submitting}
-                onChange={(e) => setGoal(e.target.value)}
-                onKeyDown={async (e) => {
-                  if (e.key === "Enter" && !e.shiftKey) {
-                    e.preventDefault();
-                    await send();
-                  }
-                }}
-              />
-            <div className="flex items-center mt-4 pt-4 border-t border-outline-variant/40 dark:border-white/5">
-              <button
-                onClick={() => send()}
-                disabled={submitting || !goal.trim()}
-                className="ml-auto w-12 h-12 rounded-full bg-surface shadow-neo-raised-primary flex items-center justify-center text-primary hover:text-primary-container transition-all duration-150 active:shadow-neo-pressed disabled:opacity-50"
-              >
-                <Icon name={submitting ? "autorenew" : "send"} size={24} fill className={submitting ? "animate-spin" : ""} />
-              </button>
+          <textarea
+            ref={composerRef}
+            className="w-full bg-transparent border-none outline-none resize-none text-on-surface placeholder:text-on-surface-variant/50 text-base leading-relaxed px-3 pt-2.5 focus:ring-0 p-0 disabled:opacity-50"
+            placeholder={
+              mode === "GOAL"
+                ? `e.g., Build a real-time dashboard in ${project?.name ?? "the project"}…`
+                : "Type your message…  (Enter to send, Shift+Enter for a new line)"
+            }
+            value={goal}
+            rows={Math.min(Math.max(goal.split("\n").length, 1) + Math.floor(goal.length / 90), 6)}
+            disabled={submitting}
+            onChange={(e) => setGoal(e.target.value)}
+            onKeyDown={async (e) => {
+              if (e.key === "Enter" && !e.shiftKey) {
+                e.preventDefault();
+                await send();
+              }
+            }}
+          />
+          {attachments.length > 0 && (
+            <div className="flex flex-wrap gap-1.5 px-3 pt-2">
+              {attachments.map((a) => (
+                <span key={a.id} className="flex items-center gap-1 text-[11px] px-2 py-1 rounded-full bg-primary/10 text-primary">
+                  <Icon name="attach_file" size={11} />
+                  {a.filename}
+                  <button onClick={() => setAttachments((p) => p.filter((x) => x.id !== a.id))} className="opacity-60 hover:opacity-100">
+                    <Icon name="close" size={11} />
+                  </button>
+                </span>
+              ))}
             </div>
+          )}
+          <div className="flex items-center gap-1 px-1.5 pb-1 pt-1.5">
+            <button
+              onClick={() => void attach()}
+              disabled={attachBusy || !project}
+              title="Attach files, photos, videos, zips…"
+              className="p-2 rounded-lg text-on-surface-variant hover:bg-surface-variant/40 dark:hover:bg-white/5 disabled:opacity-40"
+            >
+              <Icon name={attachBusy ? "autorenew" : "attach_file"} size={18} className={attachBusy ? "animate-spin" : ""} />
+            </button>
+            <span className="text-[10px] text-on-surface-variant hidden sm:block truncate">
+              {project?.name ?? ""}
+            </span>
+            <button
+              onClick={() => send()}
+              disabled={submitting || !goal.trim()}
+              className="ml-auto w-9 h-9 rounded-full bg-primary text-on-primary flex items-center justify-center hover:brightness-110 transition-all active:scale-95 disabled:opacity-40"
+              title="Send"
+            >
+              <Icon name={submitting ? "autorenew" : "send"} size={18} fill className={submitting ? "animate-spin" : ""} />
+            </button>
           </div>
         </div>
 

@@ -1,4 +1,4 @@
-import { useEffect, useState, useCallback, Component, type ReactNode } from "react";
+import { useRef, useEffect, useState, useCallback, Component, type ReactNode } from "react";
 import { ThemeProvider } from "./ThemeContext";
 import { ProjectProvider, useProject, type Project } from "./ProjectContext";
 import { Sidebar } from "./Sidebar";
@@ -81,6 +81,7 @@ function AppShell() {
   const [view, setView] = useState<View>("home");
   const [daemonStatus, setDaemonStatus] = useState<DaemonStatus | null>(null);
   const [missions, setMissions] = useState<MissionSummary[]>([]);
+  const missionStatesRef = useRef<Map<string, string>>(new Map());
   const [activeMission, setActiveMission] = useState<string | null>(null);
   // Watch-the-agent surfaces: inbuilt browser + terminal toggles live in
   // the sidebar rail (always reachable, like Codex).  The browser panel is
@@ -99,6 +100,9 @@ function AppShell() {
         setProjectAlert(true);
         return;
       }
+      // Leaving the browser view closes it — the sidebar rail icon must
+      // always reflect the real state.
+      if (target !== "browser") setBrowserOpen(false);
       setView(target);
     },
     [project]
@@ -122,6 +126,26 @@ function AppShell() {
       if (cancelled) return;
       setDaemonStatus(d);
       setMissions(m);
+      // Work-completion notifications: a mission that was running last
+      // tick and is now in a terminal state gets a toast.
+      const TERMINAL = ["completed", "failed", "cancelled", "succeeded"];
+      for (const mission of m) {
+        const before = missionStatesRef.current.get(mission.mission_id);
+        const now = mission.state;
+        if (
+          before && before !== now &&
+          TERMINAL.some((t) => now.toLowerCase().includes(t)) &&
+          !TERMINAL.some((t) => before.toLowerCase().includes(t))
+        ) {
+          const bad = now.toLowerCase().includes("fail") || now.toLowerCase().includes("cancel");
+          setNotice(
+            (bad ? "Mission ended: " : "Mission completed: ") +
+            (mission.goal ? mission.goal.slice(0, 70) : mission.mission_id)
+          );
+          setTimeout(() => setNotice(null), 5000);
+        }
+        missionStatesRef.current.set(mission.mission_id, now);
+      }
       // Select the first active mission only when nothing is selected yet.
       if (!activeRef.current && m.length > 0) setActiveMission(m[0].mission_id);
       // Intentionally DO NOT clear activeMission when it leaves the active
@@ -199,10 +223,16 @@ function AppShell() {
           onOpenProject={() => setProjectModal(project ? "open" : "choose")}
           browserOpen={browserOpen}
           onToggleBrowser={() => {
-            // The browser is its own full view (Codex-IDE-style tab), not a
-            // Design Studio sub-panel.
-            setBrowserOpen((open) => !open);
-            if (view !== "browser") setView("browser");
+            // The browser is its own full view (Codex-IDE-style tab).  The
+            // toggle always shows real state: on the browser view, tapping
+            // again LEAVES it (back to home); from anywhere else it opens.
+            if (view === "browser") {
+              setBrowserOpen(false);
+              setView("home");
+            } else {
+              setBrowserOpen(true);
+              setView("browser");
+            }
           }}
           terminalOpen={terminalOpen}
           onToggleTerminal={() => {
@@ -235,6 +265,14 @@ function AppShell() {
                 } else {
                   setView(target);
                 }
+              }}
+              onOpenConversation={(mode) => {
+                // The home composer started a conversation — land the user
+                // in the matching view where the conversation continues.
+                if (mode === "DISCUSS") setView("discuss");
+                else if (mode === "DESIGN") setView("design");
+                else if (mode === "SECURITY") setView("security");
+                else setView("chat");
               }}
             />
           )}

@@ -39,7 +39,10 @@ export function SettingsView() {
       ]);
       setSettings(s);
       setDaemonStatus(d);
-      setProviders(p);
+      // OmniRoute is the routing architecture (Docs 01-08): the Providers
+      // tab surfaces exactly the two supported providers — OmniRouter
+      // (managed, click-through to credentials) and Ollama (local).
+      setProviders(p.filter((x) => /omni/i.test(x.id) || x.id === "ollama"));
       setTools(t);
       setScanners(sc);
       setMemory(m);
@@ -419,9 +422,10 @@ export function SettingsView() {
                           href={p.credential_url}
                           target="_blank"
                           rel="noopener noreferrer"
-                          className="text-xs text-primary hover:underline self-center"
+                          className="text-xs px-2.5 py-2 rounded-lg neo-button text-primary font-medium hover:brightness-110"
+                          title={`Open ${p.name} credentials — add your key there, then add the account here`}
                         >
-                          Get API key →
+                          {/omni/i.test(p.id) ? "Open OmniRouter →" : "Get API key →"}
                         </a>
                       )}
                     </div>

@@ -75,6 +75,7 @@ export function DesignView({
 }) {
   void props.missionId;
   const [conversations, setConversations] = useState<Conversation[]>([]);
+  const [designListCollapsed, setDesignListCollapsed] = useState(false);
   const [activeConvId, setActiveConvId] = useState<string | null>(null);
   const [convDetail, setConvDetail] = useState<ConversationDetail | null>(null);
   const [input, setInput] = useState("");
@@ -791,7 +792,23 @@ export function DesignView({
   return (
     <main className="flex-1 flex overflow-hidden">
       {/* Conversation List */}
-      <aside className="w-60 shrink-0 flex flex-col border-r border-outline-variant/40 dark:border-white/5 bg-surface/50">
+      {designListCollapsed ? (
+        <button
+          onClick={() => setDesignListCollapsed(false)}
+          title="Show design chats"
+          className="shrink-0 w-8 border-r border-outline-variant/40 dark:border-white/5 bg-surface/50 flex items-center justify-center text-on-surface-variant hover:text-primary"
+        >
+          <Icon name="arrow_forward" size={16} />
+        </button>
+      ) : (
+        <aside className="w-60 shrink-0 flex flex-col border-r border-outline-variant/40 dark:border-white/5 bg-surface/50 relative">
+          <button
+            onClick={() => setDesignListCollapsed(true)}
+            title="Collapse design chats"
+            className="absolute top-2 right-2 z-10 p-1 rounded-lg text-on-surface-variant hover:bg-surface-variant/40 dark:hover:bg-white/5"
+          >
+            <Icon name="arrow_back" size={14} className="rotate-180" />
+          </button>
         <div className="p-3 border-b border-outline-variant/40 dark:border-white/5">
           <button
             onClick={handleNewChat}
@@ -868,6 +885,7 @@ export function DesignView({
           )}
         </div>
       </aside>
+      )}
 
       {/* Chat Area */}
       <div className="flex-1 flex flex-col overflow-hidden min-w-0">

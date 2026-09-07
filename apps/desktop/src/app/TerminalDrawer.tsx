@@ -1,12 +1,27 @@
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { daemon } from "./daemon";
 import { Icon } from "./Icon";
 
-// Global terminal drawer — Codex bottom-pane parity.  Available from ANY
-// view (Codex's /shell + unified exec footer): runs commands through the
-// user's login shell in the OPEN PROJECT's cwd (no mission required — the
-// exact fix for "Mission has no workspace root"), streams live output, and
-// lists every session including agent-mirrored ones (watch-the-agent).
+// Global terminal drawer — Codex bottom-pane parity with a REAL terminal
+// feel: a full-bleed dark output surface, the prompt at the bottom like a
+// shell, one slim chrome row (cwd + session tabs + live indicator), and a
+// drag-to-resize handle on the top edge.  Commands run through the user's
+// login shell in the open project's cwd (Codex /shell) — no mission needed.
+const MIN_H = 200;
+const MAX_H = 780;
+const DEFAULT_H = 340;
+
+interface TerminalSession {
+  session_id: string;
+  argv: string[];
+  cwd: string;
+  source?: string;
+  alive: boolean;
+  exit_code: number | null;
+  captured_lines: number;
+  mission_id: string | null;
+}
+
 export function TerminalDrawer({
   open,
   onOpenChange,
@@ -16,18 +31,19 @@ export function TerminalDrawer({
   onOpenChange(open: boolean): void;
   projectPath: string | null;
 }) {
+  const [height, setHeight] = useState(DEFAULT_H);
   const [cmd, setCmd] = useState("");
-  const [sessions, setSessions] = useState<
-    { session_id: string; argv: string[]; cwd: string; source?: string; alive: boolean; exit_code: number | null; captured_lines: number; mission_id: string | null }[]
-  >([]);
+  const [sessions, setSessions] = useState<TerminalSession[]>([]);
   const [activeSession, setActiveSession] = useState<string | null>(null);
   const [lines, setLines] = useState<string[]>([]);
   const [cursor, setCursor] = useState(0);
   const [error, setError] = useState<string | null>(null);
-  const [evidenceId, setEvidenceId] = useState<string | null>(null);
   const [history, setHistory] = useState<string[]>([]);
   const [historyIdx, setHistoryIdx] = useState(-1);
   const pollRef = useRef<number | null>(null);
+  const outputRef = useRef<HTMLDivElement | null>(null);
+  const inputRef = useRef<HTMLInputElement | null>(null);
+  const resizeState = useRef<{ startY: number; startH: number } | null>(null);
 
   // Poll sessions + active tail while the drawer is open.
   useEffect(() => {
@@ -41,129 +57,113 @@ export function TerminalDrawer({
       stop();
       return;
     }
-    pollRef.current = window.setInterval(() => void (async () => {
-      const list = await daemon.terminalList();
-      if (list.ok && list.list) setSessions(list.list.sessions);
-      if (activeSession) {
-        const tail = await daemon.terminalTail(activeSession, cursor);
-        if (tail.ok && tail.tail) {
-          if (tail.tail.lines.length > 0) setLines((prev) => [...prev, ...tail.tail!.lines]);
-          setCursor(tail.tail.cursor);
-          if (tail.tail.evidence_id) setEvidenceId(tail.tail.evidence_id);
-        }
-      }
-    })(), 1000);
+    pollRef.current = window.setInterval(
+      () =>
+        void (async () => {
+          const list = await daemon.terminalList();
+          if (list.ok && list.list) setSessions(list.list.sessions);
+          if (activeSession) {
+            const tail = await daemon.terminalTail(activeSession, cursor);
+            if (tail.ok && tail.tail) {
+              if (tail.tail.lines.length > 0)
+                setLines((prev) => [...prev, ...tail.tail!.lines]);
+              setCursor(tail.tail.cursor);
+            }
+          }
+        })(),
+      700
+    );
     return stop;
   }, [open, activeSession, cursor]);
 
-  const run = () => void (async () => {
-    setError(null);
-    const command = cmd.trim();
-    if (!command) return;
-    // Codex /shell parity: cwd = the OPEN PROJECT (fall back to mission-less
-    // home dir), so the terminal works with no mission selected.
-    const cwd = projectPath ?? (await daemon.homeDir()) ?? "/";
-    const res = await daemon.terminalStart(null, [command], cwd, "shell");
-    if (!res.ok || !res.session) {
-      setError(res.error ?? "failed to start");
-      return;
-    }
-    setHistory((prev) => [command, ...prev].slice(0, 50));
-    setHistoryIdx(-1);
-    setActiveSession(res.session.session_id);
-    setLines([]);
-    setCursor(0);
-    setEvidenceId(null);
-    setCmd("");
-    const list = await daemon.terminalList();
-    if (list.ok && list.list) setSessions(list.list.sessions);
-  })();
+  // Auto-scroll to the newest line like a real terminal.
+  useEffect(() => {
+    const el = outputRef.current;
+    if (el) el.scrollTop = el.scrollHeight;
+  }, [lines]);
 
-  const cancel = () => void (async () => {
-    if (!activeSession) return;
-    const res = await daemon.terminalCancel(activeSession);
-    if (!res.ok) {
-      setError(res.error ?? "cancel failed");
-      return;
-    }
-    if (res.result?.evidence_id) setEvidenceId(res.result.evidence_id);
-  })();
+  const run = useCallback(() => {
+    void (async () => {
+      setError(null);
+      const command = cmd.trim();
+      if (!command) return;
+      const cwd = projectPath ?? (await daemon.homeDir()) ?? "/";
+      const res = await daemon.terminalStart(null, [command], cwd, "shell");
+      if (!res.ok || !res.session) {
+        setError(res.error ?? "failed to start");
+        return;
+      }
+      setHistory((prev) => [command, ...prev].slice(0, 50));
+      setHistoryIdx(-1);
+      setActiveSession(res.session.session_id);
+      setLines([`$ ${command}`]);
+      setCursor(0);
+      setCmd("");
+      const list = await daemon.terminalList();
+      if (list.ok && list.list) setSessions(list.list.sessions);
+    })();
+  }, [cmd, projectPath]);
 
-  if (!open) return null;
+  const cancel = () =>
+    void (async () => {
+      if (!activeSession) return;
+      const res = await daemon.terminalCancel(activeSession);
+      if (!res.ok) setError(res.error ?? "cancel failed");
+    })();
+
+  // ── Drag-to-resize (top edge handle) ─────────────────────────────
+  useEffect(() => {
+    const onMove = (e: MouseEvent) => {
+      const st = resizeState.current;
+      if (!st) return;
+      const next = Math.min(MAX_H, Math.max(MIN_H, st.startH + (st.startY - e.clientY)));
+      setHeight(next);
+    };
+    const onUp = () => {
+      resizeState.current = null;
+      document.body.style.cursor = "";
+      document.body.style.userSelect = "";
+    };
+    window.addEventListener("mousemove", onMove);
+    window.addEventListener("mouseup", onUp);
+    return () => {
+      window.removeEventListener("mousemove", onMove);
+      window.removeEventListener("mouseup", onUp);
+    };
+  }, []);
+
+  const startResize = (e: React.MouseEvent) => {
+    resizeState.current = { startY: e.clientY, startH: height };
+    document.body.style.cursor = "row-resize";
+    document.body.style.userSelect = "none";
+  };
+
+  // Focus the prompt when the drawer opens.
+  useEffect(() => {
+    if (open) inputRef.current?.focus();
+  }, [open]);
+
+  const active = activeSession ? sessions.find((s) => s.session_id === activeSession) : undefined;
 
   return (
-    <div className="shrink-0 h-72 border-t border-outline-variant/40 dark:border-white/5 bg-surface-container-lowest flex flex-col">
-      {/* Drawer header */}
-      <div className="shrink-0 flex items-center gap-2 px-4 py-2">
-        <Icon name="terminal" size={16} className="text-primary" />
-        <span className="text-sm font-semibold text-on-surface">Terminal</span>
-        <span className="text-[10px] font-mono text-on-surface-variant truncate max-w-[30%]">
-          {projectPath ?? "~/ (no project)"}
+    <div
+      className="shrink-0 flex flex-col border-t border-white/10 bg-[#0c0f14] text-[#d6e2f0] font-mono text-[13px]"
+      style={{ height }}
+    >
+      {/* Drag handle */}
+      <div
+        onMouseDown={startResize}
+        className="shrink-0 h-1.5 cursor-row-resize hover:bg-primary/60 transition-colors"
+        title="Drag to resize"
+      />
+
+      {/* Slim chrome row: cwd · session tabs · live · close */}
+      <div className="shrink-0 flex items-center gap-2 px-3 h-9 bg-[#11151c] border-b border-white/5">
+        <Icon name="terminal" size={13} className="text-primary shrink-0" />
+        <span className="text-[11px] text-white/50 truncate max-w-[26%]" title={projectPath ?? "home"}>
+          {projectPath ? projectPath.split("/").slice(-2).join("/") : "~"}
         </span>
-        {sessions.some((s) => s.alive) && (
-          <span className="w-2 h-2 rounded-full bg-emerald-500 animate-pulse" title="live process" />
-        )}
-        <button
-          onClick={() => onOpenChange(false)}
-          className="ml-auto p-1.5 rounded-lg text-on-surface-variant hover:bg-surface-variant/40 dark:hover:bg-white/5"
-          title="Hide terminal"
-        >
-          <Icon name="close" size={16} />
-        </button>
-      </div>
-
-      {/* Command input */}
-      <div className="shrink-0 flex gap-2 px-4 pb-2">
-        <div className="flex-1 flex items-center gap-2 neo-pressed rounded-xl px-3 py-2">
-          <span className="text-primary font-mono text-sm shrink-0">$</span>
-          <input
-            value={cmd}
-            onChange={(e) => setCmd(e.target.value)}
-            onKeyDown={(e) => {
-              if (e.key === "Enter") run();
-              if (e.key === "ArrowUp" && history.length > 0) {
-                e.preventDefault();
-                const next = Math.min(historyIdx + 1, history.length - 1);
-                setHistoryIdx(next);
-                setCmd(history[next]);
-              }
-              if (e.key === "ArrowDown") {
-                e.preventDefault();
-                const next = historyIdx - 1;
-                setHistoryIdx(next);
-                setCmd(next >= 0 ? history[next] : "");
-              }
-            }}
-            placeholder="any shell command — e.g. ls -la | head, npm test && npm run build"
-            className="flex-1 bg-transparent text-sm text-on-surface font-mono outline-none placeholder:text-on-surface-variant/50"
-            spellCheck={false}
-          />
-        </div>
-        <button
-          onClick={run}
-          className="neo-button px-4 py-2 rounded-xl text-sm font-medium text-primary flex items-center gap-1.5"
-        >
-          <Icon name="play_arrow" size={16} /> Run
-        </button>
-        {activeSession && sessions.find((s) => s.session_id === activeSession)?.alive && (
-          <button
-            onClick={cancel}
-            className="neo-button px-3 py-2 rounded-xl text-xs font-medium text-red-600 dark:text-red-400 flex items-center gap-1.5"
-          >
-            <Icon name="stop_circle" size={14} /> Cancel
-          </button>
-        )}
-      </div>
-
-      {error && (
-        <p className="shrink-0 px-4 pb-1 text-xs text-red-600 dark:text-red-400 flex items-center gap-1.5">
-          <Icon name="error" size={13} fill /> {error}
-        </p>
-      )}
-
-      {/* Session chips */}
-      {sessions.length > 0 && (
-        <div className="shrink-0 flex flex-wrap gap-1.5 px-4 pb-2 overflow-x-auto">
+        <div className="flex-1 flex items-center gap-1 overflow-x-auto no-scrollbar">
           {sessions.map((s) => (
             <button
               key={s.session_id}
@@ -171,48 +171,111 @@ export function TerminalDrawer({
                 setActiveSession(s.session_id);
                 setLines([]);
                 setCursor(0);
-                setEvidenceId(null);
               }}
-              className={`text-[11px] px-2.5 py-1 rounded-full font-mono flex items-center gap-1.5 ${
+              className={`shrink-0 text-[11px] px-2 py-0.5 rounded-md flex items-center gap-1 ${
                 activeSession === s.session_id
-                  ? "bg-primary/10 text-primary font-semibold"
-                  : "neo-pressed text-on-surface-variant"
+                  ? "bg-primary/25 text-white"
+                  : "text-white/40 hover:text-white/80 hover:bg-white/5"
               }`}
               title={s.argv.join(" ")}
             >
-              {s.source === "agent" ? (
-                <Icon name="smart_toy" size={11} className="text-primary" />
-              ) : (
-                <span className={`w-1.5 h-1.5 rounded-full ${s.alive ? "bg-emerald-500" : "bg-outline"}`} />
-              )}
-              {s.argv.filter(Boolean).slice(-1)[0]?.slice(0, 36) || s.session_id}
-              {s.mission_id && <span className="text-[9px] opacity-60">mission</span>}
+              {s.source === "agent" && <Icon name="smart_toy" size={10} className="text-primary" />}
+              {s.alive && <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse shrink-0" />}
+              {(s.argv.filter(Boolean).slice(-1)[0] ?? s.session_id).slice(0, 28)}
             </button>
           ))}
         </div>
-      )}
+        {active?.exit_code != null && (
+          <span
+            className={`text-[10px] px-1.5 py-0.5 rounded ${
+              active.exit_code === 0 ? "bg-emerald-500/15 text-emerald-400" : "bg-red-500/15 text-red-400"
+            }`}
+          >
+            exit {active.exit_code}
+          </span>
+        )}
+        <button
+          onClick={() => onOpenChange(false)}
+          className="p-1 rounded text-white/40 hover:text-white hover:bg-white/10"
+          title="Hide terminal"
+        >
+          <Icon name="close" size={14} />
+        </button>
+      </div>
 
-      {/* Output */}
-      <div className="flex-1 overflow-y-auto px-4 pb-3">
-        <div className="neo-pressed rounded-xl p-3 h-full font-mono text-xs leading-relaxed text-on-surface overflow-y-auto whitespace-pre-wrap break-all">
-          {activeSession ? (
-            lines.length === 0 ? (
-              <p className="text-on-surface-variant italic">waiting for output…</p>
-            ) : (
-              lines.map((l, i) => <div key={i}>{l}</div>)
-            )
+      {/* Full-bleed output */}
+      <div
+        ref={outputRef}
+        className="flex-1 overflow-y-auto px-3 py-2 leading-[1.45] whitespace-pre-wrap break-all selection:bg-primary/40"
+      >
+        {activeSession ? (
+          lines.length === 0 ? (
+            <p className="text-white/30 italic">waiting for output…</p>
           ) : (
-            <p className="text-on-surface-variant italic">
-              Run a command — output streams here live. Agent commands appear as tagged chips.
-            </p>
-          )}
-        </div>
-        {evidenceId && (
-          <p className="mt-1.5 text-[10px] text-on-surface-variant flex items-center gap-1.5">
-            <Icon name="verified_user" size={12} className="text-emerald-600" />
-            Captured output persisted as evidence
+            lines.map((l, i) => (
+              <div key={i} className={l.startsWith("$ ") ? "text-primary/90" : ""}>
+                {l}
+              </div>
+            ))
+          )
+        ) : (
+          <p className="text-white/30 italic">
+            Type a command below — anything your shell can run. Agent commands appear as tabs.
           </p>
         )}
+      </div>
+
+      {/* Error line */}
+      {error && (
+        <p className="shrink-0 px-3 pb-1 text-[11px] text-red-400 flex items-center gap-1.5">
+          <Icon name="error" size={12} fill /> {error}
+        </p>
+      )}
+
+      {/* Prompt at the bottom — like a real shell */}
+      <div className="shrink-0 flex items-center gap-2 px-3 h-10 bg-[#11151c] border-t border-white/5">
+        <span className="text-emerald-400 shrink-0">$</span>
+        <input
+          ref={inputRef}
+          value={cmd}
+          onChange={(e) => setCmd(e.target.value)}
+          onKeyDown={(e) => {
+            if (e.key === "Enter") run();
+            if (e.key === "ArrowUp" && history.length > 0) {
+              e.preventDefault();
+              const next = Math.min(historyIdx + 1, history.length - 1);
+              setHistoryIdx(next);
+              setCmd(history[next]);
+            }
+            if (e.key === "ArrowDown") {
+              e.preventDefault();
+              const next = historyIdx - 1;
+              setHistoryIdx(next);
+              setCmd(next >= 0 ? history[next] : "");
+            }
+          }}
+          placeholder="type any command — pipes, &&, env vars all work…"
+          className="flex-1 bg-transparent text-[13px] text-[#d6e2f0] outline-none placeholder:text-white/25"
+          spellCheck={false}
+        />
+        <div className="flex items-center gap-1 shrink-0">
+          {active?.alive && (
+            <button
+              onClick={cancel}
+              className="text-[11px] px-2 py-1 rounded bg-red-500/15 text-red-400 hover:bg-red-500/25"
+              title="Stop the running process"
+            >
+              stop
+            </button>
+          )}
+          <button
+            onClick={run}
+            className="text-[11px] px-2 py-1 rounded bg-primary/20 text-primary hover:bg-primary/30"
+            title="Run (Enter)"
+          >
+            run
+          </button>
+        </div>
       </div>
     </div>
   );

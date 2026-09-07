@@ -2247,6 +2247,21 @@ fn lock_pid(metadata: &str) -> Option<u32> {
 fn seed_provider_catalog(db: &ControlPlaneDb) -> AcResult<()> {
     let now = TimestampMillis::now().as_millis() as i64;
     let canonical: Vec<ProviderCatalogRow> = vec![
+        // OmniRouter — THE managed router (OmniRoute architecture): one
+        // account routes to every supported model.  First in the catalog so
+        // the Providers tab leads with it.
+        ProviderCatalogRow {
+            id: "omnirouter".to_string(),
+            display_name: "OmniRouter".to_string(),
+            description: "One account, every model — managed routing (OmniRoute).".to_string(),
+            website_url: "https://omnirouter.app".to_string(),
+            logo_url: String::new(),
+            credential_url: "https://omnirouter.app/settings/keys".to_string(),
+            pricing_classification: "free-tier".to_string(),
+            capabilities: serde_json::to_string(&vec!["chat", "tools", "vision"]).unwrap(),
+            created_at_ms: now,
+            updated_at_ms: now,
+        },
         ProviderCatalogRow {
             id: "openai".to_string(),
             display_name: "OpenAI".to_string(),
@@ -2691,7 +2706,7 @@ mod tests {
             .iter()
             .map(|entry| entry.id.to_string())
             .collect::<Vec<_>>();
-        for expected in ["openai", "anthropic", "gemini", "ollama", "lm-studio"] {
+        for expected in ["omnirouter", "openai", "anthropic", "gemini", "ollama", "lm-studio"] {
             assert!(
                 ids.contains(&expected.to_string()),
                 "catalog must contain {expected}, got {ids:?}"
@@ -2700,7 +2715,7 @@ mod tests {
         // Seeding is idempotent: reopening does not duplicate.
         drop(daemon);
         let daemon = DaemonService::open(&db, &lock).unwrap();
-        assert_eq!(daemon.provider_catalog().unwrap().len(), 5);
+        assert_eq!(daemon.provider_catalog().unwrap().len(), 6);
         let _ = fs::remove_dir_all(dir);
     }
 
