@@ -39,4 +39,4 @@ clean:
 # .app bundle (daemon sidecar inside) + DMG (hdiutil, no create-dmg) +
 # install to /Applications.
 app:
-	./scripts/bundle-mac.sh
+	bash ./scripts/bundle-mac.sh

@@ -8,7 +8,9 @@
     "build": "tsc -b && vite build",
     "typecheck": "tsc -b",
     "lint": "eslint src --max-warnings=0",
-    "tauri": "tauri"
+    "tauri": "tauri",
+    "bundle:mac": "bash ../../scripts/bundle-mac.sh",
+    "bundle:mac:no-install": "bash ../../scripts/bundle-mac.sh --no-install"
   },
   "dependencies": {
     "@tauri-apps/api": "^2.0.0",

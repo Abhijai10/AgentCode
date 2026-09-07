@@ -646,12 +646,17 @@ export const daemon = {
 
   async projectMemoryGet(projectPath: string): Promise<ProjectMemory | null> {
     try {
-      const res = await invoke<ProjectMemory & { ok: boolean }>(
-        "daemon_project_memory_get",
-        { projectPath }
-      );
+      const res = await invoke<
+        (ProjectMemory & { ok: boolean }) | { ok: boolean; memory?: ProjectMemory }
+      >("daemon_project_memory_get", { projectPath });
       if (res?.ok === false) return null;
-      return res;
+      // The daemon wraps the memory payload as { ok, memory: {...} } —
+      // unwrap it.  Older daemons returned it inline; both are accepted.
+      const memory: ProjectMemory | null =
+        "memory" in res && res.memory ? res.memory : ("counts" in res ? res : null);
+      // Defensive shape check: the HomeView panel dereferences counts.facts.
+      if (!memory || typeof memory !== "object" || !memory.counts) return null;
+      return memory;
     } catch {
       return null;
     }

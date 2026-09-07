@@ -2198,17 +2198,29 @@ port: port.map(|p| p as i64),
         // 1. Model fills a constrained spec.  The schema is tiny and every
         //    field is optional-with-default so a weak model still yields a
         //    usable spec; the DAEMON owns all rendering decisions.
+        // Premium generation (Stitch-level intent): the model proposes a
+        // genuine DESIGN DIRECTION — personality, audience voice, motifs,
+        // typographic feel and section structure — not just landing copy.
+        // The daemon still owns every rendering decision (deterministic,
+        // evidence-scored); the model supplies taste and content.
         let spec_prompt = format!(
-            "You are filling a JSON spec for a UI mockup generator.\n\
+            "You are the creative director filling a JSON spec for a premium UI mockup generator.\n\
              Request: {}\n\
+             Project context (real files): {}\n\
              Reply with ONLY a JSON object with these optional fields:\n\
              {{\"headline\": string (max 60 chars), \"subheadline\": string (max 120 chars),\n\
              \"primary_cta\": string (max 24 chars), \"secondary_cta\": string (max 24 chars),\n\
              \"hero_image_idea\": string (max 60 chars), \"section_ideas\": array of 1-3 strings (max 40 chars each),\n\
              \"palette_intent\": \"light\"|\"dark\"|\"warm\"|\"cool\"|\"high_contrast\",\n\
-             \"layout\": \"hero_left\"|\"hero_center\"|\"hero_split\"}}\n\
-             Keep copy concrete and product-specific to this project: {}\n\
-             Output JSON only, no prose.",
+             \"layout\": \"hero_left\"|\"hero_center\"|\"hero_split\",\n\
+             \"audience\": string (max 40 chars, who this is for),\n\
+             \"voice\": string (max 40 chars, one-line brand voice, e.g. 'confident, technical, zero fluff'),\n\
+             \"personality\": one of \"minimal\"|\"editorial\"|\"bold\"|\"playful\"|\"technical\",\n\
+             \"stats\": array of 1-3 {{\"value\": string (max 8 chars), \"label\": string (max 30 chars)}},\n\
+             \"feature_details\": array of 1-3 {{\"title\": string (max 24 chars), \"body\": string (max 70 chars)}},\n\
+             \"testimonial\": {{\"quote\": string (max 110 chars), \"author\": string (max 40 chars)}}}}\n\
+             Rules: copy must be concrete and product-specific (no 'Lorem', no generic marketing filler);\n\
+             stats and features must reflect what the project actually is. Output JSON only, no prose.",
             bounded_ui_summary(prompt, 512),
             bounded_project_listing(&conv.project_path, 20),
         );
@@ -2253,6 +2265,12 @@ port: port.map(|p| p as i64),
                 "section_ideas": [],
                 "palette_intent": "light",
                 "layout": "hero_center",
+                "personality": "minimal",
+                "audience": "",
+                "voice": "",
+                "stats": [],
+                "feature_details": [],
+                "testimonial": json!({}),
                 "_model_spec_parse_failed": true,
             })
         });
@@ -2267,6 +2285,10 @@ port: port.map(|p| p as i64),
             ("warm", "#fffaf5", "#292018", "#ea580c"),
             ("high_contrast", "#ffffff", "#000000", "#0047ab"),
         ];
+        // Personality is an independent design axis: it selects a distinct
+        // typographic + compositional treatment inside the renderer so two
+        // variants differ in DESIGN, not just hue.
+        let personalities = ["minimal", "editorial", "bold", "technical", "playful"];
         let spec_layout = spec
             .get("layout")
             .and_then(Value::as_str)
@@ -2301,11 +2323,23 @@ port: port.map(|p| p as i64),
                 } else {
                     layouts[idx]
                 };
+                // Variant 0 honors the model's chosen personality; later
+                // variants rotate it so the user compares true design
+                // alternatives (not the same template in another color).
+                let personality = if i == 0 {
+                    spec.get("personality")
+                        .and_then(Value::as_str)
+                        .and_then(|p| personalities.iter().find(|c| *c == &p).copied())
+                        .unwrap_or("minimal")
+                } else {
+                    personalities[(i + 1) % personalities.len()]
+                };
                 json!({
                     "variant": i,
                     "layout": layout,
                     "palette_intent": palette_name,
-                    "html": render_mockup_html(&spec, layout, bg, fg, accent),
+                    "personality": personality,
+                    "html": render_mockup_html(&spec, layout, bg, fg, accent, personality),
                 })
             })
             .collect();
@@ -2362,10 +2396,23 @@ port: port.map(|p| p as i64),
                         match rendered {
                             Ok(snapshot) => {
                                 let visible = snapshot.visible_text.trim();
+                                // Aesthetic depth signals (honest, DOM-derived):
+                                // section variety, stat density, typographic
+                                // scale, motif presence.  These reward real
+                                // compositional structure, not just text.
+                                let sections = html.matches("<section").count();
+                                let has_stats = html.contains("font-size:") && html.matches("border-top:1px solid").count() >= 1;
+                                let has_testimonial = html.contains("<blockquote");
+                                let type_tokens = html.matches("font-size:").count();
                                 json!({
                                     "source": "real-browser",
                                     "text_present": visible.len() > 10,
                                     "visible_chars": visible.len(),
+                                    "sections": sections,
+                                    "structure_richness": sections + type_tokens / 4
+                                        + usize::from(has_stats) + usize::from(has_testimonial),
+                                    "has_stats_band": has_stats,
+                                    "has_testimonial": has_testimonial,
                                 })
                             }
                             Err(_) => {
@@ -2405,7 +2452,10 @@ port: port.map(|p| p as i64),
         let rank = |v: &Value| -> i32 {
             match v["score"]["source"].as_str().unwrap_or("") {
                 "real-browser" => {
+                    // A rendered variant that is text-present AND
+                    // structurally rich outranks plain text-only renders.
                     2 + i32::from(v["score"]["text_present"].as_bool().unwrap_or(false))
+                        + v["score"]["structure_richness"].as_i64().unwrap_or(0).min(6) as i32
                 }
                 "structural" => 1,
                 _ => 0,
@@ -3119,12 +3169,26 @@ fn mockup_escape(text: &str) -> String {
 /// Deterministically render a self-contained mockup page from the model
 /// spec.  Pure function of (spec, layout, palette) — no model HTML ever
 /// runs; the daemon owns every tag it emits.
+/// Visual-check shim (used by the design_visual example for manual
+/// browser inspection of the design-system renderer).
+pub fn render_mockup_html_for_visual_check(
+    spec: &Value,
+    layout: &str,
+    bg: &str,
+    fg: &str,
+    accent: &str,
+    personality: &str,
+) -> String {
+    render_mockup_html(spec, layout, bg, fg, accent, personality)
+}
+
 fn render_mockup_html(
     spec: &Value,
     layout: &str,
     bg: &str,
     fg: &str,
     accent: &str,
+    personality: &str,
 ) -> String {
     let str_field = |name: &str, fallback: &str| -> String {
         let value = spec
@@ -3132,7 +3196,10 @@ fn render_mockup_html(
             .and_then(Value::as_str)
             .map(|s| s.trim())
             .unwrap_or("");
-        let bounded: String = value.chars().take(if name == "subheadline" { 140 } else { 70 }).collect();
+        let bounded: String = value
+            .chars()
+            .take(if name == "subheadline" { 140 } else { 70 })
+            .collect();
         if bounded.is_empty() {
             fallback.to_string()
         } else {
@@ -3147,6 +3214,10 @@ fn render_mockup_html(
     let primary_cta = str_field("primary_cta", "Get started");
     let secondary_cta = str_field("secondary_cta", "Learn more");
     let hero_image = str_field("hero_image_idea", "");
+    let audience = str_field("audience", "");
+    let voice = str_field("voice", "");
+    let project_name = str_field("project_name", "AgentCode");
+
     let sections: Vec<String> = spec
         .get("section_ideas")
         .and_then(Value::as_array)
@@ -3159,88 +3230,440 @@ fn render_mockup_html(
         })
         .unwrap_or_default();
 
-    let section_cards = sections
-        .iter()
-        .map(|s| {
-            format!(
-                "<div style=\"min-width:220px;flex:1;padding:20px;border:1px solid {fg}22;\
-                 border-radius:12px;background:{bg}\"><p style=\"margin:0;font-size:14px;\
-                 color:{fg};opacity:0.85\">{s}</p></div>"
-            )
-        })
-        .collect::<Vec<_>>()
-        .join("\n      ");
-    let sections_block = if section_cards.is_empty() {
+    // ── Design tokens: one personality = one coherent token set ──────
+    // Type feel, radius, spacing rhythm, elevation and motif all shift
+    // together, so each variant reads as a DIFFERENT design language.
+    let tokens = personality_tokens(personality);
+    let muted = |opacity: &str| format!("{fg}{opacity}");
+
+    // ── Motif: the personality's signature background treatment ──────
+    let motif = match personality {
+        "editorial" => format!(
+            "background:{bg};background-image:radial-gradient(1200px 400px at 20% -10%, {accent}14, transparent)"
+        ),
+        "bold" => format!(
+            "background:{bg};background-image:linear-gradient(120deg, {accent}0f 0%, transparent 40%)"
+        ),
+        "technical" => format!(
+            "background:{bg};background-image:linear-gradient({fg}08 1px, transparent 1px),linear-gradient(90deg, {fg}08 1px, transparent 1px);background-size:44px 44px"
+        ),
+        "playful" => format!(
+            "background:{bg};background-image:radial-gradient(600px 300px at 85% 0%, {accent}1f, transparent),radial-gradient(500px 260px at 0% 100%, {accent}14, transparent)"
+        ),
+        _ => format!("background:{bg}"),
+    };
+
+    // ── Nav ───────────────────────────────────────────────────────────
+    let nav = format!(
+        "<header style=\"display:flex;align-items:center;justify-content:space-between;         padding:{nav_pad}px 32px;border-bottom:1px solid {fgline}\">\n\
+           <div style=\"display:flex;align-items:center;gap:10px\">\n\
+             <span style=\"width:26px;height:26px;border-radius:{logo_r}px;background:{accent};\
+             display:inline-block\"></span>\n\
+             <span style=\"font-size:15px;font-weight:{logo_w};color:{fg};letter-spacing:{logo_ls}px\">{brand}</span>\n\
+           </div>\n\
+           <div style=\"display:flex;gap:20px;align-items:center\">\n\
+             <span style=\"font-size:13px;color:{muted8}\">{nav_link}</span>\n\
+             <span style=\"display:inline-block;padding:8px 16px;border-radius:{cta_r}px;background:{accent};\
+             color:{on_accent};font-size:13px;font-weight:600\">{primary_cta}</span>\n\
+           </div>\n\
+         </header>",
+        nav_pad = tokens.nav_pad,
+        fgline = muted("1f"),
+        logo_r = tokens.logo_radius,
+        logo_w = tokens.logo_weight,
+        logo_ls = tokens.logo_tracking,
+        brand = mockup_escape(&project_name),
+        muted8 = muted("cc"),
+        nav_link = if audience.is_empty() { "Overview".to_string() } else { mockup_escape(&audience) },
+        cta_r = tokens.cta_radius,
+        on_accent = on_accent_for(bg, accent),
+    );
+
+    // ── Hero ──────────────────────────────────────────────────────────
+    let hero_visual = if hero_image.is_empty() {
+        format!(
+            "<div style=\"width:300px;height:200px;border-radius:{card_r}px;             background:linear-gradient(135deg,{accent},{fg});opacity:0.92;             box-shadow:{elev}\" aria-hidden=\"true\"></div>",
+            card_r = tokens.card_radius,
+            elev = tokens.elevation,
+        )
+    } else {
+        format!(
+            "<div style=\"width:300px;height:200px;border-radius:{card_r}px;background:{accent}14;             border:1px solid {accent}66;display:flex;align-items:center;justify-content:center;             padding:16px;box-shadow:{elev}\"><span style=\"font-size:13px;color:{muted99};\
+             text-align:center\">{hero_image}</span></div>",
+            card_r = tokens.card_radius,
+            elev = tokens.elevation,
+            muted99 = muted("99"),
+        )
+    };
+    let eyebrow = if voice.is_empty() {
         String::new()
     } else {
         format!(
-            "<div style=\"display:flex;gap:16px;flex-wrap:wrap;max-width:960px;\
-             margin:48px auto;padding:0 24px\">{}</div>",
-            section_cards
+            "<p style=\"margin:0 0 14px;font-size:12px;letter-spacing:2px;text-transform:uppercase;             color:{accent};font-weight:600\">{}</p>",
+            mockup_escape(&voice)
         )
     };
-    let hero_visual = if hero_image.is_empty() {
-        format!(
-            "<div style=\"width:280px;height:180px;border-radius:12px;\
-             background:linear-gradient(135deg,{accent},{fg});opacity:0.9\" aria-hidden=\"true\"></div>"
-        )
-    } else {
-        format!(
-            "<div style=\"width:280px;height:180px;border-radius:12px;background:{accent}1a;\
-             border:1px dashed {accent};display:flex;align-items:center;justify-content:center;\
-             padding:12px\"><span style=\"font-size:12px;color:{fg};opacity:0.7\">{}</span></div>",
-            hero_image
-        )
-    };
-
     let hero_inner = format!(
-        "<h1 style=\"margin:0 0 16px;font-size:44px;line-height:1.15;color:{fg}\">{}</h1>\n\
-         <p style=\"margin:0 0 28px;font-size:18px;line-height:1.6;color:{fg};opacity:0.75;\
-         max-width:34rem\">{}</p>\n\
+        "{eyebrow}\n\
+         <h1 style=\"margin:0 0 18px;font-size:{h1}px;line-height:{h1_lh};color:{fg};\
+         font-weight:{h1_w};letter-spacing:{h1_ls}px;max-width:{h1_max}rem\">{headline}</h1>\n\
+         <p style=\"margin:0 0 30px;font-size:17px;line-height:1.65;color:{muted_cc};\
+         max-width:34rem\">{subheadline}</p>\n\
          <div style=\"display:flex;gap:12px;flex-wrap:wrap\">\n\
-           <span style=\"display:inline-block;padding:12px 24px;border-radius:10px;\
-           background:{accent};color:{bg};font-weight:600;font-size:15px\">{}</span>\n\
-           <span style=\"display:inline-block;padding:12px 24px;border-radius:10px;\
-           border:1px solid {fg}55;color:{fg};font-size:15px\">{}</span>\n\
-         </div>\n\
-         {}",
-        mockup_escape(&headline),
-        mockup_escape(&subheadline),
-        mockup_escape(&primary_cta),
-        mockup_escape(&secondary_cta),
-        hero_visual,
+           <span style=\"display:inline-block;padding:13px 26px;border-radius:{cta_r}px;           background:{accent};color:{on_accent};font-weight:600;font-size:15px\">{primary_cta}</span>\n\
+           <span style=\"display:inline-block;padding:13px 26px;border-radius:{cta_r}px;           border:1px solid {fg}55;color:{fg};font-size:15px\">{secondary_cta}</span>\n\
+         </div>",
+        eyebrow = eyebrow,
+        h1 = tokens.h1_size,
+        h1_lh = tokens.h1_line_height,
+        h1_w = tokens.h1_weight,
+        h1_ls = tokens.h1_tracking,
+        h1_max = tokens.h1_max_width,
+        headline = mockup_escape(&headline),
+        muted_cc = muted("cc"),
+        subheadline = mockup_escape(&subheadline),
+        cta_r = tokens.cta_radius,
+        on_accent = on_accent_for(bg, accent),
+        primary_cta = mockup_escape(&primary_cta),
+        secondary_cta = mockup_escape(&secondary_cta),
     );
 
-    // Layout = how the hero text and visual share the row.
     let (hero_style, hero_wrap) = match layout {
         "hero_left" => (
-            "display:flex;flex-direction:column;justify-content:center;text-align:left",
-            "display:flex;gap:48px;align-items:center;justify-content:center",
+            "display:flex;flex-direction:column;justify-content:center;text-align:left".to_string(),
+            "display:flex;gap:56px;align-items:center;justify-content:center".to_string(),
         ),
         "hero_split" => (
-            "display:flex;flex-direction:column;justify-content:center;text-align:center;flex:1",
-            "display:flex;gap:48px;align-items:center;justify-content:center",
+            "display:flex;flex-direction:column;justify-content:center;text-align:center;flex:1"
+                .to_string(),
+            "display:flex;gap:56px;align-items:center;justify-content:center".to_string(),
         ),
         _ => (
-            "display:flex;flex-direction:column;justify-content:center;align-items:center;text-align:center;max-width:44rem",
-            "display:block;padding:0 24px",
+            "display:flex;flex-direction:column;justify-content:center;align-items:center;             text-align:center;max-width:44rem"
+                .to_string(),
+            "display:block;padding:0 24px".to_string(),
         ),
     };
+    let hero_block = format!(
+        "<div style=\"{hero_wrap}\"><div style=\"{hero_style}\">{hero_inner}</div>{hero_visual}</div>",
+        hero_wrap = hero_wrap,
+        hero_style = hero_style,
+        hero_inner = hero_inner,
+        hero_visual = if layout == "hero_left" || layout == "hero_split" {
+            hero_visual
+        } else {
+            format!(
+                "<div style=\"margin-top:36px;max-width:300px;margin-left:auto;margin-right:auto\">{hero_visual}</div>",
+                hero_visual = hero_visual
+            )
+        },
+    );
+
+    // ── Stats band ────────────────────────────────────────────────────
+    let stats: Vec<(String, String)> = spec
+        .get("stats")
+        .and_then(Value::as_array)
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|s| {
+                    let value = s.get("value").and_then(Value::as_str)?.chars().take(8).collect::<String>();
+                    let label = s
+                        .get("label")
+                        .and_then(Value::as_str)
+                        .unwrap_or("")
+                        .chars()
+                        .take(30)
+                        .collect::<String>();
+                    Some((mockup_escape(&value), mockup_escape(&label)))
+                })
+                .take(3)
+                .collect()
+        })
+        .unwrap_or_default();
+    let stats_block = if stats.is_empty() {
+        String::new()
+    } else {
+        let cells: Vec<String> = stats
+            .iter()
+            .map(|(value, label)| {
+                format!(
+                    "<div style=\"flex:1;min-width:140px;text-align:left\">\n\
+                       <p style=\"margin:0;font-size:{stat}px;font-weight:700;color:{accent}\">{value}</p>\n\
+                       <p style=\"margin:6px 0 0;font-size:13px;color:{muted_aa}\">{label}</p>\n\
+                     </div>",
+                    stat = tokens.h1_size.saturating_sub(8).max(28),
+                    muted_aa = muted("aa"),
+                )
+            })
+            .collect();
+        format!(
+            "<section style=\"max-width:960px;margin:56px auto 0;padding:24px 32px;\
+             display:flex;gap:32px;flex-wrap:wrap;border-top:1px solid {fg1a};border-bottom:1px solid {fg1a}\">{}</section>",
+            cells.join("\n      "),
+            fg1a = muted("1a"),
+        )
+    };
+
+    // ── Feature grid ──────────────────────────────────────────────────
+    let feature_details: Vec<(String, String)> = spec
+        .get("feature_details")
+        .and_then(Value::as_array)
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|f| {
+                    let title = f
+                        .get("title")
+                        .and_then(Value::as_str)
+                        .unwrap_or("")
+                        .chars()
+                        .take(24)
+                        .collect::<String>();
+                    let body = f
+                        .get("body")
+                        .and_then(Value::as_str)
+                        .unwrap_or("")
+                        .chars()
+                        .take(70)
+                        .collect::<String>();
+                    if title.is_empty() {
+                        None
+                    } else {
+                        Some((mockup_escape(&title), mockup_escape(&body)))
+                    }
+                })
+                .take(3)
+                .collect()
+        })
+        .unwrap_or_default();
+    // Fall back to the copy-level section ideas when no details exist.
+    let features: Vec<(String, String)> = if feature_details.is_empty() {
+        sections
+            .iter()
+            .map(|s| (s.clone(), String::new()))
+            .collect()
+    } else {
+        feature_details
+    };
+    let features_block = if features.is_empty() {
+        String::new()
+    } else {
+        let cards: Vec<String> = features
+            .iter()
+            .map(|(title, body)| {
+                format!(
+                    "<div style=\"flex:1;min-width:230px;padding:24px;border-radius:{card_r}px;\
+                     background:{card_bg};border:1px solid {fg1f}\">\n\
+                       <span style=\"display:inline-block;width:34px;height:34px;border-radius:{icon_r}px;\
+                       background:{accent}1f;margin-bottom:14px\"></span>\n\
+                       <p style=\"margin:0 0 8px;font-size:16px;font-weight:600;color:{fg}\">{title}</p>\n\
+                       <p style=\"margin:0;font-size:14px;line-height:1.6;color:{muted_b3}\">{body}</p>\n\
+                     </div>",
+                    card_r = tokens.card_radius,
+                    card_bg = if bg == "#ffffff" { "#f8fafc".to_string() } else { format!("{fg}0d") },
+                    fg1f = muted("1f"),
+                    icon_r = tokens.icon_radius,
+                    muted_b3 = muted("b3"),
+                )
+            })
+            .collect();
+        format!(
+            "<section style=\"max-width:960px;margin:56px auto 0;padding:0 32px\">\n\
+               <h2 style=\"margin:0 0 24px;font-size:26px;font-weight:650;color:{fg}\">Why teams choose this</h2>\n\
+               <div style=\"display:flex;gap:18px;flex-wrap:wrap\">{}</div>\n\
+             </section>",
+            cards.join("\n      "),
+        )
+    };
+
+    // ── Testimonial ───────────────────────────────────────────────────
+    let testimonial = spec.get("testimonial").cloned().unwrap_or(json!({}));
+    let t_quote = testimonial
+        .get("quote")
+        .and_then(Value::as_str)
+        .map(|q| mockup_escape(&q.chars().take(110).collect::<String>()))
+        .unwrap_or_default();
+    let t_author = testimonial
+        .get("author")
+        .and_then(Value::as_str)
+        .map(|a| mockup_escape(&a.chars().take(40).collect::<String>()))
+        .unwrap_or_default();
+    let testimonial_block = if t_quote.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "<section style=\"max-width:720px;margin:56px auto 0;padding:0 32px;text-align:left\">\n\
+               <blockquote style=\"margin:0;font-size:20px;line-height:1.55;color:{fg};font-weight:500\">\u{201c}{t_quote}\u{201d}</blockquote>\n\
+               <p style=\"margin:14px 0 0;font-size:13px;color:{muted_aa}\">\u{2014} {t_author}</p>\n\
+             </section>",
+            muted_aa = muted("aa"),
+            t_quote = t_quote,
+            t_author = t_author,
+        )
+    };
+
+    // ── Closing CTA band ──────────────────────────────────────────────
+    let cta_band = format!(
+        "<section style=\"max-width:960px;margin:64px auto 0;padding:32px;margin-left:32px;\
+         margin-right:32px;border-radius:{card_r}px;background:{accent}14;\
+         display:flex;align-items:center;justify-content:space-between;gap:24px;flex-wrap:wrap\">\n\
+           <p style=\"margin:0;font-size:19px;font-weight:600;color:{fg}\">Ready when you are.</p>\n\
+           <span style=\"display:inline-block;padding:12px 24px;border-radius:{cta_r}px;background:{accent};\
+           color:{on_accent};font-weight:600;font-size:14px\">{primary_cta}</span>\n\
+         </section>",
+        card_r = tokens.card_radius,
+        cta_r = tokens.cta_radius,
+        on_accent = on_accent_for(bg, accent),
+        primary_cta = mockup_escape(&primary_cta),
+    );
 
     format!(
         "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">\n\
          <meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"></head>\n\
-         <body style=\"margin:0;font-family:ui-sans-serif,system-ui,-apple-system,'Segoe UI',\
-         sans-serif;background:{bg};min-height:100vh\">\n\
-         <main style=\"padding:64px 0\"><div style=\"{hero_wrap}\">\n\
-         <div style=\"{hero_style}\">{hero_inner}</div></div>{sections_block}</main>\n\
+         <body style=\"margin:0;font-family:{font_stack};background:{motif_bg};min-height:100vh;color:{fg}\">\n\
+         {nav}\n\
+         <main style=\"padding:{main_pad}px 0 88px\"><div style=\"max-width:1040px;margin:0 auto\">\n\
+           {hero_block}\n\
+           {stats_block}\n\
+           {features_block}\n\
+           {testimonial_block}\n\
+           {cta_band}\n\
+         </div></main>\n\
+         <footer style=\"border-top:1px solid {fg1f};padding:24px 32px;display:flex;\
+         justify-content:space-between;align-items:center;flex-wrap:wrap;gap:12px\">\n\
+           <span style=\"font-size:12px;color:{muted_99}\">{brand} \u{00b7} {aud}</span>\n\
+           <span style=\"font-size:12px;color:{muted_99}\">Generated by AgentCode design engine</span>\n\
+         </footer>\n\
          </body></html>",
-        hero_style = hero_style,
-        hero_wrap = hero_wrap,
-        hero_inner = hero_inner,
-        sections_block = sections_block,
-        bg = bg,
+        font_stack = tokens.font_stack,
+        motif_bg = motif,
+        main_pad = tokens.main_pad,
+        fg1f = muted("1f"),
+        brand = mockup_escape(&project_name),
+        aud = if audience.is_empty() { mockup_escape("Built for modern teams") } else { mockup_escape(&audience) },
+        muted_99 = muted("99"),
     )
+}
+
+/// Per-personality design tokens.  Each personality selects ONE coherent
+/// token set (type feel + radii + spacing rhythm + elevation + motif) so
+/// variants read as genuinely different design languages.
+struct PersonalityTokens {
+    font_stack: &'static str,
+    h1_size: u32,
+    h1_weight: u32,
+    h1_line_height: &'static str,
+    h1_tracking: i32,
+    h1_max_width: u32,
+    nav_pad: u32,
+    main_pad: u32,
+    logo_radius: u32,
+    logo_weight: u32,
+    logo_tracking: i32,
+    card_radius: u32,
+    cta_radius: u32,
+    icon_radius: u32,
+    elevation: &'static str,
+}
+
+fn personality_tokens(personality: &str) -> PersonalityTokens {
+    match personality {
+        "editorial" => PersonalityTokens {
+            font_stack: "'Georgia', 'Times New Roman', serif",
+            h1_size: 52,
+            h1_weight: 500,
+            h1_line_height: "1.12",
+            h1_tracking: -1,
+            h1_max_width: 22,
+            nav_pad: 20,
+            main_pad: 88,
+            logo_radius: 2,
+            logo_weight: 400,
+            logo_tracking: 4,
+            card_radius: 4,
+            cta_radius: 4,
+            icon_radius: 2,
+            elevation: "0 12px 32px rgba(0,0,0,0.14)",
+        },
+        "bold" => PersonalityTokens {
+            font_stack: "ui-sans-serif, system-ui, -apple-system, 'Segoe UI', sans-serif",
+            h1_size: 60,
+            h1_weight: 800,
+            h1_line_height: "1.05",
+            h1_tracking: -2,
+            h1_max_width: 20,
+            nav_pad: 18,
+            main_pad: 72,
+            logo_radius: 8,
+            logo_weight: 800,
+            logo_tracking: 0,
+            card_radius: 16,
+            cta_radius: 14,
+            icon_radius: 10,
+            elevation: "0 16px 40px rgba(0,0,0,0.18)",
+        },
+        "technical" => PersonalityTokens {
+            font_stack: "'SF Mono', ui-monospace, 'Cascadia Code', Menlo, monospace",
+            h1_size: 40,
+            h1_weight: 600,
+            h1_line_height: "1.2",
+            h1_tracking: 0,
+            h1_max_width: 26,
+            nav_pad: 16,
+            main_pad: 80,
+            logo_radius: 4,
+            logo_weight: 600,
+            logo_tracking: 1,
+            card_radius: 6,
+            cta_radius: 6,
+            icon_radius: 4,
+            elevation: "0 8px 24px rgba(0,0,0,0.12)",
+        },
+        "playful" => PersonalityTokens {
+            font_stack: "ui-rounded, 'SF Pro Rounded', ui-sans-serif, system-ui, sans-serif",
+            h1_size: 48,
+            h1_weight: 700,
+            h1_line_height: "1.1",
+            h1_tracking: -1,
+            h1_max_width: 24,
+            nav_pad: 20,
+            main_pad: 76,
+            logo_radius: 14,
+            logo_weight: 700,
+            logo_tracking: 0,
+            card_radius: 22,
+            cta_radius: 18,
+            icon_radius: 12,
+            elevation: "0 10px 28px rgba(0,0,0,0.14)",
+        },
+        _ => PersonalityTokens {
+            font_stack: "ui-sans-serif, system-ui, -apple-system, 'Segoe UI', sans-serif",
+            h1_size: 44,
+            h1_weight: 650,
+            h1_line_height: "1.15",
+            h1_tracking: -1,
+            h1_max_width: 24,
+            nav_pad: 18,
+            main_pad: 80,
+            logo_radius: 8,
+            logo_weight: 600,
+            logo_tracking: 0,
+            card_radius: 12,
+            cta_radius: 10,
+            icon_radius: 8,
+            elevation: "0 10px 28px rgba(0,0,0,0.12)",
+        },
+    }
+}
+
+/// Text color that stays readable on the accent fill (dark palettes use a
+/// light accent that already contrasts; light palettes need white text).
+fn on_accent_for(_bg: &str, accent: &str) -> String {
+    let light = ["#38bdf8", "#ea580c"];
+    if light.contains(&accent) {
+        "#0b1120".to_string()
+    } else {
+        "#ffffff".to_string()
+    }
 }
 
 fn test_http_ready(port: u16) -> bool {

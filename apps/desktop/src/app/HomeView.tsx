@@ -152,7 +152,8 @@ export function HomeView({
           <p className="text-xs text-on-surface-variant font-mono max-w-xl mx-auto truncate">{project.path}</p>
         </div>
 
-        {memory && (memory.counts.facts > 0 || memory.counts.task_memories > 0) && (
+        {memory?.counts &&
+          (memory.counts.facts > 0 || memory.counts.task_memories > 0) && (
           <details className="neo-raised rounded-2xl px-4 py-3 group" open>
             <summary className="cursor-pointer text-sm font-medium text-on-surface flex items-center gap-2 list-none">
               <Icon name="brain" size={16} />
@@ -163,7 +164,7 @@ export function HomeView({
               </span>
             </summary>
             <div className="mt-3 space-y-3 text-left">
-              {memory.facts.length > 0 && (
+              {(memory.facts?.length ?? 0) > 0 && (
                 <div>
                   <p className="text-xs font-medium text-on-surface-variant mb-1">Learned facts</p>
                   <ul className="space-y-1">
@@ -177,7 +178,7 @@ export function HomeView({
                   </ul>
                 </div>
               )}
-              {memory.task_memories.length > 0 && (
+              {(memory.task_memories?.length ?? 0) > 0 && (
                 <div>
                   <p className="text-xs font-medium text-on-surface-variant mb-1">Recent task outcomes</p>
                   <ul className="space-y-1">

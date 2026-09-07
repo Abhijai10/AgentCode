@@ -311,13 +311,35 @@ pub struct ViewportProfile {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum BrowserAction {
-    Navigate { url: String },
-    OpenHtmlForTest { url: String, html: String },
-    Click { selector: String },
-    Type { selector: String, text: String },
-    Select { selector: String, value: String },
-    Scroll { y: i32 },
-    Wait { millis: u64 },
+    Navigate {
+        url: String,
+    },
+    OpenHtmlForTest {
+        url: String,
+        html: String,
+    },
+    Click {
+        selector: String,
+    },
+    Type {
+        selector: String,
+        text: String,
+    },
+    Select {
+        selector: String,
+        value: String,
+    },
+    Scroll {
+        y: i32,
+    },
+    Wait {
+        millis: u64,
+    },
+    /// Evaluate a JS expression in the page and return its JSON result
+    /// (diagnostics + design QA measurements; never a control-flow path).
+    Evaluate {
+        script: String,
+    },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -327,6 +349,9 @@ pub struct BrowserActionResult {
     pub ok: bool,
     pub url: String,
     pub evidence_ref: StableId,
+    /// Evaluate actions: the JSON value the expression returned (None for
+    /// every other action) — consumed by diagnostics and design QA.
+    pub value: Option<serde_json::Value>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1448,6 +1473,7 @@ impl BrowserRuntime {
                 "scroll"
             }
             BrowserAction::Wait { .. } => "wait",
+            BrowserAction::Evaluate { .. } => "evaluate",
         };
         let url = page.url.clone();
         {
@@ -1472,6 +1498,7 @@ impl BrowserRuntime {
             ok: true,
             url,
             evidence_ref,
+            value: None,
         })
     }
 
@@ -2221,6 +2248,7 @@ impl BrowserRuntime {
         action: BrowserAction,
         evidence_store: &mut EvidenceStore,
     ) -> AcResult<BrowserActionResult> {
+        let mut evaluate_value: Option<serde_json::Value> = None;
         let action_name = {
             let page = self.real_page_mut(session_id)?;
             match &action {
@@ -2254,6 +2282,12 @@ impl BrowserRuntime {
                     page.wait(*millis)?;
                     "wait"
                 }
+                BrowserAction::Evaluate { script } => {
+                    // Runtime.evaluate; the returned JSON value travels on
+                    // the action result (diagnostics + design QA metrics).
+                    evaluate_value = Some(page.client.evaluate_value(script)?);
+                    "evaluate"
+                }
             }
         };
         let url = self.real_page_mut(session_id)?.url.clone();
@@ -2279,6 +2313,7 @@ impl BrowserRuntime {
             ok: true,
             url,
             evidence_ref,
+            value: evaluate_value,
         })
     }
 
