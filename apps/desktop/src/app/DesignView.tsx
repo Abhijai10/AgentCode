@@ -129,7 +129,26 @@ export function DesignView({
   const [panelImg, setPanelImg] = useState<string | null>(null);
   const [panelMeta, setPanelMeta] = useState<BrowserPanelResult | null>(null);
   const [panelBusy, setPanelBusy] = useState(false);
+  // Watch-the-agent: the design run's live observation point, shown in the
+  // browser panel while a run is active.
+  const [agentViewing, setAgentViewing] = useState<{ label: string; url: string } | null>(null);
   const [panelError, setPanelError] = useState<string | null>(null);
+
+  // Poll the agent's live browse status while the panel is open.
+  useEffect(() => {
+    if (!panelOpen) return;
+    let stop = false;
+    const tick = async () => {
+      const res = await daemon.agentBrowseStatus();
+      if (!stop) setAgentViewing(res.status ?? null);
+    };
+    tick();
+    const timer = setInterval(tick, 1000);
+    return () => {
+      stop = true;
+      clearInterval(timer);
+    };
+  }, [panelOpen]);
 
   const panelNavigate = useCallback(
     async (action: "navigate" | "back" | "forward" | "reload" | "close", url?: string) => {
@@ -1203,6 +1222,12 @@ export function DesignView({
           <section className="neo-raised rounded-2xl p-4">
             <div className="flex items-center justify-between mb-2">
               <h4 className="text-sm font-semibold text-on-surface">Inbuilt Browser</h4>
+              {agentViewing && (
+                <div className="flex items-center gap-1.5 text-[10px] text-primary bg-primary/5 rounded-full px-2 py-0.5">
+                  <span className="w-1.5 h-1.5 rounded-full bg-primary animate-pulse" />
+                  Agent viewing: {agentViewing.label}
+                </div>
+              )}
               <button
                 onClick={() => (panelOpen ? panelNavigate("close") : setPanelOpen(true))}
                 className="text-[10px] text-primary hover:opacity-80"

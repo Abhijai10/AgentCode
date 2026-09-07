@@ -1808,6 +1808,11 @@ fn daemon_design_preview_stop(
 }
 
 #[tauri::command]
+fn daemon_agent_browse_status(state: tauri::State<DaemonClient>) -> Result<Value, String> {
+    request(&state.0, "ui", "AgentBrowseStatus", json!({}))
+}
+
+#[tauri::command]
 fn daemon_browser_panel(
     state: tauri::State<DaemonClient>,
     action: String,
@@ -2363,6 +2368,7 @@ fn main() {
             daemon_design_preview_start,
             daemon_design_preview_status,
             daemon_design_preview_stop,
+            daemon_agent_browse_status,
             daemon_browser_panel,
             daemon_browser_screenshot,
             daemon_design_browser,

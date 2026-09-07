@@ -104,6 +104,121 @@ pub struct SecretProcessRequest<'a> {
 /// running record is always kept.
 const MAX_PROCESS_RECORDS: usize = 1024;
 
+// ── Live agent-command mirroring (watch-the-agent terminal) ───────────
+// Agent tool executions can mirror their live output into the daemon's
+// terminal surface so users SEE what the agent runs while it runs.  This is
+// a pull-free, lock-light registry: tools push lines; the daemon installs
+// at most one forwarder per process.  No forwarder = zero overhead.
+
+use std::sync::OnceLock;
+
+static LIVE_FORWARDER: OnceLock<std::sync::mpsc::Sender<LiveChunk>> = OnceLock::new();
+
+/// The live-tag registry: one entry per EXECUTING command (mission ctx +
+/// argv + cwd), keyed by a unique command id.  Reader threads quote the id,
+/// so concurrent missions (one per daemon; several in tests) can never
+/// overwrite each other's tags, and a mission-end clear only swaps the
+/// CURRENT-mission default used to seed the next command.
+#[derive(Clone)]
+struct LiveTagEntry {
+    mission_context: Option<String>,
+    argv: Vec<String>,
+    cwd: String,
+}
+
+static LIVE_TAGS: OnceLock<std::sync::Mutex<BTreeMap<String, LiveTagEntry>>> = OnceLock::new();
+
+fn live_tags() -> &'static std::sync::Mutex<BTreeMap<String, LiveTagEntry>> {
+    LIVE_TAGS.get_or_init(|| std::sync::Mutex::new(BTreeMap::new()))
+}
+
+thread_local! {
+    /// The mission context of the thread running the mission (the daemon's
+    /// mission worker).  Thread-local by design: concurrent mission workers
+    /// (one per daemon; several in tests) keep independent contexts.
+    static LIVE_MISSION_CTX: std::cell::RefCell<Option<String>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+fn live_tag_by_id(id: &str) -> Option<LiveTagEntry> {
+    live_tags()
+        .lock()
+        .ok()
+        .and_then(|guard| guard.get(id).cloned())
+}
+
+/// Set the live-mirroring mission context (id + workspace root, one line)
+/// for THIS thread — the mission worker (or a test thread driving tools).
+pub fn set_live_mission_context(context: Option<String>) {
+    LIVE_MISSION_CTX.with(|cell| *cell.borrow_mut() = context);
+}
+
+/// Install the process-wide live-output forwarder.  Returns the receiving
+/// end.  Calling twice returns the existing channel's receiver is NOT
+/// possible (mpsc), so this is install-once: the daemon owns it.
+pub fn install_live_forwarder() -> std::sync::mpsc::Receiver<LiveChunk> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let _ = LIVE_FORWARDER.set(tx); // first installer wins; later attempts are no-ops
+    rx
+}
+
+/// One mirrored live chunk from an agent-executed command.
+pub struct LiveChunk {
+    pub mission_context: Option<String>,
+    /// argv of the running command (session key: one session per command).
+    pub argv: Vec<String>,
+    pub cwd: String,
+    pub stream: String,
+    pub bytes: Vec<u8>,
+}
+
+/// Whether live mirroring has a listener (avoids building lines nobody reads).
+pub fn live_forwarder_active() -> bool {
+    LIVE_FORWARDER.get().is_some()
+}
+
+/// Push one line chunk to the live forwarder (best-effort, never fails a
+/// tool run).  The chunk quotes the command id; the consumer resolves the
+/// mission tag by that id, so concurrent missions never mix.
+pub fn push_live_line(command_id: &str, stream: &str, chunk: Vec<u8>) {
+    if let Some(sender) = LIVE_FORWARDER.get() {
+        let Some(tag) = live_tag_by_id(command_id) else {
+            return;
+        };
+        let _ = sender.send(LiveChunk {
+            mission_context: tag.mission_context,
+            argv: tag.argv,
+            cwd: tag.cwd,
+            stream: stream.to_string(),
+            bytes: chunk,
+        });
+    }
+}
+
+/// Begin a live-tagged command: registers its tag (argv+cwd + the current
+/// mission default) under a unique id; returns the id.  Reader threads
+/// quote this id until [`end_live_command`] removes it.
+fn begin_live_command(argv: &[String], cwd: &str) -> String {
+    let command_id = format!("cmd-{}", StableId::new("live"));
+    let mission_context = LIVE_MISSION_CTX.with(|cell| cell.borrow().clone());
+    let entry = LiveTagEntry {
+        mission_context,
+        argv: argv.to_vec(),
+        cwd: cwd.to_string(),
+    };
+    if let Ok(mut guard) = live_tags().lock() {
+        guard.insert(command_id.clone(), entry);
+    }
+    command_id
+}
+
+/// End a live-tagged command (drops its tag entry).
+fn end_live_command(command_id: &str) {
+    if let Ok(mut guard) = live_tags().lock() {
+        guard.remove(command_id);
+    }
+}
+
 #[derive(Clone, Default)]
 pub struct ProcessManager {
     children: Arc<Mutex<BTreeMap<StableId, std::process::Child>>>,
@@ -216,6 +331,24 @@ impl ProcessManager {
         plan: ac_sandbox::SandboxedExecutionPlan,
         cancelled: &AtomicBool,
     ) -> AcResult<NativeProcessResult> {
+        // Watch-the-agent: register this execution's live tag (mission
+        // default + argv + cwd) so its reader threads stream into the
+        // right mission-tagged terminal session even when other missions
+        // run concurrently.
+        let live_command_id = begin_live_command(&plan.argv, &plan.cwd.display().to_string());
+        let result = self.run_with_cancellation_inner(task, plan, cancelled, &live_command_id);
+        end_live_command(&live_command_id);
+        result
+    }
+
+    fn run_with_cancellation_inner(
+        &self,
+        task: impl Into<String>,
+        plan: ac_sandbox::SandboxedExecutionPlan,
+        cancelled: &AtomicBool,
+        live_command_id: &str,
+    ) -> AcResult<NativeProcessResult> {
+        let live_command_id = Some(live_command_id.to_string());
         let manifest = ExecutionManifest {
             argv: plan.argv.clone(),
             cwd: plan.cwd.clone(),
@@ -240,8 +373,22 @@ impl ProcessManager {
         let stdout = child.stdout.take();
         let stderr = child.stderr.take();
         let max_output_bytes = plan.max_output_bytes;
-        let stdout_reader = stdout.map(|pipe| read_limited_in_thread(pipe, max_output_bytes));
-        let stderr_reader = stderr.map(|pipe| read_limited_in_thread(pipe, max_output_bytes));
+        let stdout_reader = stdout.map(|pipe| {
+            read_limited_in_thread(
+                pipe,
+                max_output_bytes,
+                Some("stdout"),
+                live_command_id.clone(),
+            )
+        });
+        let stderr_reader = stderr.map(|pipe| {
+            read_limited_in_thread(
+                pipe,
+                max_output_bytes,
+                Some("stderr"),
+                live_command_id.clone(),
+            )
+        });
         let id = plan.id;
         let record = ProcessRecord {
             id: id.clone(),
@@ -422,6 +569,8 @@ fn cleanup_plan_paths(paths: &[PathBuf]) {
 fn read_limited_in_thread<R: Read + Send + 'static>(
     mut reader: R,
     max_output_bytes: usize,
+    live_stream: Option<&'static str>,
+    live_command_id: Option<String>,
 ) -> std::thread::JoinHandle<AcResult<(String, bool)>> {
     std::thread::spawn(move || {
         let mut buffer = Vec::new();
@@ -433,6 +582,13 @@ fn read_limited_in_thread<R: Read + Send + 'static>(
             })?;
             if read == 0 {
                 break;
+            }
+            // Live mirroring: forward the chunk as it arrives so the user
+            // watches agent commands stream in real time.
+            if let (Some(stream), Some(command_id)) = (live_stream, live_command_id.as_deref()) {
+                if live_forwarder_active() {
+                    push_live_line(command_id, stream, chunk[..read].to_vec());
+                }
             }
             let remaining = max_output_bytes.saturating_sub(buffer.len());
             if remaining == 0 {
@@ -1055,6 +1211,20 @@ impl ToolExecutor for SecurityVerifyTool {
 }
 
 fn run_sandboxed_command(
+    manager: &ProcessManager,
+    sandbox: &SandboxManager,
+    cwd: PathBuf,
+    argv: Vec<String>,
+    timeout_ms: u64,
+    cancelled: &AtomicBool,
+) -> AcResult<String> {
+    // Watch-the-agent: the live tag is registered inside
+    // run_with_cancellation (which owns the actual execution), so no
+    // double registration happens here.
+    run_sandboxed_command_inner(manager, sandbox, cwd, argv, timeout_ms, cancelled)
+}
+
+fn run_sandboxed_command_inner(
     manager: &ProcessManager,
     sandbox: &SandboxManager,
     cwd: PathBuf,

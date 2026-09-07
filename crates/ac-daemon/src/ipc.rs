@@ -896,6 +896,15 @@ fn dispatch_request(request: &Value, daemon: &mut DaemonService) -> (Value, bool
                 Err(error) => error_response(correlation_id, error.code(), error.to_string()),
             }
         },
+        // Watch-the-agent: what is the design run currently viewing?
+        "AgentBrowseStatus" => {
+            let status = daemon
+                .agent_browse_status
+                .lock()
+                .map(|guard| guard.clone())
+                .unwrap_or(None);
+            json!({"id": correlation_id, "ok": true, "status": status})
+        }
         "BrowserPanel" => {
             let action = request.get("action").and_then(Value::as_str).unwrap_or("navigate");
             let url = request.get("url").and_then(Value::as_str).unwrap_or("");
@@ -7545,6 +7554,191 @@ p{font-size:9px;color:#ccc}</style></head>
             json!({"id":"x1","command":"CancelMission","mission_id": mission_id}),
         );
         assert_eq!(cancel["ok"], true);
+
+        server.cleanup();
+        daemon.shutdown().unwrap();
+        std::env::remove_var("AGENTCODE_PROVIDER_MODE");
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn agent_command_mirrors_live_into_terminal_session() {
+        // Watch-the-agent (terminal): a sandboxed agent command streams its
+        // live output into a mission-tagged terminal session that the user's
+        // terminal drawer lists and tails like any other session.
+        let _env_lock = crate::TEST_ENV_LOCK.lock().unwrap();
+        std::env::set_var("AGENTCODE_PROVIDER_MODE", "mock");
+        let (dir, db, lock, socket) = temp_paths("ipc-agent-live-mirror");
+        let mut daemon = DaemonService::open(&db, &lock).unwrap();
+        daemon.start().unwrap();
+        let Some((server, listener)) = bind_or_skip(&socket, None) else {
+            daemon.shutdown().unwrap();
+            std::env::remove_var("AGENTCODE_PROVIDER_MODE");
+            let _ = fs::remove_dir_all(dir);
+            return;
+        };
+
+        // Register the per-mission sink exactly as the mission runner does:
+        // chunks tagged with this mission id land in THIS daemon's
+        // terminal map (production: the one daemon; tests: this instance).
+        {
+            let sink = Arc::clone(&daemon.terminal_sessions);
+            let mut sinks = crate::LIVE_AGENT_SINKS
+                .lock()
+                .expect("live agent sinks lock");
+            sinks.insert("mission-live-mirror".to_string(), sink);
+        }
+        // Simulate what the mission runner does: set THIS THREAD's mission
+        // context and run a sandboxed command through the tool layer's live
+        // path.  The context is thread-local: each daemon's mission worker
+        // (and this test thread) carries its own, so parallel daemons can
+        // never clobber each other's tag.
+        crate::ac_tool_mirror_for_test::set_context(Some(
+            "mission-live-mirror|/tmp".to_string(),
+        ));
+        let argv = [
+            "bash".to_string(),
+            "-c".to_string(),
+            "printf 'line-one\\nline-two\\n'".to_string(),
+        ];
+        let policy = ac_security::CapabilityPolicy::new()
+            .allow(ac_security::Capability::ProcessExec("*".to_string()));
+        let mut broker = ac_tool::ToolBroker::new(policy);
+        // Register workspace tools rooted at /tmp so the sandbox accepts the
+        // command; then invoke cmd.exec exactly as the agent would.
+        let tools = ac_tool::WorkspaceTools::new(std::path::PathBuf::from("/tmp"));
+        tools.register_all(&mut broker).unwrap();
+        let request = ac_tool::ToolRequest {
+            id: ac_common::StableId::new("test-cmd"),
+            tool_id: "cmd.exec".to_string(),
+            tool_version: "1".to_string(),
+            payload: argv.join("\n"),
+            capabilities: vec![ac_security::Capability::ProcessExec("*".to_string())],
+        };
+        let mut evidence = ac_evidence::EvidenceStore::new();
+        let _ = broker.invoke(request, &mut evidence);
+
+        // The mirrored chunks must have produced a terminal session the
+        // drawer can see.  Poll briefly: the forwarder thread consumes async.
+        let mut found = None;
+        for _ in 0..40 {
+            let list = request_via_ipc(
+                &server, &listener, &mut daemon,
+                json!({"id":"tl","command":"TerminalList"}),
+            );
+            let sessions = list["list"]["sessions"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default();
+            found = sessions
+                .iter()
+                .find(|s| {
+                    s["argv"]
+                        .as_array()
+                        .map(|parts| {
+                            parts
+                                .iter()
+                                .filter_map(|p| p.as_str())
+                                .collect::<String>()
+                                .contains("line-one")
+                        })
+                        .unwrap_or(false)
+                })
+                .cloned();
+            if found.is_some() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        crate::ac_tool_mirror_for_test::set_context(None);
+        let session = found.expect("agent command must open a mirrored terminal session");
+        assert_eq!(
+            session["mission_id"].as_str(),
+            Some("mission-live-mirror"),
+            "mirrored session must be mission-tagged: {session}"
+        );
+
+        // The streamed lines are tailable like any user session.
+        let sid = session["session_id"].as_str().unwrap().to_string();
+        let mut tail = None;
+        for _ in 0..40 {
+            tail = Some(request_via_ipc(
+                &server, &listener, &mut daemon,
+                json!({"id":"tt","command":"TerminalTail","session_id": sid, "cursor": 0}),
+            ));
+            let lines = tail.as_ref().unwrap()["tail"]["lines"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default();
+            if lines.len() >= 2 {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        let lines = tail.unwrap()["tail"]["lines"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        assert!(
+            lines.iter().any(|l| l.as_str().unwrap_or("").contains("line-one")),
+            "mirrored output must be tailable: {lines:?}"
+        );
+
+        let _ = crate::LIVE_AGENT_SINKS
+            .lock()
+            .map(|mut sinks| sinks.remove("mission-live-mirror"));
+        server.cleanup();
+        daemon.shutdown().unwrap();
+        std::env::remove_var("AGENTCODE_PROVIDER_MODE");
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn agent_browse_status_reports_design_run_observation() {
+        // Watch-the-agent (browser): while a design run is active the
+        // daemon exposes what the run is viewing; the panel shows it live.
+        // When no run is active, the status is null (honest empty state).
+        let _env_lock = crate::TEST_ENV_LOCK.lock().unwrap();
+        std::env::set_var("AGENTCODE_PROVIDER_MODE", "mock");
+        let (dir, db, lock, socket) = temp_paths("ipc-agent-browse");
+        let mut daemon = DaemonService::open(&db, &lock).unwrap();
+        daemon.start().unwrap();
+        let Some((server, listener)) = bind_or_skip(&socket, None) else {
+            daemon.shutdown().unwrap();
+            std::env::remove_var("AGENTCODE_PROVIDER_MODE");
+            let _ = fs::remove_dir_all(dir);
+            return;
+        };
+
+        // No run active: status is null.
+        let idle = request_via_ipc(
+            &server, &listener, &mut daemon,
+            json!({"id":"b0","command":"AgentBrowseStatus"}),
+        );
+        assert_eq!(idle["ok"], true);
+        assert_eq!(idle["status"], serde_json::Value::Null, "idle: {idle}");
+
+        // Simulate a run publishing its observation point (what
+        // design_generate_mockups does per variant while scoring).
+        {
+            let mut status = daemon.agent_browse_status.lock().unwrap();
+            *status = Some(json!({
+                "label": "Design run · variant 0 (editorial)",
+                "url": "mockup-variant-0",
+                "kind": "design-mockups",
+            }));
+        }
+        let active = request_via_ipc(
+            &server, &listener, &mut daemon,
+            json!({"id":"b1","command":"AgentBrowseStatus"}),
+        );
+        assert_eq!(active["ok"], true);
+        assert_eq!(
+            active["status"]["label"].as_str().unwrap(),
+            "Design run · variant 0 (editorial)",
+            "active: {active}"
+        );
+        assert_eq!(active["status"]["kind"].as_str().unwrap(), "design-mockups");
 
         server.cleanup();
         daemon.shutdown().unwrap();

@@ -1965,6 +1965,30 @@ port: port.map(|p| p as i64),
         url: &str,
         viewport_hint: &str,
     ) -> AcResult<Value> {
+        // Watch-the-agent: while a design run holds the shared engine, user
+        // navigation returns an honest busy state instead of blocking for the
+        // whole run (the UI already shows what the run is viewing via
+        // AgentBrowseStatus; between runs the panel is fully user-driven).
+        if action != "close" {
+            let run_active = self
+                .agent_browse_status
+                .lock()
+                .map(|status| status.is_some())
+                .unwrap_or(false);
+            let lock_free = self.live_browser.try_lock().is_ok();
+            if run_active && !lock_free {
+                return Ok(json!({
+                    "busy": true,
+                    "reason": "agent-run",
+                    "status": self
+                        .agent_browse_status
+                        .lock()
+                        .ok()
+                        .and_then(|guard| guard.clone())
+                        .unwrap_or(Value::Null),
+                }));
+            }
+        }
         // Only http(s) and the local dev preview are navigable from the
         // panel; file:// and other schemes are refused outright.
         let validate_url = |u: &str| -> AcResult<String> {
@@ -2170,6 +2194,36 @@ port: port.map(|p| p as i64),
     /// then scored by the REAL browser (rendered text presence) and the
     /// winning variant is persisted as a design document the user can
     /// critique further; nothing is ever fabricated.
+    /// Watch-the-agent (browser): acquire the SHARED browser runtime for a
+    /// design run.  Non-deterministic runs reuse the daemon's persistent
+    /// `live_browser` (the same engine the user's inbuilt browser panel
+    /// drives) so the panel can observe what the run is viewing while it
+    /// runs.  Deterministic harnesses keep their isolated test runtime.
+    /// Run `body` with the SHARED live browser runtime (kept in the slot).
+    /// Non-deterministic design paths use this so the panel observes the
+    /// run while it executes; the runtime is never removed from the slot.
+    fn with_shared_browser<T>(
+        &self,
+        deterministic: bool,
+        policy: ac_security::CapabilityPolicy,
+        body: impl FnOnce(&mut ac_verification::BrowserRuntime) -> T,
+    ) -> T {
+        if deterministic {
+            let mut harness = ac_verification::BrowserRuntime::deterministic_harness_for_tests(policy);
+            return body(&mut harness);
+        }
+        let mut guard = self
+            .live_browser
+            .lock()
+            .map_err(|_| AcError::validation("BROWSER-PANEL_LOCK", "browser panel lock poisoned"))
+            .expect("live browser lock");
+        if guard.is_none() {
+            *guard = Some(ac_verification::BrowserRuntime::new(policy));
+        }
+        let runtime = guard.as_mut().expect("live browser runtime");
+        body(runtime)
+    }
+
     pub fn design_generate_mockups(
         &mut self,
         conversation_id: &str,
@@ -2350,14 +2404,13 @@ port: port.map(|p| p as i64),
         //    structural score instead — never fabricated pixels.
         let policy = ac_security::CapabilityPolicy::new()
             .allow(ac_security::Capability::BrowserAutomation);
-        let mut browser = if deterministic {
-            ac_verification::BrowserRuntime::deterministic_harness_for_tests(policy)
-        } else {
-            ac_verification::BrowserRuntime::new(policy)
-        };
-        let task_id = StableId::new("design");
-        let mut evidence_store = EvidenceStore::new();
-        let mut scored: Vec<Value> = Vec::new();
+        // Score through the shared engine when a real browser is available:
+        // with_shared_browser keeps the runtime in the daemon slot so the
+        // inbuilt panel observes the run while it executes.
+        let scored = self.with_shared_browser(deterministic, policy, |browser| {
+            let task_id = StableId::new("design");
+            let mut evidence_store = EvidenceStore::new();
+            let mut scored: Vec<Value> = Vec::new();
         // Chrome-crash-dialog fix: launch ONE browser process for the whole
         // run and reuse it across variants (the per-variant launch + never
         // closed loop leaked a Chrome per mockup and left them to be
@@ -2366,6 +2419,21 @@ port: port.map(|p| p as i64),
         for variant in &variants {
             let html = variant["html"].as_str().unwrap_or("").to_string();
             let url = format!("mockup-variant-{}", variant["variant"].as_i64().unwrap_or(0));
+            // Watch-the-agent: publish what this run is viewing so the
+            // inbuilt panel can display the run's live observation point.
+            if !deterministic {
+                let _ = self.agent_browse_status.lock().map(|mut status| {
+                    *status = Some(json!({
+                        "label": format!(
+                            "Design run · variant {} ({})",
+                            variant["variant"].as_i64().unwrap_or(0),
+                            variant["personality"].as_str().unwrap_or("minimal"),
+                        ),
+                        "url": url,
+                        "kind": "design-mockups",
+                    }));
+                });
+            }
             let score = if deterministic {
                 json!({
                     "source": "structural",
@@ -2440,11 +2508,12 @@ port: port.map(|p| p as i64),
             v["score"] = score;
             scored.push(v);
         }
-        // Close the shared browser exactly once, gracefully (CDP
-        // Browser.close), after every variant is scored.
-        if let Some(process) = shared_process.take() {
-            let _ = browser.close_process(&process.id);
-        }
+        // Deterministic harness: close after the run.  The SHARED engine
+        // stays alive — the inbuilt panel (and the next design run) reuse
+        // it; its teardown happens on panel close / daemon stop.
+
+            scored
+        });
 
         // 4. Winner: the variant whose real evidence is strongest — real
         //    browser renders with text beat structural scores beat
@@ -2469,6 +2538,13 @@ port: port.map(|p| p as i64),
             .ok_or_else(|| {
                 AcError::validation("DESIGN-GENERATE_NO_VARIANTS", "no variants were produced")
             })?;
+
+        // Watch-the-agent: the run is done; clear the live observation
+        // point (the panel returns to user-driven browsing).
+        let _ = self
+            .agent_browse_status
+            .lock()
+            .map(|mut status| *status = None);
 
         // 5. Persist the run as a design document (survives restarts,
         //    feeds design memory + downstream contract).

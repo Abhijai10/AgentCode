@@ -289,10 +289,15 @@ struct MissionCoordinator {
 }
 
 impl MissionCoordinator {
-    fn new(db_path: PathBuf, kernel: Arc<Mutex<Kernel<ProductionKernelPolicy>>>) -> Self {
+    fn new(
+        db_path: PathBuf,
+        kernel: Arc<Mutex<Kernel<ProductionKernelPolicy>>>,
+        terminal_sink_registry: Arc<Mutex<BTreeMap<String, Arc<TerminalSessionState>>>>,
+    ) -> Self {
         let (tx, rx) = mpsc::sync_channel::<CoordinatorMessage>(64);
         let state = Arc::new(Mutex::new(CoordinatorState::default()));
         let worker_state = Arc::clone(&state);
+        let terminal_sink_registry = Arc::clone(&terminal_sink_registry);
         let shutdown_flag = Arc::new(AtomicBool::new(false));
         let shutdown_check = Arc::clone(&shutdown_flag);
         let worker = thread::Builder::new()
@@ -361,14 +366,33 @@ impl MissionCoordinator {
                                     .unwrap_or_else(|| Arc::new(AtomicBool::new(false))),
                             )
                         };
-                        execute_mission(
+                        // Watch-the-agent: tag all tool output of THIS
+                        // mission so mirrored chunks open the right
+                        // mission-tagged terminal session, and register
+                        // THIS daemon's terminal map as the sink while the
+                        // mission runs (removed after it ends).
+                        ac_tool::set_live_mission_context(Some(format!(
+                            "{}|{}",
+                            job.mission_id.as_str(),
+                            job.workspace_root.display()
+                        )));
+                        let sink = Arc::clone(&terminal_sink_registry);
+                        let _ = LIVE_AGENT_SINKS
+                            .lock()
+                            .map(|mut sinks| sinks.insert(job.mission_id.to_string(), sink));
+                        let outcome = execute_mission(
                             &db_path,
                             &job.workspace_root,
                             Arc::clone(&kernel),
                             &job,
                             token,
                             pause,
-                        )
+                        );
+                        let _ = LIVE_AGENT_SINKS
+                            .lock()
+                            .map(|mut sinks| sinks.remove(job.mission_id.as_str()));
+                        ac_tool::set_live_mission_context(None);
+                        outcome
                     }));
                     let terminal = match outcome {
                         Ok(Ok(state)) => state,
@@ -813,6 +837,15 @@ fn task_memory_row_to_model(row: &ac_db::TaskMemoryRow) -> ac_context::TaskMemor
     }
 }
 
+/// Parse the mission id from a live-mirroring context tag
+/// ("mission_id|workspace_root"); returns None when unset.
+fn parse_mission_tag(ctx: &str) -> Option<String> {
+    ctx.split('|')
+        .next()
+        .map(str::to_string)
+        .filter(|s| !s.is_empty())
+}
+
 fn execute_mission(
     db_path: &Path,
     workspace_root: &Path,
@@ -1214,7 +1247,11 @@ pub struct DaemonService {
     /// Tracked terminal sessions (batch N4): live process handles + captured
     /// output, keyed by session id.  Children are killed on stop (same as
     /// design_children); finished sessions persist their output as evidence.
-    terminal_sessions: Mutex<BTreeMap<String, Arc<TerminalSessionState>>>,
+    terminal_sessions: Arc<Mutex<BTreeMap<String, Arc<TerminalSessionState>>>>,
+    /// Watch-the-agent (browser): the design run's CURRENT observation
+    /// (label + url), updated as the run navigates; the inbuilt panel shows
+    /// it live while the run is active.
+    agent_browse_status: Arc<Mutex<Option<Value>>>,
     /// Live panel browser (Codex-style inbuilt browser): ONE Chrome runtime
     /// reused across navigations so the panel behaves like an embedded
     /// browser instead of relaunching per request.  None until first use;
@@ -1224,6 +1261,15 @@ pub struct DaemonService {
 
 /// Public alias for the include'd terminal module's session type.
 pub type TerminalSession = TerminalSessionState;
+
+// Watch-the-agent globals: one process-wide consumer thread (OnceLock) plus
+// the terminal registry of the CURRENT daemon (set on each start).
+type TerminalRegistry = Arc<Mutex<BTreeMap<String, Arc<TerminalSessionState>>>>;
+static LIVE_AGENT_REGISTRY: Mutex<Option<TerminalRegistry>> = Mutex::new(None);
+/// Per-mission terminal sinks: the daemon running THAT mission receives the
+/// mirrored chunks.  Registered at mission dispatch, removed at mission end.
+static LIVE_AGENT_SINKS: Mutex<BTreeMap<String, TerminalRegistry>> = Mutex::new(BTreeMap::new());
+static LIVE_AGENT_REGISTRY_ONCE: std::sync::Once = std::sync::Once::new();
 
 /// Production daemon policy. Tool capability checks remain owned by ToolBroker;
 /// the bound agent's deterministic final-audit/completion gate supplies
@@ -1257,10 +1303,16 @@ impl DaemonService {
                 std::env::current_dir()
                     .map_err(|error| AcError::validation("DAEMON-WORKSPACE", error.to_string()))?,
             );
+        let terminal_sessions: Arc<Mutex<BTreeMap<String, Arc<TerminalSessionState>>>> =
+            Arc::new(Mutex::new(BTreeMap::new()));
         Ok(Self {
             lifecycle: DaemonLifecycle::Created,
             db,
-            coordinator: MissionCoordinator::new(db_path.clone(), Arc::clone(&kernel)),
+            coordinator: MissionCoordinator::new(
+                db_path.clone(),
+                Arc::clone(&kernel),
+                Arc::clone(&terminal_sessions),
+            ),
             db_path,
             kernel,
             lock_path: lock_path.into(),
@@ -1270,7 +1322,8 @@ impl DaemonService {
             hydrated: Vec::new(),
             default_workspace_root: workspace_root,
             design_children: Mutex::new(BTreeMap::new()),
-            terminal_sessions: Mutex::new(BTreeMap::new()),
+            terminal_sessions,
+            agent_browse_status: Arc::new(Mutex::new(None)),
             live_browser: Mutex::new(None),
         })
     }
@@ -1349,6 +1402,110 @@ impl DaemonService {
                     "completed" | "cancelled" | "failed" => {}
                     _ => self.coordinator.enqueue(job)?,
                 }
+            }
+        }
+        // Watch-the-agent (live terminal mirroring): bind this daemon's
+        // terminal registry to the process-global consumer so agent-command
+        // output streams into mission-tagged sessions the drawer can watch.
+        {
+            let registry = Arc::clone(&self.terminal_sessions);
+            let spawned_once: &mut Option<Result<(), String>> = &mut None;
+            LIVE_AGENT_REGISTRY_ONCE.call_once(|| {
+                let receiver = ac_tool::install_live_forwarder();
+                let spawned = std::thread::Builder::new()
+                    .name("live-agent-output".to_string())
+                    .spawn(move || {
+                        // (mission_ctx, argv) -> (session_id, partial line)
+                        let mut sessions: std::collections::HashMap<
+                            (String, String),
+                            (String, String),
+                        > = std::collections::HashMap::new();
+                        while let Ok(chunk) = receiver.recv() {
+                            // Resolve the sink by the chunk's mission id: the
+                            // daemon that RUNS the mission owns the session.
+                            // (Production has one daemon; tests may run
+                            // several — each mission lands in its own.)
+                            let mission_id = parse_mission_tag(
+                                &chunk.mission_context.clone().unwrap_or_default(),
+                            )
+                            .unwrap_or_default();
+                            let Some(registry) = LIVE_AGENT_SINKS
+                                .lock()
+                                .ok()
+                                .and_then(|sinks| sinks.get(&mission_id).cloned())
+                                .or_else(|| {
+                                    LIVE_AGENT_REGISTRY.lock().ok().and_then(|g| g.clone())
+                                })
+                            else {
+                                continue;
+                            };
+                            let ctx = chunk.mission_context.clone().unwrap_or_default();
+                            let argv_key = chunk.argv.join(" ");
+                            if argv_key.is_empty() {
+                                continue;
+                            }
+                            let session_id = match sessions.get(&(ctx.clone(), argv_key.clone())) {
+                                Some((id, _)) => id.clone(),
+                                None => {
+                                    let id = StableId::new("terminal").to_string();
+                                    let state = Arc::new(TerminalSessionState {
+                                        id: id.clone(),
+                                        argv: chunk.argv.clone(),
+                                        cwd: chunk.cwd.clone(),
+                                        mission_id: parse_mission_tag(&ctx),
+                                        output: Mutex::new(VecDeque::new()),
+                                        total_bytes: AtomicUsize::new(0),
+                                        total_lines: AtomicUsize::new(0),
+                                        child: Mutex::new(None),
+                                        exit_code: Mutex::new(None),
+                                        cancelled: AtomicBool::new(false),
+                                        started_at_ms: TimestampMillis::now().as_millis() as i64,
+                                        evidence_id: Mutex::new(None),
+                                    });
+                                    registry.lock().unwrap().insert(id.clone(), state);
+                                    sessions.insert(
+                                        (ctx.clone(), argv_key.clone()),
+                                        (id.clone(), String::new()),
+                                    );
+                                    id
+                                }
+                            };
+                            let entry = match sessions.get_mut(&(ctx, argv_key)) {
+                                Some(entry) => entry,
+                                None => continue,
+                            };
+                            entry.1.push_str(&String::from_utf8_lossy(&chunk.bytes));
+                            while let Some(pos) = entry.1.find('\n') {
+                                let line: String = entry.1.drain(..pos + 1).collect();
+                                let line = line.trim_end_matches('\n').to_string();
+                                if let Some(state) = registry.lock().unwrap().get(&session_id) {
+                                    let mut output = state.output.lock().unwrap();
+                                    let bounded: String = line.chars().take(400).collect();
+                                    state.total_bytes.fetch_add(
+                                        bounded.len(),
+                                        std::sync::atomic::Ordering::SeqCst,
+                                    );
+                                    state
+                                        .total_lines
+                                        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                                    output.push_back(bounded);
+                                    while output.len() > MAX_TERMINAL_RING_LINES {
+                                        output.pop_front();
+                                    }
+                                }
+                            }
+                        }
+                    });
+                *spawned_once = Some(spawned.map(|_| ()).map_err(|e| e.to_string()));
+            });
+            if let Some(Err(error)) = &*spawned_once {
+                eprintln!("live agent-output mirroring unavailable: {error}");
+            }
+            // Sinks are registered per-mission at dispatch time (see the
+            // mission runner); nothing to bind here.  Keep a fallback for
+            // context-less chunks: this daemon is the sink of record.
+            if let Ok(mut guard) = LIVE_AGENT_REGISTRY.lock() {
+                *guard = Some(registry);
             }
         }
         self.lifecycle = DaemonLifecycle::Running;
@@ -2498,6 +2655,15 @@ fn _timestamp_for_observability() -> TimestampMillis {
 #[cfg(test)]
 pub(crate) static TEST_ENV_LOCK: Mutex<()> = Mutex::new(());
 
+/// Test-only re-export of the live-mirroring context setter (tests drive
+/// the watch-the-agent path exactly as the mission runner does).
+#[cfg(test)]
+pub mod ac_tool_mirror_for_test {
+    pub fn set_context(ctx: Option<String>) {
+        ac_tool::set_live_mission_context(ctx);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3399,7 +3565,8 @@ mod tests {
         let mission_id = StableId::new("pause-active");
         let session_id = StableId::new("session-pause-active");
         let kernel = Arc::clone(&daemon.kernel);
-        let coordinator = MissionCoordinator::new(db.clone(), kernel);
+        let coordinator =
+            MissionCoordinator::new(db.clone(), kernel, Arc::new(Mutex::new(BTreeMap::new())));
         {
             let mut state = coordinator.state.lock().unwrap();
             state.active = Some(mission_id.clone());

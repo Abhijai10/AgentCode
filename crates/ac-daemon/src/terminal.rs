@@ -40,7 +40,7 @@ const MAX_TERMINAL_CAPTURE_BYTES: usize = 256 * 1024;
 /// only bounds what a poll must clone.  The dropped-line count keeps the
 /// cursor math honest: a cursor older than the ring start reports the
 /// ring head, never a silent gap.
-const MAX_TERMINAL_RING_LINES: usize = 2_000;
+pub(crate) const MAX_TERMINAL_RING_LINES: usize = 2_000;
 
 /// Hard lifetime cap so a forgotten session cannot run forever.
 const MAX_TERMINAL_LIFETIME_SECS: u64 = 30 * 60;
@@ -266,6 +266,66 @@ impl crate::DaemonService {
             "started_at_ms": state.started_at_ms,
             "note": "tracked process; tail via TerminalTail with the session_id",
         }))
+    }
+
+    /// Watch-the-agent (live agent-command mirroring): register a synthetic
+    /// terminal session for an AGENT-executed command.  It appears in the
+    /// same terminal drawer, mission-tagged, and streams the command's
+    /// live output; there is no user-owned child process (the agent's
+    /// sandbox owns it), which the session records honestly.
+    pub fn terminal_register_agent_session(
+        &self,
+        mission_id: Option<&str>,
+        argv: &[String],
+        cwd: &str,
+    ) -> String {
+        let session_id = StableId::new("terminal").to_string();
+        let state = Arc::new(TerminalSessionState {
+            id: session_id.clone(),
+            argv: argv.to_vec(),
+            cwd: cwd.to_string(),
+            mission_id: mission_id.map(str::to_string),
+            output: Mutex::new(VecDeque::new()),
+            total_bytes: AtomicUsize::new(0),
+            total_lines: AtomicUsize::new(0),
+            child: Mutex::new(None),
+            exit_code: Mutex::new(None),
+            cancelled: AtomicBool::new(false),
+            started_at_ms: TimestampMillis::now().as_millis() as i64,
+            evidence_id: Mutex::new(None),
+        });
+        self.terminal_sessions
+            .lock()
+            .unwrap()
+            .insert(session_id.clone(), state);
+        session_id
+    }
+
+    /// Append one live line to an agent session (best-effort; ring cap
+    /// applies exactly like user sessions).
+    pub fn terminal_append_agent_line(&self, session_id: &str, line: &str) {
+        let sessions = self.terminal_sessions.lock().unwrap();
+        let Some(state) = sessions.get(session_id) else {
+            return;
+        };
+        let mut output = state.output.lock().unwrap();
+        let line = line.chars().take(400).collect::<String>();
+        state
+            .total_bytes
+            .fetch_add(line.len(), Ordering::SeqCst);
+        state.total_lines.fetch_add(1, Ordering::SeqCst);
+        output.push_back(line);
+        while output.len() > MAX_TERMINAL_RING_LINES {
+            output.pop_front();
+        }
+    }
+
+    /// Mark an agent session complete with the real exit code.
+    pub fn terminal_finish_agent_session(&self, session_id: &str, exit_code: Option<i32>) {
+        let sessions = self.terminal_sessions.lock().unwrap();
+        if let Some(state) = sessions.get(session_id) {
+            *state.exit_code.lock().unwrap() = exit_code;
+        }
     }
 
     /// Tail captured output since `cursor` (line offset).  Returns the new

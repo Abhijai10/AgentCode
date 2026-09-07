@@ -1212,16 +1212,42 @@ export const daemon = {
     viewportHint?: string
   ): Promise<{ ok: boolean; panel?: BrowserPanelResult; error?: string }> {
     try {
-      const res = await invoke<{ panel: BrowserPanelResult }>("daemon_browser_panel", {
+      const res = await invoke<{
+        panel: BrowserPanelResult;
+        busy?: { reason: string };
+      }>("daemon_browser_panel", {
         action,
         url: url ?? "",
         viewportHint: viewportHint ?? "desktop",
       });
+      if (res.busy) {
+        return {
+          ok: false,
+          error:
+            res.busy.reason === "agent-run"
+              ? "The agent is using the browser for a design run — watch it live above; your navigation resumes when the run finishes."
+              : "browser busy",
+        };
+      }
       return { ok: true, panel: res.panel };
     } catch (e: unknown) {
       const message = e instanceof Error ? e.message : String(e);
       const cleaned = message.replace(/^[A-Z0-9_-]+:\s*/, "");
       return { ok: false, error: cleaned || message };
+    }
+  },
+
+  async agentBrowseStatus(): Promise<{
+    ok: boolean;
+    status?: { label: string; url: string; kind: string } | null;
+  }> {
+    try {
+      const res = await invoke<{ status?: { label: string; url: string; kind: string } | null }>(
+        "daemon_agent_browse_status"
+      );
+      return { ok: true, status: res.status ?? null };
+    } catch {
+      return { ok: false, status: null };
     }
   },
 
