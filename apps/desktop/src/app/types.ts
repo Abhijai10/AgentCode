@@ -1,4 +1,12 @@
-export type View = "home" | "mission" | "chat" | "discuss" | "design" | "security" | "settings";
+export type View =
+  | "home"
+  | "mission"
+  | "chat"
+  | "discuss"
+  | "design"
+  | "browser"
+  | "security"
+  | "settings";
 
 export type ConversationMode = "GOAL" | "DISCUSS" | "DESIGN" | "SECURITY";
 
@@ -127,6 +135,9 @@ export interface TerminalListItem {
   argv: string[];
   cwd: string;
   mission_id: string | null;
+  /** "argv" (allowlisted direct exec), "user_shell" (login-shell, Codex
+   *  /shell parity), or "agent" (mirrored agent command). */
+  source?: string;
   alive: boolean;
   exit_code: number | null;
   cancelled: boolean;

@@ -2018,6 +2018,15 @@ port: port.map(|p| p as i64),
             }
             return Ok(json!({"closed": true}));
         }
+        // The standalone BrowserView drives this panel directly, so any
+        // action auto-opens the shared runtime when it is not up yet — the
+        // SAME one Chrome the design runs use (live_browser), keeping a
+        // single engine across surfaces.
+        if guard.is_none() {
+            let policy = ac_security::CapabilityPolicy::new()
+                .allow(ac_security::Capability::BrowserAutomation);
+            *guard = Some(ac_verification::BrowserRuntime::new(policy));
+        }
         let runtime_slot = guard
             .as_mut()
             .ok_or_else(|| AcError::validation("BROWSER-PANEL_CLOSED", "panel browser is closed"))?;
@@ -2133,7 +2142,13 @@ port: port.map(|p| p as i64),
                 "screenshot artifact must be a png",
             ));
         }
-        let allowed = std::env::temp_dir().join("agentcode-browser-artifacts");
+        // Canonicalize BOTH sides: on macOS /var and /tmp are symlinks into
+        // /private, so comparing a canonicalized path against the raw
+        // temp_dir would always fail the containment check.
+        let allowed = std::env::temp_dir()
+            .join("agentcode-browser-artifacts")
+            .canonicalize()
+            .unwrap_or_else(|_| std::env::temp_dir().join("agentcode-browser-artifacts"));
         let canonical = path.canonicalize().map_err(|err| {
             AcError::validation(
                 "BROWSER-SCREENSHOT_READ",

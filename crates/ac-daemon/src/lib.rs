@@ -1453,6 +1453,7 @@ impl DaemonService {
                                         argv: chunk.argv.clone(),
                                         cwd: chunk.cwd.clone(),
                                         mission_id: parse_mission_tag(&ctx),
+                                        source: "agent".to_string(),
                                         output: Mutex::new(VecDeque::new()),
                                         total_bytes: AtomicUsize::new(0),
                                         total_lines: AtomicUsize::new(0),

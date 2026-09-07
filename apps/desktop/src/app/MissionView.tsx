@@ -6,7 +6,6 @@ import type {
   MissionActivityEvent,
   ChangeSetSummary,
   EvidenceSummaryItem,
-  TerminalListItem,
   VerificationSummary,
 } from "./types";
 import { daemon } from "./daemon";
@@ -96,19 +95,7 @@ function eventMeta(kind: string): { label: string; icon: string; cls: string } {
   return { label: kind.replace(/_/g, " "), icon: "info", cls: "text-on-surface-variant" };
 }
 
-export function MissionView({
-  missionId,
-  onOpenSettings,
-  terminalOpen: terminalOpenProp,
-  onTerminalOpenChange,
-}: {
-  missionId: string | null;
-  onOpenSettings(): void;
-  /** Sidebar rail control: the drawer's open state is lifted so the global
-   *  terminal toggle (watch-the-agent) can drive it. */
-  terminalOpen?: boolean;
-  onTerminalOpenChange?(open: boolean): void;
-}) {
+export function MissionView({ missionId, onOpenSettings }: { missionId: string | null; onOpenSettings(): void }) {
   const [details, setDetails] = useState<MissionDetails | null>(null);
   const [tasks, setTasks] = useState<TaskDetail[]>([]);
   const [events, setEvents] = useState<MissionActivityEvent[]>([]);
@@ -126,94 +113,8 @@ export function MissionView({
   const [exportResult, setExportResult] = useState<{ path: string } | null>(null);
   const [exportError, setExportError] = useState<string | null>(null);
   const [exportBusy, setExportBusy] = useState(false);
-  // ── Terminal drawer (batch N4) ────────────────────────────────────────
-  // Open state is lifted to the app shell when the sidebar rail drives it
-  // (watch-the-agent toggle); the in-view chevron keeps working through the
-  // same single source of truth.
-  const [terminalOpenLocal, setTerminalOpenLocal] = useState(false);
-  const terminalOpen = terminalOpenProp ?? terminalOpenLocal;
-  const setTerminalOpen = (open: boolean | ((prev: boolean) => boolean)) => {
-    const next = typeof open === "function" ? open(terminalOpen) : open;
-    setTerminalOpenLocal(next);
-    onTerminalOpenChange?.(next);
-  };
-  const [sessions, setSessions] = useState<TerminalListItem[]>([]);
-  const [activeSession, setActiveSession] = useState<string | null>(null);
-  const [terminalLines, setTerminalLines] = useState<string[]>([]);
-  const [terminalCursor, setTerminalCursor] = useState(0);
-  const [terminalCmd, setTerminalCmd] = useState("");
-  const [terminalError, setTerminalError] = useState<string | null>(null);
-  const [terminalEvidenceId, setTerminalEvidenceId] = useState<string | null>(null);
-  const terminalPollRef = useRef<number | null>(null);
 
-  // Poll the active terminal session while the drawer is open and the
-  // session is alive.  Cursor-based tail: only new lines append.
-  useEffect(() => {
-    const stopPolling = () => {
-      if (terminalPollRef.current !== null) {
-        window.clearInterval(terminalPollRef.current);
-        terminalPollRef.current = null;
-      }
-    };
-    if (!terminalOpen) {
-      stopPolling();
-      return;
-    }
-    stopPolling();
-    terminalPollRef.current = window.setInterval(() => void (async () => {
-      const list = await daemon.terminalList();
-      if (list.ok && list.list) setSessions(list.list.sessions);
-      if (activeSession) {
-        const tail = await daemon.terminalTail(activeSession, terminalCursor);
-        if (tail.ok && tail.tail) {
-          if (tail.tail.lines.length > 0) {
-            setTerminalLines((prev) => [...prev, ...tail.tail!.lines]);
-          }
-          setTerminalCursor(tail.tail.cursor);
-          if (tail.tail.evidence_id) setTerminalEvidenceId(tail.tail.evidence_id);
-          if (!tail.tail.alive) stopPolling();
-        }
-      }
-    })(), 1000);
-    return stopPolling;
-  }, [terminalOpen, activeSession, terminalCursor]);
 
-  // Start a command in the mission workspace (allowlisted executables only).
-  const startTerminalCommand = () =>
-    void (async () => {
-      setTerminalError(null);
-      const cwd = details?.workspace_root ?? "";
-      if (!cwd) {
-        setTerminalError("Mission has no workspace root.");
-        return;
-      }
-      const argv = terminalCmd.trim().split(/\s+/).filter(Boolean);
-      if (argv.length === 0) return;
-      const res = await daemon.terminalStart(missionId, argv, cwd);
-      if (!res.ok || !res.session) {
-        setTerminalError(res.error ?? "failed to start");
-        return;
-      }
-      setActiveSession(res.session.session_id);
-      setTerminalLines([]);
-      setTerminalCursor(0);
-      setTerminalEvidenceId(null);
-      const list = await daemon.terminalList();
-      if (list.ok && list.list) setSessions(list.list.sessions);
-    })();
-
-  const cancelTerminal = () =>
-    void (async () => {
-      if (!activeSession) return;
-      const res = await daemon.terminalCancel(activeSession);
-      if (!res.ok) {
-        setTerminalError(res.error ?? "cancel failed");
-        return;
-      }
-      if (res.result?.evidence_id) setTerminalEvidenceId(res.result.evidence_id);
-      const list = await daemon.terminalList();
-      if (list.ok && list.list) setSessions(list.list.sessions);
-    })();
 
   const handleExport = () =>
     void (async () => {
@@ -360,112 +261,6 @@ export function MissionView({
     if (v) setVerification(v);
   };
 
-  // Terminal drawer (batch N4, watch-the-agent): rendered in EVERY state
-  // so the sidebar rail toggle always has a surface to open.
-  const terminalDrawer = (
-        <div className="neo-raised rounded-2xl flex flex-col">
-          <button
-            onClick={() => setTerminalOpen((v) => !v)}
-            className="w-full flex items-center gap-2 px-6 py-4 text-left"
-          >
-            <Icon name="terminal" size={20} className="text-primary" />
-            <span className="text-lg font-semibold text-on-surface">Terminal</span>
-            {sessions.some((s) => s.alive) && (
-              <span className="w-2 h-2 rounded-full bg-emerald-500 animate-pulse" title="live process" />
-            )}
-            <Icon
-              name={terminalOpen ? "expand_less" : "expand_more"}
-              size={18}
-              className="ml-auto text-on-surface-variant"
-            />
-          </button>
-          {terminalOpen && (
-            <div className="px-6 pb-6 flex flex-col gap-3">
-              {/* Command input (allowlisted executables enforced daemon-side) */}
-              <div className="flex gap-2">
-                <input
-                  value={terminalCmd}
-                  onChange={(e) => setTerminalCmd(e.target.value)}
-                  onKeyDown={(e) => {
-                    if (e.key === "Enter") startTerminalCommand();
-                  }}
-                  placeholder="e.g. cargo test --lib"
-                  className="flex-1 neo-pressed rounded-xl px-4 py-2.5 text-sm text-on-surface placeholder:text-on-surface-variant/50 outline-none"
-                />
-                <button
-                  onClick={startTerminalCommand}
-                  className="neo-button px-4 py-2.5 rounded-xl text-sm font-medium text-primary flex items-center gap-1.5"
-                >
-                  <Icon name="play_arrow" size={18} /> Run
-                </button>
-              </div>
-              {terminalError && (
-                <p className="text-xs text-red-600 flex items-center gap-1.5">
-                  <Icon name="error" size={14} fill /> {terminalError}
-                </p>
-              )}
-              {/* Session list */}
-              {sessions.length > 0 && (
-                <div className="flex flex-wrap gap-2">
-                  {sessions.map((s) => (
-                    <button
-                      key={s.session_id}
-                      onClick={() => {
-                        setActiveSession(s.session_id);
-                        setTerminalLines([]);
-                        setTerminalCursor(0);
-                        setTerminalEvidenceId(null);
-                      }}
-                      className={`text-xs px-3 py-1.5 rounded-full font-mono flex items-center gap-1.5 ${
-                        activeSession === s.session_id
-                          ? "bg-primary/10 text-primary font-semibold"
-                          : "neo-pressed text-on-surface-variant"
-                      }`}
-                    >
-                      <span
-                        className={`w-1.5 h-1.5 rounded-full ${s.alive ? "bg-emerald-500" : "bg-outline"}`}
-                      />
-                      {s.argv.join(" ").slice(0, 40)}
-                    </button>
-                  ))}
-                </div>
-              )}
-              {/* Live output */}
-              {activeSession && (
-                <div className="relative">
-                  <div className="neo-pressed rounded-xl p-3 max-h-64 overflow-y-auto font-mono text-xs leading-relaxed text-on-surface">
-                    {terminalLines.length === 0 ? (
-                      <p className="text-on-surface-variant italic">waiting for output…</p>
-                    ) : (
-                      terminalLines.map((line, i) => (
-                        <div key={i} className="whitespace-pre-wrap break-all">
-                          {line}
-                        </div>
-                      ))
-                    )}
-                  </div>
-                  <div className="flex items-center gap-2 mt-2 flex-wrap">
-                    {sessions.find((s) => s.session_id === activeSession)?.alive && (
-                      <button
-                        onClick={cancelTerminal}
-                        className="px-3 py-1.5 rounded-xl text-xs font-medium text-red-600 dark:text-red-400 flex items-center gap-1.5 neo-button"
-                      >
-                        <Icon name="stop_circle" size={15} /> Cancel
-                      </button>
-                    )}
-                    {terminalEvidenceId && (
-                      <span className="text-[11px] text-on-surface-variant flex items-center gap-1.5">
-                        <Icon name="verified_user" size={13} className="text-emerald-600" />
-                        Captured output persisted as evidence
-                      </span>
-                    )}
-                  </div>
-                </div>
-              )}
-            </div>
-          )}
-        </div>
-  );
 
   if (status === "no_mission") {
     return (
@@ -479,7 +274,6 @@ export function MissionView({
             <p className="text-on-surface-variant text-sm">Start a mission from Home, or select one from the mission list.</p>
           </div>
         </main>
-        {terminalDrawer}
       </div>
     );
   }
@@ -496,7 +290,6 @@ export function MissionView({
             <p className="text-on-surface-variant text-sm">The AgentCode daemon is not responding. Start it, then reopen this view to reload authoritative mission state.</p>
           </div>
         </main>
-        {terminalDrawer}
       </div>
     );
   }
@@ -510,7 +303,6 @@ export function MissionView({
             Loading mission…
           </p>
         </main>
-        {terminalDrawer}
       </div>
     );
   }
@@ -760,8 +552,7 @@ export function MissionView({
             )}
           </div>
 
-          {terminalDrawer}
-
+  
           {/* Evidence */}
           <div className="neo-raised rounded-2xl p-6 flex flex-col gap-2">
             <h2 className="text-lg font-semibold flex items-center gap-2 text-on-surface mb-2">

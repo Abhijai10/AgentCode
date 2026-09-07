@@ -19,6 +19,9 @@ const DiscussView = lazy(() =>
 const DesignView = lazy(() =>
   import("./DesignView").then((m) => ({ default: m.DesignView }))
 );
+const BrowserView = lazy(() =>
+  import("./BrowserView").then((m) => ({ default: m.BrowserView }))
+);
 const SecurityView = lazy(() =>
   import("./SecurityView").then((m) => ({ default: m.SecurityView }))
 );
@@ -27,11 +30,11 @@ const SettingsView = lazy(() =>
 );
 import { ProjectModal } from "./ProjectModal";
 import { Icon } from "./Icon";
+import { TerminalDrawer } from "./TerminalDrawer";
 import { daemon } from "./daemon";
 import type { View, MissionSummary, DaemonStatus } from "./types";
 
 const PROJECT_REQUIRED_VIEWS: View[] = ["mission", "chat", "discuss", "design", "security"];
-
 /// F5 (final audit): top-level error boundary — a thrown render error shows
 /// a recovery screen with reload + error detail instead of white-screening
 /// the whole window. State lives nowhere but this component; the daemon is
@@ -196,14 +199,14 @@ function AppShell() {
           onOpenProject={() => setProjectModal(project ? "open" : "choose")}
           browserOpen={browserOpen}
           onToggleBrowser={() => {
-            // Navigate to the panel's owning view, then flip the surface.
+            // The browser is its own full view (Codex-IDE-style tab), not a
+            // Design Studio sub-panel.
             setBrowserOpen((open) => !open);
-            if (view !== "design") setView("design");
+            if (view !== "browser") setView("browser");
           }}
           terminalOpen={terminalOpen}
           onToggleTerminal={() => {
             setTerminalOpen((open) => !open);
-            if (view !== "mission") setView("mission");
           }}
         />
         <div className="flex-1 flex flex-col overflow-hidden">
@@ -235,7 +238,7 @@ function AppShell() {
               }}
             />
           )}
-          {view === "mission" && <Suspense fallback={<ViewLoading />}><MissionView missionId={activeMission} onOpenSettings={() => setView("settings")} terminalOpen={terminalOpen} onTerminalOpenChange={setTerminalOpen} /></Suspense>}
+          {view === "mission" && <Suspense fallback={<ViewLoading />}><MissionView missionId={activeMission} onOpenSettings={() => setView("settings")} /></Suspense>}
           {view === "chat" && (
             <Suspense fallback={<ViewLoading />}>
             <ChatView
@@ -289,6 +292,14 @@ function AppShell() {
             </Suspense>
           )}
           {view === "settings" && <Suspense fallback={<ViewLoading />}><SettingsView /></Suspense>}
+          {view === "browser" && <Suspense fallback={<ViewLoading />}><BrowserView /></Suspense>}
+          {/* Codex parity: the terminal is a GLOBAL bottom drawer available on
+              every view — not a MissionView sub-panel. */}
+          <TerminalDrawer
+            open={terminalOpen}
+            onOpenChange={setTerminalOpen}
+            projectPath={project?.path ?? null}
+          />
           <Footer
             daemonConnected={daemonConnected}
             modelLabel="Model: daemon-managed"

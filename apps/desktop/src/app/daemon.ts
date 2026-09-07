@@ -269,13 +269,15 @@ export const daemon = {
   async terminalStart(
     missionId: string | null,
     argv: string[],
-    cwd: string
+    cwd: string,
+    mode: "argv" | "shell" = "argv"
   ): Promise<{ ok: boolean; session?: TerminalSessionInfo; error?: string }> {
     try {
       const res = await invoke<{ session: TerminalSessionInfo }>("daemon_terminal_start", {
         missionId,
         argv,
         cwd,
+        mode,
       });
       return { ok: true, session: res.session };
     } catch (error) {
@@ -1234,6 +1236,15 @@ export const daemon = {
       const message = e instanceof Error ? e.message : String(e);
       const cleaned = message.replace(/^[A-Z0-9_-]+:\s*/, "");
       return { ok: false, error: cleaned || message };
+    }
+  },
+
+  /** Home directory (Codex-parity terminal cwd fallback when no project open). */
+  async homeDir(): Promise<string | null> {
+    try {
+      return await invoke<string>("user_home_dir");
+    } catch {
+      return null;
     }
   },
 

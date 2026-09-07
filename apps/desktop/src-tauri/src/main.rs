@@ -424,12 +424,19 @@ fn daemon_terminal_start(
     mission_id: Option<String>,
     argv: Vec<String>,
     cwd: String,
+    mode: Option<String>,
 ) -> Result<Value, String> {
     request(
         &state.0,
         "ui",
         "TerminalStart",
-        json!({ "mission_id": mission_id, "argv": argv, "cwd": cwd }),
+        json!({
+            "mission_id": mission_id,
+            "argv": argv,
+            "cwd": cwd,
+            // Codex parity: "shell" runs the line through the login shell.
+            "mode": mode.unwrap_or_else(|| "argv".to_string()),
+        }),
     )
 }
 
@@ -1808,6 +1815,11 @@ fn daemon_design_preview_stop(
 }
 
 #[tauri::command]
+fn user_home_dir() -> Result<String, String> {
+    std::env::var("HOME").map_err(|e| e.to_string())
+}
+
+#[tauri::command]
 fn daemon_agent_browse_status(state: tauri::State<DaemonClient>) -> Result<Value, String> {
     request(&state.0, "ui", "AgentBrowseStatus", json!({}))
 }
@@ -2369,6 +2381,7 @@ fn main() {
             daemon_design_preview_status,
             daemon_design_preview_stop,
             daemon_agent_browse_status,
+            user_home_dir,
             daemon_browser_panel,
             daemon_browser_screenshot,
             daemon_design_browser,

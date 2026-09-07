@@ -510,6 +510,10 @@ fn dispatch_request(request: &Value, daemon: &mut DaemonService) -> (Value, bool
         }
         "TerminalStart" => {
             let mission_id = request.get("mission_id").and_then(Value::as_str);
+            // Codex parity: mode "shell" runs the command line through the
+            // user's login shell (like Codex /shell) — any command, pipes,
+            // env vars; mode "argv" (default) stays allowlisted direct exec.
+            let mode = request.get("mode").and_then(Value::as_str).unwrap_or("argv");
             let argv: Vec<String> = request
                 .get("argv")
                 .and_then(Value::as_array)
@@ -522,7 +526,7 @@ fn dispatch_request(request: &Value, daemon: &mut DaemonService) -> (Value, bool
                 })
                 .unwrap_or_default();
             let cwd = request.get("cwd").and_then(Value::as_str).unwrap_or("");
-            match daemon.terminal_start(mission_id, &argv, cwd) {
+            match daemon.terminal_start_full(mission_id, &argv, cwd, mode) {
                 Ok(session) => json!({"id": correlation_id, "ok": true, "session": session}),
                 Err(error) => error_response(correlation_id, error.code(), error.to_string()),
             }
@@ -3007,16 +3011,16 @@ mod ipc_tests {
         assert_eq!(bad_ext["ok"], false);
         assert_eq!(bad_ext["error"]["code"], "BROWSER-SCREENSHOT_INVALID_URI");
 
-        // 4) Unknown panel action: honest error, not a silent no-op.  With
-        //    no panel open yet the closed-guard fires first (correct
-        //    ordering), so assert the closed guard here; the action guard is
-        //    exercised by the same handler's match arm on the daemon fn.
+        // 4) Unknown panel action: honest error, not a silent no-op.  Any
+        //    action auto-opens the shared runtime now (the standalone
+        //    BrowserView drives the panel directly), so the unknown action
+        //    reaches the action guard.
         let unknown = request_via_ipc(
             &server, &listener, &mut daemon,
             json!({"id":"bp4","command":"BrowserPanel","action": "sideways"}),
         );
         assert_eq!(unknown["ok"], false);
-        assert_eq!(unknown["error"]["code"], "BROWSER-PANEL_CLOSED");
+        assert_eq!(unknown["error"]["code"], "BROWSER-PANEL_ACTION");
 
         // 5) Panel "close" is always valid and reports honestly even when
         //    nothing is open (idempotent teardown).
@@ -7559,6 +7563,83 @@ p{font-size:9px;color:#ccc}</style></head>
         daemon.shutdown().unwrap();
         std::env::remove_var("AGENTCODE_PROVIDER_MODE");
         let _ = fs::remove_dir_all(dir);
+    }
+
+    /// Codex /shell parity: mode="shell" runs the whole command line
+    /// through the user's login shell — pipes, sequences and non-allowlisted
+    /// binaries work, with NO mission and cwd = any real directory.
+    #[test]
+    fn terminal_shell_mode_runs_full_shell_lines_without_mission() {
+        let _env_lock = crate::TEST_ENV_LOCK.lock().unwrap();
+        std::env::set_var("AGENTCODE_PROVIDER_MODE", "mock");
+        let (dir, db, lock, socket) = temp_paths("ipc-terminal-shell");
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut daemon = DaemonService::open(&db, &lock).unwrap();
+        daemon.start().unwrap();
+        let Some((server, listener)) = bind_or_skip(&socket, None) else {
+            daemon.shutdown().unwrap();
+            std::env::remove_var("AGENTCODE_PROVIDER_MODE");
+            let _ = std::fs::remove_dir_all(dir);
+            return;
+        };
+
+        // A pipe + a sequence: impossible in allowlisted argv mode.
+        let start = request_via_ipc(
+            &server, &listener, &mut daemon,
+            json!({
+                "id": "sh1",
+                "command": "TerminalStart",
+                "mission_id": null,
+                "mode": "shell",
+                "cwd": dir.to_string_lossy(),
+                "argv": ["printf 'codex-shell-parity\\n' | tr a-z A-Z"],
+            }),
+        );
+        assert_eq!(start["ok"], true, "shell start: {start}");
+        let session_id = start["session"]["session_id"].as_str().unwrap().to_string();
+        assert_eq!(
+            start["session"]["source"].as_str(),
+            Some("user_shell"),
+            "session must record its source: {start}"
+        );
+
+        // Tail until the process finishes and the piped output lands.
+        let mut lines = Vec::new();
+        for _ in 0..50 {
+            let tail = request_via_ipc(
+                &server, &listener, &mut daemon,
+                json!({"id":"sh2","command":"TerminalTail","session_id": session_id, "cursor": 0}),
+            );
+            lines = tail["tail"]["lines"].as_array().cloned().unwrap_or_default();
+            let alive = tail["tail"]["alive"].as_bool().unwrap_or(true);
+            if !alive && !lines.is_empty() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        assert!(
+            lines.iter().any(|l| l.as_str().unwrap_or("").contains("CODEX-SHELL-PARITY")),
+            "piped shell output must stream: {lines:?}"
+        );
+
+        // The classic allowlist still refuses arbitrary binaries in argv mode.
+        let refused = request_via_ipc(
+            &server, &listener, &mut daemon,
+            json!({
+                "id": "sh3",
+                "command": "TerminalStart",
+                "mission_id": null,
+                "mode": "argv",
+                "cwd": dir.to_string_lossy(),
+                "argv": ["tr", "a-z", "A-Z"],
+            }),
+        );
+        assert_eq!(refused["ok"], false, "argv mode must stay allowlisted: {refused}");
+
+        server.cleanup();
+        daemon.shutdown().unwrap();
+        std::env::remove_var("AGENTCODE_PROVIDER_MODE");
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

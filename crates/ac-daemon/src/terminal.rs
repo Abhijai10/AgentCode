@@ -72,9 +72,13 @@ fn terminal_argv_allowed(argv: &[String]) -> bool {
 /// UI only ever sees ids, states, and captured bytes.
 pub struct TerminalSessionState {
     pub id: String,
+    /// The DISPLAY argv (shell mode shows `sh -c <command>`).
     pub argv: Vec<String>,
     pub cwd: String,
     pub mission_id: Option<String>,
+    /// Codex parity: "argv" (allowlisted direct exec) or "user_shell"
+    /// (login-shell command like Codex `/shell`).
+    pub source: String,
     pub output: Mutex<VecDeque<String>>,
     pub total_bytes: AtomicUsize,
     /// Lines appended EVER (monotonic) — the stable cursor domain even
@@ -121,21 +125,67 @@ fn terminal_redact(line: &str) -> String {
 impl crate::DaemonService {
     /// Start a tracked terminal process.  argv must be allowlisted and cwd
     /// must exist; failures are honest validation errors, never silent.
+    /// Start a terminal session in one of two modes (Codex parity):
+    ///
+    /// * `argv` mode — the classic allowlisted-executable surface (npm,
+    ///   cargo, git, …).  `cwd` is any valid directory.
+    /// * `shell` mode — `mode: "shell"`: the command runs through the
+    ///   user's login shell (`$SHELL -lc <command>`) like Codex `/shell`,
+    ///   so pipes, `&&`, env vars and any binary work.  The shell itself
+    ///   is the allowlisted executable; the cwd must still be a real
+    ///   directory.  Sessions are tagged `source: "user_shell"`.
     pub fn terminal_start(
         &mut self,
         mission_id: Option<&str>,
         argv: &[String],
         cwd: &str,
     ) -> AcResult<Value> {
-        if !terminal_argv_allowed(argv) {
-            return Err(AcError::validation(
-                "TERMINAL-COMMAND_NOT_ALLOWED",
-                format!(
-                    "executable '{}' is not allowlisted for the terminal surface",
-                    argv.first().map(String::as_str).unwrap_or("")
-                ),
-            ));
-        }
+        self.terminal_start_full(mission_id, argv, cwd, "argv")
+    }
+
+    pub fn terminal_start_full(
+        &mut self,
+        mission_id: Option<&str>,
+        argv: &[String],
+        cwd: &str,
+        mode: &str,
+    ) -> AcResult<Value> {
+        let source = match mode {
+            "shell" => "user_shell",
+            _ => "argv",
+        };
+        let (spawn_argv, display_argv): (Vec<String>, Vec<String>) = if source == "user_shell" {
+            // Codex `/shell`: the whole command line goes through the login
+            // shell.  Refuse an empty command outright.
+            let command_line = argv.join(" ");
+            let trimmed = command_line.trim();
+            if trimmed.is_empty() {
+                return Err(AcError::validation(
+                    "TERMINAL-COMMAND_EMPTY",
+                    "shell command is empty",
+                ));
+            }
+            let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".to_string());
+            (
+                vec![
+                    shell,
+                    "-lc".to_string(),
+                    trimmed.to_string(),
+                ],
+                vec!["sh".to_string(), "-c".to_string(), trimmed.to_string()],
+            )
+        } else {
+            if !terminal_argv_allowed(argv) {
+                return Err(AcError::validation(
+                    "TERMINAL-COMMAND_NOT_ALLOWED",
+                    format!(
+                        "executable '{}' is not allowlisted for the terminal surface",
+                        argv.first().map(String::as_str).unwrap_or("")
+                    ),
+                ));
+            }
+            (argv.to_vec(), argv.to_vec())
+        };
         let dir = Path::new(cwd);
         if !dir.is_dir() {
             return Err(AcError::validation(
@@ -144,9 +194,9 @@ impl crate::DaemonService {
             ));
         }
         let session_id = StableId::new("terminal").to_string();
-        let mut command = Command::new(&argv[0]);
+        let mut command = Command::new(&spawn_argv[0]);
         command
-            .args(&argv[1..])
+            .args(&spawn_argv[1..])
             .current_dir(dir)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -163,9 +213,10 @@ impl crate::DaemonService {
 
         let state = Arc::new(TerminalSessionState {
             id: session_id.clone(),
-            argv: argv.to_vec(),
+            argv: display_argv,
             cwd: cwd.to_string(),
             mission_id: mission_id.map(str::to_string),
+            source: source.to_string(),
             output: Mutex::new(VecDeque::new()),
             total_bytes: AtomicUsize::new(0),
             total_lines: AtomicUsize::new(0),
@@ -259,10 +310,11 @@ impl crate::DaemonService {
 
         Ok(json!({
             "session_id": session_id,
-            "argv": argv,
+            "argv": state.argv,
             "cwd": cwd,
             "pid": pid,
             "mission_id": mission_id,
+            "source": source,
             "started_at_ms": state.started_at_ms,
             "note": "tracked process; tail via TerminalTail with the session_id",
         }))
@@ -285,6 +337,7 @@ impl crate::DaemonService {
             argv: argv.to_vec(),
             cwd: cwd.to_string(),
             mission_id: mission_id.map(str::to_string),
+            source: "agent".to_string(),
             output: Mutex::new(VecDeque::new()),
             total_bytes: AtomicUsize::new(0),
             total_lines: AtomicUsize::new(0),
@@ -428,6 +481,7 @@ impl crate::DaemonService {
                 "argv": state.argv,
                 "cwd": state.cwd,
                 "mission_id": state.mission_id,
+                "source": state.source,
                 "alive": exit_code.is_none(),
                 "exit_code": exit_code,
                 "cancelled": state.cancelled.load(Ordering::SeqCst),
@@ -539,6 +593,7 @@ mod terminal_tests {
             argv: vec!["node".into()],
             cwd: "/tmp".into(),
             mission_id: None,
+            source: "argv".to_string(),
             output: Mutex::new(VecDeque::new()),
             total_bytes: AtomicUsize::new(0),
             total_lines: AtomicUsize::new(0),
@@ -585,6 +640,7 @@ mod terminal_tests {
             argv: vec!["node".into()],
             cwd: "/tmp".into(),
             mission_id: None,
+            source: "argv".to_string(),
             output: Mutex::new(VecDeque::new()),
             total_bytes: AtomicUsize::new(0),
             total_lines: AtomicUsize::new(0),
