@@ -2194,6 +2194,12 @@ impl BrowserRuntime {
             "--disable-sync",
             "--disable-extensions",
             "--disable-popup-blocking",
+            // Crisp rendering: enable the GPU/ANGLE compositing path so
+            // fonts and layout render at full fidelity in headless captures
+            // (software-Skia raster can soften text under DPR scaling).
+            "--use-angle=metal",
+            "--enable-gpu-rasterization",
+            "--disable-lcd-text=false",
         ];
         let attempt = |extra_args: &[&str]| -> AcResult<(Child, TempDir, u16, String)> {
             let profile_dir = tempfile::Builder::new()
@@ -2211,6 +2217,10 @@ impl BrowserRuntime {
                 base_args.iter().map(|arg| arg.to_string()).collect();
             browser_args.extend(extra_args.iter().map(|arg| arg.to_string()));
             browser_args.push(format!("--user-data-dir={}", profile_dir.path().display()));
+            // Provenance marker: distinguishes AgentCode-launched Chrome from
+            // the user's own browsers (the orphan sweep only ever touches its
+            // own processes).
+            browser_args.push("--user-agent=AgentCode-Headless-Browser/1.0".to_string());
             browser_args.push("about:blank".to_string());
             let plan = prepare_browser_spawn(executable, &browser_args, profile_dir.path())?;
             let mut child = Command::new(plan.backend_argv.first().ok_or_else(|| {
@@ -3023,17 +3033,20 @@ impl RealBrowserPage {
             json!({
                 "width": viewport.width,
                 "height": viewport.height,
-                "deviceScaleFactor": 1,
+                // 2x device scale: the capture holds retina-pixel density so
+                // CSS downscaling in the UI stays crisp instead of blurring
+                // a 1x image up (the "blurred display" report).
+                "deviceScaleFactor": 2,
                 "mobile": viewport.width < 600
             }),
         )?;
         self.client.drain_events(Duration::from_millis(100))?;
-        // JPEG q80: 5-8x smaller than PNG for real pages — the screenshot
-        // crosses the daemon->UI IPC boundary on every browser action, so
-        // payload size is the single biggest latency factor.
+        // PNG lossless at 2x: JPEG q80 ringing + upscaling compounded the
+        // blur; identical screenshots are skipped UI-side so steady-state
+        // bandwidth is unchanged, and navigation captures render crisp.
         let value = self.client.call(
             "Page.captureScreenshot",
-            json!({ "format": "jpeg", "quality": 80, "fromSurface": true }),
+            json!({ "format": "png", "fromSurface": true }),
         )?;
         let data = value.get("data").and_then(Value::as_str).ok_or_else(|| {
             AcError::validation(

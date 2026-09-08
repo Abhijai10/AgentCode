@@ -664,7 +664,11 @@ impl DaemonService {
         after_id: &str,
         wait_ms: u64,
     ) -> AcResult<Value> {
-        const MAX_WAIT_MS: u64 = 10_000;
+        // Long-poll cap: 1s.  The subscribe holds a daemon-guard slot for its
+        // whole wait (UI cursors chain immediately on return), so a shorter
+        // cap keeps the dispatch mutex available for state-changing work —
+        // with 250ms poll ticks inside the wait, semantics are unchanged.
+        const MAX_WAIT_MS: u64 = 1_000;
         const POLL_INTERVAL_MS: u64 = 250;
         const MAX_EVENTS: usize = 200;
         let bounded_wait = wait_ms.min(MAX_WAIT_MS);

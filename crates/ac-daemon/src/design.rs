@@ -2004,7 +2004,11 @@ port: port.map(|p| p as i64),
             Err(error) => {
                 let socket_dead = matches!(
                     error.code(),
-                    "BROWSER-CDP_SEND" | "BROWSER-CDP_READ" | "BROWSER-CDP_TIMEOUT"
+                    "BROWSER-CDP_SEND"
+                        | "BROWSER-CDP_READ"
+                        | "BROWSER-CDP_TIMEOUT"
+                        | "BROWSER-CDP_CONNECT"
+                        | "BROWSER-CDP_TARGET"
                 );
                 if !socket_dead {
                     return Err(error);

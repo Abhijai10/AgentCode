@@ -68,7 +68,7 @@ export function BrowserView() {
         // avoids a full re-render + image decode per refresh tick.
         if (res.panel.png_base64 && res.panel.png_base64 !== lastPng.current) {
           lastPng.current = res.panel.png_base64;
-          setImg(`data:image/jpeg;base64,${res.panel.png_base64}`);
+          setImg(`data:image/png;base64,${res.panel.png_base64}`);
         }
         setError(null);
       }
@@ -285,7 +285,7 @@ export function BrowserView() {
                   void send("interact", JSON.stringify({ key: e.key }));
                 }
               }}
-              className="block max-w-full"
+              className="block max-w-full [image-rendering:auto]"
               draggable={false}
             />
           </figure>

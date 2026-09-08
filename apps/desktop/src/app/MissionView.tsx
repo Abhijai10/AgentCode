@@ -142,6 +142,11 @@ export function MissionView({ missionId, onOpenSettings }: { missionId: string |
       timerRef.current = null;
     }
   }, []);
+  // Event-burst refresh coalescing (component-scope refs — hooks inside
+  // an effect crash production builds with React #321):
+  const lastRefreshRef = useRef(0);
+  const pendingRefreshRef = useRef<number | null>(null);
+  const cancelledRef = useRef(false);
 
   useEffect(() => {
     if (!missionId) {
@@ -149,30 +154,26 @@ export function MissionView({ missionId, onOpenSettings }: { missionId: string |
       stopPolling();
       return;
     }
-    let cancelled = false;
+    cancelledRef.current = false;
     let sawTerminal = false;
     setStatus("loading");
     setControlError(null);
 
-    // Event batches arrive in bursts; a full 6-call refresh per batch made
-  // the mission view laggy.  Coalesce: at most one heavy refresh per tick.
-  const lastRefreshRef = useRef(0);
-  const pendingRefreshRef = useRef<number | null>(null);
-  const refresh = async () => {
-    if (!cancelled) {
-      const now = Date.now();
-      const since = now - lastRefreshRef.current;
-      if (since < 750) {
-        if (pendingRefreshRef.current === null) {
-          pendingRefreshRef.current = window.setTimeout(() => {
-            pendingRefreshRef.current = null;
-            void refresh();
-          }, 750 - since);
+    const refresh = async () => {
+      if (!cancelledRef.current) {
+        const now = Date.now();
+        const since = now - lastRefreshRef.current;
+        if (since < 750) {
+          if (pendingRefreshRef.current === null) {
+            pendingRefreshRef.current = window.setTimeout(() => {
+              pendingRefreshRef.current = null;
+              void refresh();
+            }, 750 - since);
+          }
+          return;
         }
-        return;
+        lastRefreshRef.current = now;
       }
-      lastRefreshRef.current = now;
-    }
       const [d, t, e, c, ev, v] = await Promise.all([
         daemon.getMissionDetails(missionId),
         daemon.getTaskDetails(missionId),
@@ -181,17 +182,15 @@ export function MissionView({ missionId, onOpenSettings }: { missionId: string |
         daemon.getEvidenceSummary(missionId),
         daemon.getVerificationSummary(missionId),
       ]);
-      if (cancelled) return;
+      if (cancelledRef.current) return;
       if (d) {
         setDetails(d);
         setStatus("loaded");
       } else {
-        // Distinguish a daemon outage from a genuinely missing mission by
-        // checking the real daemon health signal rather than guessing from
-        // local history.  This ensures a stopped daemon shows "Daemon
-        // unavailable" instead of a misleading "No mission selected".
+        // A stopped daemon must show "Daemon unavailable" rather than a
+        // misleading "No mission selected" — ask the real health signal.
         const health = await daemon.health();
-        if (cancelled) return;
+        if (cancelledRef.current) return;
         setStatus(health.state === "running" ? "no_mission" : "daemon_unavailable");
       }
       if (t) setTasks(t);
@@ -199,13 +198,12 @@ export function MissionView({ missionId, onOpenSettings }: { missionId: string |
       if (c) setChangesets(c);
       if (ev) setEvidence(ev);
       if (v) setVerification(v);
-// Once the mission reaches a terminal state, stop polling but keep the
-    // final snapshot rendered.  Terminal data is authoritative from SQLite.
-    if (d?.terminal) {
-      sawTerminal = true;
-      stopPolling();
-    }
-  };
+      // Terminal mission: stop polling, keep the final snapshot rendered.
+      if (d?.terminal) {
+        sawTerminal = true;
+        stopPolling();
+      }
+    };
 
   refresh();
   stopPolling();
@@ -214,16 +212,16 @@ export function MissionView({ missionId, onOpenSettings }: { missionId: string |
   // heavy refresh.  Falls back to the interval poll when the stream is
   // unavailable; stops on terminal state exactly as before.
   const subscribeLoop = async (cursorMs: number, cursorId: string) => {
-    if (cancelled) return;
+    if (cancelledRef.current) return;
     const res = await daemon.eventsSubscribe(cursorMs, cursorId, 5000);
-    if (cancelled) return;
+    if (cancelledRef.current) return;
     if (!res) {
       timerRef.current = window.setInterval(refresh, POLL_INTERVAL_MS);
       return;
     }
     if (res.events.length > 0) {
       await refresh();
-      if (cancelled || sawTerminal) return;
+      if (cancelledRef.current || sawTerminal) return;
     }
     timerRef.current = window.setTimeout(
       () => void subscribeLoop(res.cursor.created_at_ms, res.cursor.id),
@@ -232,7 +230,7 @@ export function MissionView({ missionId, onOpenSettings }: { missionId: string |
   };
   void subscribeLoop(-1, "");
   return () => {
-    cancelled = true;
+    cancelledRef.current = true;
     stopPolling();
   };
 }, [missionId]);

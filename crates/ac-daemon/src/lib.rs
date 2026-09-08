@@ -1142,15 +1142,16 @@ include!("security.rs");
 include!("e2e.rs");
 include!("terminal.rs");
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Default)]
 pub enum DaemonLifecycle {
+    #[default]
     Created,
     Running,
     Stopping,
     Stopped,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct DaemonHealth {
     pub lifecycle: DaemonLifecycle,
     pub recovered_sessions: usize,
@@ -1228,6 +1229,10 @@ impl IpcTransport for LocalIpc<'_> {
 pub struct DaemonService {
     lifecycle: DaemonLifecycle,
     db: ControlPlaneDb,
+    /// Cheap shared snapshot for IPC Health/Ping: read by dispatch workers
+    /// WITHOUT locking the daemon mutex (a browser command holds it for
+    /// seconds — health polls must never queue behind that).
+    health_snapshot: Arc<Mutex<DaemonHealth>>,
     db_path: PathBuf,
     kernel: Arc<Mutex<Kernel<ProductionKernelPolicy>>>,
     lock_path: PathBuf,
@@ -1330,6 +1335,10 @@ impl DaemonService {
             agent_browse_status: Arc::new(Mutex::new(None)),
             live_browser: Mutex::new(None),
             panel_tabs: Mutex::new(std::collections::HashMap::new()),
+            health_snapshot: Arc::new(Mutex::new(DaemonHealth {
+                lifecycle: DaemonLifecycle::Running,
+                recovered_sessions: 0,
+            })),
         })
     }
 
@@ -1348,6 +1357,9 @@ impl DaemonService {
             .iter()
             .map(|hydrated| hydrated.session.clone())
             .collect();
+        if let Ok(mut snapshot) = self.health_snapshot.lock() {
+            snapshot.recovered_sessions = self.recovered.len();
+        }
         for hydrated in &self.hydrated {
             if let Some(mission) = self
                 .db
@@ -1526,6 +1538,9 @@ impl DaemonService {
             ));
         }
         self.lifecycle = DaemonLifecycle::Stopping;
+        if let Ok(mut snapshot) = self.health_snapshot.lock() {
+            snapshot.lifecycle = DaemonLifecycle::Stopping;
+        }
         // Close the inbuilt-browser panel's shared Chrome FIRST and
         // gracefully (CDP Browser.close): the runtime's Drop handler also
         // escalates politely, but stopping here keeps the teardown ordered
@@ -1565,6 +1580,11 @@ impl DaemonService {
             lifecycle: self.lifecycle,
             recovered_sessions: self.recovered.len(),
         }
+    }
+
+    /// Shared cheap snapshot for IPC dispatch workers (see health_snapshot).
+    pub fn health_snapshot_handle(&self) -> Arc<Mutex<DaemonHealth>> {
+        Arc::clone(&self.health_snapshot)
     }
 
     pub fn heartbeat(&self) -> AcResult<DaemonHealth> {

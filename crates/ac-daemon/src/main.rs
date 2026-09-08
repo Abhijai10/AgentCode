@@ -49,23 +49,34 @@ fn main() {
     ac_signals::install_shutdown_handler();
     let record = logger.record(Severity::Info, "AgentCode daemon started");
     println!("{} {:?}", record.component, record.severity);
+    // Concurrent dispatch: requests are handled on per-request worker
+    // threads so one slow command (browser navigation, events long-poll)
+    // never blocks the accept loop — the UI stays responsive while heavy
+    // work runs.  Read-only polls (health, tails, mission details) answer
+    // under a shared guard and never queue behind state-changing work.
+    let shared_daemon = std::sync::Arc::new(std::sync::Mutex::new(daemon));
     loop {
         if ac_signals::shutdown_requested() {
             eprintln!("daemon: shutdown signal received; stopping cleanly");
             break;
         }
         if ipc
-            .serve_once(&listener, &mut daemon)
+            .serve_accepted(&listener, std::sync::Arc::clone(&shared_daemon))
             .expect("daemon IPC should serve")
         {
             break;
         }
         std::thread::sleep(std::time::Duration::from_millis(10));
     }
+    // Wait briefly for in-flight dispatch workers to finish so the clean
+    // stop below does not race a running command.
+    std::thread::sleep(std::time::Duration::from_millis(300));
     // Clean stop: reaps design-preview + terminal children, removes the
     // socket file.  Never skip even on the error path — best effort.
-    if let Err(error) = daemon.stop() {
-        eprintln!("daemon stop reported: {error}");
+    if let Ok(mut guard) = shared_daemon.lock() {
+        if let Err(error) = guard.stop() {
+            eprintln!("daemon stop reported: {error}");
+        }
     }
     ipc.cleanup();
 }

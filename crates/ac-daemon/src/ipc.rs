@@ -105,9 +105,106 @@ impl UnixIpcServer {
                 return Err(AcError::conflict("DAEMON-IPC_QUEUE_CLOSED", "IPC request queue closed"))
             }
         };
-        let (response, should_shutdown) = dispatch_request(&request.payload, daemon);
+        // Read-only lane: polls and projections answer with a shared
+        // borrow — they never queue behind a long browser command or an
+        // events long-poll on the main lane.  This is what keeps the UI
+        // responsive while heavy work runs.
+        let (response, should_shutdown) =
+            match dispatch_request_readonly(&request.payload, daemon) {
+                Some(response) => (response, false),
+                None => dispatch_request(&request.payload, daemon),
+            };
         let _ = request.response_tx.send(response);
         Ok(should_shutdown)
+    }
+
+    /// Drains accepted requests from the queue and dispatches each on its
+    /// own worker thread.  The main loop calls this instead of
+    /// serve_once's inline dispatch, so ONE slow command (browser
+    /// navigation, events long-poll) never blocks the next request from
+    /// being accepted.  Read-only commands run under a SHARED guard
+    /// (never queue behind state-changing work); others serialize on the
+    /// daemon mutex, preserving SQLite single-writer semantics.
+    pub fn serve_accepted(
+        &self,
+        listener: &UnixListener,
+        daemon: Arc<Mutex<DaemonService>>,
+    ) -> AcResult<bool> {
+        // Health/Ping answers come from the cheap shared snapshot — no
+        // daemon-mutex acquisition, so they never queue behind a long
+        // browser command even when that command holds the main lock.
+        let health_snapshot = daemon
+            .lock()
+            .map_err(|_| AcError::conflict("DAEMON-IPC_LOCK", "daemon lock poisoned"))?
+            .health_snapshot_handle();
+        loop {
+            match listener.accept() {
+                Ok((stream, _)) => self.spawn_client(stream)?,
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
+                Err(error) => return Err(AcError::validation("DAEMON-IPC_ACCEPT", error.to_string())),
+            }
+        }
+        while let Ok(request) = self
+            .request_rx
+            .lock()
+            .map_err(|_| AcError::conflict("DAEMON-IPC_QUEUE_POISONED", "IPC request queue lock poisoned"))?
+            .try_recv()
+        {
+            let daemon = Arc::clone(&daemon);
+            let health_snapshot = Arc::clone(&health_snapshot);
+            thread::Builder::new()
+                .name("agentcode-ipc-dispatch".to_string())
+                .spawn(move || {
+                    let command = request
+                        .payload
+                        .get("command")
+                        .and_then(Value::as_str)
+                        .unwrap_or("");
+                    let correlation_id = request
+                        .payload
+                        .get("id")
+                        .and_then(Value::as_str)
+                        .unwrap_or("unknown");
+                    // Health-class commands answer from the cheap shared
+                    // snapshot WITHOUT the daemon mutex — never queue behind
+                    // a long browser command.
+                    let response = if command == "Ping" || command == "Health" || command == "GetDaemonInfo" {
+                        let snapshot = health_snapshot
+                            .lock()
+                            .map(|guard| guard.clone())
+                            .unwrap_or_default();
+                        json!({
+                            "id": correlation_id,
+                            "ok": true,
+                            "protocol_version": IPC_PROTOCOL_VERSION,
+                            "lifecycle": format!("{:?}", snapshot.lifecycle),
+                            "recovered_sessions": snapshot.recovered_sessions,
+                        })
+                    } else {
+                        match daemon.lock() {
+                            Ok(mut guard) => dispatch_request_readonly(&request.payload, &guard)
+                                .unwrap_or_else(|| dispatch_request(&request.payload, &mut guard).0),
+                            Err(poisoned) => error_response(
+                                correlation_id,
+                                "DAEMON-IPC_LOCK",
+                                poisoned.to_string(),
+                            ),
+                        }
+                    };
+                    let _ = request.response_tx.send(response);
+                })
+                .map_err(|error| {
+                    AcError::validation("DAEMON-IPC_DISPATCH_THREAD", error.to_string())
+                })?;
+        }
+        // Shutdown signals through the queue as before: a Stop command
+        // leaves no live session — detect it from the daemon lifecycle
+        // under a SHARED borrow (no state change needed).
+        let shutdown = daemon
+            .lock()
+            .map(|guard| guard.health().lifecycle != DaemonLifecycle::Running)
+            .unwrap_or(true);
+        Ok(shutdown)
     }
 
     pub fn cleanup(&self) { let _ = std::fs::remove_file(&self.path); }
@@ -260,6 +357,137 @@ fn serve_client(
         }
     }
     Ok(())
+}
+
+/// Read-only commands servable with a shared borrow: UI polls, terminal
+/// tails, event streams, mission detail projections.  They never mutate
+/// daemon state, so they can run on the side lane while the main lane
+/// executes a long browser command — the app stays responsive while a
+/// navigate/screenshot is in flight.
+/// Read-only commands the side lane serves.  Anything not listed falls
+/// through to the main (sequential) lane.
+const READONLY_COMMANDS: &[&str] = &[
+    "Ping",
+    "Health",
+    "GetDaemonInfo",
+    "ListActiveMissions",
+    "AgentBrowseStatus",
+    "TerminalList",
+    "TerminalTail",
+    "EventsSubscribe",
+    "GetMission",
+    "GetTaskState",
+    "GetMissionDetails",
+    "GetTaskDetails",
+    "GetMissionEvents",
+    "GetChangeSetSummary",
+    "GetEvidenceSummary",
+    "GetVerificationSummary",
+];
+
+fn dispatch_request_readonly(request: &Value, daemon: &DaemonService) -> Option<Value> {
+    READONLY_COMMANDS
+        .iter()
+        .any(|c| *c == request.get("command").and_then(Value::as_str).unwrap_or(""))
+        .then(|| dispatch_request_readonly_inner(request, daemon))
+}
+
+/// Commands servable with a shared borrow (see READONLY_COMMANDS).
+fn dispatch_request_readonly_inner(request: &Value, daemon: &DaemonService) -> Value {
+    let correlation_id = request.get("id").and_then(Value::as_str).unwrap_or("unknown");
+    let command = request.get("command").and_then(Value::as_str).unwrap_or("");
+    let response = match command {
+        "Ping" | "Health" | "GetDaemonInfo" => json!({"id": correlation_id, "ok": true, "protocol_version": IPC_PROTOCOL_VERSION, "lifecycle": format!("{:?}", daemon.health().lifecycle), "recovered_sessions": daemon.health().recovered_sessions}),
+        "ListActiveMissions" => match daemon.active_missions() {
+            Ok(missions) => json!({"id": correlation_id, "ok": true, "missions": missions.into_iter().map(|(mission_id, state, task_count)| json!({"mission_id": mission_id, "state": state, "task_count": task_count})).collect::<Vec<_>>() }),
+            Err(error) => error_response(correlation_id, error.code(), error.to_string()),
+        },
+        "AgentBrowseStatus" => {
+            let status = daemon
+                .agent_browse_status
+                .lock()
+                .map(|guard| guard.clone())
+                .unwrap_or(None);
+            json!({"id": correlation_id, "ok": true, "status": status})
+        }
+        "TerminalList" => match daemon.terminal_list() {
+            Ok(list) => json!({"id": correlation_id, "ok": true, "list": list}),
+            Err(error) => error_response(correlation_id, error.code(), error.to_string()),
+        },
+        "TerminalTail" => {
+            let session_id = request.get("session_id").and_then(Value::as_str).unwrap_or("");
+            let cursor = request.get("cursor").and_then(Value::as_u64).unwrap_or(0) as usize;
+            match daemon.terminal_tail(session_id, cursor) {
+                Ok(tail) => json!({"id": correlation_id, "ok": true, "tail": tail}),
+                Err(error) => error_response(correlation_id, error.code(), error.to_string()),
+            }
+        }
+        "EventsSubscribe" => {
+            let after_ms = request.get("after_created_at_ms").and_then(Value::as_i64).unwrap_or(-1);
+            let after_id = request.get("after_id").and_then(Value::as_str).unwrap_or("").to_string();
+            let wait_ms = request.get("wait_ms").and_then(Value::as_u64).unwrap_or(0);
+            // Same payload shape as the main lane (waited/cursor/events all
+            // pass through untouched — tests pin the exact contract).
+            match daemon.events_subscribe(after_ms, &after_id, wait_ms) {
+                Ok(mut payload) => {
+                    payload["id"] = json!(correlation_id);
+                    payload["ok"] = json!(true);
+                    payload
+                }
+                Err(error) => error_response(correlation_id, error.code(), error.to_string()),
+            }
+        }
+        "GetMission" | "GetTaskState" => match request.get("mission_id").and_then(Value::as_str) {
+            Some(mission_id) => match daemon.task_states(mission_id) {
+                Ok(tasks) => {
+                    let status = daemon.mission_status(mission_id);
+                    let state = match &status {
+                        Some(status) => Some(status.state.clone()),
+                        None => daemon.persisted_mission_state(mission_id).ok().flatten(),
+                    };
+                    let goal = daemon.mission_goal(mission_id).ok().flatten();
+                    let workspace_root = daemon.mission_workspace(mission_id).ok().flatten();
+                    json!({"id": correlation_id, "ok": true, "mission_id": mission_id, "session_id": status.as_ref().map(|status| status.session_id.to_string()), "state": state, "goal": goal, "workspace_root": workspace_root, "tasks": tasks.into_iter().map(|(task_id, state)| json!({"task_id": task_id, "state": state})).collect::<Vec<_>>() })
+                },
+                Err(error) => error_response(correlation_id, error.code(), error.to_string()),
+            },
+            None => error_response(correlation_id, "DAEMON-IPC_INVALID", "mission_id is required".to_string()),
+        },
+        "GetMissionDetails" | "GetTaskDetails" | "GetMissionEvents" | "GetChangeSetSummary"
+        | "GetEvidenceSummary" | "GetVerificationSummary" => {
+            match request.get("mission_id").and_then(Value::as_str) {
+                Some(mission_id) => {
+                    let result = match command {
+                        "GetMissionDetails" => daemon.mission_details(mission_id),
+                        "GetTaskDetails" => daemon.task_details(mission_id),
+                        "GetMissionEvents" => daemon.mission_events(
+                            mission_id,
+                            request.get("limit").and_then(Value::as_u64).map(|n| n as usize),
+                        ),
+                        "GetChangeSetSummary" => daemon.changeset_summary(mission_id),
+                        "GetEvidenceSummary" => daemon.evidence_summary(mission_id),
+                        _ => daemon.verification_summary(mission_id),
+                    };
+                    match result {
+                        Ok(mut payload) => {
+                            payload["id"] = json!(correlation_id);
+                            payload["ok"] = json!(true);
+                            payload["mission_id"] = json!(mission_id);
+                            payload
+                        }
+                        Err(error) => error_response(correlation_id, error.code(), error.to_string()),
+                    }
+                }
+                None => error_response(
+                    correlation_id,
+                    "DAEMON-IPC_INVALID",
+                    "command requires mission_id".to_string(),
+                ),
+            }
+        }
+        _ => Value::Null,
+    };
+    response
 }
 
 fn dispatch_request(request: &Value, daemon: &mut DaemonService) -> (Value, bool) {
