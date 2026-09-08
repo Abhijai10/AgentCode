@@ -2969,9 +2969,12 @@ impl RealBrowserPage {
             }),
         )?;
         self.client.drain_events(Duration::from_millis(100))?;
+        // JPEG q80: 5-8x smaller than PNG for real pages — the screenshot
+        // crosses the daemon->UI IPC boundary on every browser action, so
+        // payload size is the single biggest latency factor.
         let value = self.client.call(
             "Page.captureScreenshot",
-            json!({ "format": "png", "fromSurface": true }),
+            json!({ "format": "jpeg", "quality": 80, "fromSurface": true }),
         )?;
         let data = value.get("data").and_then(Value::as_str).ok_or_else(|| {
             AcError::validation(
@@ -2985,7 +2988,9 @@ impl RealBrowserPage {
         let dir = std::env::temp_dir().join("agentcode-browser-artifacts");
         fs::create_dir_all(&dir)
             .map_err(|err| AcError::validation("BROWSER-SCREENSHOT_DIR", err.to_string()))?;
-        let path = dir.join(format!("{}.png", StableId::new("browser-shot")));
+        // One stable path per panel page — each capture overwrites the
+        // previous shot instead of accumulating temp files.
+        let path = dir.join("panel.jpg");
         fs::write(&path, bytes)
             .map_err(|err| AcError::validation("BROWSER-SCREENSHOT_WRITE", err.to_string()))?;
         Ok(path.display().to_string())

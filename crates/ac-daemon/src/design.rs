@@ -835,7 +835,7 @@ Rules: describe only what is actually visible. Each array holds short factual st
         )?;
         let _ = browser.act(
             &session.id,
-            ac_verification::BrowserAction::Wait { millis: 400 },
+            ac_verification::BrowserAction::Wait { millis: 150 },
             &mut evidence_store,
         )?;
         let viewport = ac_verification::ViewportProfile {
@@ -2021,7 +2021,7 @@ port: port.map(|p| p as i64),
         // Address-bar semantics (real browser parity): http(s) URLs pass
         // through; anything else that LOOKS like a host ("example.com",
         // "localhost:3000") gets https:// prefixed; plain words become a
-        // DuckDuckGo search.  file:// and other schemes are refused.
+        // Bing search.  file:// and other schemes are refused.
         let validate_url = |u: &str| -> AcResult<String> {
             let raw = u.trim();
             if raw.is_empty() {
@@ -2054,9 +2054,12 @@ port: port.map(|p| p as i64),
             if looks_like_host {
                 return Ok(format!("https://{raw}"));
             }
-            // Search query — DuckDuckGo needs no API key.
+            // Search query — Bing: a normal major-engine results page that
+            // serves REAL results to embedded browsers (Google walls
+            // embedded/headless clients behind a captcha interstitial, so
+            // it can never render here — verified against the live site).
             let encoded = raw.replace(' ', "+");
-            Ok(format!("https://duckduckgo.com/?q={encoded}"))
+            Ok(format!("https://www.bing.com/search?q={encoded}"))
         };
 
         let mut guard = self
@@ -2187,7 +2190,7 @@ port: port.map(|p| p as i64),
         }
         runtime_slot.act(
             &session_id,
-            ac_verification::BrowserAction::Wait { millis: 400 },
+            ac_verification::BrowserAction::Wait { millis: 150 },
             &mut evidence_store,
         )?;
 
@@ -2256,10 +2259,14 @@ port: port.map(|p| p as i64),
                 "screenshot uri must be an absolute artifacts path",
             ));
         }
-        if !path.extension().map(|ext| ext == "png").unwrap_or(false) {
+        if !path
+            .extension()
+            .map(|ext| ext == "png" || ext == "jpg")
+            .unwrap_or(false)
+        {
             return Err(AcError::validation(
                 "BROWSER-SCREENSHOT_INVALID_URI",
-                "screenshot artifact must be a png",
+                "screenshot artifact must be a png or jpg",
             ));
         }
         // Canonicalize BOTH sides: on macOS /var and /tmp are symlinks into

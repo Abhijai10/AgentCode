@@ -28,7 +28,11 @@ fn command_response_timeout(command: &str) -> Duration {
         | "DesignQAReport"
         | "SecuritySend"
         | "SecurityAudit"
-        | "E2ERun" => PROVIDER_COMMAND_TIMEOUT,
+        | "E2ERun"
+        // BrowserPanel drives real Chrome: navigation + screenshot
+        // legitimately takes 6-15s on heavy pages, and a dropped frame
+        // at the old 5s budget read as "glitchy/slow browser" in the UI.
+        | "BrowserPanel" => PROVIDER_COMMAND_TIMEOUT,
         _ => FRAME_TIMEOUT,
     }
 }

@@ -9,7 +9,10 @@ import type { BrowserPanelResult } from "./types";
 // click position maps through the page geometry to a trusted CDP input
 // event), keyboard entry into the focused field, and diagnostics.
 const HOME_URL = "https://example.com/";
-const REFRESH_MS = 1500;
+// Live refresh cadence — long enough that the screenshot round-trip
+// never queues up on a slow page (the old 1.5s cadence caused visible
+// glitchiness when renders took longer than the interval).
+const REFRESH_MS = 4000;
 
 type Panel = BrowserPanelResult & {
   geometry?: { scrollX: number; scrollY: number; innerW: number; innerH: number };
@@ -27,6 +30,7 @@ export function BrowserView() {
   const [bootstrapped, setBootstrapped] = useState(false);
   const [scale, setScale] = useState(1);
   const shotRef = useRef<HTMLImageElement | null>(null);
+  const lastPng = useRef<string | null>(null);
 
   const send = useCallback(
     async (action: "navigate" | "back" | "forward" | "reload" | "interact", payload?: string) => {
@@ -41,7 +45,12 @@ export function BrowserView() {
         setPanel(res.panel as Panel);
         setCurrentUrl(res.panel.url);
         if (action === "navigate") setInput(res.panel.url);
-        if (res.panel.png_base64) setImg(`data:image/png;base64,${res.panel.png_base64}`);
+        // Skip the image state update when the pixels are identical —
+        // avoids a full re-render + image decode per refresh tick.
+        if (res.panel.png_base64 && res.panel.png_base64 !== lastPng.current) {
+          lastPng.current = res.panel.png_base64;
+          setImg(`data:image/jpeg;base64,${res.panel.png_base64}`);
+        }
         setError(null);
       }
       return true;
@@ -60,7 +69,12 @@ export function BrowserView() {
   // interaction takes over and the next refresh follows it.
   useEffect(() => {
     if (busy || naviging) return;
-    const timer = window.setInterval(() => void send("reload"), REFRESH_MS);
+    const timer = window.setInterval(() => {
+      // Pause the live refresh while the window is hidden — no wasted
+      // daemon round-trips, no screenshot queue buildup.
+      if (document.hidden) return;
+      void send("reload");
+    }, REFRESH_MS);
     return () => window.clearInterval(timer);
   }, [busy, naviging, send]);
 
@@ -71,7 +85,7 @@ export function BrowserView() {
       setAgentViewing(res.status ?? null);
     };
     tick();
-    const timer = window.setInterval(tick, 1000);
+    const timer = window.setInterval(tick, 2500);
     return () => window.clearInterval(timer);
   }, []);
 

@@ -330,7 +330,33 @@ export function SettingsView() {
                     </div>
                     <div className="text-xs text-on-surface-variant space-y-1">
                       <p>{p.model_count} model{p.model_count !== 1 ? "s" : ""}</p>
-                      <p>{p.connected_accounts} account{p.connected_accounts !== 1 ? "s" : ""}</p>
+                      <p>
+                        {p.id === "ollama"
+                          ? ollamaStatus.running
+                            ? `${ollamaStatus.models.length} local model${ollamaStatus.models.length !== 1 ? "s" : ""} available`
+                            : "Not running — start Ollama to use local models"
+                          : `${p.connected_accounts} linked account${p.connected_accounts !== 1 ? "s" : ""}`}
+                      </p>
+                      {/* OmniRouter: name every linked account so the user can
+                          see exactly which provider keys are routed. */}
+                      {/omni/i.test(p.id) && p.accounts.length > 0 && (
+                        <div className="flex flex-wrap gap-1.5 pt-1">
+                          {p.accounts.map((a) => (
+                            <span
+                              key={a.id}
+                              className={`px-2 py-0.5 rounded-full text-[10px] font-medium ${
+                                a.enabled
+                                  ? "bg-emerald-500/10 text-emerald-600 dark:text-emerald-400"
+                                  : "bg-on-surface-variant/10 text-on-surface-variant"
+                              }`}
+                              title={`${a.label} — ${a.credential_masked}`}
+                            >
+                              {a.label}
+                              {!a.enabled && " (off)"}
+                            </span>
+                          ))}
+                        </div>
+                      )}
                     </div>
 
                     {p.accounts.length > 0 && (
@@ -411,22 +437,50 @@ export function SettingsView() {
                     )}
 
                     <div className="flex gap-2 mt-auto">
-                      <button
-                        onClick={() => setAccountModal({ providerId: p.id, providerName: p.name })}
-                        className="flex-1 py-2 rounded-lg neo-button text-xs text-primary font-medium"
-                      >
-                        + Add Account
-                      </button>
-                      {p.credential_url && (
-                        <a
-                          href={p.credential_url}
-                          target="_blank"
-                          rel="noopener noreferrer"
-                          className="text-xs px-2.5 py-2 rounded-lg neo-button text-primary font-medium hover:brightness-110"
-                          title={`Open ${p.name} credentials — add your key there, then add the account here`}
-                        >
-                          {/omni/i.test(p.id) ? "Open OmniRouter →" : "Get API key →"}
-                        </a>
+                      {p.id === "ollama" ? (
+                        // Local models need no API key or account: they run
+                        // on this machine.  The honest CTA is getting more
+                        // models (or opening Ollama itself).
+                        <>
+                          <a
+                            href="https://ollama.com/library"
+                            target="_blank"
+                            rel="noopener noreferrer"
+                            className="flex-1 py-2 rounded-lg neo-button text-xs text-primary font-medium text-center"
+                            title="Browse the Ollama model library — pull models with 'ollama pull <name>'"
+                          >
+                            Download more local models →
+                          </a>
+                          <a
+                            href="https://ollama.com/download"
+                            target="_blank"
+                            rel="noopener noreferrer"
+                            className="text-xs px-2.5 py-2 rounded-lg neo-button text-primary font-medium hover:brightness-110"
+                            title="Get the Ollama app for macOS"
+                          >
+                            Get Ollama
+                          </a>
+                        </>
+                      ) : (
+                        <>
+                          <button
+                            onClick={() => setAccountModal({ providerId: p.id, providerName: p.name })}
+                            className="flex-1 py-2 rounded-lg neo-button text-xs text-primary font-medium"
+                          >
+                            + Add Account
+                          </button>
+                          {p.credential_url && (
+                            <a
+                              href={p.credential_url}
+                              target="_blank"
+                              rel="noopener noreferrer"
+                              className="text-xs px-2.5 py-2 rounded-lg neo-button text-primary font-medium hover:brightness-110"
+                              title={`Open ${p.name} — add your API key there, then add the account here`}
+                            >
+                              {/omni/i.test(p.id) ? "Open OmniRouter →" : "Get API key →"}
+                            </a>
+                          )}
+                        </>
                       )}
                     </div>
                   </div>
@@ -711,7 +765,7 @@ export function SettingsView() {
       </div>
 
       {/* Add Account Modal */}
-      {accountModal && (
+      {accountModal && accountModal.providerId !== "ollama" && (
         <div className="fixed inset-0 bg-black/40 flex items-center justify-center z-50" onClick={() => { setAccountModal(null); setTestResult(null); }}>
           <div className="bg-surface rounded-2xl p-8 max-w-lg w-full mx-4 neo-raised max-h-[90vh] overflow-y-auto" onClick={(e) => e.stopPropagation()}>
             <h3 className="text-xl font-semibold text-on-surface mb-6">Add Account</h3>

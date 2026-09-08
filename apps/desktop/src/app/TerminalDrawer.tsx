@@ -145,6 +145,11 @@ export function TerminalDrawer({
 
   const active = activeSession ? sessions.find((s) => s.session_id === activeSession) : undefined;
 
+  // THE drawer only exists while open: closed = nothing rendered (the
+  // toggle and the cross both collapse it instantly; no hidden element
+  // can steal focus or sit in the layout).
+  if (!open) return null;
+
   return (
     <div
       className="shrink-0 flex flex-col border-t border-white/10 bg-[#0c0f14] text-[#d6e2f0] font-mono text-[13px]"
@@ -169,7 +174,9 @@ export function TerminalDrawer({
               key={s.session_id}
               onClick={() => {
                 setActiveSession(s.session_id);
-                setLines([]);
+                setLines([
+                  `$ ${s.argv.filter(Boolean).join(" ") || s.session_id}  (session ${s.session_id.slice(0, 8)})`,
+                ]);
                 setCursor(0);
               }}
               className={`shrink-0 text-[11px] px-2 py-0.5 rounded-md flex items-center gap-1 ${

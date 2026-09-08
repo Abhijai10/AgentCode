@@ -187,6 +187,106 @@ fn main() {
                 // (matching the daemon_health pattern); daemon-shaped
                 // responses keep their own {ok,...} envelope.
                 "user_home_dir" => json!(std::env::var("HOME").unwrap_or_default()),
+                "daemon_list_providers" => {
+                    // Mirror the tauri provider_catalog wrapper 1:1 so the
+                    // Providers tab renders identically in bridge mode.
+                    let r = handle_invoke(&client, json!({"command": "ListProviders"}));
+                    let providers = r.get("providers").cloned().unwrap_or(json!([]));
+                    let enriched: Vec<Value> = providers
+                        .as_array()
+                        .map(|arr| {
+                            arr.iter()
+                                .filter(|p| {
+                                    let id = p.get("id").and_then(Value::as_str).unwrap_or("");
+                                    id == "ollama" || id.contains("omni")
+                                })
+                                .map(|p| {
+                                    let pid = p.get("id").and_then(Value::as_str).unwrap_or("").to_string();
+                                    let accounts = handle_invoke(
+                                        &client,
+                                        json!({"command": "ListProviderAccounts", "provider_id": pid}),
+                                    )
+                                    .get("accounts")
+                                    .cloned()
+                                    .unwrap_or(json!([]));
+                                    let account_count = accounts.as_array().map(|a| a.len()).unwrap_or(0);
+                                    let local = pid == "ollama";
+                                    let health = if local {
+                                        // Local model health: does the daemon see models at
+                                        // the local endpoint (tauri wrapper parity)?
+                                        let endpoint = std::env::var("OLLAMA_BASE_URL")
+                                            .unwrap_or_else(|_| "http://127.0.0.1:11434".to_string());
+                                        let d = handle_invoke(
+                                            &client,
+                                            json!({"command": "DiscoverProviderModels", "endpoint": endpoint, "kind": "ollama"}),
+                                        );
+                                        let running = d
+                                            .get("models")
+                                            .and_then(Value::as_array)
+                                            .map(|m| !m.is_empty())
+                                            .unwrap_or(false);
+                                        if running { "healthy" } else { "unavailable" }
+                                    } else if account_count > 0 { "healthy" } else { "unavailable" };
+                                    let model_count = if local {
+                                        let endpoint = std::env::var("OLLAMA_BASE_URL")
+                                            .unwrap_or_else(|_| "http://127.0.0.1:11434".to_string());
+                                        handle_invoke(
+                                            &client,
+                                            json!({"command": "DiscoverProviderModels", "endpoint": endpoint, "kind": "ollama"}),
+                                        )
+                                        .get("models")
+                                        .and_then(Value::as_array)
+                                        .map(|m| m.len())
+                                        .unwrap_or(0)
+                                    } else { 1 };
+                                    json!({
+                                        "id": pid,
+                                        "name": p.get("display_name").and_then(Value::as_str).unwrap_or(""),
+                                        "description": p.get("description").and_then(Value::as_str).unwrap_or(""),
+                                        "category": p.get("pricing_classification").and_then(Value::as_str).unwrap_or(""),
+                                        "health": health,
+                                        "connected_accounts": account_count,
+                                        "model_count": model_count,
+                                        "website": p.get("website_url").and_then(Value::as_str).unwrap_or(""),
+                                        "credential_url": p.get("credential_url").and_then(Value::as_str).unwrap_or(""),
+                                        "local": local,
+                                        "paid": p.get("pricing_classification").and_then(Value::as_str).unwrap_or("") == "paid",
+                                        "accounts": accounts,
+                                    })
+                                })
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    json!(enriched)
+                }
+                "daemon_discover_ollama" => {
+                    // Tauri wrapper parity: discover the real local model list.
+                    let endpoint = std::env::var("OLLAMA_BASE_URL")
+                        .unwrap_or_else(|_| "http://127.0.0.1:11434".to_string());
+                    let r = handle_invoke(
+                        &client,
+                        json!({"command": "DiscoverProviderModels", "endpoint": endpoint, "kind": "ollama"}),
+                    );
+                    let models: Vec<Value> = r
+                        .get("models")
+                        .and_then(Value::as_array)
+                        .cloned()
+                        .unwrap_or_default()
+                        .into_iter()
+                        .map(|m| {
+                            json!({
+                                "name": m.get("model_name").and_then(Value::as_str).unwrap_or(""),
+                                "size": m.get("parameters").and_then(Value::as_str),
+                                "capabilities": m.get("capabilities").and_then(Value::as_array).cloned().unwrap_or_default(),
+                                "loaded": true,
+                            })
+                        })
+                        .collect();
+                    json!({
+                        "running": !models.is_empty(),
+                        "models": models,
+                    })
+                }
                 "daemon_e2e_run" => {
                     let mut f = json!({"command": "E2ERun"});
                     if let Some(v) = args.get("conversationId") {
