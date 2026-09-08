@@ -1261,7 +1261,18 @@ export const daemon = {
   },
 
   async browserPanel(
-    action: "navigate" | "back" | "forward" | "reload" | "screenshot" | "close" | "interact",
+    action:
+      | "navigate"
+      | "back"
+      | "forward"
+      | "reload"
+      | "screenshot"
+      | "close"
+      | "interact"
+      | "new_tab"
+      | "switch_tab"
+      | "close_tab"
+      | "list_tabs",
     url?: string,
     viewportHint?: string
   ): Promise<{ ok: boolean; panel?: BrowserPanelResult; error?: string }> {

@@ -2121,6 +2121,112 @@ port: port.map(|p| p as i64),
             },
         };
 
+        // ── Multi-tab support ──────────────────────────────────────
+        // Tabs are page sessions in the SAME shared runtime; the panel
+        // session id becomes tab-scoped.  Tab ids ride in the panel
+        // registry (per-runtime tab list stored in the daemon).
+        let tabs_key = "browser-panel-tabs";
+        let mut tab_ids: Vec<String> = self
+            .panel_tabs
+            .lock()
+            .map_err(|_| AcError::validation("BROWSER-PANEL_LOCK", "panel tabs lock poisoned"))?
+            .get(tabs_key)
+            .cloned()
+            .unwrap_or_default();
+        if tab_ids.is_empty() {
+            tab_ids.push(session_id.to_string());
+            self.panel_tabs
+                .lock()
+                .map_err(|_| AcError::validation("BROWSER-PANEL_LOCK", "panel tabs lock poisoned"))?
+                .insert(tabs_key.to_string(), tab_ids.clone());
+        }
+        match action {
+            "new_tab" | "switch_tab" | "close_tab" | "list_tabs" => {
+                let active_tab_id = match action {
+                    "new_tab" => {
+                        let Some(process_id) = runtime_slot.panel_process() else {
+                            return Err(AcError::validation(
+                                "BROWSER-PANEL_TAB_SPAWN",
+                                "no running browser process for a new tab",
+                            ));
+                        };
+                        // Sessions are task-owned: reuse the SAME task the
+                        // panel's original session belongs to.
+                        let tab_task = runtime_slot
+                            .panel_task()
+                            .unwrap_or_else(|| task_id.clone());
+                        let tab_session = runtime_slot.create_session(tab_task, process_id)?;
+                        runtime_slot.set_panel_session(&tab_session.id);
+                        let tab_id = tab_session.id.to_string();
+                        if let Some(tabs) = self
+                            .panel_tabs
+                            .lock()
+                            .map_err(|_| AcError::validation("BROWSER-PANEL_LOCK", "panel tabs lock poisoned"))?
+                            .get_mut(tabs_key)
+                        {
+                            tabs.push(tab_id.clone());
+                        }
+                        tab_id
+                    }
+                    "switch_tab" => {
+                        let tab_id = url.trim().to_string();
+                        if !tab_ids.contains(&tab_id) {
+                            return Err(AcError::validation(
+                                "BROWSER-PANEL_TAB_UNKNOWN",
+                                "unknown tab id",
+                            ));
+                        }
+                        runtime_slot.set_panel_session(&StableId::from_existing(&tab_id).map_err(|_| {
+                            AcError::validation("BROWSER-PANEL_TAB_INVALID", "tab id is not a stable id")
+                        })?);
+                        tab_id
+                    }
+                    "close_tab" => {
+                        let tab_id = url.trim().to_string();
+                        let mut tabs_guard = self
+                            .panel_tabs
+                            .lock()
+                            .map_err(|_| AcError::validation("BROWSER-PANEL_LOCK", "panel tabs lock poisoned"))?;
+                        if let Some(tabs) = tabs_guard.get_mut(tabs_key) {
+                            tabs.retain(|t| t != &tab_id);
+                        }
+                        // Last tab closed: full teardown (the panel has no
+                        // pages left).
+                        let remaining = tabs_guard
+                            .get(tabs_key)
+                            .cloned()
+                            .unwrap_or_default();
+                        let last_closed = remaining.is_empty();
+                        drop(tabs_guard);
+                        if last_closed {
+                            let mut guard = self
+                                .live_browser
+                                .lock()
+                                .map_err(|_| AcError::validation("BROWSER-PANEL_LOCK", "browser panel lock poisoned"))?;
+                            if let Some(mut runtime) = guard.take() {
+                                runtime.close_all();
+                            }
+                        }
+                        url.trim().to_string()
+                    }
+                    _ => String::new(),
+                };
+                let current_tabs = self
+                    .panel_tabs
+                    .lock()
+                    .map_err(|_| AcError::validation("BROWSER-PANEL_LOCK", "panel tabs lock poisoned"))?
+                    .get(tabs_key)
+                    .cloned()
+                    .unwrap_or_default();
+                return Ok(json!({
+                    "tabs": current_tabs,
+                    "active_tab": active_tab_id,
+                    "tab_count": current_tabs.len(),
+                }));
+            }
+            _ => {}
+        }
+
         let mut evidence_store = EvidenceStore::new();
         let mut final_url = String::new();
         match action {
@@ -2232,7 +2338,16 @@ port: port.map(|p| p as i64),
             &mut evidence_store,
         )?;
         let png = self.browser_screenshot_png(&screenshot.artifact_uri)?;
+        let current_tabs = self
+            .panel_tabs
+            .lock()
+            .map_err(|_| AcError::validation("BROWSER-PANEL_LOCK", "panel tabs lock poisoned"))?
+            .get(tabs_key)
+            .cloned()
+            .unwrap_or_default();
         Ok(json!({
+            "tabs": current_tabs,
+            "active_tab": session_id.to_string(),
             "url": final_url,
             "title": dom.visible_text.lines().next().unwrap_or("").trim().to_string(),
             "viewport": {"name": viewport.name, "width": viewport.width, "height": viewport.height},

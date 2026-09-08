@@ -16,9 +16,14 @@ const REFRESH_MS = 4000;
 
 type Panel = BrowserPanelResult & {
   geometry?: { scrollX: number; scrollY: number; innerW: number; innerH: number };
+  tabs?: string[];
+  active_tab?: string;
+  tab_count?: number;
 };
 
 export function BrowserView() {
+  const [tabs, setTabs] = useState<string[]>([]);
+  const [activeTab, setActiveTab] = useState<string>("");
   const [input, setInput] = useState(HOME_URL);
   const [currentUrl, setCurrentUrl] = useState("");
   const [img, setImg] = useState<string | null>(null);
@@ -33,7 +38,19 @@ export function BrowserView() {
   const lastPng = useRef<string | null>(null);
 
   const send = useCallback(
-    async (action: "navigate" | "back" | "forward" | "reload" | "interact", payload?: string) => {
+    async (
+      action:
+        | "navigate"
+        | "back"
+        | "forward"
+        | "reload"
+        | "interact"
+        | "new_tab"
+        | "switch_tab"
+        | "close_tab"
+        | "list_tabs",
+      payload?: string
+    ) => {
       setBusy(true);
       const res = await daemon.browserPanel(action, payload ?? "", "desktop");
       setBusy(false);
@@ -43,6 +60,9 @@ export function BrowserView() {
       }
       if (res.panel) {
         setPanel(res.panel as Panel);
+        if (Array.isArray((res.panel as Panel).tabs) && (res.panel as Panel).tabs!.length > 0)
+          setTabs((res.panel as Panel).tabs!);
+        if ((res.panel as Panel).active_tab) setActiveTab((res.panel as Panel).active_tab!);
         setCurrentUrl(res.panel.url);
         if (action === "navigate") setInput(res.panel.url);
         // Skip the image state update when the pixels are identical —
@@ -193,6 +213,44 @@ export function BrowserView() {
             agent viewing
           </span>
         )}
+      </div>
+
+      {/* Tab strip — multiple tabs in the ONE shared browser, like a
+          normal browser: click to switch, + to open, × to close. */}
+      <div className="shrink-0 flex items-center gap-1 px-2 h-9 bg-surface-container-low border-b border-outline-variant/30 dark:border-white/5 overflow-x-auto no-scrollbar">
+        {tabs.map((tab, i) => (
+          <span
+            key={tab}
+            className={`shrink-0 flex items-center gap-1.5 pl-2.5 pr-1.5 h-7 rounded-t-lg text-[11px] font-medium group ${
+              activeTab === tab
+                ? "bg-surface text-on-surface shadow-sm"
+                : "text-on-surface-variant hover:bg-surface-variant/30"
+            }`}
+          >
+            <button
+              onClick={() => void send("switch_tab", tab)}
+              title={`Tab ${i + 1} — ${tab === activeTab ? panel?.url ?? "" : "switch to this tab"}`}
+              className="outline-none"
+            >
+              Tab {i + 1}
+              {activeTab === tab && panel?.title ? ` — ${panel.title.slice(0, 18)}` : ""}
+            </button>
+            <button
+              onClick={() => void send("close_tab", tab)}
+              className="opacity-40 group-hover:opacity-100 hover:text-red-500"
+              title="Close this tab"
+            >
+              <Icon name="close" size={11} />
+            </button>
+          </span>
+        ))}
+        <button
+          onClick={() => void send("new_tab")}
+          className="shrink-0 w-7 h-7 rounded-lg flex items-center justify-center text-on-surface-variant hover:text-on-surface hover:bg-surface-variant/30"
+          title="Open a new tab"
+        >
+          <Icon name="add" size={14} />
+        </button>
       </div>
 
       {/* Agent banner */}

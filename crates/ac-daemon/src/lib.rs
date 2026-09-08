@@ -1258,6 +1258,9 @@ pub struct DaemonService {
     /// browser instead of relaunching per request.  None until first use;
     /// torn down gracefully on daemon stop (Drop) and on explicit close.
     live_browser: Mutex<Option<ac_verification::BrowserRuntime>>,
+    /// Inbuilt-browser panel tab registry: tab (page session) ids per
+    /// runtime, so the panel can drive multiple tabs in one Chrome.
+    panel_tabs: Mutex<std::collections::HashMap<String, Vec<String>>>,
 }
 
 /// Public alias for the include'd terminal module's session type.
@@ -1326,6 +1329,7 @@ impl DaemonService {
             terminal_sessions,
             agent_browse_status: Arc::new(Mutex::new(None)),
             live_browser: Mutex::new(None),
+            panel_tabs: Mutex::new(std::collections::HashMap::new()),
         })
     }
 

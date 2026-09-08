@@ -1407,6 +1407,7 @@ impl BrowserRuntime {
                 "browser session must be tied to a running task-owned process",
             ));
         }
+        let mut panel_page_session_id: Option<StableId> = None;
         if self.mode == BrowserAdapterMode::ChromiumCdp {
             let real_process = self.real_processes.get(&process_id).ok_or_else(|| {
                 AcError::validation(
@@ -1415,10 +1416,17 @@ impl BrowserRuntime {
                 )
             })?;
             let page = RealBrowserPage::create(real_process.port, &real_process.browser_ws_path)?;
-            self.real_pages.insert(process_id.clone(), page);
+            // One CDP target per SESSION (tab): keying by session lets the
+            // panel hold multiple tabs in ONE browser process.  The id is
+            // generated ONCE and shared by the page map and the record.
+            panel_page_session_id = Some(StableId::new("browsersession"));
+            self.real_pages
+                .insert(panel_page_session_id.clone().unwrap(), page);
         }
         let session = BrowserSessionRecord {
-            id: StableId::new("browsersession"),
+            id: panel_page_session_id
+                .take()
+                .unwrap_or_else(|| StableId::new("browsersession")),
             task_id,
             process_id,
             current_url: None,
@@ -2046,6 +2054,17 @@ impl BrowserRuntime {
         }
         process.state = BrowserProcessState::Closing;
         let mut graceful = false;
+        // Session-keyed page cleanup: every tab (session) owned by this
+        // process drops its CDP page.
+        let owned: Vec<StableId> = self
+            .sessions
+            .iter()
+            .filter(|(_, sess)| &sess.process_id == process_id)
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in owned {
+            self.real_pages.remove(&id);
+        }
         if let Some(real) = self.real_processes.remove(process_id) {
             let mut real = real;
             graceful = terminate_browser_process_gracefully(&mut real);
@@ -2255,9 +2274,10 @@ impl BrowserRuntime {
                     "browser session is not registered",
                 )
             })?
-            .process_id
             .clone();
-        self.real_pages.get_mut(&process_id).ok_or_else(|| {
+        let _ = process_id;
+        // Pages are SESSION-keyed (one CDP target per tab).
+        self.real_pages.get_mut(session_id).ok_or_else(|| {
             AcError::validation("BROWSER-PAGE_UNKNOWN", "real browser page is not open")
         })
     }
@@ -2474,6 +2494,21 @@ impl BrowserRuntime {
     /// Remember (or clear) the panel's persistent page session.
     pub fn set_panel_session(&mut self, session_id: &StableId) {
         self.panel_session = Some(session_id.clone());
+    }
+
+    /// The process that owns the panel's persistent page session (for
+    /// opening additional tabs in the SAME browser).
+    pub fn panel_process(&self) -> Option<StableId> {
+        let session_id = self.panel_session.as_ref()?;
+        self.sessions.get(session_id).map(|s| s.process_id.clone())
+    }
+
+    /// The task that owns the panel's persistent page session — a new tab
+    /// must reuse BOTH the process and its owning task (sessions are
+    /// task-owned; a fresh random task id would be rejected).
+    pub fn panel_task(&self) -> Option<StableId> {
+        let session_id = self.panel_session.as_ref()?;
+        self.sessions.get(session_id).map(|s| s.task_id.clone())
     }
 
     /// Gracefully close every live process (panel shutdown + daemon stop).

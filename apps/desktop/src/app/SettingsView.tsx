@@ -497,13 +497,47 @@ export function SettingsView() {
                   <p className="text-sm text-on-surface-variant mt-2 max-w-md mx-auto">
                     AgentCode needs at least one usable model route. Connect a provider account or start a local model to begin.
                   </p>
-                  <div className="flex justify-center gap-3 mt-6">
-                    <button
-                      onClick={() => { const first = providers[0]; if (first) setAccountModal({ providerId: first.id, providerName: first.name }); }}
-                      className="px-6 py-3 rounded-xl bg-primary text-on-primary text-sm font-medium hover:brightness-110 transition-all"
+                  <div className="flex flex-wrap justify-center gap-3 mt-6">
+                    {/* OmniRouter: one managed account routes every model. */}
+                    {providers.filter((x) => /omni/i.test(x.id)).map((x) => (
+                      <button
+                        key={x.id}
+                        onClick={() => setAccountModal({ providerId: x.id, providerName: x.name })}
+                        className="px-6 py-3 rounded-xl bg-primary text-on-primary text-sm font-medium hover:brightness-110 transition-all"
+                      >
+                        Add OmniRouter Account
+                      </button>
+                    ))}
+                    {providers.filter((x) => /omni/i.test(x.id)).map((x) => (
+                      <a
+                        key={`${x.id}-link`}
+                        href={x.credential_url || "https://omnirouter.app/settings/keys"}
+                        target="_blank"
+                        rel="noopener noreferrer"
+                        className="px-6 py-3 rounded-xl neo-button text-primary text-sm font-medium hover:brightness-110"
+                        title="Open OmniRouter — create an account and add your API key"
+                      >
+                        Open OmniRouter →
+                      </a>
+                    ))}
+                    <a
+                      href="https://ollama.com/download"
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      className="px-6 py-3 rounded-xl neo-button text-primary text-sm font-medium hover:brightness-110"
+                      title="Install Ollama for fully local models — no key needed"
                     >
-                      Configure Provider
-                    </button>
+                      Get Ollama (local) →
+                    </a>
+                    <a
+                      href="https://ollama.com/library"
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      className="px-6 py-3 rounded-xl neo-button text-primary text-sm font-medium hover:brightness-110"
+                      title="Browse the local model library"
+                    >
+                      Local Model Library →
+                    </a>
                   </div>
                 </div>
               )}
@@ -534,7 +568,27 @@ export function SettingsView() {
                   </div>
                 )}
                 {!ollamaStatus.running && (
-                  <p className="text-xs text-on-surface-variant mt-2">Ollama is not available. Install and start Ollama to use local models.</p>
+                  <div className="mt-2 space-y-2">
+                    <p className="text-xs text-on-surface-variant">Ollama is not available. Install and start Ollama to use local models.</p>
+                    <div className="flex gap-2">
+                      <a
+                        href="https://ollama.com/download"
+                        target="_blank"
+                        rel="noopener noreferrer"
+                        className="neo-button px-3 py-1.5 rounded-lg text-xs text-primary font-medium"
+                      >
+                        Download Ollama →
+                      </a>
+                      <a
+                        href="https://lmstudio.ai"
+                        target="_blank"
+                        rel="noopener noreferrer"
+                        className="neo-button px-3 py-1.5 rounded-lg text-xs text-primary font-medium"
+                      >
+                        LM Studio →
+                      </a>
+                    </div>
+                  </div>
                 )}
               </div>
             </>

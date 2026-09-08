@@ -154,7 +154,25 @@ export function MissionView({ missionId, onOpenSettings }: { missionId: string |
     setStatus("loading");
     setControlError(null);
 
-    const refresh = async () => {
+    // Event batches arrive in bursts; a full 6-call refresh per batch made
+  // the mission view laggy.  Coalesce: at most one heavy refresh per tick.
+  const lastRefreshRef = useRef(0);
+  const pendingRefreshRef = useRef<number | null>(null);
+  const refresh = async () => {
+    if (!cancelled) {
+      const now = Date.now();
+      const since = now - lastRefreshRef.current;
+      if (since < 750) {
+        if (pendingRefreshRef.current === null) {
+          pendingRefreshRef.current = window.setTimeout(() => {
+            pendingRefreshRef.current = null;
+            void refresh();
+          }, 750 - since);
+        }
+        return;
+      }
+      lastRefreshRef.current = now;
+    }
       const [d, t, e, c, ev, v] = await Promise.all([
         daemon.getMissionDetails(missionId),
         daemon.getTaskDetails(missionId),
