@@ -1988,7 +1988,45 @@ port: port.map(|p| p as i64),
     /// diagnostics.  The runtime is shared across calls (`live_browser`), so
     /// the panel behaves like an embedded browser — Chrome starts once and
     /// stays up while the user browses.
+    /// Self-healing panel driver: a dead CDP socket (Chrome exited or
+    /// was killed externally) used to surface as BROWSER-CDP_SEND
+    /// "Broken pipe" until the daemon restarted.  On socket-death
+    /// errors the stale runtime is torn down and the exact user action
+    /// is retried once with a fresh engine.
     pub fn browser_panel(
+        &self,
+        action: &str,
+        url: &str,
+        viewport_hint: &str,
+    ) -> AcResult<Value> {
+        match self.browser_panel_once(action, url, viewport_hint) {
+            Ok(result) => Ok(result),
+            Err(error) => {
+                let socket_dead = matches!(
+                    error.code(),
+                    "BROWSER-CDP_SEND" | "BROWSER-CDP_READ" | "BROWSER-CDP_TIMEOUT"
+                );
+                if !socket_dead {
+                    return Err(error);
+                }
+                let mut guard = match self.live_browser.lock() {
+                    Ok(guard) => guard,
+                    Err(_) => return Err(error),
+                };
+                if let Some(mut runtime) = guard.take() {
+                    runtime.close_all();
+                }
+                // The tab registry dies with the runtime.
+                if let Ok(mut tabs) = self.panel_tabs.lock() {
+                    tabs.remove("browser-panel-tabs");
+                }
+                drop(guard);
+                self.browser_panel_once(action, url, viewport_hint)
+            }
+        }
+    }
+
+    fn browser_panel_once(
         &self,
         action: &str,
         url: &str,
@@ -2072,11 +2110,15 @@ port: port.map(|p| p as i64),
         // Handled BEFORE the closed-guard so close is always valid.
         if action == "close" {
             let runtime = guard.take();
+            // The tab registry dies with the runtime.
+            if let Ok(mut tabs) = self.panel_tabs.lock() {
+                tabs.remove("browser-panel-tabs");
+            }
             drop(guard);
             if let Some(mut runtime) = runtime {
                 runtime.close_all();
             }
-            return Ok(json!({"closed": true}));
+            return Ok(json!({"closed": true, "tabs": []}));
         }
         // The standalone BrowserView drives this panel directly, so any
         // action auto-opens the shared runtime when it is not up yet — the
@@ -2123,8 +2165,8 @@ port: port.map(|p| p as i64),
 
         // ── Multi-tab support ──────────────────────────────────────
         // Tabs are page sessions in the SAME shared runtime; the panel
-        // session id becomes tab-scoped.  Tab ids ride in the panel
-        // registry (per-runtime tab list stored in the daemon).
+        // session id is tab-scoped, and the tab registry rides in the
+        // daemon so it survives across panel calls.
         let tabs_key = "browser-panel-tabs";
         let mut tab_ids: Vec<String> = self
             .panel_tabs
@@ -2133,88 +2175,115 @@ port: port.map(|p| p as i64),
             .get(tabs_key)
             .cloned()
             .unwrap_or_default();
-        if tab_ids.is_empty() {
-            tab_ids.push(session_id.to_string());
-            self.panel_tabs
-                .lock()
-                .map_err(|_| AcError::validation("BROWSER-PANEL_LOCK", "panel tabs lock poisoned"))?
-                .insert(tabs_key.to_string(), tab_ids.clone());
+        // Registry hygiene: drop ids whose sessions are no longer live in
+        // THIS runtime (stale after a teardown, self-heal restart, or
+        // explicit close) so the strip never offers dead tabs.
+        tab_ids.retain(|id| match StableId::from_existing(id) {
+            Ok(sid) => runtime_slot.has_live_session(&sid),
+            Err(_) => false,
+        });
+        let current_tab = session_id.to_string();
+        if !tab_ids.contains(&current_tab) {
+            tab_ids.push(current_tab);
         }
-        match action {
-            "new_tab" | "switch_tab" | "close_tab" | "list_tabs" => {
-                let active_tab_id = match action {
-                    "new_tab" => {
-                        let Some(process_id) = runtime_slot.panel_process() else {
-                            return Err(AcError::validation(
-                                "BROWSER-PANEL_TAB_SPAWN",
-                                "no running browser process for a new tab",
-                            ));
-                        };
-                        // Sessions are task-owned: reuse the SAME task the
-                        // panel's original session belongs to.
-                        let tab_task = runtime_slot
-                            .panel_task()
-                            .unwrap_or_else(|| task_id.clone());
-                        let tab_session = runtime_slot.create_session(tab_task, process_id)?;
-                        runtime_slot.set_panel_session(&tab_session.id);
-                        let tab_id = tab_session.id.to_string();
-                        if let Some(tabs) = self
-                            .panel_tabs
-                            .lock()
-                            .map_err(|_| AcError::validation("BROWSER-PANEL_LOCK", "panel tabs lock poisoned"))?
-                            .get_mut(tabs_key)
-                        {
-                            tabs.push(tab_id.clone());
-                        }
-                        tab_id
+        self.panel_tabs
+            .lock()
+            .map_err(|_| AcError::validation("BROWSER-PANEL_LOCK", "panel tabs lock poisoned"))?
+            .insert(tabs_key.to_string(), tab_ids.clone());
+
+        let mut teardown = false;
+        if matches!(
+            action,
+            "new_tab" | "switch_tab" | "close_tab" | "list_tabs"
+        ) {
+            let active_tab_id = match action {
+                "new_tab" => {
+                    let Some(process_id) = runtime_slot.panel_process() else {
+                        return Err(AcError::validation(
+                            "BROWSER-PANEL_TAB_SPAWN",
+                            "no running browser process for a new tab",
+                        ));
+                    };
+                    // Sessions are task-owned: reuse the SAME task the
+                    // panel's original session belongs to.
+                    let tab_task = runtime_slot
+                        .panel_task()
+                        .unwrap_or_else(|| task_id.clone());
+                    let tab_session = runtime_slot.create_session(tab_task, process_id)?;
+                    runtime_slot.set_panel_session(&tab_session.id);
+                    let tab_id = tab_session.id.to_string();
+                    if let Some(tabs) = self
+                        .panel_tabs
+                        .lock()
+                        .map_err(|_| {
+                            AcError::validation("BROWSER-PANEL_LOCK", "panel tabs lock poisoned")
+                        })?
+                        .get_mut(tabs_key)
+                    {
+                        tabs.push(tab_id.clone());
                     }
-                    "switch_tab" => {
-                        let tab_id = url.trim().to_string();
-                        if !tab_ids.contains(&tab_id) {
-                            return Err(AcError::validation(
-                                "BROWSER-PANEL_TAB_UNKNOWN",
-                                "unknown tab id",
-                            ));
-                        }
-                        runtime_slot.set_panel_session(&StableId::from_existing(&tab_id).map_err(|_| {
-                            AcError::validation("BROWSER-PANEL_TAB_INVALID", "tab id is not a stable id")
-                        })?);
-                        tab_id
+                    tab_id
+                }
+                "switch_tab" => {
+                    let tab_id = url.trim().to_string();
+                    if !tab_ids.contains(&tab_id) {
+                        return Err(AcError::validation(
+                            "BROWSER-PANEL_TAB_UNKNOWN",
+                            "unknown tab id",
+                        ));
                     }
-                    "close_tab" => {
-                        let tab_id = url.trim().to_string();
-                        let mut tabs_guard = self
-                            .panel_tabs
-                            .lock()
-                            .map_err(|_| AcError::validation("BROWSER-PANEL_LOCK", "panel tabs lock poisoned"))?;
-                        if let Some(tabs) = tabs_guard.get_mut(tabs_key) {
-                            tabs.retain(|t| t != &tab_id);
-                        }
-                        // Last tab closed: full teardown (the panel has no
-                        // pages left).
-                        let remaining = tabs_guard
-                            .get(tabs_key)
-                            .cloned()
-                            .unwrap_or_default();
-                        let last_closed = remaining.is_empty();
-                        drop(tabs_guard);
-                        if last_closed {
-                            let mut guard = self
-                                .live_browser
-                                .lock()
-                                .map_err(|_| AcError::validation("BROWSER-PANEL_LOCK", "browser panel lock poisoned"))?;
-                            if let Some(mut runtime) = guard.take() {
-                                runtime.close_all();
-                            }
-                        }
-                        url.trim().to_string()
+                    let sid = StableId::from_existing(&tab_id).map_err(|_| {
+                        AcError::validation(
+                            "BROWSER-PANEL_TAB_INVALID",
+                            "tab id is not a stable id",
+                        )
+                    })?;
+                    runtime_slot.set_panel_session(&sid);
+                    tab_id
+                }
+                "close_tab" => {
+                    let tab_id = url.trim().to_string();
+                    let mut tabs_guard = self
+                        .panel_tabs
+                        .lock()
+                        .map_err(|_| {
+                            AcError::validation("BROWSER-PANEL_LOCK", "panel tabs lock poisoned")
+                        })?;
+                    if let Some(tabs) = tabs_guard.get_mut(tabs_key) {
+                        tabs.retain(|t| t != &tab_id);
                     }
-                    _ => String::new(),
-                };
+                    let remaining = tabs_guard.get(tabs_key).cloned().unwrap_or_default();
+                    drop(tabs_guard);
+                    // Free the tab's session + page socket; the headless
+                    // target is reclaimed at teardown.
+                    if let Ok(sid) = StableId::from_existing(&tab_id) {
+                        runtime_slot.close_session(&sid);
+                    }
+                    if remaining.is_empty() {
+                        // Last tab: no pages left — tear the shared engine
+                        // down.  (Take the ALREADY-HELD guard: re-locking
+                        // live_browser here would deadlock.)
+                        teardown = true;
+                    } else if let Some(next) = remaining.first() {
+                        // Hand the panel to a surviving tab.
+                        if let Ok(sid) = StableId::from_existing(next) {
+                            runtime_slot.set_panel_session(&sid);
+                        }
+                    }
+                    tab_id
+                }
+                _ => runtime_slot
+                    .panel_session()
+                    .map(|id| id.to_string())
+                    .unwrap_or_default(),
+            };
+            if !teardown {
                 let current_tabs = self
                     .panel_tabs
                     .lock()
-                    .map_err(|_| AcError::validation("BROWSER-PANEL_LOCK", "panel tabs lock poisoned"))?
+                    .map_err(|_| {
+                        AcError::validation("BROWSER-PANEL_LOCK", "panel tabs lock poisoned")
+                    })?
                     .get(tabs_key)
                     .cloned()
                     .unwrap_or_default();
@@ -2224,7 +2293,18 @@ port: port.map(|p| p as i64),
                     "tab_count": current_tabs.len(),
                 }));
             }
-            _ => {}
+        }
+        if teardown {
+            // runtime_slot's last use was above on this path, so the guard
+            // is free to take here (NLL proves it dead at this point).
+            if let Some(mut runtime) = guard.take() {
+                runtime.close_all();
+            }
+            return Ok(json!({
+                "tabs": [],
+                "active_tab": "",
+                "tab_count": 0,
+            }));
         }
 
         let mut evidence_store = EvidenceStore::new();

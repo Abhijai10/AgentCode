@@ -2,12 +2,14 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { daemon } from "./daemon";
 import { Icon } from "./Icon";
 
-// Global terminal drawer — Codex bottom-pane parity with a REAL terminal
-// model: the top bar holds TERMINAL TABS (user-created, closable), not
-// one page per command.  Each tab is one continuous shell transcript:
-// every command echoes inline and its output appends in order, exactly
-// like a terminal window.  Clicking a tab shows its stored output —
-// nothing ever reruns.  Agent commands surface as read-only robot tabs.
+// Global terminal drawer — REAL terminal model: the top bar holds
+// TERMINAL TABS (user-created, closable), not one page per command.
+// Each tab is one continuous shell transcript: every command echoes
+// inline and its output appends in order, like a terminal window.
+// Clicking a tab shows its STORED output — nothing ever reruns.  Tabs
+// and their output are restored after an app reload (sessions live in
+// the daemon until the tab is closed).  Agent commands surface as
+// read-only robot tabs.
 const MIN_H = 200;
 const MAX_H = 780;
 const DEFAULT_H = 340;
@@ -23,13 +25,13 @@ interface TerminalSession {
   mission_id: string | null;
 }
 
-/** A user terminal tab: continuous output + its own command history. */
+/** A user terminal tab: one continuous transcript + its own history. */
 interface TerminalTab {
   id: string;
   title: string;
   lines: string[];
   sessions: string[];
-  cursor: number;
+  cursors: Record<string, number>;
   history: string[];
   historyIdx: number;
   agent?: boolean;
@@ -41,7 +43,7 @@ const newTab = (userTabs: number): TerminalTab => ({
   title: `sh ${userTabs + 1}`,
   lines: [],
   sessions: [],
-  cursor: 0,
+  cursors: {},
   history: [],
   historyIdx: -1,
 });
@@ -65,12 +67,19 @@ export function TerminalDrawer({
   const inputRef = useRef<HTMLInputElement | null>(null);
   const resizeState = useRef<{ startY: number; startH: number } | null>(null);
   // Agent sessions seen in the daemon list become read-only tabs.
-  const agentTabs = useRef<Map<string, TerminalTab>>(new Map());
+  const agentTabs = useRef<Set<string>>(new Set());
+  const restoredRef = useRef(false);
+  // Mirrors so the 700ms poll never restarts on every keystroke/line.
+  const tabsRef = useRef(tabs);
+  tabsRef.current = tabs;
+  const activeIdRef = useRef(activeId);
+  activeIdRef.current = activeId;
 
   const active = tabs.find((t) => t.id === activeId) ?? tabs[0];
 
-  // Poll the ACTIVE tab's latest session tail + the daemon session list
-  // (for agent tabs) while the drawer is open.
+  // Poll while the drawer is open: restore daemon-side sessions once
+  // (after an app reload), sync new agent sessions, and stream new
+  // output for EVERY session of the active tab.
   useEffect(() => {
     const stop = () => {
       if (pollRef.current !== null) {
@@ -82,63 +91,121 @@ export function TerminalDrawer({
       stop();
       return;
     }
-    pollRef.current = window.setInterval(
-      () =>
-        void (async () => {
-          const list = await daemon.terminalList();
-          const sessions: TerminalSession[] = list.ok && list.list ? list.list.sessions : [];
-          // Sync agent sessions (mirrored agent commands) as read-only tabs.
-          const known = new Set(tabs.filter((t) => t.agent).map((t) => t.sessions[0]).filter(Boolean));
-          const agentIds = sessions.filter((s) => s.source === "agent").map((s) => s.session_id);
-          const added = agentIds.filter((id) => !known.has(id) && !agentTabs.current.has(id));
-          if (added.length > 0) {
-            setTabs((prev) => {
-              const next = [...prev];
-              for (const sid of added) {
-                const t: TerminalTab = {
-                  id: `agent-${sid}`,
-                  title: sid.slice(0, 10),
-                  lines: [],
-                  sessions: [sid],
-                  cursor: 0,
-                  history: [],
-                  historyIdx: -1,
-                  agent: true,
-                };
-                agentTabs.current.set(sid, t);
-                next.push(t);
-              }
-              return next;
+    const tick = async () => {
+      const list = await daemon.terminalList();
+      const sessions: TerminalSession[] =
+        list.ok && list.list ? list.list.sessions : [];
+      if (!restoredRef.current) {
+        restoredRef.current = true;
+        const cur = tabsRef.current;
+        const owned = new Set(cur.flatMap((t) => t.sessions));
+        const userTabs: TerminalTab[] = [];
+        const agentAdded: TerminalTab[] = [];
+        for (const s of sessions) {
+          if (owned.has(s.session_id)) continue;
+          if (s.source === "agent") {
+            agentTabs.current.add(s.session_id);
+            agentAdded.push({
+              id: `agent-${s.session_id}`,
+              title: s.session_id.slice(0, 8),
+              lines: [],
+              sessions: [s.session_id],
+              cursors: { [s.session_id]: 0 },
+              history: [],
+              historyIdx: -1,
+              agent: true,
+            });
+          } else if (s.source === "user_shell" && !s.mission_id) {
+            userTabs.push({
+              id: `s-${s.session_id}`,
+              title: `sh ${userTabs.length + 1}`,
+              lines: [],
+              sessions: [s.session_id],
+              cursors: { [s.session_id]: 0 },
+              history: [],
+              historyIdx: -1,
             });
           }
-          // Poll the active tab's latest session for NEW lines only.
-          const sid = active?.sessions[active.sessions.length - 1];
-          if (sid) {
-            const session = sessions.find((s) => s.session_id === sid);
-            const tail = await daemon.terminalTail(sid, active.cursor);
-            if (tail.ok && tail.tail && tail.tail.lines.length > 0) {
-              const lines = tail.tail.lines;
-              const cursor = tail.tail.cursor;
-              setTabs((prev) =>
-                prev.map((t) =>
-                  t.id === active.id
-                    ? { ...t, lines: [...t.lines, ...lines], cursor }
-                    : t
-                )
-              );
-            } else if (tail.ok && tail.tail) {
-              // keep cursor fresh even with no new lines
-              setTabs((prev) =>
-                prev.map((t) => (t.id === active.id ? { ...t, cursor: tail.tail!.cursor } : t))
-              );
+        }
+        if (userTabs.length > 0 || agentAdded.length > 0) {
+          setTabs((prev) => {
+            // Drop a never-used placeholder when real tabs exist.
+            const base = prev.filter(
+              (t) => t.sessions.length > 0 || t.lines.length > 0 || t.agent
+            );
+            return [...base, ...userTabs, ...agentAdded];
+          });
+          const lastUser = userTabs[userTabs.length - 1];
+          if (lastUser) setActiveId(lastUser.id);
+        }
+      } else {
+        const cur = tabsRef.current;
+        const owned = new Set(cur.flatMap((t) => t.sessions));
+        const added = sessions.filter(
+          (s) =>
+            s.source === "agent" &&
+            !owned.has(s.session_id) &&
+            !agentTabs.current.has(s.session_id)
+        );
+        if (added.length > 0) {
+          setTabs((prev) => {
+            const ownedNow = new Set(prev.flatMap((t) => t.sessions));
+            const next = [...prev];
+            for (const s of added) {
+              if (ownedNow.has(s.session_id)) continue;
+              agentTabs.current.add(s.session_id);
+              next.push({
+                id: `agent-${s.session_id}`,
+                title: s.session_id.slice(0, 8),
+                lines: [],
+                sessions: [s.session_id],
+                cursors: { [s.session_id]: 0 },
+                history: [],
+                historyIdx: -1,
+                agent: true,
+              });
             }
-            void session;
+            return next;
+          });
+        }
+      }
+      // Stream new output for every session of the ACTIVE tab (each
+      // session keeps its own cursor, so interleaved commands stream
+      // without duplicating or dropping lines).
+      const curTabs = tabsRef.current;
+      const act = curTabs.find((t) => t.id === activeIdRef.current) ?? curTabs[0];
+      if (!act || act.sessions.length === 0) return;
+      let changed = false;
+      const appended: Record<string, string[]> = {};
+      const cursors: Record<string, number> = {};
+      for (const sid of act.sessions) {
+        const tail = await daemon.terminalTail(sid, act.cursors[sid] ?? 0);
+        if (tail.ok && tail.tail) {
+          const from = act.cursors[sid] ?? 0;
+          if (tail.tail.cursor !== from) {
+            changed = true;
+            cursors[sid] = tail.tail.cursor;
+            if (tail.tail.lines.length > 0) appended[sid] = tail.tail.lines;
           }
-        })(),
-      700
-    );
+        }
+      }
+      if (changed) {
+        setTabs((prev) =>
+          prev.map((t) => {
+            if (t.id !== act.id) return t;
+            let lines = t.lines;
+            for (const sid of t.sessions) {
+              const l = appended[sid];
+              if (l && l.length > 0) lines = [...lines, ...l];
+            }
+            return { ...t, lines, cursors: { ...t.cursors, ...cursors } };
+          })
+        );
+      }
+    };
+    pollRef.current = window.setInterval(() => void tick(), 700);
     return stop;
-  }, [open, activeId, tabs, active?.id, active?.cursor, active?.sessions]);
+  }, [open]);
 
   // Auto-scroll to the newest line like a real terminal.
   useEffect(() => {
@@ -155,7 +222,10 @@ export function TerminalDrawer({
     void (async () => {
       setError(null);
       const command = cmd.trim();
-      if (!command || !active) return;
+      const act =
+        tabsRef.current.find((t) => t.id === activeIdRef.current) ??
+        tabsRef.current[0];
+      if (!command || !act || act.agent) return;
       const cwd = projectPath ?? (await daemon.homeDir()) ?? "/";
       const res = await daemon.terminalStart(null, [command], cwd, "shell");
       if (!res.ok || !res.session) {
@@ -167,12 +237,12 @@ export function TerminalDrawer({
       // its output after it — like a terminal window.
       setTabs((prev) =>
         prev.map((t) =>
-          t.id === active.id
+          t.id === act.id
             ? {
                 ...t,
                 lines: [...t.lines, `$ ${command}`],
                 sessions: [...t.sessions, sid],
-                cursor: 0,
+                cursors: { ...t.cursors, [sid]: 0 },
                 history: [command, ...t.history].slice(0, 50),
                 historyIdx: -1,
               }
@@ -181,12 +251,15 @@ export function TerminalDrawer({
       );
       setCmd("");
     })();
-  }, [cmd, projectPath, active]);
+  }, [cmd, projectPath]);
 
   const cancelActive = () =>
     void (async () => {
-      if (!active) return;
-      const sid = active.sessions[active.sessions.length - 1];
+      const act =
+        tabsRef.current.find((t) => t.id === activeIdRef.current) ??
+        tabsRef.current[0];
+      if (!act) return;
+      const sid = act.sessions[act.sessions.length - 1];
       if (!sid) return;
       const res = await daemon.terminalCancel(sid);
       if (!res.ok) setError(res.error ?? "cancel failed");
@@ -195,36 +268,37 @@ export function TerminalDrawer({
   const closeTab = (id: string) =>
     void (async () => {
       // Cancel any live session owned by the tab, then drop the tab and
-      // its output (the terminal session ring lives until the daemon
-      // reaps it; the tab no longer displays it).
-      const tab = tabs.find((t) => t.id === id);
-      if (tab && tab.agent) agentTabs.current.delete(tab.sessions[0]);
+      // its transcript (the tab no longer displays the stored output).
+      const tab = tabsRef.current.find((t) => t.id === id);
       if (tab) {
+        if (tab.agent) agentTabs.current.delete(tab.sessions[0]);
         for (const sid of tab.sessions) {
           const list = await daemon.terminalList();
-          const s = list.ok && list.list ? list.list.sessions.find((x) => x.session_id === sid) : undefined;
+          const s =
+            list.ok && list.list
+              ? list.list.sessions.find((x) => x.session_id === sid)
+              : undefined;
           if (s?.alive) await daemon.terminalCancel(sid);
         }
       }
-      setTabs((prev) => {
-        const next = prev.filter((t) => t.id !== id);
-        if (next.length === 0) return [newTab(0)];
-        return next;
-      });
-      setActiveId((cur) => {
-        const remaining = tabs.filter((t) => t.id !== id);
-        if (remaining.length === 0) return "t" + tabSeq;
-        return cur === id ? remaining[remaining.length - 1].id : cur;
-      });
+      const remaining = tabsRef.current.filter((t) => t.id !== id);
+      if (remaining.length === 0) {
+        const fresh = newTab(0);
+        setTabs([fresh]);
+        setActiveId(fresh.id);
+        return;
+      }
+      setTabs(remaining);
+      if (activeIdRef.current === id)
+        setActiveId(remaining[remaining.length - 1].id);
     })();
 
   const addTab = () => {
-    setTabs((prev) => {
-      const userTabs = prev.filter((t) => !t.agent).length;
-      const t = newTab(userTabs);
-      setActiveId(t.id);
-      return [...prev, t];
-    });
+    const prev = tabsRef.current;
+    const userTabs = prev.filter((t) => !t.agent).length;
+    const t = newTab(userTabs);
+    setTabs([...prev, t]);
+    setActiveId(t.id);
   };
 
   // ── Drag-to-resize (top edge handle) ─────────────────────────────
@@ -373,7 +447,7 @@ export function TerminalDrawer({
             }
           }}
           placeholder={active?.agent ? "read-only agent session" : "type any command — pipes, &&, env vars all work…"}
-          className="flex-1 bg-transparent text-[13px] text-[#d6e2f0] outline-none placeholder:text-white/25 disabled:opacity-50"
+          className="flex-1 bg-transparent text-[13px] text-[#d6e2f0] outline-none placeholder:text-white/45 disabled:opacity-50"
           spellCheck={false}
         />
         <div className="flex items-center gap-1 shrink-0">

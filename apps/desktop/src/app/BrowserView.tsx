@@ -60,8 +60,7 @@ export function BrowserView() {
       }
       if (res.panel) {
         setPanel(res.panel as Panel);
-        if (Array.isArray((res.panel as Panel).tabs) && (res.panel as Panel).tabs!.length > 0)
-          setTabs((res.panel as Panel).tabs!);
+        if (Array.isArray((res.panel as Panel).tabs)) setTabs((res.panel as Panel).tabs!);
         if ((res.panel as Panel).active_tab) setActiveTab((res.panel as Panel).active_tab!);
         setCurrentUrl(res.panel.url);
         if (action === "navigate") setInput(res.panel.url);
@@ -192,7 +191,7 @@ export function BrowserView() {
               onChange={(e) => setInput(e.target.value)}
               placeholder="Search or enter address"
               spellCheck={false}
-              className="flex-1 min-w-0 bg-transparent text-[13px] text-on-surface font-mono outline-none placeholder:text-on-surface-variant/50"
+              className="flex-1 min-w-0 bg-transparent text-[13px] text-on-surface font-mono outline-none placeholder:text-on-surface-variant/70"
             />
             {naviging && <Icon name="autorenew" size={13} className="animate-spin text-primary shrink-0" />}
           </div>

@@ -2511,6 +2511,30 @@ impl BrowserRuntime {
         self.sessions.get(session_id).map(|s| s.task_id.clone())
     }
 
+    /// Whether a tab's session is still LIVE in this runtime (registered
+    /// AND owned by a running process) — tab-registry hygiene after
+    /// teardowns and restarts.
+    pub fn has_live_session(&self, session_id: &StableId) -> bool {
+        let Some(session) = self.sessions.get(session_id) else {
+            return false;
+        };
+        let Some(process) = self.processes.get(&session.process_id) else {
+            return false;
+        };
+        matches!(
+            process.state,
+            BrowserProcessState::Running | BrowserProcessState::Ready
+        )
+    }
+
+    /// Drop one tab (page session): removes the session record and its
+    /// page socket.  The headless Chrome target itself is reclaimed at
+    /// teardown.
+    pub fn close_session(&mut self, session_id: &StableId) {
+        self.real_pages.remove(session_id);
+        self.sessions.remove(session_id);
+    }
+
     /// Gracefully close every live process (panel shutdown + daemon stop).
     pub fn close_all(&mut self) {
         let ids: Vec<StableId> = self.processes.keys().cloned().collect();
